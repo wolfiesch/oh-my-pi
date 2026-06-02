@@ -158,6 +158,31 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(headers["X-Api-Key"]).toBeUndefined();
 	});
 
+	it("uses bearer-only SDK auth for custom Anthropic-compatible endpoints", () => {
+		const options = buildAnthropicClientOptions({
+			model: {
+				...ANTHROPIC_MODEL,
+				provider: "anthropic",
+				baseUrl: "https://proxy.example.com/v1",
+				headers: {
+					Authorization: "Bearer stale-token",
+					"X-Api-Key": "sk-ant-leak",
+				},
+			},
+			apiKey: "custom-provider-key",
+			extraBetas: [],
+			stream: true,
+			interleavedThinking: false,
+			dynamicHeaders: {},
+		});
+
+		expect(options.baseURL).toBe("https://proxy.example.com");
+		expect(options.apiKey).toBeNull();
+		expect(options.authToken).toBeNull();
+		expect(options.defaultHeaders.Authorization).toBe("Bearer custom-provider-key");
+		expect(options.defaultHeaders["X-Api-Key"]).toBeUndefined();
+	});
+
 	it("forwards only prefix-matching Claude Code User-Agent values", () => {
 		const forwardedHeaders = buildAnthropicHeaders({
 			apiKey: "sk-ant-oat-test",

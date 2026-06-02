@@ -98,6 +98,25 @@ describe("DeepSeek reasoning_content tool-call replay", () => {
 			});
 		});
 
+		it("maps custom OpenAI-compatible DeepSeek endpoints by base URL", () => {
+			const compat = detectCompat(
+				deepseekModel({
+					provider: "custom" as Model["provider"],
+					baseUrl: "https://api.deepseek.com/v1",
+					id: "deepseek-v4-pro",
+				}),
+			);
+			expect(compat.reasoningEffortMap).toMatchObject({
+				minimal: "high",
+				low: "high",
+				medium: "high",
+				high: "high",
+				xhigh: "max",
+			});
+			expect(compat.requiresReasoningContentForToolCalls).toBe(true);
+			expect(compat.allowsSyntheticReasoningContentForToolCalls).toBe(false);
+			expect(compat.supportsToolChoice).toBe(false);
+		});
 		it("does NOT map xhigh for non-DeepSeek models", () => {
 			const compat = detectCompat(
 				deepseekModel({

@@ -4,6 +4,7 @@
 ### Fixed
 
 - Fixed OpenAI-compatible chat-completions streams that still use the deprecated `delta.function_call` contract, reconstructing them into tool calls instead of dropping the call body. ([#1691](https://github.com/can1357/oh-my-pi/issues/1691))
+- Fixed custom Anthropic-compatible endpoints receiving duplicate SDK `X-Api-Key` auth alongside bearer auth, keeping proxy/gateway requests on the endpoint contract. ([#1691](https://github.com/can1357/oh-my-pi/issues/1691))
 - Fixed Cursor provider requests failing with `Cannot send empty user message to Cursor API` after tool-result history by selecting the latest user/developer turn instead of assuming the final context message is the active user turn.
 
 ### Fixed

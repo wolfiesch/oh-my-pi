@@ -102,4 +102,15 @@ describe("issue #814: z.ai tool_result id workaround", () => {
 		expect(block.tool_use_id).toBe("toolu_abc123");
 		expect("id" in block).toBe(false);
 	});
+
+	it("detects z.ai by custom Anthropic-compatible base URL", () => {
+		const block = getToolResultBlock({
+			...anthropicModel,
+			id: "glm-4.6",
+			name: "GLM-4.6 via custom z.ai endpoint",
+			baseUrl: "https://api.z.ai/api/anthropic",
+		});
+		expect(block.tool_use_id).toBe("toolu_abc123");
+		expect(block.id).toBe("toolu_abc123");
+	});
 });

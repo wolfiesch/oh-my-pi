@@ -132,6 +132,47 @@ describe("Anthropic assistant-prefill fallback", () => {
 		expect(blocks.map(block => block.type)).toEqual(["tool_result", "tool_result"]);
 		expect(blocks.map(block => block.tool_use_id)).toEqual(["toolu_weather", "toolu_time"]);
 	});
+
+	it("preserves unsigned thinking for custom non-signing Anthropic-compatible endpoints", () => {
+		const customDeepseekModel: Model<"anthropic-messages"> = {
+			...model,
+			provider: "anthropic",
+			baseUrl: "https://api.deepseek.com/anthropic",
+			id: "deepseek-v4-pro",
+			name: "DeepSeek V4 Pro via Anthropic-compatible custom endpoint",
+		};
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: "provider-native reasoning" }],
+			api: "anthropic-messages",
+			provider: "deepseek",
+			model: customDeepseekModel.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 2,
+		};
+
+		const params = convertAnthropicMessages(
+			[{ role: "user", content: "continue", timestamp: 1 }, assistant],
+			customDeepseekModel,
+			false,
+		);
+		const assistantParam = params.find(param => param.role === "assistant");
+		expect(assistantParam).toBeDefined();
+		const blocks = assistantParam?.content as unknown as Array<Record<string, unknown>>;
+		expect(blocks[0]).toEqual({
+			type: "thinking",
+			thinking: "provider-native reasoning",
+			signature: "",
+		});
+	});
 });
 
 it("preserves redacted thinking blocks in assistant replay payloads", () => {

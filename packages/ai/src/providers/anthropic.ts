@@ -1754,6 +1754,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		isCloudflareAiGateway: model.provider === "cloudflare-ai-gateway",
 	});
 
+	const usesBearerOnlyCustomEndpoint = !oauthToken && !isAnthropicApiBaseUrl(baseUrl);
 	if (model.provider === "cloudflare-ai-gateway") {
 		return {
 			isOAuthToken: false,
@@ -1787,8 +1788,8 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 
 	return {
 		isOAuthToken: oauthToken,
-		apiKey: oauthToken ? null : apiKey,
-		authToken: oauthToken ? apiKey : undefined,
+		apiKey: oauthToken || usesBearerOnlyCustomEndpoint ? null : apiKey,
+		authToken: oauthToken ? apiKey : usesBearerOnlyCustomEndpoint ? null : undefined,
 		baseURL: baseUrl,
 		maxRetries: 5,
 		dangerouslyAllowBrowser: true,
