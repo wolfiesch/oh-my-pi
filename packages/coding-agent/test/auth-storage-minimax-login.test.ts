@@ -93,5 +93,10 @@ describe("AuthStorage MiniMax login", () => {
 			type: "api_key",
 			key: "sk-cn",
 		});
+		expect(authStorage.get("minimax-code-cn")).toEqual({
+			type: "api_key",
+			key: "sk-cn",
+		});
+		expect(await authStorage.getApiKey("minimax-code-cn")).toBe("sk-cn");
 	});
 });

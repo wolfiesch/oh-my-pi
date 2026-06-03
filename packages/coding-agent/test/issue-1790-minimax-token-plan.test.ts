@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { Snowflake } from "@oh-my-pi/pi-utils";
+import { hookFetch, Snowflake } from "@oh-my-pi/pi-utils";
 
 describe("MiniMax Token Plan catalog availability (issue #1790)", () => {
 	let tempDir: string;
@@ -35,6 +35,29 @@ describe("MiniMax Token Plan catalog availability (issue #1790)", () => {
 			api: "anthropic-messages",
 			provider: "minimax-cn",
 			baseUrl: "https://api.minimaxi.com/anthropic",
+			contextWindow: 512000,
+			maxTokens: 128000,
+		});
+	});
+
+	test("a CN Anthropic-compatible Token Plan login makes the CN OpenAI-compatible M3 SKU selectable", async () => {
+		using _hook = hookFetch(
+			() => new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }),
+		);
+		await authStorage.login("minimax-cn", {
+			onAuth: () => {},
+			onPrompt: async () => "sk-cn",
+		});
+
+		const registry = new ModelRegistry(authStorage, path.join(tempDir, "models.json"));
+		const model = registry
+			.getAvailable()
+			.find(candidate => candidate.provider === "minimax-code-cn" && candidate.id === "MiniMax-M3");
+
+		expect(model).toMatchObject({
+			api: "openai-completions",
+			provider: "minimax-code-cn",
+			baseUrl: "https://api.minimaxi.com/v1",
 			contextWindow: 512000,
 			maxTokens: 128000,
 		});

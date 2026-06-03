@@ -1681,12 +1681,14 @@ export class AuthStorage {
 				const { loginMiniMaxTokenPlan } = await import("./utils/oauth/minimax-code");
 				const apiKey = await loginMiniMaxTokenPlan(ctrl);
 				await saveApiKeyCredential(apiKey);
+				await this.set("minimax-code", { type: "api_key", key: apiKey });
 				return;
 			}
 			case "minimax-cn": {
 				const { loginMiniMaxTokenPlanCn } = await import("./utils/oauth/minimax-code");
 				const apiKey = await loginMiniMaxTokenPlanCn(ctrl);
 				await saveApiKeyCredential(apiKey);
+				await this.set("minimax-code-cn", { type: "api_key", key: apiKey });
 				return;
 			}
 			case "minimax-code": {
