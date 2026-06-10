@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `glm-5.1` sessions using the strict hashline edit grammar by default; they now use the tolerant replace edit mode unless the user explicitly configures `edit.mode` or an `edit.modelVariants` override ([#2241](https://github.com/can1357/oh-my-pi/issues/2241)).
+
 ## [15.10.12] - 2026-06-10
 
 ### Added
@@ -25,7 +29,6 @@
 
 ### Fixed
 
-- Fixed `glm-5.1` sessions using the strict hashline edit grammar by default; they now use the tolerant replace edit mode unless the user explicitly configures `edit.mode` or an `edit.modelVariants` override ([#2241](https://github.com/can1357/oh-my-pi/issues/2241)).
 - Fixed Ollama chat turns using the `:off` thinking selector so requests explicitly send reasoning disablement instead of falling back to the provider default ([#2239](https://github.com/can1357/oh-my-pi/issues/2239)).
 - Fixed long-running sessions becoming sluggish because the status line recomputed context usage by walking the full message history on every refresh. Message-token totals are now cached incrementally, and status lines that do not render context segments skip context accounting entirely. ([#2089](https://github.com/can1357/oh-my-pi/issues/2089))
 - Fixed extension-registered slash commands being allowed to shadow builtin command names in the ACP/RPC command list: both the TUI and `getSessionSlashCommands()` now filter against the shared builtin reserved-name registry.
