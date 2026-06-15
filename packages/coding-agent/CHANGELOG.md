@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Refreshed the hidden `workflowz` notice with advisor-consult and provenance-rich `local://` briefing patterns ([#2642](https://github.com/can1357/oh-my-pi/issues/2642)).
+
 ## [15.13.3] - 2026-06-15
 
 ### Added

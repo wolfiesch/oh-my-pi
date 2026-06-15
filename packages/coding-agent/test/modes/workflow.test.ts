@@ -52,5 +52,9 @@ describe("workflow notice", () => {
 		expect(WORKFLOW_NOTICE.length).toBeGreaterThan(0);
 		expect(WORKFLOW_NOTICE).toContain("**workflowz** keyword");
 		expect(WORKFLOW_NOTICE).toContain("parallel(");
+		expect(WORKFLOW_NOTICE).toContain("consult the `advisor` tool");
+		expect(WORKFLOW_NOTICE).toContain("files/commits to touch");
+		expect(WORKFLOW_NOTICE).toContain('what "done" means');
+		expect(WORKFLOW_NOTICE).toContain("local://");
 	});
 });

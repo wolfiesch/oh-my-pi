@@ -58,6 +58,8 @@ Compose the harness the task calls for:
 - **Budget/count loops** — `while len(bugs) < 10:` to hit a target, or `while budget.total and budget.remaining() > 50_000:` to scale depth to the turn budget; `log()` each round.
 - **No silent caps** — if you bound coverage (top-N, no-retry, sampling), `log()` what you dropped; silent truncation reads as "covered everything" when it didn't.
 
+- **Advisor consult** — at a hard fork, consult the `advisor` tool before committing to one direction; feed it the concrete options, constraints, and consequences so the chosen path is explicit.
+- **Provenance-rich context** — brief every subagent from a `local://` file naming the files/commits to touch, the evidence already gathered, and what "done" means; cite that brief instead of cloning fuzzy prose into each prompt.
 Scale to the ask: "find any bugs" → a few finders, single-vote verify. "thoroughly audit / be comprehensive" → larger finder pool, 3–5-vote adversarial pass, a synthesis stage.
 </patterns>
 
