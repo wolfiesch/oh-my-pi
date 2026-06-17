@@ -1,0 +1,77 @@
+{
+	"type": "module",
+	"name": "@oh-my-pi/omp-mechanism",
+	"version": "16.0.1",
+	"description": "Local live visualizer for the pi harness running state",
+	"homepage": "https://omp.sh",
+	"author": "Can Boluk",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/can1357/oh-my-pi.git",
+		"directory": "packages/mechanism"
+	},
+	"bugs": {
+		"url": "https://github.com/can1357/oh-my-pi/issues"
+	},
+	"keywords": [
+		"ai",
+		"observability",
+		"visualization",
+		"threejs",
+		"orrery",
+		"statistics"
+	],
+	"main": "./src/index.ts",
+	"types": "./src/index.ts",
+	"bin": {
+		"omp-mechanism": "./src/index.ts"
+	},
+	"scripts": {
+		"build": "bun run build.ts",
+		"dev": "bun run src/index.ts",
+		"verify": "bun run scripts/verify-harness.ts",
+		"check": "biome check . && bun run check:types",
+		"check:types": "tsgo -p tsconfig.json --noEmit && tsgo -p tsconfig.client.json --noEmit",
+		"lint": "biome lint .",
+		"fix": "biome check --write --unsafe .",
+		"fmt": "biome format --write ."
+	},
+	"dependencies": {
+		"@oh-my-pi/pi-ai": "catalog:",
+		"@oh-my-pi/pi-catalog": "catalog:",
+		"@oh-my-pi/pi-utils": "catalog:",
+		"three": "^0.169.0"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:",
+		"@types/three": "^0.169.0"
+	},
+	"engines": {
+		"bun": ">=1.3.14"
+	},
+	"files": [
+		"src",
+		"build.ts",
+		"README.md",
+		"CHANGELOG.md"
+	],
+	"exports": {
+		".": {
+			"types": "./src/index.ts",
+			"import": "./src/index.ts"
+		},
+		"./*": {
+			"types": "./src/*.ts",
+			"import": "./src/*.ts"
+		},
+		"./client": {
+			"types": "./src/client/main.ts",
+			"import": "./src/client/main.ts"
+		},
+		"./client/*": {
+			"types": "./src/client/*.ts",
+			"import": "./src/client/*.ts"
+		}
+	}
+}

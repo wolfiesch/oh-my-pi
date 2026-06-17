@@ -1,0 +1,69 @@
+:root {
+	--ink: #050505;
+	--gold: #e5c158;
+	--gold-dim: rgba(229, 193, 88, 0.45);
+}
+
+html,
+body {
+	margin: 0;
+	padding: 0;
+	height: 100%;
+}
+
+body {
+	background-color: var(--ink);
+	color: var(--gold);
+	font-family: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, monospace;
+	overflow: hidden;
+}
+
+#canvas-container {
+	position: fixed;
+	inset: 0;
+	z-index: 1;
+}
+
+#canvas-container canvas {
+	display: block;
+}
+
+/* Quiet single-corner instrument readout. No box, no tiles, no card grid. */
+#hud {
+	position: fixed;
+	bottom: 28px;
+	left: 28px;
+	z-index: 10;
+	pointer-events: none;
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+
+.hud-line {
+	display: flex;
+	align-items: baseline;
+	gap: 14px;
+	font-size: 11px;
+	line-height: 1;
+	letter-spacing: 0.18em;
+	text-transform: uppercase;
+}
+
+.hud-label {
+	color: var(--gold-dim);
+	min-width: 92px;
+}
+
+.hud-value {
+	color: var(--gold);
+	font-variant-numeric: tabular-nums;
+	letter-spacing: 0.12em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	* {
+		transition: none !important;
+		animation: none !important;
+	}
+}
