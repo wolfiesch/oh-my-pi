@@ -184,12 +184,12 @@ export class InputController {
 			// → /compact → auto end → manual finally), leaving Esc wired to a
 			// stale no-op closure until restart.
 			//
-			// Skip these aborts while a subagent is focused: that view's status
-			// promises "Esc returns to main", so it must not cancel the main
-			// session's maintenance. The focused branch below returns to main
-			// instead (#2819). Side panels (/btw, /omfg) and the loop/collab
-			// handlers between here and there keep their existing precedence.
-			if (!this.ctx.focusedAgentId) {
+			// Skip only main-session aborts while a subagent is focused: that
+			// view's status promises "Esc returns to main". If `viewSession` has
+			// been retargeted to the focused subagent, the visible subagent
+			// maintenance still owns its advertised "(esc to cancel)" handler.
+			const focusedViewOwnsMaintenance = this.ctx.focusedAgentId && viewSession !== this.ctx.session;
+			if (!this.ctx.focusedAgentId || focusedViewOwnsMaintenance) {
 				let aborted = false;
 				if (viewSession.isCompacting) {
 					try {

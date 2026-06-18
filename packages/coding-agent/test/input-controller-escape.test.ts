@@ -433,12 +433,16 @@ describe("InputController escape behavior", () => {
 		expect(spies.abort).not.toHaveBeenCalled();
 	});
 
-	it("returns a focused subagent view to main without aborting active context maintenance (#2819)", () => {
+	it("returns a focused subagent view to main without aborting main-session maintenance (#2819)", () => {
 		const { ctx, editor, spies } = createContext();
 		Object.defineProperty(ctx, "focusedAgentId", { value: "Worker", configurable: true });
+		ctx.viewSession = ctx.session as unknown as InteractiveModeContext["viewSession"];
 		(ctx.viewSession as { isCompacting: boolean }).isCompacting = true;
 		(ctx.viewSession as { isGeneratingHandoff: boolean }).isGeneratingHandoff = true;
 		(ctx.viewSession as { isRetrying: boolean }).isRetrying = true;
+		(ctx.viewSession as { abortCompaction: Spy }).abortCompaction = vi.fn();
+		(ctx.viewSession as { abortHandoff: Spy }).abortHandoff = spies.abortHandoff;
+		(ctx.viewSession as { abortRetry: Spy }).abortRetry = vi.fn();
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
@@ -448,6 +452,20 @@ describe("InputController escape behavior", () => {
 		expect(ctx.viewSession.abortCompaction as unknown as Spy).not.toHaveBeenCalled();
 		expect(spies.abortHandoff).not.toHaveBeenCalled();
 		expect(ctx.viewSession.abortRetry as unknown as Spy).not.toHaveBeenCalled();
+	});
+
+	it("cancels focused subagent maintenance before returning to main", () => {
+		const { ctx, editor, spies } = createContext();
+		Object.defineProperty(ctx, "focusedAgentId", { value: "Worker", configurable: true });
+		(ctx.viewSession as { isCompacting: boolean }).isCompacting = true;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(ctx.viewSession.abortCompaction as unknown as Spy).toHaveBeenCalledTimes(1);
+		expect(ctx.unfocusSession).not.toHaveBeenCalled();
+		expect(spies.abortHandoff).not.toHaveBeenCalled();
 	});
 
 	it("lets an active /btw panel keep Esc precedence over a focused subagent view", () => {
