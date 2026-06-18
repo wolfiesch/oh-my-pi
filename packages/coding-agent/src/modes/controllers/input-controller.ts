@@ -175,6 +175,7 @@ export class InputController {
 			});
 		}
 		this.ctx.editor.onEscape = () => {
+			const viewSession = this.ctx.viewSession;
 			// Active context maintenance owns Esc: auto/manual compaction,
 			// handoff generation, and auto-retry backoff all advertise
 			// "(esc to cancel)". Dispatch on live session state instead of
@@ -182,27 +183,34 @@ export class InputController {
 			// to clobber the single saved-handler slot (auto-compaction start
 			// → /compact → auto end → manual finally), leaving Esc wired to a
 			// stale no-op closure until restart.
-			const viewSession = this.ctx.viewSession;
-			let aborted = false;
-			if (viewSession.isCompacting) {
-				try {
-					viewSession.abortCompaction();
-				} catch {}
-				aborted = true;
+			//
+			// Skip these aborts while a subagent is focused: that view's status
+			// promises "Esc returns to main", so it must not cancel the main
+			// session's maintenance. The focused branch below returns to main
+			// instead (#2819). Side panels (/btw, /omfg) and the loop/collab
+			// handlers between here and there keep their existing precedence.
+			if (!this.ctx.focusedAgentId) {
+				let aborted = false;
+				if (viewSession.isCompacting) {
+					try {
+						viewSession.abortCompaction();
+					} catch {}
+					aborted = true;
+				}
+				if (viewSession.isGeneratingHandoff) {
+					try {
+						viewSession.abortHandoff();
+					} catch {}
+					aborted = true;
+				}
+				if (viewSession.isRetrying) {
+					try {
+						viewSession.abortRetry();
+					} catch {}
+					aborted = true;
+				}
+				if (aborted) return;
 			}
-			if (viewSession.isGeneratingHandoff) {
-				try {
-					viewSession.abortHandoff();
-				} catch {}
-				aborted = true;
-			}
-			if (viewSession.isRetrying) {
-				try {
-					viewSession.abortRetry();
-				} catch {}
-				aborted = true;
-			}
-			if (aborted) return;
 
 			if (this.ctx.loopModeEnabled) {
 				this.ctx.pauseLoop();

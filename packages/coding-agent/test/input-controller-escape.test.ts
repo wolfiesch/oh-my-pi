@@ -433,6 +433,49 @@ describe("InputController escape behavior", () => {
 		expect(spies.abort).not.toHaveBeenCalled();
 	});
 
+	it("returns a focused subagent view to main without aborting active context maintenance (#2819)", () => {
+		const { ctx, editor, spies } = createContext();
+		Object.defineProperty(ctx, "focusedAgentId", { value: "Worker", configurable: true });
+		(ctx.viewSession as { isCompacting: boolean }).isCompacting = true;
+		(ctx.viewSession as { isGeneratingHandoff: boolean }).isGeneratingHandoff = true;
+		(ctx.viewSession as { isRetrying: boolean }).isRetrying = true;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(ctx.unfocusSession).toHaveBeenCalledTimes(1);
+		expect(ctx.viewSession.abortCompaction as unknown as Spy).not.toHaveBeenCalled();
+		expect(spies.abortHandoff).not.toHaveBeenCalled();
+		expect(ctx.viewSession.abortRetry as unknown as Spy).not.toHaveBeenCalled();
+	});
+
+	it("lets an active /btw panel keep Esc precedence over a focused subagent view", () => {
+		const { ctx, editor, spies } = createContext();
+		Object.defineProperty(ctx, "focusedAgentId", { value: "Worker", configurable: true });
+		spies.hasActiveBtw.mockReturnValue(true);
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.handleBtwEscape).toHaveBeenCalledTimes(1);
+		expect(ctx.unfocusSession).not.toHaveBeenCalled();
+	});
+
+	it("lets an active /omfg panel keep Esc precedence over a focused subagent view", () => {
+		const { ctx, editor, spies } = createContext();
+		Object.defineProperty(ctx, "focusedAgentId", { value: "Worker", configurable: true });
+		spies.hasActiveOmfg.mockReturnValue(true);
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.handleOmfgEscape).toHaveBeenCalledTimes(1);
+		expect(ctx.unfocusSession).not.toHaveBeenCalled();
+	});
+
 	it("routes a focused double-← through the global input listener like Esc", () => {
 		const now = vi.spyOn(Date, "now");
 		const { ctx, inputListeners } = createContext();

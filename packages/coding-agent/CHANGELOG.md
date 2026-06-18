@@ -70,6 +70,7 @@
 
 ### Fixed
 
+- Fixed Esc in a focused subagent view canceling the main session's context compaction, handoff generation, or auto-retry instead of returning to the main session; the view-maintenance abort now defers to the focused-return while `/btw` and `/omfg` side panels keep their Esc precedence ([#2819](https://github.com/can1357/oh-my-pi/issues/2819)).
 - Fixed legacy plugin validation for extensions that import `defineTool`, `StringEnum`, frontmatter helpers, `SettingsManager`, `createCodingTools`, or the bare `typebox` package through the hosted Pi compatibility shims ([#2858](https://github.com/can1357/oh-my-pi/issues/2858)).
 - Fixed edit seen-line guard mismatch assertion message formatting to report the actual state instead of generic failure notices
 - Fixed hashline edit mode rendering in the TUI when `setIgnoreTight` triggers synchronous display rebuilds in the constructor before `#editMode` is assigned, which previously caused the tool envelope target path to display as `…` instead of the parsed hashline filename.
