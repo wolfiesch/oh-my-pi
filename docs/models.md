@@ -501,7 +501,7 @@ Context promotion is an overflow recovery mechanism for small-context variants (
 
 ### Trigger and order
 
-Threshold maintenance and overflow recovery are separate paths. A successful turn that crosses the compaction threshold runs auto-compaction on the selected model. Context promotion is only considered after a real provider overflow or length-stop recovery signal.
+Threshold maintenance and overflow recovery are separate paths. Threshold checks run at safe maintenance boundaries, not mid-token; long-running commands can briefly pass the configured threshold before compaction gets a turn. When the turn succeeds, auto-compaction still runs on the selected model. Context promotion is only considered after a real provider overflow or length-stop recovery signal.
 
 When a turn fails with a context overflow error (e.g. `context_length_exceeded`), `AgentSession` attempts promotion **before** falling back to compaction:
 
@@ -524,10 +524,11 @@ If switching from/to `openai-codex-responses`, session provider state key `opena
 
 ### Persistence behavior
 
-Promotion uses temporary switching (`setModelTemporary`):
+Promotion uses temporary switching (`setModelTemporary`). Temporary means session-scoped, not auto-reverting:
 
-- recorded as a temporary `model_change` in session history
-- does not rewrite saved role mapping
+- changes the active model for the current session until the user changes it
+- records a temporary `model_change` in session history
+- does not rewrite saved role mapping or settings for future sessions
 
 ### Configuring explicit fallback chains
 
