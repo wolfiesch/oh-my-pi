@@ -129,13 +129,17 @@ export function linkOpenAIPromotionTargets(models: ModelSpec<Api>[]): void {
 		}
 		// Prefer the plainest sibling id (shortest bare segment) so the base model
 		// wins over `-pro`/`-mini`/`-nano` siblings that parse to the same version.
+		// Ignore equal/smaller siblings before ranking so a stale lateral target does
+		// not mask a larger namespaced or dated sibling on the same provider/API.
 		let fallback: ModelSpec<Api> | undefined;
 		let fallbackBareLength = Number.POSITIVE_INFINITY;
 		for (const model of models) {
 			if (model === candidate) continue;
 			if (model.provider !== candidate.provider || model.api !== candidate.api) continue;
+			if (!hasLargerContextWindow(model, candidate)) continue;
 			const parsed = parseKnownModel(model.id);
 			if (parsed.family !== "openai" || !semverEqual(parsed.version, targetVersion)) continue;
+			if (parsed.variant !== "base") continue;
 			const bareLength = bareModelId(model.id).length;
 			if (bareLength < fallbackBareLength) {
 				fallback = model;
@@ -144,7 +148,6 @@ export function linkOpenAIPromotionTargets(models: ModelSpec<Api>[]): void {
 		}
 		delete candidate.contextPromotionTarget;
 		if (!fallback) continue;
-		if (!hasLargerContextWindow(fallback, candidate)) continue;
 		candidate.contextPromotionTarget = `${fallback.provider}/${fallback.id}`;
 	}
 }

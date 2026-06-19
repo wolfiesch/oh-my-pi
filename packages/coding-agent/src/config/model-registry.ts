@@ -1569,7 +1569,7 @@ export class ModelRegistry {
 	}
 	#applyHardcodedModelPolicies(models: Model<Api>[]): Model<Api>[] {
 		return models.map(model => {
-			if (model.id !== "gpt-5.4" || model.provider === "github-copilot") {
+			if (model.id !== "gpt-5.4" || model.provider === "github-copilot" || model.provider === "openai") {
 				return model;
 			}
 			const overrides = this.#modelOverrides.get(model.provider)?.get(model.id);

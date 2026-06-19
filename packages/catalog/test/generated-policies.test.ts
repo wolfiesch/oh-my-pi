@@ -280,6 +280,42 @@ describe("generated model policies", () => {
 				provider: "openai-codex",
 				contextWindow: 272000,
 			}),
+			createSpec({
+				id: "gpt-5.5-instant",
+				api: "openai-responses",
+				provider: "zenmux",
+				contextWindow: 400000,
+			}),
+			createSpec({
+				id: "gpt-5.4",
+				api: "openai-responses",
+				provider: "zenmux",
+				contextWindow: 400000,
+			}),
+			createSpec({
+				id: "openai/gpt-5.4",
+				api: "openai-responses",
+				provider: "zenmux",
+				contextWindow: 1050000,
+			}),
+			createSpec({
+				id: "gpt-5.5",
+				api: "openai-responses",
+				provider: "openai",
+				contextWindow: 320000,
+			}),
+			createSpec({
+				id: "gpt-5.4",
+				api: "openai-responses",
+				provider: "openai",
+				contextWindow: 320000,
+			}),
+			createSpec({
+				id: "gpt-5.4-mini",
+				api: "openai-responses",
+				provider: "openai",
+				contextWindow: 400000,
+			}),
 		];
 		models[1]!.contextPromotionTarget = "openai-codex/gpt-5.4";
 
@@ -287,6 +323,8 @@ describe("generated model policies", () => {
 
 		expect(models[0]?.contextPromotionTarget).toBe("openai-codex/gpt-5.5");
 		expect(models[1]?.contextPromotionTarget).toBeUndefined();
+		expect(models[3]?.contextPromotionTarget).toBe("zenmux/openai/gpt-5.4");
+		expect(models[6]?.contextPromotionTarget).toBeUndefined();
 	});
 
 	it("links every gpt-5.5 flavor to its gpt-5.4 sibling across namespaced and dated provider ids", () => {
