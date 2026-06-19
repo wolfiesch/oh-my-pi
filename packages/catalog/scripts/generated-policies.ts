@@ -61,6 +61,9 @@ const COPILOT_GENERATED_LIMITS: Record<string, { contextWindow: number; maxToken
 	"grok-code-fast-1": { contextWindow: 192000, maxTokens: 64000 },
 };
 
+const OPENAI_EXTENDED_CONTEXT_PRICING_THRESHOLD = 272_000;
+const OPENAI_EXTENDED_CONTEXT_BUDGET_WINDOW = Math.ceil(OPENAI_EXTENDED_CONTEXT_PRICING_THRESHOLD / 0.85);
+
 /**
  * Apply upstream metadata corrections to a mutable array of models, then
  * re-bake canonical thinking metadata so generated catalogs always carry the
@@ -324,6 +327,21 @@ function inferGeneratedApplyPatchToolType(
 }
 
 function applyOpenAICatalogPolicy(model: ModelSpec<Api>, parsedModel: OpenAIModel): void {
+	// First-party GPT-5.4/5.5 advertise a 1.05M technical window, but OpenAI prices
+	// prompts above 272K input tokens at a higher full-session rate. Use a 320K
+	// local budget so the default 15% reserve triggers compaction at 272K while
+	// users who accept the higher tier can opt into the full window with
+	// modelOverrides.contextWindow.
+	if (
+		model.provider === "openai" &&
+		model.contextWindow !== null &&
+		model.contextWindow > OPENAI_EXTENDED_CONTEXT_BUDGET_WINDOW &&
+		(semverEqual(parsedModel.version, "5.4") || semverEqual(parsedModel.version, "5.5")) &&
+		parsedModel.variant === "base"
+	) {
+		model.contextWindow = OPENAI_EXTENDED_CONTEXT_BUDGET_WINDOW;
+	}
+
 	// Codex models: 400K figure includes output budget; input window is 272K.
 	if (parsedModel.variant.startsWith("codex") && parsedModel.variant !== "codex-spark") {
 		model.contextWindow = 272000;

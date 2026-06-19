@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Capped first-party OpenAI GPT-5.4/GPT-5.5 catalog context budgets at 320K tokens so default compaction stays below the 272K standard-pricing input boundary unless users opt into the full long-context tier.
+
 ## [16.0.9] - 2026-06-18
 
 ### Fixed
