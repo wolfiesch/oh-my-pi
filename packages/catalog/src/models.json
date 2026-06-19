@@ -55024,7 +55024,7 @@
 				"cacheRead": 0.25,
 				"cacheWrite": 0
 			},
-			"contextWindow": 320000,
+			"contextWindow": 1050000,
 			"maxTokens": 128000,
 			"applyPatchToolType": "freeform",
 			"thinking": {
@@ -55114,7 +55114,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 320000,
+			"contextWindow": 1050000,
 			"maxTokens": 128000,
 			"applyPatchToolType": "freeform",
 			"thinking": {
@@ -55144,7 +55144,7 @@
 				"cacheRead": 0.5,
 				"cacheWrite": 0
 			},
-			"contextWindow": 320000,
+			"contextWindow": 1050000,
 			"maxTokens": 128000,
 			"applyPatchToolType": "freeform",
 			"thinking": {
@@ -55174,7 +55174,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 320000,
+			"contextWindow": 1050000,
 			"maxTokens": 128000,
 			"applyPatchToolType": "freeform",
 			"thinking": {

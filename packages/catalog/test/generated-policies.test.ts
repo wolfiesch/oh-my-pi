@@ -87,42 +87,6 @@ describe("generated model policies", () => {
 		expect(models[3]?.priority).toBe(1);
 	});
 
-	it("caps first-party GPT-5.4 and GPT-5.5 at the standard pricing budget", () => {
-		const models: ModelSpec<Api>[] = [
-			createSpec({
-				id: "gpt-5.4",
-				api: "openai-responses",
-				provider: "openai",
-				contextWindow: 1_050_000,
-			}),
-			createSpec({
-				id: "gpt-5.5",
-				api: "openai-responses",
-				provider: "openai",
-				contextWindow: 1_050_000,
-			}),
-			createSpec({
-				id: "gpt-5.5-pro",
-				api: "openai-responses",
-				provider: "openai",
-				contextWindow: 1_050_000,
-			}),
-			createSpec({
-				id: "gpt-5.4-mini",
-				api: "openai-responses",
-				provider: "openai",
-				contextWindow: 400_000,
-			}),
-		];
-
-		applyGeneratedModelPolicies(models);
-
-		expect(models[0]?.contextWindow).toBe(320_000);
-		expect(models[1]?.contextWindow).toBe(320_000);
-		expect(models[2]?.contextWindow).toBe(320_000);
-		expect(models[3]?.contextWindow).toBe(400_000);
-	});
-
 	it("pins Claude Mythos 5 first-party Anthropic catalog metadata", () => {
 		const models: ModelSpec<Api>[] = [
 			createSpec({

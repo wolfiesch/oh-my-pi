@@ -250,17 +250,17 @@ Provider defaults vs per-model overrides:
 - `modelOverrides` can override model metadata (`name`, `reasoning`, `thinking`, `input`, `supportsTools`, `cost`, `premiumMultiplier`, `contextWindow`, `maxTokens`, `omitMaxOutputTokens`, `headers`, `compat`, `contextPromotionTarget`).
 - `compat` is deep-merged for nested routing blocks (`openRouterRouting`, `vercelGatewayRouting`, `extraBody`).
 
-`modelOverrides.contextWindow` changes local budgeting and selector metadata only. Provider discovery remains the default source of truth. A smaller override is a cost guardrail: for OpenAI GPT-5.4/GPT-5.5, `320000` keeps the default 15% compaction reserve at the 272K standard-pricing input boundary.
+`modelOverrides.contextWindow` changes local budgeting and selector metadata only. Provider discovery remains the default source of truth. Use an override only when your account's usable window differs from the discovered limit, for example:
 
 ```yaml
 providers:
-  openai:
+  openai-codex:
     modelOverrides:
       gpt-5.5:
-        contextWindow: 320000
+        contextWindow: 1000000
 ```
 
-Use the full provider-advertised window only when your account accepts larger prompts and you explicitly accept the higher long-context price tier.
+If the provider still enforces the discovered limit, oversized requests can still fail.
 
 ## Runtime discovery integration
 
@@ -549,7 +549,7 @@ providers:
         contextPromotionTarget: openai-codex/gpt-5.4
 ```
 
-The built-in model policy currently links OpenAI `codex-spark` variants to `gpt-5.5`, and `gpt-5.5` variants to a `gpt-5.4` sibling, only when the target exists on the same provider/API and has a strictly larger policy-adjusted context window.
+The built-in model policy currently links OpenAI `codex-spark` variants to `gpt-5.5`, and `gpt-5.5` variants to a `gpt-5.4` sibling, only when the target exists on the same provider/API and has a strictly larger context window.
 
 ## Compatibility and routing fields
 
