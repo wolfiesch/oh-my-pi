@@ -24,6 +24,9 @@
 ### Fixed
 
 - Fixed MiniMax Anthropic-compatible M2/M3 thinking metadata to expose the adaptive transport and keep M2 mandatory reasoning floored ([#2928](https://github.com/can1357/oh-my-pi/issues/2928)).
+### Fixed
+
+- Fixed generated OpenAI context promotion targets to keep only strictly larger context-window siblings and clear stale lateral targets.
 
 ## [16.0.6] - 2026-06-18
 

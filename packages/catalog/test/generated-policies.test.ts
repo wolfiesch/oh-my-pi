@@ -224,33 +224,74 @@ describe("generated model policies", () => {
 		expect(models[0]?.compat?.supportsForcedToolChoice).toBe(false);
 	});
 
-	it("links spark variants and gpt-5.5 to their context promotion targets", () => {
+	it("links only strictly larger context promotion targets", () => {
 		const models = [
-			createSpec({ id: "gpt-5.3-codex-spark", api: "openai-codex-responses", provider: "openai-codex" }),
-			createSpec({ id: "gpt-5.5", api: "openai-codex-responses", provider: "openai-codex" }),
-			createSpec({ id: "gpt-5.4", api: "openai-codex-responses", provider: "openai-codex" }),
+			createSpec({
+				id: "gpt-5.3-codex-spark",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				contextWindow: 128000,
+			}),
+			createSpec({
+				id: "gpt-5.5",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				contextWindow: 272000,
+			}),
+			createSpec({
+				id: "gpt-5.4",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				contextWindow: 272000,
+			}),
 		];
+		models[1]!.contextPromotionTarget = "openai-codex/gpt-5.4";
 
 		linkOpenAIPromotionTargets(models);
 
 		expect(models[0]?.contextPromotionTarget).toBe("openai-codex/gpt-5.5");
-		expect(models[1]?.contextPromotionTarget).toBe("openai-codex/gpt-5.4");
+		expect(models[1]?.contextPromotionTarget).toBeUndefined();
 	});
 
 	it("links every gpt-5.5 flavor to its gpt-5.4 sibling across namespaced and dated provider ids", () => {
 		const models = [
 			// Namespaced provider ids (id carries an `openai/` prefix).
-			createSpec({ id: "openai/gpt-5.5", api: "openai-responses", provider: "openrouter" }),
-			createSpec({ id: "openai/gpt-5.5-pro", api: "openai-responses", provider: "openrouter" }),
-			createSpec({ id: "openai/gpt-5.4", api: "openai-responses", provider: "openrouter" }),
-			createSpec({ id: "openai/gpt-5.4-pro", api: "openai-responses", provider: "openrouter" }),
-			createSpec({ id: "openai/gpt-5.4-mini", api: "openai-responses", provider: "openrouter" }),
+			createSpec({ id: "openai/gpt-5.5", api: "openai-responses", provider: "openrouter", contextWindow: 200000 }),
+			createSpec({
+				id: "openai/gpt-5.5-pro",
+				api: "openai-responses",
+				provider: "openrouter",
+				contextWindow: 200000,
+			}),
+			createSpec({ id: "openai/gpt-5.4", api: "openai-responses", provider: "openrouter", contextWindow: 400000 }),
+			createSpec({
+				id: "openai/gpt-5.4-pro",
+				api: "openai-responses",
+				provider: "openrouter",
+				contextWindow: 400000,
+			}),
+			createSpec({
+				id: "openai/gpt-5.4-mini",
+				api: "openai-responses",
+				provider: "openrouter",
+				contextWindow: 400000,
+			}),
 			// Dated snapshot ids on a provider with no plain `gpt-5.4`.
-			createSpec({ id: "gpt-5.5-2026-04-23", api: "openai-responses", provider: "aimlapi" }),
-			createSpec({ id: "gpt-5.4-2026-03-05", api: "openai-responses", provider: "aimlapi" }),
+			createSpec({ id: "gpt-5.5-2026-04-23", api: "openai-responses", provider: "aimlapi", contextWindow: 200000 }),
+			createSpec({ id: "gpt-5.4-2026-03-05", api: "openai-responses", provider: "aimlapi", contextWindow: 400000 }),
 			// Dotted namespace (amazon-bedrock `openai.gpt-5.x`).
-			createSpec({ id: "openai.gpt-5.5", api: "openai-responses", provider: "amazon-bedrock" }),
-			createSpec({ id: "openai.gpt-5.4", api: "openai-responses", provider: "amazon-bedrock" }),
+			createSpec({
+				id: "openai.gpt-5.5",
+				api: "openai-responses",
+				provider: "amazon-bedrock",
+				contextWindow: 200000,
+			}),
+			createSpec({
+				id: "openai.gpt-5.4",
+				api: "openai-responses",
+				provider: "amazon-bedrock",
+				contextWindow: 400000,
+			}),
 		];
 
 		linkOpenAIPromotionTargets(models);

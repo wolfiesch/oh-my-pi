@@ -1,13 +1,15 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ExtensionRunner, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
 describe("AgentSession context promotion", () => {
 	let tempDir: TempDir;
@@ -120,6 +122,37 @@ describe("AgentSession context promotion", () => {
 		throw new Error("Timed out waiting for condition");
 	}
 
+	async function createShortCircuitCompactionRunner(sessionManager: SessionManager): Promise<ExtensionRunner> {
+		const extensionsDir = path.join(getProjectAgentDir(tempDir.path()), "extensions");
+		fs.mkdirSync(extensionsDir, { recursive: true });
+		const extensionPath = path.join(extensionsDir, "compaction-short-circuit.ts");
+		fs.writeFileSync(
+			extensionPath,
+			[
+				"export default function(pi) {",
+				'\tpi.on("session_before_compact", async (event) => ({',
+				"\t\tcompaction: {",
+				'\t\t\tsummary: "compacted",',
+				"\t\t\tshortSummary: undefined,",
+				"\t\t\tfirstKeptEntryId: event.preparation.firstKeptEntryId,",
+				"\t\t\ttokensBefore: event.preparation.tokensBefore,",
+				"\t\t\tdetails: {},",
+				"\t\t},",
+				"\t}));",
+				"}",
+			].join("\n"),
+		);
+
+		const extensionsResult = await loadExtensions([extensionPath], tempDir.path());
+		return new ExtensionRunner(
+			extensionsResult.extensions,
+			extensionsResult.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+	}
+
 	// Deterministically drain the fire-and-forget `agent_end` handler that
 	// `emitExternalEvent` dispatches. The handler's terminal maintenance work
 	// (`#checkCompaction`) is microtask-based on the no-promotion paths, so a
@@ -130,6 +163,70 @@ describe("AgentSession context promotion", () => {
 		await new Promise(resolve => setTimeout(resolve, 0));
 		await session.waitForIdle();
 	}
+
+	it("runs threshold compaction before considering promotion targets", async () => {
+		const sparkModel = modelRegistry.find("openai-codex", "gpt-5.3-codex-spark");
+		if (!sparkModel) {
+			throw new Error("Expected codex spark model to exist");
+		}
+
+		const settings = Settings.isolated({
+			"compaction.autoContinue": false,
+			"compaction.enabled": true,
+			"compaction.thresholdPercent": 50,
+			"contextPromotion.enabled": true,
+		});
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		sessionManager.appendMessage(createUserMessage("seed"));
+
+		const agent = new Agent({
+			initialState: {
+				model: sparkModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+		});
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			extensionRunner: await createShortCircuitCompactionRunner(sessionManager),
+		});
+
+		const compactionReasons: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_start") {
+				compactionReasons.push(event.reason);
+			}
+		});
+
+		const assistantMessage = createAssistantMessage(sparkModel);
+		assistantMessage.usage = {
+			input: 100000,
+			output: 1000,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 101000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+
+		await waitFor(
+			() =>
+				sessionManager.getEntries().some(entry => entry.type === "compaction") ||
+				session.model?.provider !== sparkModel.provider ||
+				session.model?.id !== sparkModel.id,
+		);
+
+		expect(session.model?.provider).toBe(sparkModel.provider);
+		expect(session.model?.id).toBe(sparkModel.id);
+		expect(compactionReasons).toEqual(["threshold"]);
+		expect(sessionManager.getEntries().some(entry => entry.type === "compaction")).toBe(true);
+	});
 
 	it("promotes to a larger-context model on overflow and clears codex websocket session state", async () => {
 		const sparkModel = modelRegistry.find("openai-codex", "gpt-5.3-codex-spark");
@@ -174,6 +271,11 @@ describe("AgentSession context promotion", () => {
 		expect(session.model?.id).toBe(codexModel.id);
 		expect(closeSpy).toHaveBeenCalledTimes(1);
 		expect(session.providerSessionState.size).toBe(0);
+		expect(
+			session.sessionManager
+				.getEntries()
+				.find(entry => entry.type === "model_change" && entry.model === `${codexModel.provider}/${codexModel.id}`),
+		).toMatchObject({ reason: "context promotion after overflow" });
 	});
 
 	it("promotes on 413 payload-too-large overflow errors", async () => {

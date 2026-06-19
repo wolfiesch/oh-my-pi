@@ -667,9 +667,11 @@ class TreeList implements Component {
 			case "branch_summary":
 				result = theme.fg("warning", `[branch summary]: `) + normalize(entry.summary);
 				break;
-			case "model_change":
-				result = theme.fg("dim", `[model: ${entry.model}]`);
+			case "model_change": {
+				const reason = entry.reason ? `: ${normalize(entry.reason)}` : "";
+				result = theme.fg("dim", `[model: ${entry.model}${reason}]`);
 				break;
+			}
 			case "thinking_level_change":
 				result = theme.fg("dim", `[thinking: ${entry.thinkingLevel ?? ThinkingLevel.Off}]`);
 				break;

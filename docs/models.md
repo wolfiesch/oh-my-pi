@@ -250,6 +250,18 @@ Provider defaults vs per-model overrides:
 - `modelOverrides` can override model metadata (`name`, `reasoning`, `thinking`, `input`, `supportsTools`, `cost`, `premiumMultiplier`, `contextWindow`, `maxTokens`, `omitMaxOutputTokens`, `headers`, `compat`, `contextPromotionTarget`).
 - `compat` is deep-merged for nested routing blocks (`openRouterRouting`, `vercelGatewayRouting`, `extraBody`).
 
+`modelOverrides.contextWindow` changes local budgeting and selector metadata only. Provider discovery remains the default source of truth. Use an override only when your account is actually provisioned for a larger window than discovery reports, for example:
+
+```yaml
+providers:
+  openai-codex:
+    modelOverrides:
+      gpt-5.5:
+        contextWindow: 1000000
+```
+
+Only use this when the account actually accepts prompts above the discovered limit; otherwise the provider can still reject oversized requests.
+
 ## Runtime discovery integration
 
 ### Implicit Ollama discovery
@@ -489,10 +501,12 @@ Context promotion is an overflow recovery mechanism for small-context variants (
 
 ### Trigger and order
 
+Threshold maintenance and overflow recovery are separate paths. A successful turn that crosses the compaction threshold runs auto-compaction on the selected model. Context promotion is only considered after a real provider overflow or length-stop recovery signal.
+
 When a turn fails with a context overflow error (e.g. `context_length_exceeded`), `AgentSession` attempts promotion **before** falling back to compaction:
 
 1. If `contextPromotion.enabled` is true, resolve a promotion target (see below).
-2. If a target is found, switch to it and retry the request — no compaction needed.
+2. If a target is found, switch to it and retry the request. The session history records the automatic model change reason.
 3. If no target is available, fall through to auto-compaction on the current model.
 
 ### Target selection
@@ -534,7 +548,7 @@ providers:
         contextPromotionTarget: openai-codex/gpt-5.4
 ```
 
-The built-in model policy currently links OpenAI `codex-spark` variants to `gpt-5.5`, and `gpt-5.5` to `gpt-5.4`, when that target exists on the same provider/API.
+The built-in model policy currently links OpenAI `codex-spark` variants to `gpt-5.5`, and `gpt-5.5` variants to a `gpt-5.4` sibling, only when the target exists on the same provider/API and has a strictly larger discovered context window.
 
 ## Compatibility and routing fields
 

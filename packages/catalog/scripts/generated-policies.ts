@@ -97,17 +97,21 @@ export function rebakeModelThinking(model: ModelSpec<Api>): void {
  *
  * When a model's context is exhausted, the agent can promote to a sibling model
  * on the same provider:
- * - `codex-spark` variants promote to the full `gpt-5.5`.
+ * - `codex-spark` variants promote to the full `gpt-5.5` only when it has a
+ *   larger discovered context window.
  * - every `gpt-5.5` flavor (base, `-pro`, `-instant`, dated snapshots, and
- *   namespaced ids like `openai/gpt-5.5`) promotes to its `gpt-5.4` sibling.
+ *   namespaced ids like `openai/gpt-5.5`) promotes to its `gpt-5.4` sibling
+ *   only when that sibling has a larger discovered context window.
  *
  * The sibling is resolved by parsed version + matching provider/api, not a
  * hardcoded bare id, so namespaced (`openrouter/openai/gpt-5.4`), dotted
  * (`amazon-bedrock` `openai.gpt-5.4`), and dated (`gpt-5.4-2026-03-05`) ids all
- * link. The runtime still gates on the target actually being larger
- * (`#resolveContextPromotionTarget`), so an equal/smaller sibling is a harmless
- * no-op rather than a counterproductive switch.
+ * link when the target is genuinely larger.
  */
+function hasLargerContextWindow(target: ModelSpec<Api>, source: ModelSpec<Api>): boolean {
+	return target.contextWindow !== null && source.contextWindow !== null && target.contextWindow > source.contextWindow;
+}
+
 export function linkOpenAIPromotionTargets(models: ModelSpec<Api>[]): void {
 	for (const candidate of models) {
 		const parsedCandidate = parseKnownModel(candidate.id);
@@ -135,7 +139,9 @@ export function linkOpenAIPromotionTargets(models: ModelSpec<Api>[]): void {
 				fallbackBareLength = bareLength;
 			}
 		}
+		delete candidate.contextPromotionTarget;
 		if (!fallback) continue;
+		if (!hasLargerContextWindow(fallback, candidate)) continue;
 		candidate.contextPromotionTarget = `${fallback.provider}/${fallback.id}`;
 	}
 }

@@ -45,6 +45,8 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	model: string;
 	/** Role: "default", "smol", "slow", etc. Undefined treated as "default" */
 	role?: string;
+	/** Reason surfaced for automatic model changes. */
+	reason?: string;
 }
 
 export interface ServiceTierChangeEntry extends SessionEntryBase {

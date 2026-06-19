@@ -6834,7 +6834,7 @@ export class AgentSession {
 	async setModelTemporary(
 		model: Model,
 		thinkingLevel?: ThinkingLevel,
-		options?: { ephemeral?: boolean },
+		options?: { ephemeral?: boolean; reason?: string },
 	): Promise<void> {
 		const previousEditMode = this.#resolveActiveEditMode();
 		if (!this.#modelRegistry.hasConfiguredAuth(model)) {
@@ -6846,6 +6846,7 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(
 			`${model.provider}/${model.id}`,
 			options?.ephemeral ? EPHEMERAL_MODEL_CHANGE_ROLE : "temporary",
+			{ reason: options?.reason },
 		);
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
@@ -7957,19 +7958,6 @@ export class AgentSession {
 		const contextTokens = this.#estimatePrePromptContextTokens(messages, contextWindow);
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) return;
 
-		// Auto-promote first: switching to a larger-context model avoids compacting
-		// the history at all. The post-turn threshold path already promotes before
-		// compacting; without this, the pre-prompt path would pre-empt promotion and
-		// compact (snapcompact/summary) a session that should have just been promoted.
-		if (await this.#promoteContextModel()) {
-			logger.debug("Pre-prompt context promotion avoided compaction", {
-				contextTokens,
-				contextWindow,
-				model: `${model.provider}/${model.id}`,
-			});
-			return;
-		}
-
 		logger.debug("Pre-prompt context maintenance triggered by pending prompt size", {
 			contextTokens,
 			contextWindow,
@@ -8111,14 +8099,10 @@ export class AgentSession {
 			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
 		if (shouldCompact(contextTokens, contextWindow, compactionSettings)) {
-			// Try promotion first — if a larger model is available, switch instead of compacting
-			const promoted = await this.#tryContextPromotion(assistantMessage);
-			if (!promoted) {
-				return await this.#runAutoCompaction("threshold", false, false, allowDefer, {
-					autoContinue,
-					triggerContextTokens: contextTokens,
-				});
-			}
+			return await this.#runAutoCompaction("threshold", false, false, allowDefer, {
+				autoContinue,
+				triggerContextTokens: contextTokens,
+			});
 		}
 		return COMPACTION_CHECK_NONE;
 	}
@@ -8651,9 +8635,8 @@ export class AgentSession {
 	 * Switch to a larger-context sibling when context promotion is enabled and a
 	 * target with a strictly larger window (and a usable key) exists. Returns true
 	 * when the model was switched, so the caller can retry without compacting.
-	 * Message-independent core shared by the post-turn overflow path
-	 * ({@link #tryContextPromotion}) and the pre-prompt threshold path
-	 * ({@link #runPrePromptCompactionIfNeeded}).
+	 * Message-independent core shared by the overflow and length-stop recovery
+	 * paths.
 	 */
 	async #promoteContextModel(): Promise<boolean> {
 		const promotionSettings = this.settings.getGroup("contextPromotion");
@@ -8666,7 +8649,10 @@ export class AgentSession {
 		if (!targetModel) return false;
 
 		try {
-			await this.setModelTemporary(targetModel, undefined, { ephemeral: true });
+			await this.setModelTemporary(targetModel, undefined, {
+				ephemeral: true,
+				reason: "context promotion after overflow",
+			});
 			logger.debug("Context promotion switched model on overflow", {
 				from: `${currentModel.provider}/${currentModel.id}`,
 				to: `${targetModel.provider}/${targetModel.id}`,
