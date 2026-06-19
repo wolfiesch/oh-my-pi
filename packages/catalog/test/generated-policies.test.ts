@@ -212,12 +212,24 @@ describe("generated model policies", () => {
 				contextWindow: 1048576,
 				maxTokens: 1048576,
 			}),
+			createSpec({
+				id: "future-cloud-only:999b",
+				api: "ollama-chat",
+				provider: "ollama-cloud",
+				contextWindow: 999_000,
+				maxTokens: 999_000,
+			}),
 		];
 
 		applyGeneratedModelPolicies(models);
 
 		expect(models[0]?.omitMaxOutputTokens).toBe(true);
+		expect(models[0]?.contextWindow).toBe(1048576);
+		expect(models[0]?.maxTokens).toBe(1048576);
 		expect(models[1]?.omitMaxOutputTokens).toBeUndefined();
+		expect(models[2]?.omitMaxOutputTokens).toBe(true);
+		expect(models[2]?.contextWindow).toBe(999_000);
+		expect(models[2]?.maxTokens).toBe(999_000);
 	});
 
 	it("marks OpenCode Go MiMo models as not supporting tool_choice", () => {
