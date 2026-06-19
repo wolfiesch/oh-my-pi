@@ -876,13 +876,34 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("accepts only ACP underscore-prefixed extension methods", async () => {
+	it("exposes speech model catalogs to ACP mobile clients", async () => {
 		const harness = await createHarness();
 
-		const result = await harness.agent.extMethod("_omp/sessions/listAll", { limit: 2 });
+		const result = await harness.agent.extMethod("speech.models.list", {});
+		const models = result.models;
+		const voices = result.voices;
+		const defaults = result.defaults;
+		expect(Array.isArray(models)).toBe(true);
+		expect(Array.isArray(voices)).toBe(true);
+		expect(defaults && typeof defaults === "object").toBe(true);
 
-		expect(Array.isArray(result.sessions)).toBe(true);
-		expect(typeof result.total).toBe("number");
+		if (!Array.isArray(models) || !Array.isArray(voices)) {
+			throw new Error("speech.models.list did not return model and voice arrays");
+		}
+
+		const modelIds = models.map(model =>
+			model && typeof model === "object" ? (model as { id?: unknown }).id : undefined,
+		);
+		const voiceIds = voices.map(voice =>
+			voice && typeof voice === "object" ? (voice as { id?: unknown }).id : undefined,
+		);
+		expect(modelIds).toContain("parakeet");
+		expect(modelIds).toContain("kokoro");
+		expect(voiceIds).toContain("af_heart");
+
+		const prefixedSessions = await harness.agent.extMethod("_omp/sessions/listAll", { limit: 2 });
+		expect(Array.isArray(prefixedSessions.sessions)).toBe(true);
+
 		await expect(harness.agent.extMethod("omp/sessions/listAll", { limit: 2 })).rejects.toThrow(
 			"Unknown ACP ext method",
 		);

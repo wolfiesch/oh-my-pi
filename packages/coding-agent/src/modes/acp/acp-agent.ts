@@ -68,10 +68,17 @@ import type { SessionInfo as StoredSessionInfo } from "../../session/session-lis
 import { SessionManager } from "../../session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands, toAcpAvailableCommands } from "../../slash-commands/available-commands";
+import { DEFAULT_STT_MODEL_KEY, STT_MODEL_OPTIONS } from "../../stt/models";
 import { AUTO_THINKING, parseConfiguredThinkingLevel } from "../../thinking";
 import { normalizeLocalScheme } from "../../tools/path-utils";
 import { runResolveInvocation } from "../../tools/resolve";
 import { ToolError } from "../../tools/tool-errors";
+import {
+	DEFAULT_TTS_LOCAL_MODEL_KEY,
+	DEFAULT_TTS_VOICE,
+	TTS_LOCAL_MODEL_OPTIONS,
+	TTS_LOCAL_VOICE_OPTIONS,
+} from "../../tts/models";
 import { canonicalizeMessage } from "../../utils/thinking-display";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
@@ -103,6 +110,34 @@ export const ACP_BOOTSTRAP_RACE_GUARD_MS = 50;
 const ACP_CANCEL_CLEANUP_TIMEOUT_MS = 5_000;
 const ACP_ASYNC_DELIVERY_DRAIN_TIMEOUT_MS = 250;
 const ACP_ASYNC_DELIVERY_DRAIN_MAX_PASSES = 3;
+
+function buildSpeechModelsListResult(): { [key: string]: unknown } {
+	return {
+		defaults: {
+			sttModel: DEFAULT_STT_MODEL_KEY,
+			ttsModel: DEFAULT_TTS_LOCAL_MODEL_KEY,
+			voice: DEFAULT_TTS_VOICE,
+		},
+		models: [
+			...STT_MODEL_OPTIONS.map(model => ({
+				id: model.value,
+				name: model.label,
+				description: model.description,
+				kind: "stt",
+			})),
+			...TTS_LOCAL_MODEL_OPTIONS.map(model => ({
+				id: model.value,
+				name: model.label,
+				description: model.description,
+				kind: "tts",
+			})),
+		],
+		voices: TTS_LOCAL_VOICE_OPTIONS.map(voice => ({
+			id: voice.value,
+			name: voice.label,
+		})),
+	};
+}
 
 type AgentImageContent = {
 	type: "image";
@@ -904,6 +939,10 @@ export class AcpAgent implements Agent {
 				const reports = await target.fetchUsageReports();
 				return { reports: reports ?? [] };
 			}
+			// OMP Mobile calls this public speech settings method directly; keep the
+			// response static so opening settings never downloads or warms local models.
+			case "speech.models.list":
+				return buildSpeechModelsListResult();
 			case "_omp/extensions": {
 				const cwd = typeof params.cwd === "string" ? (params.cwd as string) : undefined;
 				const sm = await Settings.init();

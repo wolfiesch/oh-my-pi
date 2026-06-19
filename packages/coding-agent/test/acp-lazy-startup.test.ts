@@ -19,6 +19,8 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
+const repoRoot = path.resolve(import.meta.dir, "../../..");
+
 const TEST_MODEL: Model = buildModel({
 	id: "claude-sonnet-4-20250514",
 	name: "Claude Sonnet",
@@ -441,6 +443,79 @@ describe("ACP lazy startup", () => {
 			await closeTransport(agentToClient.writable);
 			await Promise.allSettled([agentConnection.closed, serverConnection.closed]);
 		}
+	});
+
+	it("routes speech model catalog requests before creating the first AgentSession", async () => {
+		const clientToAgent = new TransformStream();
+		const agentToClient = new TransformStream();
+		const client = new TestClient();
+		let createCalls = 0;
+
+		const agentConnection = new ClientSideConnection(
+			() => client,
+			ndJsonStream(clientToAgent.writable, agentToClient.readable),
+		);
+		const serverConnection = createAcpConnection(
+			ndJsonStream(agentToClient.writable, clientToAgent.readable),
+			async cwd => {
+				createCalls++;
+				return new LazyFakeSession(cwd) as unknown as AgentSession;
+			},
+		);
+
+		try {
+			const result = await agentConnection.extMethod("speech.models.list", {});
+			const models = result.models;
+			const voices = result.voices;
+			const defaults = result.defaults;
+
+			expect(createCalls).toBe(0);
+			expect(Array.isArray(models)).toBe(true);
+			expect(Array.isArray(voices)).toBe(true);
+			expect(defaults && typeof defaults === "object").toBe(true);
+
+			if (!Array.isArray(models) || !Array.isArray(voices) || !defaults || typeof defaults !== "object") {
+				throw new Error("speech.models.list did not return model arrays, voice arrays, and defaults");
+			}
+
+			expect(models).toContainEqual(expect.objectContaining({ id: "parakeet", kind: "stt" }));
+			expect(models).toContainEqual(expect.objectContaining({ id: "kokoro", kind: "tts" }));
+			expect(voices).toContainEqual(expect.objectContaining({ id: "af_heart" }));
+			expect(defaults).toEqual(
+				expect.objectContaining({
+					sttModel: "parakeet",
+					ttsModel: "kokoro",
+					voice: "af_heart",
+				}),
+			);
+		} finally {
+			await closeTransport(clientToAgent.writable);
+			await closeTransport(agentToClient.writable);
+			await Promise.allSettled([agentConnection.closed, serverConnection.closed]);
+		}
+	});
+
+	it("imports ACP speech catalog without loading TTS worker env validation", async () => {
+		const proc = Bun.spawn([process.execPath, "-e", 'import "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";'], {
+			cwd: repoRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+			env: {
+				...process.env,
+				PI_TINY_DEVICE: "not-a-device",
+				PI_TINY_DTYPE: "not-a-dtype",
+			},
+		});
+
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+
+		expect(exitCode, stderr || stdout).toBe(0);
+		expect(stderr).not.toContain("Unsupported PI_TINY_DEVICE");
+		expect(stderr).not.toContain("Unsupported PI_TINY_DTYPE");
 	});
 
 	it("applies CLI runtime API keys after ACP lazy session creation resolves extension models", async () => {

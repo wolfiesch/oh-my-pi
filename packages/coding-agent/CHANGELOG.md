@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed ACP mobile voice settings failing to list local speech models by exposing the supported STT/TTS model and voice catalog through `speech.models.list`. ([#3011](https://github.com/can1357/oh-my-pi/issues/3011))
+
 ## [16.0.10] - 2026-06-18
 
 ### Added
