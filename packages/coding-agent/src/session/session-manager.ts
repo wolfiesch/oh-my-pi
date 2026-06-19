@@ -1173,6 +1173,7 @@ export class SessionManager {
 	 * Append a model change as a child of the current leaf, then advance the leaf.
 	 * @param model Model in "provider/modelId" format
 	 * @param role Optional role (default: "default")
+	 * @param options Optional metadata to persist with the model-change entry.
 	 */
 	appendModelChange(model: string, role?: string, options?: { reason?: string }): string {
 		const entry: ModelChangeEntry = {
