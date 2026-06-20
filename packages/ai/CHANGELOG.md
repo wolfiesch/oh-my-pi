@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Anthropic Messages retry classification for transient TLS/server-error failures such as `tls: bad record MAC (type=server_error)`. These pre-content transport blips are now retried inside the provider loop before the session sees an error banner.
+
 ## [16.1.4] - 2026-06-19
 
 ### Added

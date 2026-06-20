@@ -1501,7 +1501,7 @@ export function isProviderRetryableError(error: unknown, provider?: string): boo
 	const msg = error.message.toLowerCase();
 	if (
 		isUnexpectedSocketCloseMessage(msg) ||
-		/rate.?limit|too many requests|overloaded|service.?unavailable|internal_error|stream error.*received from peer|1302|timed?\s*out while waiting for the first event|timeout waiting for first/i.test(
+		/rate.?limit|too many requests|overloaded|service.?unavailable|internal_error|server_error|bad record mac|stream error.*received from peer|1302|timed?\s*out while waiting for the first event|timeout waiting for first/i.test(
 			msg,
 		) ||
 		isTransientStreamParseError(error) ||
