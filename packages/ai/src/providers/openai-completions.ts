@@ -27,6 +27,7 @@ import type {
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
+import { hasVisibleAssistantContent, withEmptyCompletionRetry } from "../utils/empty-completion-retry";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } from "../utils/http-inspector";
 import {
@@ -56,6 +57,17 @@ import type {
 	ChatCompletionTool,
 	ChatCompletionToolMessageParam,
 } from "./openai-chat-wire";
+import {
+	applyOpenAIReasoningEffortFallback,
+	clearOpenAIReasoningEffortFallbackState,
+	createOpenAIReasoningEffortFallbackKey,
+	createOpenAIReasoningEffortFallbackState,
+	getOpenAIReasoningEffortFallback,
+	type OpenAIReasoningEffortFallback,
+	type OpenAIReasoningEffortFallbackState,
+	rememberOpenAIReasoningEffortFallback,
+	resolveOpenAIReasoningEffortFallback,
+} from "./openai-reasoning-fallback";
 import {
 	applyChatCompletionsCompatPolicy,
 	applyChatCompletionsToolStream,
@@ -163,6 +175,19 @@ function normalizeMistralToolId(id: string, isMistral: boolean): string {
 // #1488). The default route forwards `delta.content` (including DSML
 // envelope leaks) which `StreamMarkupHealing` heals into a structured call
 // client-side.
+function resolveOpenAICompletionsRoutingEffort(
+	model: Model<"openai-completions">,
+	effort: Effort | undefined,
+): Effort | undefined {
+	if (!effort) return undefined;
+	if (model.thinking?.efforts.includes(effort)) return effort;
+	const compatMappedEffort = model.compat.reasoningEffortMap?.[effort] as Effort | undefined;
+	if (compatMappedEffort && model.thinking?.efforts.includes(compatMappedEffort)) return compatMappedEffort;
+	const thinkingMappedEffort = model.thinking?.effortMap?.[effort] as Effort | undefined;
+	if (thinkingMappedEffort && model.thinking?.efforts.includes(thinkingMappedEffort)) return thinkingMappedEffort;
+	return effort;
+}
+
 function resolveOpenAICompletionsModelId(
 	model: Model<"openai-completions">,
 	options: OpenAICompletionsOptions | undefined,
@@ -170,8 +195,9 @@ function resolveOpenAICompletionsModelId(
 	// Effort-tier variants route per request effort (off → bare id, efforts →
 	// the thinking backing id); catalog variants (Copilot long-context `-1m`
 	// entries) pin via `requestModelId`; everything else serializes `model.id`.
-	const effort =
+	const requestedEffort =
 		options?.reasoning && !options.disableReasoning && model.reasoning ? (options.reasoning as Effort) : undefined;
+	const effort = resolveOpenAICompletionsRoutingEffort(model, requestedEffort);
 	const wireId = resolveWireModelId(model, effort);
 	return applyWireModelIdTransform(wireId, model.compat.wireModelIdMode, options?.openrouterVariant);
 }
@@ -444,14 +470,19 @@ type BuiltOpenAICompletionTools = {
 
 const OPENAI_COMPLETIONS_PROVIDER_SESSION_STATE_PREFIX = "openai-completions:";
 
-type OpenAICompletionsProviderSessionState = ProviderSessionState & OpenAIStrictToolsState;
+type OpenAICompletionsProviderSessionState = ProviderSessionState &
+	OpenAIStrictToolsState &
+	OpenAIReasoningEffortFallbackState;
 
 function createOpenAICompletionsProviderSessionState(): OpenAICompletionsProviderSessionState {
 	const strictToolsState = createOpenAIStrictToolsState();
+	const reasoningEffortFallbackState = createOpenAIReasoningEffortFallbackState();
 	const state: OpenAICompletionsProviderSessionState = {
 		...strictToolsState,
+		...reasoningEffortFallbackState,
 		close: () => {
 			clearOpenAIStrictToolsState(state);
+			clearOpenAIReasoningEffortFallbackState(state);
 		},
 	};
 	return state;
@@ -521,7 +552,7 @@ const OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE =
 // converts the already-successful response into a timeout error.
 const OPENAI_COMPLETIONS_POST_FINISH_GRACE_MS = 2_500;
 
-export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
+const streamOpenAICompletionsOnce = (
 	model: Model<"openai-completions">,
 	context: Context,
 	options?: OpenAICompletionsOptions,
@@ -581,6 +612,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			let appliedStrictTools = false;
+			const requestReasoningEffortFallbacks = new Map<string, OpenAIReasoningEffortFallback>();
+			const attemptedReasoningEffortFallbacks = new Set<string>();
+			let activeReasoningEffortFallbackKey: string | undefined;
+			let activeRequestParams: OpenAICompletionsParams | undefined;
 			const providerSessionState = getOpenAICompletionsProviderSessionState(
 				model,
 				baseUrl,
@@ -601,6 +636,19 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					effectiveToolStrictModeOverride,
 				);
 				appliedStrictTools = strictToolsApplied;
+				const reasoningEffortFallbackKey = createOpenAIReasoningEffortFallbackKey(
+					"chat-completions",
+					trimmedBaseUrl,
+					params.model,
+				);
+				const requestReasoningEffortFallback = requestReasoningEffortFallbacks.has(reasoningEffortFallbackKey)
+					? requestReasoningEffortFallbacks.get(reasoningEffortFallbackKey)
+					: getOpenAIReasoningEffortFallback(providerSessionState, reasoningEffortFallbackKey);
+				if (requestReasoningEffortFallback !== undefined) {
+					applyOpenAIReasoningEffortFallback(params, requestReasoningEffortFallback);
+				}
+				activeReasoningEffortFallbackKey = reasoningEffortFallbackKey;
+				activeRequestParams = params;
 				options?.onPayload?.(params);
 				rawRequestDump = {
 					provider: model.provider,
@@ -650,7 +698,24 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				});
 			} catch (error) {
 				const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
-				if (
+				const reasoningEffortFallback =
+					activeReasoningEffortFallbackKey && activeRequestParams && !requestSignal.aborted
+						? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, activeRequestParams, {
+								explicitDisable: options?.disableReasoning === true && options.reasoning === undefined,
+							})
+						: undefined;
+				if (reasoningEffortFallback !== undefined && activeReasoningEffortFallbackKey) {
+					const retryMarker = `${activeReasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
+					if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;
+					attemptedReasoningEffortFallbacks.add(retryMarker);
+					requestReasoningEffortFallbacks.set(activeReasoningEffortFallbackKey, reasoningEffortFallback);
+					openaiStream = await createCompletionsStream();
+					rememberOpenAIReasoningEffortFallback(
+						providerSessionState,
+						activeReasoningEffortFallbackKey,
+						reasoningEffortFallback,
+					);
+				} else if (
 					isOpenRouterAnthropicModel(model) &&
 					!disableStrictTools &&
 					isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse)
@@ -1184,7 +1249,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			if (
 				policy.stream.emptyLengthFinishIsContextError &&
 				output.stopReason === "length" &&
-				!hasVisibleCompletionContent(output)
+				!hasVisibleAssistantContent(output)
 			) {
 				output.stopReason = "error";
 				output.errorMessage = EMPTY_OLLAMA_LENGTH_COMPLETION_MESSAGE;
@@ -1237,6 +1302,15 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 
 	return stream;
 };
+
+/**
+ * Public entry: wrap the single-attempt streamer with bounded empty-completion
+ * retries — flaky gateways occasionally 200 with `delta: {}` + `finish_reason:
+ * "stop"` and no usage, which would otherwise stall the agent loop. Shared with
+ * the Anthropic provider via `withEmptyCompletionRetry`.
+ */
+export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (model, context, options) =>
+	withEmptyCompletionRetry(model, context, options, streamOpenAICompletionsOnce);
 
 function createRequestSetup(
 	model: Model<"openai-completions">,
@@ -2009,16 +2083,6 @@ function convertTools(
 			tools.length > 0 &&
 			(toolStrictMode === "all_strict" || (toolStrictMode === "mixed" && adaptedTools.some(tool => tool.strict))),
 	};
-}
-
-const NON_WHITESPACE_RE = /\S/;
-
-function hasVisibleCompletionContent(message: AssistantMessage): boolean {
-	for (const block of message.content) {
-		if (block.type === "toolCall") return true;
-		if (block.type === "text" && NON_WHITESPACE_RE.test(block.text)) return true;
-	}
-	return false;
 }
 
 const EMPTY_OLLAMA_LENGTH_COMPLETION_MESSAGE =

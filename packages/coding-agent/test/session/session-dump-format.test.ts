@@ -94,6 +94,39 @@ describe("formatSessionDumpText tool parameters", () => {
 		expect(out).toContain("<examples>");
 		expect(out).toContain('<invoke name="find">');
 	});
+
+	it("omits the Available Tools section if inlineToolDescriptors is true", () => {
+		const out = formatSessionDumpText({
+			messages: [],
+			inlineToolDescriptors: true,
+			tools: [
+				{
+					name: "web_search",
+					description: "Searches the web.",
+					parameters: { type: "object" },
+				},
+			],
+		});
+
+		expect(out).not.toContain("## Available Tools");
+	});
+
+	it("does not falsely omit the Available Tools section even if systemPrompt contains tool headings", () => {
+		const out = formatSessionDumpText({
+			messages: [],
+			systemPrompt: ["# Inventory\nThis is a rule discussing # Tool: web_search.\nNever call it directly."],
+			inlineToolDescriptors: false,
+			tools: [
+				{
+					name: "web_search",
+					description: "Searches the web.",
+					parameters: { type: "object" },
+				},
+			],
+		});
+
+		expect(out).toContain("## Available Tools");
+	});
 });
 
 describe("formatSessionDumpText markdown-headings transcript", () => {
@@ -137,7 +170,7 @@ describe("formatSessionDumpText markdown-headings transcript", () => {
 		expect(out).toContain("### Tool Result: read");
 		expect(out).toContain("### Tool Call: read");
 		expect(out).toContain("path: src/foo.ts");
-		// The `_i` intent renders as a `//` comment under the heading, never inside the YAML args.
+		// The `i` intent renders as a `//` comment under the heading, never inside the YAML args.
 		expect(out).toContain("// Reading the file");
 		expect(out).not.toContain(`${INTENT_FIELD}:`);
 		// Tool calls render as a readable heading + YAML, never the <invoke>/<parameter> XML.

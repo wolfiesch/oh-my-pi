@@ -12,7 +12,7 @@ import {
 	ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
-import type { AssistantMessage, ImageContent, Message, Model, UsageReport } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ImageContent, Message, Model, Usage, UsageReport } from "@oh-my-pi/pi-ai";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import type {
 	Component,
@@ -70,7 +70,12 @@ import type { Goal, GoalModeState } from "../goals/state";
 import { resolveLocalUrlToPath } from "../internal-urls";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
 import type { MCPManager } from "../mcp";
-import { formatMCPConnectingMessage, isMcpConnectingEvent, MCP_CONNECTING_EVENT_CHANNEL } from "../mcp/startup-events";
+import {
+	formatMCPConnectionStatusMessage,
+	isMcpConnectionStatusEvent,
+	MCP_CONNECTION_STATUS_EVENT_CHANNEL,
+	type McpConnectionStatusEvent,
+} from "../mcp/startup-events";
 import {
 	humanizePlanTitle,
 	type PlanApprovalDetails,
@@ -401,6 +406,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#modelCycleClearTimer: NodeJS.Timeout | undefined;
 	todoPhases: TodoPhase[] = [];
 	hideThinkingBlock = false;
+	proseOnlyThinking = true;
 	pendingImages: ImageContent[] = [];
 	pendingImageLinks: (string | undefined)[] = [];
 	compactionQueuedMessages: CompactionQueuedMessage[] = [];
@@ -412,6 +418,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	isPythonMode = false;
 	streamingComponent: AssistantMessageComponent | undefined = undefined;
 	streamingMessage: AssistantMessage | undefined = undefined;
+	lastAssistantUsage: Usage | undefined = undefined;
 	loadingAnimation: Loader | undefined = undefined;
 	autoCompactionLoader: Loader | undefined = undefined;
 	retryLoader: Loader | undefined = undefined;
@@ -512,6 +519,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.compactionQueuedMessages = [];
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
+		this.lastAssistantUsage = undefined;
 		this.pendingTools.clear();
 	}
 	readonly #uiHelpers: UiHelpers;
@@ -524,6 +532,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	#observerRegistry: SessionObserverRegistry;
 	#eventBus?: EventBus;
 	#eventBusUnsubscribers: Array<() => void> = [];
+	#mcpStatusOrder: string[] = [];
+	#mcpPendingServers = new Set<string>();
+	#mcpConnectedServers = new Set<string>();
+	#mcpFailedServers = new Map<string, string>();
 	#welcomeComponent?: WelcomeComponent;
 	readonly #chatHost: ChatBlockHost = { requestRender: () => this.ui.requestRender() };
 
@@ -557,13 +569,12 @@ export class InteractiveMode implements InteractiveModeContext {
 				}),
 			);
 			this.#eventBusUnsubscribers.push(
-				eventBus.on(MCP_CONNECTING_EVENT_CHANNEL, data => {
-					if (!isMcpConnectingEvent(data)) {
-						logger.warn("Ignoring malformed mcp:connecting event", { data });
+				eventBus.on(MCP_CONNECTION_STATUS_EVENT_CHANNEL, data => {
+					if (!isMcpConnectionStatusEvent(data)) {
+						logger.warn("Ignoring malformed mcp:connection-status event", { data });
 						return;
 					}
-					if (this.settings.get("startup.quiet")) return;
-					this.showStatus(formatMCPConnectingMessage(data.serverNames));
+					this.#handleMcpConnectionStatusEvent(data);
 				}),
 			);
 		}
@@ -616,6 +627,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.statusLine.setAutoCompactEnabled(session.autoCompactionEnabled);
 
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
+		this.proseOnlyThinking = settings.get("proseOnlyThinking");
 
 		const hookCommands: SlashCommand[] = (
 			this.session.extensionRunner?.getRegisteredCommands(BUILTIN_SLASH_COMMAND_RESERVED_NAMES) ?? []
@@ -656,6 +668,54 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#focusController = new SessionFocusController(this);
 		this.#inputController = new InputController(this);
 		this.#observerRegistry = new SessionObserverRegistry();
+	}
+
+	#handleMcpConnectionStatusEvent(event: McpConnectionStatusEvent): void {
+		if (this.settings.get("startup.quiet")) return;
+		if (event.type === "connecting") {
+			this.#mcpStatusOrder = [];
+			this.#mcpPendingServers.clear();
+			this.#mcpConnectedServers.clear();
+			this.#mcpFailedServers.clear();
+			for (const serverName of event.serverNames) {
+				this.#trackMcpStatusServer(serverName);
+				this.#mcpPendingServers.add(serverName);
+			}
+		} else if (event.type === "connected") {
+			this.#trackMcpStatusServer(event.serverName);
+			this.#mcpPendingServers.delete(event.serverName);
+			this.#mcpFailedServers.delete(event.serverName);
+			this.#mcpConnectedServers.add(event.serverName);
+		} else {
+			this.#trackMcpStatusServer(event.serverName);
+			this.#mcpPendingServers.delete(event.serverName);
+			this.#mcpConnectedServers.delete(event.serverName);
+			this.#mcpFailedServers.set(event.serverName, event.error);
+		}
+
+		const message = formatMCPConnectionStatusMessage({
+			pendingServers: this.#orderedMcpStatusServers(this.#mcpPendingServers),
+			connectedServers: this.#orderedMcpStatusServers(this.#mcpConnectedServers),
+			failedServers: this.#orderedMcpStatusFailures(),
+		});
+		if (message) this.showStatus(message);
+	}
+
+	#trackMcpStatusServer(serverName: string): void {
+		if (!this.#mcpStatusOrder.includes(serverName)) {
+			this.#mcpStatusOrder.push(serverName);
+		}
+	}
+
+	#orderedMcpStatusServers(servers: ReadonlySet<string>): string[] {
+		return this.#mcpStatusOrder.filter(serverName => servers.has(serverName));
+	}
+
+	#orderedMcpStatusFailures(): Array<{ serverName: string; error: string }> {
+		return this.#mcpStatusOrder.flatMap(serverName => {
+			const error = this.#mcpFailedServers.get(serverName);
+			return error === undefined ? [] : [{ serverName, error }];
+		});
 	}
 
 	playWelcomeIntro(): void {
@@ -1126,27 +1186,33 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#cancelLoopAutoSubmit();
 	}
 
-	async handleLoopCommand(args = ""): Promise<void> {
+	async handleLoopCommand(args = ""): Promise<string | undefined> {
 		if (this.loopModeEnabled) {
 			this.disableLoopMode();
-			return;
+			return undefined;
 		}
-		const parsedLimit = parseLoopLimitArgs(args);
-		if (typeof parsedLimit === "string") {
-			this.showError(parsedLimit);
-			return;
+		const parsed = parseLoopLimitArgs(args);
+		if (typeof parsed === "string") {
+			this.showError(parsed);
+			return undefined;
 		}
 		this.loopModeEnabled = true;
 		this.loopPrompt = undefined;
-		this.loopLimit = createLoopLimitRuntime(parsedLimit);
+		this.loopLimit = createLoopLimitRuntime(parsed.limit);
 		this.statusLine.setLoopModeStatus({ enabled: true });
 		this.updateEditorTopBorder();
 		this.ui.requestRender();
-		const limitSuffix = parsedLimit ? ` Limited to ${describeLoopLimit(parsedLimit)}.` : "";
+		const limitSuffix = parsed.limit ? ` Limited to ${describeLoopLimit(parsed.limit)}.` : "";
 		const remainingSuffix = this.loopLimit ? ` ${describeLoopLimitRuntime(this.loopLimit)}.` : "";
+		const tail = parsed.prompt ? "Repeating it after each turn." : "Your next prompt will repeat after each turn.";
 		this.showStatus(
-			`Loop mode enabled.${limitSuffix}${remainingSuffix} Your next prompt will repeat after each turn. Esc cancels the current iteration; /loop again to disable.`,
+			`Loop mode enabled.${limitSuffix}${remainingSuffix} ${tail} Esc cancels the current iteration; /loop again to disable.`,
 		);
+		// Hand any inline prompt back to the dispatcher so the normal submit flow
+		// runs the first iteration — it records the text as the loop prompt and
+		// auto-resubmits it after each yield, identical to typing the prompt right
+		// after enabling loop mode.
+		return parsed.prompt;
 	}
 
 	recordLocalSubmission(text: string, imageCount = 0): () => void {
@@ -1858,6 +1924,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#planModePreviousTools = previousTools;
 		this.planModePlanFilePath = planFilePath;
 		this.planModeEnabled = true;
+		// Suppress cache-miss marker on the next turn: plan mode changes the system
+		// prompt, which predictably invalidates the cache.
+		this.lastAssistantUsage = undefined;
 
 		await this.session.setActiveToolsByName(uniquePlanTools);
 		this.session.setPlanModeState({
@@ -1975,6 +2044,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.session.setStandingResolveHandler?.(null);
 		this.session.setPlanModeState(undefined);
 		this.planModeEnabled = false;
+		// Suppress cache-miss marker on the next turn: plan exit changes the system
+		// prompt, which predictably invalidates the cache.
+		this.lastAssistantUsage = undefined;
 		this.planModePaused = options?.paused ?? false;
 		this.planModePlanFilePath = undefined;
 		this.#planModePreviousTools = undefined;

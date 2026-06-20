@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+## [16.1.0] - 2026-06-19
+
+### Added
+
+- Added `historyBlocks(archive)` to reconstruct ordered history blocks from archive data
+
+### Changed
+
+- Refactored compaction to be text-sourced, re-rendering from unified `Archive.text` source
+- Implemented foveated archive layout (HQ edges, dense LQ middle) for optimized context usage
+- Raised `MAX_FRAMES_DEFAULT` to 80 and consolidated `PROVIDER_IMAGE_BUDGETS`
+- Updated OpenRouter to use standard 90-image budget
+- Updated prompt instructions to clearly distinguish between plain-text and image history regions
+- `Options.maxFrames` is now an upper limit clamped to `MAX_FRAMES_DEFAULT`, not a per-call default
+- Rewrote the resume summary prompt into a structured reading guide (turn headings, grid/two-column layout, ink notes) and render file operations inline as a `FILES` section instead of a spliced `<files>` tag
+
+### Fixed
+
+- Fixed context budget undercounting by raising `FRAME_TOKEN_ESTIMATE` to 5024
+- Improved file list formatting in compaction summaries
+
 ## [16.0.11] - 2026-06-19
 
 ### Changed

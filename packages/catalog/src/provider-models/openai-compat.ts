@@ -4,7 +4,7 @@ import {
 	type OpenAICompatibleModelRecord,
 } from "../discovery/openai-compatible";
 import { Effort } from "../effort";
-import { toFireworksPublicModelId } from "../fireworks-model-id";
+import { FIREWORKS_FAST_SUFFIX, toFireworksPublicModelId } from "../fireworks-model-id";
 import { isGlmVisionModelId, isGrokReasoningEffortCapable, isReasoningGlmModelId } from "../identity/family";
 import type { ModelManagerOptions } from "../model-manager";
 import { getBundledModels } from "../models";
@@ -854,8 +854,20 @@ interface XAICuratedModel {
 // omit/include/history replay defaults live in catalog compat so every
 // OpenAI-family endpoint consumes the same constraint.
 export const XAI_OAUTH_CURATED_MODELS: readonly XAICuratedModel[] = [
-	// grok-build is text-only per the bundled catalog; omit `input` for the default.
-	{ id: "grok-build", contextWindow: 512_000, name: "Grok Build", supportsReasoningEffort: false },
+	{
+		id: "grok-build",
+		contextWindow: 512_000,
+		name: "Grok Build",
+		supportsReasoningEffort: false,
+		input: ["text", "image"],
+	},
+	{
+		id: "grok-build-0.1",
+		contextWindow: 256_000,
+		name: "Grok Build 0.1",
+		supportsReasoningEffort: false,
+		input: ["text", "image"],
+	},
 	{ id: "grok-4.3", contextWindow: 1_000_000, name: "Grok 4.3", input: ["text", "image"] },
 	// grok-4.20-multi-agent-0309 is text-only per the bundled catalog; omit `input` for the default.
 	{ id: "grok-4.20-multi-agent-0309", contextWindow: 2_000_000, name: "Grok 4.20 (Multi-Agent)" },
@@ -1244,6 +1256,51 @@ export function clampKimiK27CodeMaxTokens(modelId: string, candidate: number | n
 export function clampKimiK27CodeMaxTokens(modelId: string, candidate: number | null): number | null {
 	if (candidate === null) return null;
 	return isKimiK27CodeModelId(modelId) ? Math.min(candidate, KIMI_K27_CODE_RECOMMENDED_MAX_TOKENS) : candidate;
+}
+
+/**
+ * Fireworks Fast variants we surface. Each inherits the base model's
+ * limits/modalities/thinking and overrides only the cost with the Standard-column
+ * Fast prices from the Serverless pricing table; `cacheWrite` stays 0 (Fireworks
+ * bills no cache-write). Derived from the bundled base entries so metadata stays
+ * in lockstep, and the runtime auto-falls back to the base id on a failed fast
+ * request. See https://docs.fireworks.ai/serverless/pricing.
+ */
+const FIREWORKS_FAST_VARIANT_SPECS: ReadonlyArray<{
+	base: string;
+	name: string;
+	cost: { input: number; output: number; cacheRead: number };
+}> = [
+	{ base: "kimi-k2.7-code", name: "Kimi K2.7 Code Fast", cost: { input: 1.9, output: 8, cacheRead: 0.38 } },
+	{ base: "kimi-k2.6", name: "Kimi K2.6 Fast", cost: { input: 2, output: 8, cacheRead: 0.3 } },
+	{ base: "glm-5.1", name: "GLM-5.1 Fast", cost: { input: 2.8, output: 8.8, cacheRead: 0.52 } },
+];
+
+/**
+ * Build the Fireworks Fast seed by projecting each base bundled spec into a
+ * `<id>-fast` variant. Pushed into the generated catalog (Fast routers never
+ * appear in the serverless control-plane list, so discovery cannot surface
+ * them) and deduped behind any identical previous-snapshot entry.
+ */
+export function buildFireworksFastSeed(): ModelSpec<"openai-completions">[] {
+	const bundled = createBundledReferenceMap<"openai-completions">("fireworks");
+	const seeds: ModelSpec<"openai-completions">[] = [];
+	for (const variant of FIREWORKS_FAST_VARIANT_SPECS) {
+		const base = bundled.get(variant.base);
+		if (!base) continue;
+		seeds.push({
+			...base,
+			id: `${variant.base}${FIREWORKS_FAST_SUFFIX}`,
+			name: variant.name,
+			cost: {
+				input: variant.cost.input,
+				output: variant.cost.output,
+				cacheRead: variant.cost.cacheRead,
+				cacheWrite: 0,
+			},
+		});
+	}
+	return seeds;
 }
 
 /**
