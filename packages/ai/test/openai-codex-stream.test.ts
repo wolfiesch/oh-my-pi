@@ -322,6 +322,42 @@ describe("openai-codex streaming", () => {
 		expect(capturedBody?.prompt_cache_key).toBe("replacement-cache-key");
 	});
 
+	it("omits unsupported sampling params for Codex responses requests", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const context = createCodexTestContext();
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		let capturedBody: Record<string, unknown> | undefined;
+		const fetchMock = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+			capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return new Response(createCompletedCodexSse("Hello"), {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+		});
+
+		const result = await streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			fetch: fetchMock as FetchImpl,
+			temperature: 0.2,
+			topP: 0.9,
+			topK: 40,
+			minP: 0.1,
+			presencePenalty: 0.5,
+			repetitionPenalty: 1.1,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(capturedBody).toBeDefined();
+		if (!capturedBody) throw new Error("expected Codex request body capture");
+		for (const key of ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repetition_penalty"]) {
+			expect(Object.hasOwn(capturedBody, key)).toBe(false);
+		}
+		expect((capturedBody.text as { verbosity?: string } | undefined)?.verbosity).toBe("low");
+		expect(capturedBody.model).toBe(model.id);
+	});
+
 	it("maps end_turn=false on the terminal event to a pause_turn stop", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());

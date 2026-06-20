@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed OpenAI Codex Responses requests forwarding unsupported sampling parameters such as temperature and top_p, which caused the ChatGPT Codex backend to reject sessions with non-default sampling settings. ([#3119](https://github.com/can1357/oh-my-pi/pull/3119) by [@wolfiesch](https://github.com/wolfiesch))
+
 ## [16.1.4] - 2026-06-19
 
 ### Added
