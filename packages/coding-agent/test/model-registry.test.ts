@@ -1071,13 +1071,13 @@ describe("ModelRegistry", () => {
 			expect(anthropicModels.some(m => m.id.includes("claude"))).toBe(true);
 		});
 
-		test("built-in OpenAI gpt-5.4 keeps the catalog standard-pricing budget", () => {
-			expect(sharedBuiltin.find("openai", "gpt-5.4")?.contextWindow).toBe(320_000);
+		test("built-in OpenAI gpt-5.4 keeps the bundled long-context budget", () => {
+			expect(sharedBuiltin.find("openai", "gpt-5.4")?.contextWindow).toBe(1_050_000);
 		});
 
-		test("custom OpenAI gpt-5.4 replacement inherits the catalog standard-pricing budget when contextWindow is omitted", () => {
+		test("custom OpenAI gpt-5.4 replacement inherits the bundled long-context budget when contextWindow is omitted", () => {
 			const model = openaiGpt54Replace.find("openai", "gpt-5.4");
-			expect(model?.contextWindow).toBe(320_000);
+			expect(model?.contextWindow).toBe(1_050_000);
 			expect(model?.baseUrl).toBe("https://my-proxy.example.com/v1");
 		});
 
