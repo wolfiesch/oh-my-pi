@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
@@ -7,6 +8,9 @@ import type { AgentStatus, MechAgent } from "./events.js";
 import {
 	arcPoints,
 	circleGeometry,
+	type FamilyKey,
+	familyGeometry,
+	familyKeyFromToken,
 	nodeEdges,
 	PLATONIC_ORDER,
 	piGlyphGeometry,
@@ -25,9 +29,23 @@ const NODE_RADIUS = 1.0;
 
 const FLARE_COLOR = colour(PALETTE.flare);
 
+const familyGeometries = new Map<FamilyKey, THREE.BufferGeometry>();
+
+function geometryForFamily(family: FamilyKey): THREE.BufferGeometry {
+	let geometry = familyGeometries.get(family);
+	if (!geometry) {
+		geometry = familyGeometry(family, NODE_RADIUS);
+		familyGeometries.set(family, geometry);
+	}
+	return geometry;
+}
+
 interface AgentNode {
 	id: string;
 	depth: number; // clamped ring index 0..MAX_DEPTH
+	parentId: string | null;
+	model: string;
+	family: FamilyKey;
 	status: AgentStatus;
 	group: THREE.Group;
 	mesh: THREE.LineSegments;
@@ -68,6 +86,7 @@ interface Transient {
 export interface HudInfo {
 	agents: number;
 	costUsd: number;
+	tokens: number;
 }
 
 const STATUS_STYLE: Record<AgentStatus, { color: number; intensity: number; spin: number; pulse: boolean }> = {
@@ -83,6 +102,12 @@ export class Mechanism {
 	private readonly camera: THREE.PerspectiveCamera;
 	private readonly composer: EffectComposer;
 	private readonly bloom: UnrealBloomPass;
+	private readonly controls: OrbitControls;
+	private readonly raycaster = new THREE.Raycaster();
+	private readonly pointer = new THREE.Vector2(10, 10);
+	private readonly pickTargets: THREE.LineSegments[] = [];
+	private hoverGroup: THREE.Group | null = null;
+	private hoveredId: string | null = null;
 	private readonly clock = new THREE.Clock();
 
 	private readonly wheel = new THREE.Group();
@@ -98,6 +123,7 @@ export class Mechanism {
 	private readonly laneByModel = new Map<string, number>();
 	private totalCost = 0;
 
+	private totalTokens = 0;
 	private readonly transients: Transient[] = [];
 	private reduced = false;
 	private running = true;
@@ -113,9 +139,29 @@ export class Mechanism {
 		this.renderer.setClearColor(PALETTE.background, 1);
 		container.appendChild(this.renderer.domElement);
 
+		this.installDebugHook();
+
 		this.camera = new THREE.PerspectiveCamera(46, window.innerWidth / window.innerHeight, 0.1, 600);
 		this.camera.position.set(0, 46, 64);
 		this.camera.lookAt(0, 0, 0);
+
+		this.mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+		this.reduced = this.mq.matches;
+
+		this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+		this.controls.enablePan = false;
+		this.controls.minDistance = 36;
+		this.controls.maxDistance = 140;
+		this.controls.minPolarAngle = 0.15;
+		this.controls.maxPolarAngle = 1.05;
+		this.controls.target.set(0, 0, 0);
+		this.controls.dampingFactor = 0.08;
+		this.controls.autoRotateSpeed = 0.3;
+		this.configureControlsForMotion();
+		this.controls.addEventListener("start", () => {
+			this.controls.autoRotate = false;
+		});
+		this.raycaster.params.Line = { threshold: 0.6 };
 
 		this.composer = new EffectComposer(this.renderer);
 		this.composer.addPass(new RenderPass(this.scene, this.camera));
@@ -131,15 +177,38 @@ export class Mechanism {
 		this.scene.add(this.wheel);
 		this.buildStructure();
 
-		this.mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-		this.reduced = this.mq.matches;
 		this.mq.addEventListener("change", e => {
 			this.reduced = e.matches;
+			this.configureControlsForMotion();
 		});
-
+		this.renderer.domElement.addEventListener("pointermove", this.onPointerMove);
+		this.renderer.domElement.addEventListener("pointerleave", this.onPointerLeave);
 		window.addEventListener("resize", this.onResize);
 		this.clock.start();
 		requestAnimationFrame(this.loop);
+	}
+
+	private configureControlsForMotion(): void {
+		this.controls.enabled = !this.reduced;
+		this.controls.enableDamping = !this.reduced;
+		this.controls.autoRotate = !this.reduced;
+	}
+
+	private installDebugHook(): void {
+		(
+			window as Window & {
+				__mechDebug?: {
+					agents: () => { id: string; family: FamilyKey; vertices: number }[];
+				};
+			}
+		).__mechDebug = {
+			agents: () =>
+				[...this.nodes.values()].map(n => ({
+					id: n.id,
+					family: n.family,
+					vertices: n.mesh.geometry.getAttribute("position").count,
+				})),
+		};
 	}
 
 	// --- static structure ---------------------------------------------------
@@ -195,6 +264,9 @@ export class Mechanism {
 
 	applySpawn(agent: MechAgent): void {
 		this.addAgent(agent);
+		const parent = agent.parentId ? this.nodes.get(agent.parentId) : null;
+		const child = this.nodes.get(agent.id);
+		if (parent && child) this.spawnUmbilical(parent.group.position.clone(), child.group.position.clone());
 		this.emitHud();
 	}
 
@@ -218,10 +290,11 @@ export class Mechanism {
 		this.spawnArc(a.group.position.clone(), b.group.position.clone());
 	}
 
-	applyUsage(model: string, costUsd: number): void {
+	applyUsage(model: string, costUsd: number, tokensIn: number, tokensOut: number): void {
 		const lane = this.ensureLane(model);
 		if (lane) lane.cost += Math.max(0, costUsd);
 		this.totalCost += Math.max(0, costUsd);
+		this.totalTokens += Math.max(0, tokensIn) + Math.max(0, tokensOut);
 		this.recomputeShares();
 		this.emitHud();
 	}
@@ -235,12 +308,17 @@ export class Mechanism {
 		const depth = Math.max(0, Math.min(MAX_DEPTH, agent.depth));
 		const group = new THREE.Group();
 		const mat = lineMaterial(PALETTE.accent, 1);
-		const mesh = new THREE.LineSegments(nodeEdges(NODE_RADIUS), mat);
+		const family = familyKeyFromToken(agent.family);
+		const mesh = new THREE.LineSegments(geometryForFamily(family), mat);
 		group.add(mesh);
 		this.scene.add(group);
+		mesh.userData.agentId = agent.id;
 
 		const node: AgentNode = {
 			id: agent.id,
+			parentId: agent.parentId,
+			model: agent.model,
+			family,
 			depth,
 			status: agent.status,
 			group,
@@ -260,10 +338,12 @@ export class Mechanism {
 		};
 		this.nodes.set(agent.id, node);
 		this.buckets[depth].push(agent.id);
+		this.pickTargets.push(mesh);
 		this.reflow(depth);
 		this.setStatus(node, agent.status);
 		// New body accretes in: start dim, let the colour/intensity tween bring it up.
 		node.cur.setHex(PALETTE.dim);
+		this.placeNode(node, node.slotTarget);
 		node.intensity = 0.1;
 	}
 
@@ -271,11 +351,14 @@ export class Mechanism {
 		const n = this.nodes.get(id);
 		if (!n) return;
 		this.scene.remove(n.group);
-		n.mesh.geometry.dispose();
 		n.mat.dispose();
 		this.nodes.delete(id);
 		const bucket = this.buckets[n.depth];
 		const i = bucket.indexOf(id);
+		const targetIndex = this.pickTargets.indexOf(n.mesh);
+		this.clearHoverGroup();
+		if (targetIndex >= 0) this.pickTargets.splice(targetIndex, 1);
+		if (this.hoveredId === id) this.hoveredId = null;
 		if (i >= 0) bucket.splice(i, 1);
 		this.reflow(n.depth);
 	}
@@ -289,6 +372,12 @@ export class Mechanism {
 		}
 	}
 
+	private placeNode(n: AgentNode, slot: number): void {
+		const angle = this.ringPhase[n.depth] + slot;
+		const r = RING_RADII[n.depth];
+		n.group.position.set(Math.cos(angle) * r, 0, Math.sin(angle) * r);
+	}
+
 	private setStatus(n: AgentNode, status: AgentStatus): void {
 		n.status = status;
 		const s = STATUS_STYLE[status];
@@ -297,6 +386,11 @@ export class Mechanism {
 		n.spinRate = s.spin;
 		n.pulsing = s.pulse;
 		if (status === "aborted") n.flare = 1; // flare red, then heal toward dim base
+	}
+
+	// --- HUD ----------------------------------------------------------------
+	private emitHud(): void {
+		this.onHud({ agents: this.nodes.size, costUsd: this.totalCost, tokens: this.totalTokens });
 	}
 
 	// --- transients ---------------------------------------------------------
@@ -337,6 +431,31 @@ export class Mechanism {
 				lineMat.dispose();
 				compass.geometry.dispose();
 				compassMat.dispose();
+			},
+		});
+	}
+
+	private spawnUmbilical(from: THREE.Vector3, to: THREE.Vector3): void {
+		const mat = lineMaterial(PALETTE.structureBright, 1);
+		const geo = new THREE.BufferGeometry().setFromPoints([from.clone(), from.clone()]);
+		const line = new THREE.Line(geo, mat);
+		this.scene.add(line);
+		const pos = geo.getAttribute("position") as THREE.BufferAttribute;
+
+		this.transients.push({
+			obj: line,
+			age: 0,
+			life: 0.7,
+			update: (p, reduced) => {
+				const draw = reduced ? 1 : Math.min(1, p / 0.35);
+				const tip = from.clone().lerp(to, draw);
+				pos.setXYZ(1, tip.x, tip.y, tip.z);
+				pos.needsUpdate = true;
+				mat.opacity = 1 - p;
+			},
+			dispose: () => {
+				geo.dispose();
+				mat.dispose();
 			},
 		});
 	}
@@ -384,6 +503,48 @@ export class Mechanism {
 		});
 	}
 
+	private makeHoverLine(from: THREE.Vector3, to: THREE.Vector3, color: number, opacity: number): THREE.Line {
+		return new THREE.Line(
+			new THREE.BufferGeometry().setFromPoints([from.clone(), to.clone()]),
+			lineMaterial(color, opacity),
+		);
+	}
+
+	private clearHoverGroup(): void {
+		if (!this.hoverGroup) return;
+		this.scene.remove(this.hoverGroup);
+		for (const child of this.hoverGroup.children) {
+			if (child instanceof THREE.Line) {
+				child.geometry.dispose();
+				if (Array.isArray(child.material)) for (const mat of child.material) mat.dispose();
+				else child.material.dispose();
+			}
+		}
+		this.hoverGroup = null;
+	}
+
+	private renderHoverTethers(): void {
+		this.clearHoverGroup();
+		if (!this.hoveredId) return;
+		const hovered = this.nodes.get(this.hoveredId);
+		if (!hovered) return;
+		const group = new THREE.Group();
+		let child = hovered;
+		while (child.parentId) {
+			const parent = this.nodes.get(child.parentId);
+			if (!parent) break;
+			group.add(this.makeHoverLine(child.group.position, parent.group.position, PALETTE.structureBright, 0.75));
+			child = parent;
+		}
+		const laneIndex = this.laneByModel.get(hovered.model);
+		if (laneIndex !== undefined) {
+			group.add(this.makeHoverLine(hovered.group.position, this.lanes[laneIndex].group.position, PALETTE.dim, 0.65));
+		}
+		if (group.children.length === 0) return;
+		this.hoverGroup = group;
+		this.scene.add(group);
+	}
+
 	// --- model lanes --------------------------------------------------------
 	private ensureLane(model: string): Lane | null {
 		const existing = this.laneByModel.get(model);
@@ -402,11 +563,6 @@ export class Mechanism {
 			const share = lane.cost / total;
 			lane.scaleTarget = SOLID_MIN + share * SOLID_RANGE;
 		}
-	}
-
-	// --- HUD ----------------------------------------------------------------
-	private emitHud(): void {
-		this.onHud({ agents: this.nodes.size, costUsd: this.totalCost });
 	}
 
 	// --- frame loop ---------------------------------------------------------
@@ -430,9 +586,7 @@ export class Mechanism {
 		// Agents.
 		for (const n of this.nodes.values()) {
 			n.slot += (n.slotTarget - n.slot) * ease;
-			const angle = this.ringPhase[n.depth] + n.slot;
-			const r = RING_RADII[n.depth];
-			n.group.position.set(Math.cos(angle) * r, 0, Math.sin(angle) * r);
+			this.placeNode(n, n.slot);
 
 			if (!reduced) {
 				n.spin += n.spinRate * dt;
@@ -481,17 +635,32 @@ export class Mechanism {
 			}
 		}
 
-		// Subtle camera breath (disabled under reduced motion).
 		if (!reduced) {
-			this.camera.position.x = Math.sin(t * 0.05) * 4;
-			this.camera.position.y = 46 + Math.sin(t * 0.07) * 2;
-			this.camera.lookAt(0, 0, 0);
+			this.controls.update();
 		} else {
 			this.camera.position.set(0, 46, 64);
 			this.camera.lookAt(0, 0, 0);
 		}
+		this.updateHovered();
+		this.renderHoverTethers();
 
 		this.composer.render();
+	};
+
+	private updateHovered(): void {
+		this.raycaster.setFromCamera(this.pointer, this.camera);
+		const hit = this.raycaster.intersectObjects(this.pickTargets, false)[0];
+		this.hoveredId = typeof hit?.object.userData.agentId === "string" ? hit.object.userData.agentId : null;
+	}
+
+	private onPointerMove = (ev: PointerEvent): void => {
+		const rect = this.renderer.domElement.getBoundingClientRect();
+		this.pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+		this.pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+	};
+
+	private onPointerLeave = (): void => {
+		this.pointer.set(10, 10);
 	};
 
 	private onResize = (): void => {
@@ -507,6 +676,10 @@ export class Mechanism {
 	dispose(): void {
 		this.running = false;
 		window.removeEventListener("resize", this.onResize);
+		this.renderer.domElement.removeEventListener("pointermove", this.onPointerMove);
+		this.renderer.domElement.removeEventListener("pointerleave", this.onPointerLeave);
+		this.clearHoverGroup();
+		this.controls.dispose();
 		this.renderer.dispose();
 	}
 }

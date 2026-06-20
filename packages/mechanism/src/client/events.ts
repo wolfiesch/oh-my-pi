@@ -9,6 +9,7 @@ export interface MechAgent {
 	id: string;
 	parentId: string | null;
 	model: string;
+	family: string;
 	status: AgentStatus;
 	depth: number;
 	label: string;

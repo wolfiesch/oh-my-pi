@@ -153,6 +153,12 @@ function boxAround(label: string, p: Vec3, radius: number): Box {
 }
 /** A body sitting alone in ring `depth`'s bucket lands at angle 0 → world (r,0,0) under reduced motion. */
 const ringBody = (depth: number): Vec3 => [RING_RADII[depth], 0, 0];
+function bodyAt(depth: number, index: number, count: number): Vec3 {
+	const a = (index / count) * Math.PI * 2;
+	const r = RING_RADII[depth];
+	return [Math.cos(a) * r, 0, Math.sin(a) * r];
+}
+
 /** Lane `i` solid orbits at angle i/5·2π, radius LANE_RADIUS (static under reduced motion). */
 function lanePoint(i: number): Vec3 {
 	const a = (i / LANE_COUNT) * Math.PI * 2;
@@ -476,22 +482,31 @@ function consoleErrorsOf(page: Page): string[] {
 	return (page as Page & { __consoleErrors?: string[] }).__consoleErrors ?? [];
 }
 
-async function readHud(page: Page): Promise<{ profile: string; agents: string; cost: string }> {
+async function readHud(page: Page): Promise<{ profile: string; agents: string; cost: string; tokens: string }> {
 	return page.evaluate(`(() => ({
 		profile: document.getElementById("hud-profile")?.textContent ?? "",
 		agents: document.getElementById("hud-agents")?.textContent ?? "",
 		cost: document.getElementById("hud-cost")?.textContent ?? "",
-	}))()`) as Promise<{ profile: string; agents: string; cost: string }>;
+		tokens: document.getElementById("hud-tokens")?.textContent ?? "",
+	}))()`) as Promise<{ profile: string; agents: string; cost: string; tokens: string }>;
 }
 
 // ----------------------------------------------------------------------------------------------
 // Suite A — reduced motion (deterministic geometry + every event binding)
 // ----------------------------------------------------------------------------------------------
 
-const agent = (id: string, parentId: string | null, depth: number, model: string, status: AgentStatus): MechAgent => ({
+const agent = (
+	id: string,
+	parentId: string | null,
+	depth: number,
+	model: string,
+	status: AgentStatus,
+	family = "anthropic",
+): MechAgent => ({
 	id,
 	parentId,
 	model,
+	family,
 	status,
 	depth,
 	label: id,
@@ -719,6 +734,35 @@ async function suiteReducedMotion(h: Harness, browser: Browser): Promise<void> {
 		pass: hudCost.cost === `$${expectCost.toFixed(2)}`,
 		shots: [usageShot.shot],
 	});
+	h.record({
+		id: "hud-token-total",
+		binding: "Session token total (application binding: Σ usage.tokensIn+tokensOut → HUD)",
+		expected: "12.5k",
+		actual: `HUD tokens = ${hudCost.tokens}`,
+		pass: hudCost.tokens === "12.5k",
+		shots: [usageShot.shot],
+	});
+
+	// --- A8: spawn umbilical → dim radial drop from parent to child ---
+	const umbilicalBox = boxAround("umbilical", [-12, 0, 0], 18);
+	const umbBeforeM = (
+		await h.analyzer.measure((await h.shot(page, "reduced-umbilical-before")).base64, [umbilicalBox])
+	).boxes[0];
+	h.server.push({ t: "spawn", agent: agent("UmbilicalChild", "Main", 3, "model/umbilical", "running") });
+	await sleep(TRANSIENT_MS);
+	const umbDuringShot = await h.shot(page, "reduced-umbilical-during");
+	const umbDuringM = (await h.analyzer.measure(umbDuringShot.base64, [umbilicalBox])).boxes[0];
+	await sleep(800);
+	const umbAfterShot = await h.shot(page, "reduced-umbilical-after");
+	const umbAfterM = (await h.analyzer.measure(umbAfterShot.base64, [umbilicalBox])).boxes[0];
+	h.record({
+		id: "spawn-umbilical",
+		binding: "Subagent spawn → dim straight parent→child umbilical drops in then fades",
+		expected: "mid-segment luminance rises during spawn, then falls after the 0.7s life",
+		actual: `mid-box mean ${umbBeforeM.mean.toFixed(1)} → ${umbDuringM.mean.toFixed(1)} → ${umbAfterM.mean.toFixed(1)}`,
+		pass: umbDuringM.mean > umbBeforeM.mean + 3 && umbAfterM.mean < umbDuringM.mean - 3,
+		shots: [umbDuringShot.shot, umbAfterShot.shot],
+	});
 
 	// --- A8: SSE transport contract — probe received the exact pushed sequence ---
 	const expectedSeq = h.server.pushed;
@@ -748,6 +792,205 @@ async function suiteReducedMotion(h: Harness, browser: Browser): Promise<void> {
 		shots: [],
 	});
 
+	await page.close();
+}
+
+// ----------------------------------------------------------------------------------------------
+// Suite B — family silhouettes (transport + debug binding + rendered bodies)
+// ----------------------------------------------------------------------------------------------
+
+async function suiteFamilySilhouettes(h: Harness, browser: Browser): Promise<void> {
+	console.log("\n— Suite B: family silhouettes —");
+	const page = await openClientPage(browser, h.server, { reducedMotion: true, profile: "verify-families" });
+	const agents = [
+		agent("Anthropic", null, 0, "anthropic/claude-opus-4-8", "running", "anthropic"),
+		agent("OpenAI", "Anthropic", 1, "openai/gpt-5.5", "running", "openai"),
+		agent("Google", "OpenAI", 2, "google/gemini-3-pro", "running", "gemini"),
+		agent("GLM", "OpenAI", 2, "zai/glm-5.2", "running", "glm"),
+		agent("Kimi", "GLM", 3, "moonshot/kimi-k2", "running", "kimi"),
+		agent("Neutral", "GLM", 3, "xai/grok-4", "running", ""),
+	];
+	const expectedFamilies = new Map([
+		["Anthropic", "anthropic"],
+		["OpenAI", "openai"],
+		["Google", "google"],
+		["GLM", "glm"],
+		["Kimi", "kimi"],
+		["Neutral", "neutral"],
+	]);
+	h.server.push({ t: "roster", agents });
+	await sleep(SETTLE_MS);
+
+	const pushed = h.server.pushed[0];
+	const transportHasFamilies =
+		pushed?.t === "roster" &&
+		pushed.agents.length === agents.length &&
+		pushed.agents.every(a => typeof a.family === "string" && a.family === agents.find(x => x.id === a.id)?.family);
+	h.record({
+		id: "family-transport-field",
+		binding: "MechEvent roster carries agent.family across SSE",
+		expected: "every roster agent has its byte-exact family token",
+		actual: transportHasFamilies ? "all roster family tokens preserved" : `bad payload ${JSON.stringify(pushed)}`,
+		pass: transportHasFamilies,
+		shots: [],
+	});
+
+	const debugAgents = (await page.evaluate("window.__mechDebug.agents()")) as {
+		id: string;
+		family: string;
+		vertices: number;
+	}[];
+	const debugById = new Map(debugAgents.map(a => [a.id, a]));
+	const familyMatches = [...expectedFamilies].every(([id, family]) => debugById.get(id)?.family === family);
+	const vertexCounts = debugAgents.map(a => a.vertices);
+	const distinctVertices = new Set(vertexCounts).size === agents.length;
+	h.record({
+		id: "family-debug-binding",
+		binding: "__mechDebug exposes family key and silhouette topology per live node",
+		expected: "expected FamilyKey per id and six mutually distinct vertex counts",
+		actual: `families=[${debugAgents.map(a => `${a.id}:${a.family}`).join(", ")}], vertices=[${vertexCounts.join(", ")}]`,
+		pass: familyMatches && distinctVertices,
+		shots: [],
+	});
+
+	const boxes = [
+		boxAround("Anthropic", bodyAt(0, 0, 1), 24),
+		boxAround("OpenAI", bodyAt(1, 0, 1), 24),
+		boxAround("Google", bodyAt(2, 0, 2), 24),
+		boxAround("GLM", bodyAt(2, 1, 2), 24),
+		boxAround("Kimi", bodyAt(3, 0, 2), 24),
+		boxAround("Neutral", bodyAt(3, 1, 2), 24),
+	];
+	const shot = await h.shot(page, "family-silhouettes");
+	const metrics = (await h.analyzer.measure(shot.base64, boxes)).boxes;
+	const lit = metrics.filter(m => m.bright >= TH.bodyBrightMin);
+	h.record({
+		id: "family-silhouette-render",
+		binding: "Family silhouettes render as luminous agent bodies at deterministic reduced-motion positions",
+		expected: `six projected bodies have bright-core px ≥ ${TH.bodyBrightMin}`,
+		actual: metrics.map(m => `${m.label}:${m.bright}`).join(", "),
+		pass: lit.length === boxes.length,
+		shots: [shot.shot],
+	});
+
+	const errs = consoleErrorsOf(page);
+	h.record({
+		id: "family-suite-no-errors",
+		binding: "Family silhouette suite produces no browser errors",
+		expected: "0 console errors",
+		actual: errs.length === 0 ? "no page/console errors" : `errors: ${errs.slice(0, 4).join(" | ")}`,
+		pass: errs.length === 0,
+		shots: [],
+	});
+	await page.close();
+}
+
+// ----------------------------------------------------------------------------------------------
+// Suite C — hover-gated lineage + model-lane tethers
+// ----------------------------------------------------------------------------------------------
+
+async function suiteHoverTethers(h: Harness, browser: Browser): Promise<void> {
+	console.log("\n— Suite C: hover tethers —");
+	const page = await openClientPage(browser, h.server, { reducedMotion: true, profile: "verify-hover" });
+	const main = agent("Main", null, 0, "model/main", "running");
+	const child = agent("Child", "Main", 1, "model/child", "running");
+	const grand = agent("Grandchild", "Child", 2, "model/grand", "running");
+	h.server.push({ t: "roster", agents: [main, child, grand] });
+	h.server.push({ t: "usage", model: "model/grand", costUsd: 1.0, tokensIn: 100, tokensOut: 50 });
+	await sleep(SETTLE_MS);
+
+	const tetherBoxes = [
+		boxAround("grand-child", [23, 0, 0], 12),
+		boxAround("child-main", [15, 0, 0], 12),
+		boxAround("grand-lane", [40, 0, 0], 12),
+	];
+	const before = await h.shot(page, "hover-tethers-before");
+	const beforeM = (await h.analyzer.measure(before.base64, tetherBoxes)).boxes;
+	const [x, y] = project(ringBody(2));
+	await page.mouse.move(x, y);
+	await sleep(SETTLE_MS);
+	const during = await h.shot(page, "hover-tethers-during");
+	const duringM = (await h.analyzer.measure(during.base64, tetherBoxes)).boxes;
+	await page.mouse.move(4, 4);
+	await sleep(SETTLE_MS);
+	const after = await h.shot(page, "hover-tethers-after");
+	const afterM = (await h.analyzer.measure(after.base64, tetherBoxes)).boxes;
+	const rises = tetherBoxes.map((_, i) => duringM[i].mean - beforeM[i].mean);
+	const clears = tetherBoxes.map((_, i) => duringM[i].mean - afterM[i].mean);
+	h.record({
+		id: "hover-tether-lines",
+		binding: "Hover an orb → lineage tethers to ancestors plus a line to its model lane",
+		expected: "all three sampled tether midpoints brighten on hover and clear off-hover",
+		actual: tetherBoxes
+			.map(
+				(b, i) =>
+					`${b.label}:${beforeM[i].mean.toFixed(1)}→${duringM[i].mean.toFixed(1)}→${afterM[i].mean.toFixed(1)}`,
+			)
+			.join(", "),
+		pass: rises[0] > 4 && rises[1] > 4 && rises[2] > 1 && clears[0] > 4 && clears[1] > 4 && clears[2] > 1,
+		shots: [during.shot, after.shot],
+	});
+
+	const errs = consoleErrorsOf(page);
+	h.record({
+		id: "hover-suite-no-errors",
+		binding: "Hover tether suite produces no browser errors",
+		expected: "0 console errors",
+		actual: errs.length === 0 ? "no page/console errors" : `errors: ${errs.slice(0, 4).join(" | ")}`,
+		pass: errs.length === 0,
+		shots: [],
+	});
+	await page.close();
+}
+
+// ----------------------------------------------------------------------------------------------
+// Suite D — concealed legend overlay
+// ----------------------------------------------------------------------------------------------
+
+async function suiteLegend(h: Harness, browser: Browser): Promise<void> {
+	console.log("\n— Suite D: concealed legend —");
+	const page = await openClientPage(browser, h.server, { reducedMotion: true, profile: "verify-legend" });
+	const readLegend = () =>
+		page.evaluate(`(() => {
+			const panel = document.getElementById("legend-panel");
+			if (!panel) return { visibility: "", opacity: "", text: "" };
+			const style = getComputedStyle(panel);
+			return { visibility: style.visibility, opacity: style.opacity, text: panel.textContent || "" };
+		})()`) as Promise<{ visibility: string; opacity: string; text: string }>;
+	const rest = await readLegend();
+	await page.hover("#legend-toggle");
+	await sleep(180);
+	const shown = await readLegend();
+	await page.mouse.move(4, 4);
+	await sleep(180);
+	const hidden = await readLegend();
+	const containsTerms = ["recursion depth", "model family", "model lanes", "aborted"].every(term =>
+		shown.text.toLowerCase().includes(term),
+	);
+	h.record({
+		id: "legend-conceal-reveal",
+		binding: "Concealed info legend stays hidden at rest, reveals on hover, then conceals again",
+		expected: "hidden opacity 0 at rest; visible on hover; hidden after pointer leaves; required terms present",
+		actual: `rest ${rest.visibility}/${rest.opacity}, hover ${shown.visibility}/${shown.opacity}, away ${hidden.visibility}/${hidden.opacity}`,
+		pass:
+			rest.visibility === "hidden" &&
+			Number(rest.opacity) === 0 &&
+			shown.visibility === "visible" &&
+			Number(shown.opacity) > 0.8 &&
+			hidden.visibility === "hidden" &&
+			Number(hidden.opacity) === 0 &&
+			containsTerms,
+		shots: [],
+	});
+	const errs = consoleErrorsOf(page);
+	h.record({
+		id: "legend-suite-no-errors",
+		binding: "Legend suite produces no browser errors",
+		expected: "0 console errors",
+		actual: errs.length === 0 ? "no page/console errors" : `errors: ${errs.slice(0, 4).join(" | ")}`,
+		pass: errs.length === 0,
+		shots: [],
+	});
 	await page.close();
 }
 
@@ -953,6 +1196,9 @@ async function main(): Promise<void> {
 		const harness = new Harness(server, analyzer, args.out);
 
 		await suiteReducedMotion(harness, browser);
+		await suiteFamilySilhouettes(harness, browser);
+		await suiteHoverTethers(harness, browser);
+		await suiteLegend(harness, browser);
 		await suiteMotionContrast(harness, browser);
 
 		const summary = await writeReport(args.out, harness.results);

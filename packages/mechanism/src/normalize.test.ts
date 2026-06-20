@@ -106,6 +106,7 @@ describe("MechanismNormalizer", () => {
 						id: MAIN_AGENT_ID,
 						parentId: null,
 						model: "openai/gpt-5.5",
+						family: "openai",
 						status: "running",
 						depth: 0,
 						label: MAIN_AGENT_ID,

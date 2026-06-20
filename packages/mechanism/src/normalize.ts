@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { modelFamilyToken } from "@oh-my-pi/pi-catalog/identity/family";
 import type { MechFileEntry } from "./entries";
 
 const DEFAULT_ACTIVITY_THRESHOLD_MS = 5_000;
@@ -13,6 +14,7 @@ export interface MechAgent {
 	id: string;
 	parentId: string | null;
 	model: string;
+	family: string;
 	status: AgentStatus;
 	depth: number;
 	label: string;
@@ -56,6 +58,9 @@ interface UnknownObject {
 
 function isObject(value: unknown): value is UnknownObject {
 	return typeof value === "object" && value !== null;
+}
+function familyOf(model: string): string {
+	return modelFamilyToken(model);
 }
 
 function cloneAgent(agent: MechAgent): MechAgent {
@@ -223,6 +228,7 @@ export class MechanismNormalizer {
 			id: source.agentId,
 			parentId: source.parentId,
 			model: "",
+			family: "",
 			status,
 			depth: source.depth,
 			label: source.agentId,
@@ -312,6 +318,7 @@ export class MechanismNormalizer {
 		const record = this.#agents.get(agentId);
 		if (!record || record.agent.model === model) return null;
 		record.agent.model = model;
+		record.agent.family = familyOf(model);
 		return this.snapshotRoster();
 	}
 
@@ -420,6 +427,7 @@ export function createMockFeed(options: MockFeedOptions = {}): MockFeed {
 			id: MAIN_AGENT_ID,
 			parentId: null,
 			model: "openrouter/openai/gpt-5.5",
+			family: "openai",
 			status: "running",
 			depth: 0,
 			label: MAIN_AGENT_ID,
@@ -429,6 +437,7 @@ export function createMockFeed(options: MockFeedOptions = {}): MockFeed {
 		id: "SchemaScout",
 		parentId: MAIN_AGENT_ID,
 		model: "openrouter/anthropic/claude-sonnet-4.5",
+		family: "anthropic",
 		status: "running",
 		depth: 1,
 		label: "SchemaScout",

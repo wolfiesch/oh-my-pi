@@ -110,6 +110,106 @@ export function nodeEdges(radius: number): THREE.BufferGeometry {
 	return edges;
 }
 
+export type FamilyKey = "anthropic" | "openai" | "google" | "glm" | "kimi" | "neutral";
+
+function segmentsGeometry(points: number[]): THREE.BufferGeometry {
+	const g = new THREE.BufferGeometry();
+	g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(points), 3));
+	return g;
+}
+
+function pushSegment(points: number[], ax: number, ay: number, az: number, bx: number, by: number, bz: number): void {
+	points.push(ax, ay, az, bx, by, bz);
+}
+
+function pushRing(points: number[], radius: number, segments: number, plane: "xz" | "xy" | "yz"): void {
+	for (let i = 0; i < segments; i++) {
+		const a0 = (i / segments) * Math.PI * 2;
+		const a1 = ((i + 1) / segments) * Math.PI * 2;
+		const c0 = Math.cos(a0) * radius;
+		const s0 = Math.sin(a0) * radius;
+		const c1 = Math.cos(a1) * radius;
+		const s1 = Math.sin(a1) * radius;
+		if (plane === "xz") pushSegment(points, c0, 0, s0, c1, 0, s1);
+		else if (plane === "xy") pushSegment(points, c0, s0, 0, c1, s1, 0);
+		else pushSegment(points, 0, c0, s0, 0, c1, s1);
+	}
+}
+
+function compassRoseGeometry(radius: number): THREE.BufferGeometry {
+	const points: number[] = [];
+	pushRing(points, radius, 32, "xz");
+	for (let i = 0; i < 8; i++) {
+		const a = (i / 8) * Math.PI * 2;
+		pushSegment(points, 0, 0, 0, Math.cos(a) * radius, 0, Math.sin(a) * radius);
+	}
+	return segmentsGeometry(points);
+}
+
+function starburstGeometry(radius: number): THREE.BufferGeometry {
+	const points: number[] = [];
+	pushSegment(points, -radius, 0, 0, radius, 0, 0);
+	pushSegment(points, 0, -radius, 0, 0, radius, 0);
+	pushSegment(points, 0, 0, -radius, 0, 0, radius);
+	pushRing(points, radius * 0.55, 24, "xz");
+	return segmentsGeometry(points);
+}
+
+function armillaryGeometry(radius: number): THREE.BufferGeometry {
+	const points: number[] = [];
+	pushRing(points, radius, 32, "xz");
+	pushRing(points, radius, 32, "xy");
+	pushRing(points, radius, 32, "yz");
+	return segmentsGeometry(points);
+}
+
+function spindleGeometry(radius: number): THREE.BufferGeometry {
+	const points: number[] = [];
+	const y = radius * 1.3;
+	const verts = [
+		[radius, 0, 0],
+		[0, 0, radius],
+		[-radius, 0, 0],
+		[0, 0, -radius],
+	] as const;
+	for (let i = 0; i < verts.length; i++) {
+		const a = verts[i];
+		const b = verts[(i + 1) % verts.length];
+		pushSegment(points, a[0], a[1], a[2], b[0], b[1], b[2]);
+		pushSegment(points, 0, y, 0, a[0], a[1], a[2]);
+		pushSegment(points, 0, -y, 0, a[0], a[1], a[2]);
+	}
+	return segmentsGeometry(points);
+}
+
+function neutralJackGeometry(radius: number): THREE.BufferGeometry {
+	const r = radius * 0.85;
+	return segmentsGeometry([-r, 0, 0, r, 0, 0, 0, -r, 0, 0, r, 0, 0, 0, -r, 0, 0, r]);
+}
+
+export function familyKeyFromToken(token: string): FamilyKey {
+	if (token === "anthropic" || token === "openai" || token === "glm" || token === "kimi") return token;
+	if (token === "gemini" || token === "gemma") return "google";
+	return "neutral";
+}
+
+export function familyGeometry(key: FamilyKey, radius = 1): THREE.BufferGeometry {
+	switch (key) {
+		case "anthropic":
+			return nodeEdges(radius);
+		case "openai":
+			return compassRoseGeometry(radius);
+		case "google":
+			return starburstGeometry(radius);
+		case "glm":
+			return armillaryGeometry(radius);
+		case "kimi":
+			return spindleGeometry(radius);
+		case "neutral":
+			return neutralJackGeometry(radius);
+	}
+}
+
 /** A quadratic arc lifted above the disc plane, sampled as a polyline. */
 export function arcPoints(from: THREE.Vector3, to: THREE.Vector3, lift: number, samples = 48): THREE.Vector3[] {
 	const mid = from.clone().add(to).multiplyScalar(0.5);

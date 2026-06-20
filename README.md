@@ -538,6 +538,7 @@ For architecture and contribution guidelines, see [packages/coding-agent/DEVELOP
 | **[@oh-my-pi/pi-tui](packages/tui)**                      | Terminal UI library with differential rendering                            |
 | **[@oh-my-pi/pi-natives](packages/natives)**              | N-API bindings for grep, shell, image, text, syntax highlighting, and more |
 | **[@oh-my-pi/omp-stats](packages/stats)**                 | Local observability dashboard for AI usage statistics                      |
+| **[@oh-my-pi/omp-home](packages/home)**                   | Local profile hub, routing graph, provider editor, and launcher dashboard  |
 | **[@oh-my-pi/pi-utils](packages/utils)**                  | Shared utilities (logging, streams, dirs/env/process helpers)              |
 | **[@oh-my-pi/pi-wire](packages/wire)**                    | Shared collab live-session protocol types and relay constants              |
 | **[@oh-my-pi/hashline](packages/hashline)**               | Line-anchored patch language and applier behind the `edit` tool            |

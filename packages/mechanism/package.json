@@ -31,6 +31,7 @@
 		"build": "bun run build.ts",
 		"dev": "bun run src/index.ts",
 		"verify": "bun run scripts/verify-harness.ts",
+		"test": "bun test",
 		"check": "biome check . && bun run check:types",
 		"check:types": "tsgo -p tsconfig.json --noEmit && tsgo -p tsconfig.client.json --noEmit",
 		"lint": "biome lint .",

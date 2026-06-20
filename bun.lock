@@ -49,6 +49,33 @@
         "@types/bun": "catalog:",
       },
     },
+    "packages/auther": {
+      "name": "@oh-my-pi/omp-auther",
+      "version": "0.1.0",
+      "bin": {
+        "omp-auther": "./src/index.ts",
+      },
+      "dependencies": {
+        "@oh-my-pi/pi-ai": "catalog:",
+        "@oh-my-pi/pi-catalog": "catalog:",
+        "@oh-my-pi/pi-utils": "catalog:",
+        "@tailwindcss/node": "catalog:",
+        "chart.js": "catalog:",
+        "date-fns": "catalog:",
+        "lucide-react": "catalog:",
+        "react": "catalog:",
+        "react-chartjs-2": "catalog:",
+        "react-dom": "catalog:",
+        "simple-icons": "catalog:",
+        "tailwindcss": "catalog:",
+      },
+      "devDependencies": {
+        "@types/bun": "catalog:",
+        "@types/react": "catalog:",
+        "@types/react-dom": "catalog:",
+        "postcss": "catalog:",
+      },
+    },
     "packages/catalog": {
       "name": "@oh-my-pi/pi-catalog",
       "version": "16.4.6",
@@ -73,6 +100,7 @@
         "@babel/parser": "catalog:",
         "@mozilla/readability": "catalog:",
         "@oh-my-pi/hashline": "catalog:",
+        "@oh-my-pi/omp-home": "catalog:",
         "@oh-my-pi/omp-mechanism": "catalog:",
         "@oh-my-pi/omp-stats": "catalog:",
         "@oh-my-pi/pi-agent-core": "catalog:",
@@ -104,6 +132,7 @@
         "puppeteer-core": "catalog:",
         "turndown": "catalog:",
         "turndown-plugin-gfm": "catalog:",
+        "yaml": "2.9.0",
         "zod": "catalog:",
       },
       "devDependencies": {
@@ -139,6 +168,32 @@
       },
       "devDependencies": {
         "@types/bun": "catalog:",
+      },
+    },
+    "packages/home": {
+      "name": "@oh-my-pi/omp-home",
+      "version": "0.1.0",
+      "bin": {
+        "omp-home": "./src/index.ts",
+      },
+      "dependencies": {
+        "@oh-my-pi/pi-ai": "catalog:",
+        "@oh-my-pi/pi-catalog": "catalog:",
+        "@oh-my-pi/pi-utils": "catalog:",
+        "@tailwindcss/node": "catalog:",
+        "chart.js": "catalog:",
+        "date-fns": "catalog:",
+        "lucide-react": "catalog:",
+        "react": "catalog:",
+        "react-chartjs-2": "catalog:",
+        "react-dom": "catalog:",
+        "tailwindcss": "catalog:",
+      },
+      "devDependencies": {
+        "@types/bun": "catalog:",
+        "@types/react": "catalog:",
+        "@types/react-dom": "catalog:",
+        "postcss": "catalog:",
       },
     },
     "packages/mechanism": {
@@ -397,6 +452,7 @@
     "react-chartjs-2": "^5.3.1",
     "react-dom": "19.2.7",
     "regexp-tree": "^0.1.27",
+    "simple-icons": "^16.23.0",
     "solid-js": "^1.9.13",
     "tailwindcss": "^4.3.0",
     "turndown": "7.2.4",
@@ -738,6 +794,10 @@
     "@oh-my-pi/collab-web": ["@oh-my-pi/collab-web@workspace:packages/collab-web"],
 
     "@oh-my-pi/hashline": ["@oh-my-pi/hashline@workspace:packages/hashline"],
+
+    "@oh-my-pi/omp-auther": ["@oh-my-pi/omp-auther@workspace:packages/auther"],
+
+    "@oh-my-pi/omp-home": ["@oh-my-pi/omp-home@workspace:packages/home"],
 
     "@oh-my-pi/omp-mechanism": ["@oh-my-pi/omp-mechanism@workspace:packages/mechanism"],
 
@@ -1395,6 +1455,8 @@
     "sherpa-onnx-win-x64": ["sherpa-onnx-win-x64@1.13.4", "", { "os": "win32", "cpu": "x64" }, "sha512-R0PWby1VxC14TDZPq7GcfSyXSY6SAFO8Y4JwdCdqouFmeXkZ1L7Is9m98C9KxQ0dN7ZtDzhAmE/43FUs/elXRQ=="],
 
     "signal-exit": ["signal-exit@4.1.0", "", {}, "sha512-bzyZ1e88w9O1iNJbKnOlvYTrWPDl46O1bG0D3XInv+9tkPrxrN8jUUTiFlDkkmKWgn1M6CfIA13SuGqOa9Korw=="],
+
+    "simple-icons": ["simple-icons@16.23.0", "", {}, "sha512-08MaTpxj9zGYUIe38tfELYkaHiGE1YgbrbXmTBf+GPxi5mEqLSORQqOXrP0QKPdaFuzEDSmW5o4xkbLlFhmdCw=="],
 
     "slice-ansi": ["slice-ansi@8.0.0", "", { "dependencies": { "ansi-styles": "^6.2.3", "is-fullwidth-code-point": "^5.1.0" } }, "sha512-stxByr12oeeOyY2BlviTNQlYV5xOj47GirPr4yA1hE9JCtxfQN0+tVbkxwCtYDQWhEKWFHsEK48ORg5jrouCAg=="],
 
