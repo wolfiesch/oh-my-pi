@@ -11,58 +11,93 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { AgentHubRemote } from "@oh-my-pi/pi-coding-agent/modes/components/agent-hub";
 import { AgentTranscriptViewer } from "@oh-my-pi/pi-coding-agent/modes/components/agent-transcript-viewer";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 
 const TS = new Date().toISOString();
+const usage = {
+	input: 1,
+	output: 1,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 2,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
 
-function buildJsonl(): string {
-	const usage = {
-		input: 1,
-		output: 1,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: 2,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	};
-	const lines = [
-		JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "adv", timestamp: TS, cwd: "/tmp" }),
-	];
-	lines.push(
-		JSON.stringify({
-			type: "message",
-			id: "u0",
-			parentId: null,
-			timestamp: TS,
-			message: { role: "user", synthetic: true, attribution: "agent", content: "PROMPTMARKER", timestamp: 0 },
-		}),
-	);
-	for (let i = 0; i < 40; i++) {
-		lines.push(
-			JSON.stringify({
-				type: "message",
-				id: `a${i}`,
-				parentId: null,
-				timestamp: TS,
-				message: {
-					role: "assistant",
-					content: [{ type: "text", text: `Reviewing step ${i}.` }],
-					api: "anthropic-messages",
-					provider: "anthropic",
-					model: "gpt-5.5",
-					usage,
-					stopReason: "stop",
-					timestamp: i,
-				},
-			}),
-		);
-	}
+function sessionHeader(id = "adv"): string {
+	return JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id, timestamp: TS, cwd: "/tmp" });
+}
+
+function userLine(id: string, text: string, parentId: string | null = null): string {
+	return JSON.stringify({
+		type: "message",
+		id,
+		parentId,
+		timestamp: TS,
+		message: { role: "user", synthetic: true, attribution: "agent", content: text, timestamp: 0 },
+	});
+}
+
+function assistantLine(id: string, text: string, parentId: string | null = null): string {
+	return JSON.stringify({
+		type: "message",
+		id,
+		parentId,
+		timestamp: TS,
+		message: {
+			role: "assistant",
+			content: [{ type: "text", text }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "gpt-5.5",
+			usage,
+			stopReason: "stop",
+			timestamp: 1,
+		},
+	});
+}
+
+function jsonl(lines: string[]): string {
 	return `${lines.join("\n")}\n`;
 }
 
-function makeViewer(file: string) {
+function renderedBody(viewer: AgentTranscriptViewer): string {
+	return viewer
+		.render(80)
+		.map(l => Bun.stripANSI(l))
+		.join("\n");
+}
+
+function countOccurrences(text: string, marker: string): number {
+	return text.split(marker).length - 1;
+}
+
+async function waitForBody(viewer: AgentTranscriptViewer, predicate: (body: string) => boolean): Promise<string> {
+	const deadline = Date.now() + 5000;
+	let body = renderedBody(viewer);
+	while (!predicate(body) && Date.now() < deadline) {
+		await Bun.sleep(50);
+		body = renderedBody(viewer);
+	}
+	return body;
+}
+
+function buildJsonl(): string {
+	const lines = [sessionHeader()];
+	let parentId = "u0";
+	lines.push(userLine(parentId, "PROMPTMARKER"));
+	for (let i = 0; i < 40; i++) {
+		const id = `a${i}`;
+		lines.push(assistantLine(id, `Reviewing step ${i}.`, parentId));
+		parentId = id;
+	}
+	return jsonl(lines);
+}
+
+function makeViewer(file: string | null, remote?: AgentHubRemote, requestRender: () => void = () => {}) {
 	const agents = new AgentRegistry();
 	agents.register({
 		id: "Main/advisor",
@@ -76,11 +111,12 @@ function makeViewer(file: string) {
 	return new AgentTranscriptViewer({
 		agentId: "Main/advisor",
 		registry: agents,
+		remote,
 		ui: { requestRender: () => {}, requestComponentRender: () => {} } as never,
 		cwd: "/tmp",
 		expandKeys: ["ctrl+o"],
 		hubKeys: ["ctrl+s"],
-		requestRender: () => {},
+		requestRender,
 		onClose: () => {},
 		onHubClose: () => {},
 	});
@@ -153,6 +189,112 @@ describe("AgentTranscriptViewer", () => {
 		});
 	});
 
+	it("tails complete local appends without duplicating old transcript rows", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-"));
+		const file = path.join(dir, "__advisor.jsonl");
+		fs.writeFileSync(file, jsonl([sessionHeader(), userLine("old", "LOCAL-OLD")]));
+		const viewer = makeViewer(file);
+		try {
+			viewer.render(80);
+			fs.appendFileSync(file, `${userLine("new", "LOCAL-NEW", "old")}\n`);
+			const body = await waitForBody(viewer, text => text.includes("LOCAL-NEW"));
+			expect(body).toContain("LOCAL-NEW");
+			expect(countOccurrences(body, "LOCAL-OLD")).toBe(1);
+		} finally {
+			viewer.dispose();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("buffers partial trailing local JSONL until the newline arrives", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-"));
+		const file = path.join(dir, "__advisor.jsonl");
+		fs.writeFileSync(file, jsonl([sessionHeader(), userLine("old", "LOCAL-OLD")]));
+		const viewer = makeViewer(file);
+		const partial = userLine("partial", "LOCAL-PARTIAL", "old");
+		try {
+			viewer.render(80);
+			fs.appendFileSync(file, partial.slice(0, -2));
+			const withoutPartial = await waitForBody(viewer, text => text.includes("LOCAL-OLD"));
+			expect(withoutPartial).not.toContain("LOCAL-PARTIAL");
+
+			fs.appendFileSync(file, `${partial.slice(-2)}\n`);
+			const body = await waitForBody(viewer, text => text.includes("LOCAL-PARTIAL"));
+			expect(countOccurrences(body, "LOCAL-PARTIAL")).toBe(1);
+		} finally {
+			viewer.dispose();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("fully rebuilds local content when the transcript file is replaced", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-"));
+		const file = path.join(dir, "__advisor.jsonl");
+		fs.writeFileSync(file, jsonl([sessionHeader(), userLine("old", "LOCAL-OLD")]));
+		const viewer = makeViewer(file);
+		try {
+			viewer.render(80);
+			const replacement = path.join(dir, "replacement.jsonl");
+			fs.writeFileSync(replacement, jsonl([sessionHeader(), userLine("replaced", "LOCAL-REPLACED")]));
+			fs.renameSync(replacement, file);
+			const body = await waitForBody(viewer, text => text.includes("LOCAL-REPLACED") && !text.includes("LOCAL-OLD"));
+			expect(body).toContain("LOCAL-REPLACED");
+			expect(body).not.toContain("LOCAL-OLD");
+		} finally {
+			viewer.dispose();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("clears remote placeholders, appends later messages, and drops stale rows after rotation", async () => {
+		const firstHeader = jsonl([sessionHeader("remote")]);
+		const laterMessage = userLine("remote-message", "REMOTE-LATER");
+		const rotatedHeader = jsonl([sessionHeader("remote-rotated")]);
+		const laterChunk = `${laterMessage}\n`;
+		const responses = [
+			{ text: firstHeader, newSize: Buffer.byteLength(firstHeader) },
+			{ text: laterChunk, newSize: Buffer.byteLength(firstHeader) + Buffer.byteLength(laterChunk) },
+			{ text: "", newSize: 0 },
+			{ text: rotatedHeader, newSize: Buffer.byteLength(rotatedHeader) },
+		];
+		const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		let calls = 0;
+		const remote: AgentHubRemote = {
+			chat: () => {},
+			kill: () => {},
+			revive: () => {},
+			readTranscript: async () => {
+				const index = calls++;
+				if (index > 0) await gates[index - 1]?.promise;
+				return responses[index] ?? { text: "", newSize: Buffer.byteLength(rotatedHeader) };
+			},
+		};
+		let renderRequests = 0;
+		const viewer = makeViewer(null, remote, () => {
+			renderRequests++;
+		});
+		try {
+			const emptyBody = await waitForBody(viewer, text => text.includes("No messages yet."));
+			expect(emptyBody).toContain("No messages yet.");
+			expect(emptyBody).not.toContain("Loading transcript from host");
+			expect(renderRequests).toBeGreaterThan(0);
+			gates[0].resolve();
+
+			const messageBody = await waitForBody(viewer, text => text.includes("REMOTE-LATER"));
+			expect(messageBody).toContain("REMOTE-LATER");
+			gates[1].resolve();
+			gates[2].resolve();
+
+			const rotatedBody = await waitForBody(
+				viewer,
+				text => !text.includes("REMOTE-LATER") && text.includes("No messages yet."),
+			);
+			expect(rotatedBody).not.toContain("REMOTE-LATER");
+			expect(rotatedBody).toContain("No messages yet.");
+		} finally {
+			viewer.dispose();
+		}
+	}, 10000);
 	it("clears stale content when the transcript file is deleted while open", async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-"));
 		const file = path.join(dir, "__advisor.jsonl");

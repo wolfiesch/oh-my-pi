@@ -3,14 +3,14 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 
 describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 	let tempDir: string;
-	let storage: { deleteSessionWithArtifacts(sessionPath: string): Promise<void> };
+	let storage: FileSessionStorage;
 
 	beforeEach(async () => {
 		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-session-storage-"));
-		const { FileSessionStorage } = await import("@oh-my-pi/pi-coding-agent/session/session-storage");
 		storage = new FileSessionStorage();
 	});
 
@@ -55,5 +55,19 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 		expect(rmSpy).toHaveBeenCalledWith(artifactsDir, { recursive: true, force: true });
 		expect(fs.existsSync(sessionPath)).toBe(false);
 		expect(fs.existsSync(artifactsDir)).toBe(true);
+	});
+
+	it("replaces synchronous writes with a new file identity on POSIX", async () => {
+		const sessionPath = path.join(tempDir, "rewrite.jsonl");
+		storage.writeTextSync(sessionPath, "first\n");
+		const before = await fsp.stat(sessionPath);
+
+		storage.writeTextSync(sessionPath, "second\n");
+		const after = await fsp.stat(sessionPath);
+
+		expect(await Bun.file(sessionPath).text()).toBe("second\n");
+		if (process.platform !== "win32") {
+			expect(`${after.dev}:${after.ino}`).not.toBe(`${before.dev}:${before.ino}`);
+		}
 	});
 });

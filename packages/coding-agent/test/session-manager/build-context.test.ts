@@ -181,6 +181,87 @@ describe("buildSessionContext", () => {
 			expect((ctx.messages[4] as any).content[0].text).toBe("response3");
 		});
 
+		it("collapses display transcript history to latest compaction while full transcript keeps inline history", () => {
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "first"),
+				msg("2", "1", "assistant", "response1"),
+				msg("3", "2", "user", "second"),
+				msg("4", "3", "assistant", "response2"),
+				compaction("5", "4", "Summary of first two turns", "3"),
+				msg("6", "5", "user", "third"),
+				msg("7", "6", "assistant", "response3"),
+			];
+
+			const collapsed = buildSessionContext(entries, undefined, undefined, {
+				transcript: true,
+				collapseCompactedHistory: true,
+			});
+			expect(collapsed.messages.map(message => message.role)).toEqual([
+				"compactionSummary",
+				"user",
+				"assistant",
+				"user",
+				"assistant",
+			]);
+			expect((collapsed.messages[0] as any).summary).toContain("Summary of first two turns");
+			expect((collapsed.messages[1] as any).content).toBe("second");
+			expect((collapsed.messages[2] as any).content[0].text).toBe("response2");
+			expect((collapsed.messages[3] as any).content).toBe("third");
+			expect((collapsed.messages[4] as any).content[0].text).toBe("response3");
+
+			const fullTranscript = buildSessionContext(entries, undefined, undefined, { transcript: true });
+			expect(fullTranscript.messages.map(message => message.role)).toEqual([
+				"user",
+				"assistant",
+				"user",
+				"assistant",
+				"compactionSummary",
+				"user",
+				"assistant",
+			]);
+		});
+
+		it("collapses OpenAI remote display transcripts with raw kept turns and preserved provider payload", () => {
+			const remoteCompaction: CompactionEntry = {
+				...compaction("3", "2", "Remote summary", "1"),
+				preserveData: {
+					openaiRemoteCompaction: {
+						provider: "openai",
+						replacementHistory: [
+							{ type: "message", role: "user", content: [{ type: "input_text", text: "Preserved user" }] },
+							{ type: "compaction", encrypted_content: "enc_123" },
+						],
+						compactionItem: { type: "compaction", encrypted_content: "enc_123" },
+					},
+				},
+			};
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "first"),
+				msg("2", "1", "assistant", "response"),
+				remoteCompaction,
+				msg("4", "3", "user", "after compact"),
+			];
+
+			const ctx = buildSessionContext(entries, undefined, undefined, {
+				transcript: true,
+				collapseCompactedHistory: true,
+			});
+			expect(ctx.messages.map(message => message.role)).toEqual(["compactionSummary", "user", "assistant", "user"]);
+			expect(ctx.messages[0]?.role).toBe("compactionSummary");
+			if (ctx.messages[0]?.role !== "compactionSummary") throw new Error("Expected compaction summary message");
+			expect(ctx.messages[0].providerPayload).toEqual({
+				type: "openaiResponsesHistory",
+				provider: "openai",
+				items: [
+					{ type: "message", role: "user", content: [{ type: "input_text", text: "Preserved user" }] },
+					{ type: "compaction", encrypted_content: "enc_123" },
+				],
+			});
+			expect((ctx.messages[1] as { content: string }).content).toBe("first");
+			expect((ctx.messages[2] as { content: Array<{ text: string }> }).content[0]?.text).toBe("response");
+			expect((ctx.messages[3] as { content: string }).content).toBe("after compact");
+		});
+
 		it("handles compaction keeping from first message", () => {
 			const entries: SessionEntry[] = [
 				msg("1", null, "user", "first"),

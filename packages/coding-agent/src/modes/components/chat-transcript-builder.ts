@@ -5,11 +5,9 @@
  * viewer ({@link AgentTranscriptViewer}) to render a parked subagent / advisor /
  * collab-guest transcript that has no live session.
  *
- * Unlike the old incremental hub sync, {@link ChatTranscriptBuilder.rebuild}
- * always discards prior components and rebuilds the whole transcript from the
- * supplied entries. Re-rendering a growing transcript is therefore O(n) in the
- * entry count, but it cannot duplicate or misorder rows the way incremental
- * component reuse could.
+ * {@link ChatTranscriptBuilder.append} tails new messages through the same
+ * per-message path used by full rebuilds. Identity changes still rebuild from
+ * scratch; append-only refreshes avoid re-rendering old rows.
  */
 import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Usage } from "@oh-my-pi/pi-ai";
@@ -94,9 +92,25 @@ export class ChatTranscriptBuilder {
 	}
 
 	/** Discard all components and rebuild the whole transcript from `entries`. */
-	rebuild(entries: SessionMessageEntry[]): void {
+	rebuild(entries: readonly SessionMessageEntry[]): void {
 		this.reset();
-		for (const entry of entries) this.#appendChatMessage(entry.message);
+		this.append(entries);
+	}
+
+	/** Append persisted session entries to the existing transcript. */
+	append(entries: readonly SessionMessageEntry[]): void {
+		this.appendMessages(entries.map(entry => entry.message));
+	}
+
+	/** Discard all components and rebuild the whole transcript from messages. */
+	rebuildMessages(messages: readonly AgentMessage[]): void {
+		this.reset();
+		this.appendMessages(messages);
+	}
+
+	/** Append messages to the existing transcript using the normal render path. */
+	appendMessages(messages: readonly AgentMessage[]): void {
+		for (const message of messages) this.#appendChatMessage(message);
 		// Flush the trailing turn's usage row only once its tools are materialized
 		// (a read whose result has not arrived stays pending); otherwise the row
 		// would sit above its tools. The drain happens here at the end of the pass.

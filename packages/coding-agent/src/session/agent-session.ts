@@ -1115,6 +1115,10 @@ function toRestoredQueuedMessage(message: AgentMessage): RestoredQueuedMessage {
 	return { text: queueChipText(message), images: queuedImageContent(message) };
 }
 
+export interface TranscriptSessionContextOptions {
+	collapseCompactedHistory?: boolean;
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -5233,8 +5237,14 @@ export class AgentSession {
 	 * fired (instead of replacing prior history). Display-only — NEVER feed
 	 * the result to `agent.replaceMessages` or a provider.
 	 */
-	buildTranscriptSessionContext(): SessionContext {
-		return deobfuscateSessionContext(this.sessionManager.buildSessionContext({ transcript: true }), this.#obfuscator);
+	buildTranscriptSessionContext(options: TranscriptSessionContextOptions = {}): SessionContext {
+		return deobfuscateSessionContext(
+			this.sessionManager.buildSessionContext({
+				transcript: true,
+				collapseCompactedHistory: options.collapseCompactedHistory === true,
+			}),
+			this.#obfuscator,
+		);
 	}
 
 	#obfuscateTextForProvider(text: string | undefined): string | undefined {

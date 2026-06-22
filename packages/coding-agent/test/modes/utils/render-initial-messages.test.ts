@@ -52,7 +52,7 @@ function makeEmptyContext(): SessionContext {
 /** Build a minimal InteractiveModeContext mock, returning spies for assertions. */
 function makeCtx(): {
 	ctx: InteractiveModeContext;
-	transcriptSpy: Mock<() => SessionContext>;
+	transcriptSpy: Mock<(options?: { collapseCompactedHistory?: boolean }) => SessionContext>;
 	llmContextSpy: Mock<() => SessionContext>;
 	renderSessionContextSpy: Mock<(...args: unknown[]) => void>;
 } {
@@ -190,6 +190,7 @@ describe("UiHelpers.renderInitialMessages — transcript source", () => {
 		new UiHelpers(ctx).renderInitialMessages();
 
 		expect(transcriptSpy).toHaveBeenCalledTimes(1);
+		expect(transcriptSpy).toHaveBeenCalledWith({ collapseCompactedHistory: true });
 		expect(llmContextSpy).not.toHaveBeenCalled();
 		expect(renderSessionContextSpy).toHaveBeenCalledWith(transcript, {
 			updateFooter: true,

@@ -69,6 +69,12 @@ export interface BuildSessionContextOptions {
 	 * result to a provider.
 	 */
 	transcript?: boolean;
+	/**
+	 * Display-only transcript optimization honored only when `transcript: true`:
+	 * collapse history before the latest compaction while keeping display-visible
+	 * turns from `firstKeptEntryId` onward.
+	 */
+	collapseCompactedHistory?: boolean;
 }
 
 /**
@@ -255,59 +261,73 @@ export function buildSessionContext(
 		}
 	};
 
-	if (options?.transcript) {
-		// Display transcript: every entry in chronological order. Compactions do
-		// not erase prior history here — each renders inline (as a divider in the
-		// TUI) at the point it fired, with any snapcompact frames re-attached so
-		// the component can report them.
-		for (const entry of path) {
-			handleEntryResetTracking(entry);
-			if (entry.type === "compaction") {
-				const snapcompactArchive = snapcompact.getPreservedArchive(entry.preserveData);
-				pushMessage(
-					createCompactionSummaryMessage(
-						entry.summary,
-						entry.tokensBefore,
-						entry.timestamp,
-						entry.shortSummary,
-						undefined,
-						undefined,
-						snapcompactArchive ? snapcompact.historyBlocks(snapcompactArchive) : undefined,
-					),
-				);
-			} else {
-				appendMessage(entry);
-			}
-		}
-	} else if (compaction) {
-		const providerPayload: ProviderPayload | undefined = (() => {
-			const candidate = compaction.preserveData?.openaiRemoteCompaction;
-			if (!candidate || typeof candidate !== "object") return undefined;
-			const remote = candidate as { provider?: unknown; replacementHistory?: unknown };
-			if (typeof remote.provider !== "string" || remote.provider.length === 0) return undefined;
-			if (!Array.isArray(remote.replacementHistory)) return undefined;
-			return {
-				type: "openaiResponsesHistory",
-				provider: remote.provider,
-				items: remote.replacementHistory as Array<Record<string, unknown>>,
-			};
-		})();
-		const remoteReplacementHistory = providerPayload?.items;
+	const providerPayloadForCompaction = (entry: CompactionEntry): ProviderPayload | undefined => {
+		const candidate = entry.preserveData?.openaiRemoteCompaction;
+		if (!candidate || typeof candidate !== "object") return undefined;
+		const remote = candidate as { provider?: unknown; replacementHistory?: unknown };
+		if (typeof remote.provider !== "string" || remote.provider.length === 0) return undefined;
+		if (!Array.isArray(remote.replacementHistory)) return undefined;
+		return {
+			type: "openaiResponsesHistory",
+			provider: remote.provider,
+			items: remote.replacementHistory as Array<Record<string, unknown>>,
+		};
+	};
 
-		// Emit summary first; re-attach any archived snapcompact frames so the
-		// model can keep reading the archived history after every context rebuild.
-		const snapcompactArchive = snapcompact.getPreservedArchive(compaction.preserveData);
+	const pushCompactionSummary = (entry: CompactionEntry) => {
+		const snapcompactArchive = snapcompact.getPreservedArchive(entry.preserveData);
 		pushMessage(
 			createCompactionSummaryMessage(
-				compaction.summary,
-				compaction.tokensBefore,
-				compaction.timestamp,
-				compaction.shortSummary,
-				providerPayload,
+				entry.summary,
+				entry.tokensBefore,
+				entry.timestamp,
+				entry.shortSummary,
+				providerPayloadForCompaction(entry),
 				undefined,
 				snapcompactArchive ? snapcompact.historyBlocks(snapcompactArchive) : undefined,
 			),
 		);
+	};
+
+	if (options?.transcript) {
+		// Display transcript: every entry in chronological order by default.
+		// Compactions render inline (as dividers in the TUI) instead of erasing
+		// prior history. Hot live surfaces may request a display-only collapse
+		// around the latest compaction to avoid rebuilding very old rows.
+		if (options.collapseCompactedHistory === true && compaction) {
+			handleEntryResetTracking(compaction);
+			pushCompactionSummary(compaction);
+			const compactionIdx = path.findIndex(e => e.type === "compaction" && e.id === compaction.id);
+			let foundFirstKept = false;
+			for (let i = 0; i < compactionIdx; i++) {
+				const entry = path[i];
+				if (entry.id === compaction.firstKeptEntryId) {
+					foundFirstKept = true;
+				}
+				if (foundFirstKept) {
+					appendMessage(entry);
+				}
+			}
+			for (let i = compactionIdx + 1; i < path.length; i++) {
+				appendMessage(path[i]);
+			}
+		} else {
+			for (const entry of path) {
+				handleEntryResetTracking(entry);
+				if (entry.type === "compaction") {
+					pushCompactionSummary(entry);
+				} else {
+					appendMessage(entry);
+				}
+			}
+		}
+	} else if (compaction) {
+		const providerPayload = providerPayloadForCompaction(compaction);
+		const remoteReplacementHistory = providerPayload?.items;
+
+		// Emit summary first; re-attach any archived snapcompact frames so the
+		// model can keep reading the archived history after every context rebuild.
+		pushCompactionSummary(compaction);
 
 		// Find compaction index in path
 		const compactionIdx = path.findIndex(e => e.type === "compaction" && e.id === compaction.id);

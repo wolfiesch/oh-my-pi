@@ -137,8 +137,97 @@ export class FileSessionStorage implements SessionStorage {
 	}
 
 	writeTextSync(fpath: string, content: string): void {
-		this.ensureDirSync(path.dirname(fpath));
-		fs.writeFileSync(fpath, content);
+		const dir = path.dirname(fpath);
+		this.ensureDirSync(dir);
+		const tempPath = path.join(dir, `.${path.basename(fpath)}.${Snowflake.next()}.tmp`);
+		try {
+			fs.writeFileSync(tempPath, content);
+			try {
+				fs.renameSync(tempPath, fpath);
+			} catch (err) {
+				if (hasFsCode(err, "EPERM")) {
+					this.#replaceSessionFileAfterEpermSync(tempPath, fpath, err);
+					return;
+				}
+				try {
+					fs.rmSync(tempPath, { force: true });
+				} catch (cleanupErr) {
+					if (!isEnoent(cleanupErr)) {
+						logger.warn("Failed to remove session rewrite temp file", {
+							sessionFile: fpath,
+							tempPath,
+							error: toError(cleanupErr).message,
+						});
+					}
+				}
+				throw toError(err);
+			}
+		} catch (err) {
+			try {
+				fs.rmSync(tempPath, { force: true });
+			} catch (cleanupErr) {
+				if (!isEnoent(cleanupErr)) {
+					logger.warn("Failed to remove session rewrite temp file", {
+						sessionFile: fpath,
+						tempPath,
+						error: toError(cleanupErr).message,
+					});
+				}
+			}
+			throw toError(err);
+		}
+	}
+
+	#replaceSessionFileAfterEpermSync(tempPath: string, targetPath: string, renameError: unknown): void {
+		const dir = path.dirname(targetPath);
+		const backupPath = path.join(dir, `${path.basename(targetPath)}.${Snowflake.next()}.bak`);
+		try {
+			fs.renameSync(targetPath, backupPath);
+		} catch (moveAsideError) {
+			if (isEnoent(moveAsideError)) {
+				fs.renameSync(tempPath, targetPath);
+				return;
+			}
+			try {
+				fs.rmSync(tempPath, { force: true });
+			} catch (cleanupErr) {
+				if (!isEnoent(cleanupErr)) {
+					logger.warn("Failed to remove session rewrite temp file", {
+						sessionFile: targetPath,
+						tempPath,
+						error: toError(cleanupErr).message,
+					});
+				}
+			}
+			throw toError(renameError);
+		}
+		try {
+			fs.renameSync(tempPath, targetPath);
+		} catch (replaceError) {
+			try {
+				fs.renameSync(backupPath, targetPath);
+			} catch (rollbackErr) {
+				const rollbackError = toError(rollbackErr);
+				throw new Error(
+					`Failed to replace session file after EPERM (original: ${toError(renameError).message}; retry: ${
+						toError(replaceError).message
+					}; rollback: ${rollbackError.message})`,
+					{ cause: toError(renameError) },
+				);
+			}
+			throw toError(replaceError);
+		}
+		try {
+			fs.rmSync(backupPath, { force: true });
+		} catch (err) {
+			if (!isEnoent(err)) {
+				logger.warn("Failed to remove session rewrite backup", {
+					sessionFile: targetPath,
+					backupPath,
+					error: toError(err).message,
+				});
+			}
+		}
 	}
 
 	statSync(path: string): SessionStorageStat {
