@@ -14,7 +14,7 @@ export interface ProfileSummary {
 	agentDir: string;
 }
 
-export type ToolId = "stats" | "mechanism" | "collab" | "robomp";
+export type ToolId = "stats" | "collab" | "robomp";
 
 export interface ToolDescriptor {
 	id: ToolId;

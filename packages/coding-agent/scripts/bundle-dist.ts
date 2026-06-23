@@ -83,10 +83,13 @@ async function cleanBundleOutputs(): Promise<void> {
 async function main(): Promise<void> {
 	const start = Bun.nanoseconds();
 	await cleanBundleOutputs();
-	// The npm bundle ships no stats dashboard sources, so embed the dashboard
-	// archive the same way compiled binaries do (scripts/build-binary.ts). Reset
-	// afterwards to keep the checked-in placeholder empty.
+	// The npm bundle ships no stats dashboard sources or prebuilt dist/client,
+	// so embed the dashboard archive the same way compiled binaries do
+	// (scripts/build-binary.ts). Reset afterwards to keep the checked-in
+	// placeholder empty.
 	await runCommand(["bun", "--cwd=../stats", "run", "gen:stats"]);
+	await runCommand(["bun", "--cwd=../mechanism", "scripts/generate-client-bundle.ts", "--generate"]);
+	await runCommand(["bun", "--cwd=../home", "scripts/generate-client-bundle.ts", "--generate"]);
 	try {
 		// Build in-process: the docs embed payload is far larger than Linux's
 		// 128KiB per-argv-string cap, so it can never be passed as a CLI
@@ -113,6 +116,8 @@ async function main(): Promise<void> {
 		}
 	} finally {
 		await runCommand(["bun", "--cwd=../stats", "run", "gen:stats:reset"]);
+		await runCommand(["bun", "--cwd=../mechanism", "scripts/generate-client-bundle.ts", "--reset"]);
+		await runCommand(["bun", "--cwd=../home", "scripts/generate-client-bundle.ts", "--reset"]);
 	}
 	await ensureShebang();
 	const stat = await fs.stat(cliPath);

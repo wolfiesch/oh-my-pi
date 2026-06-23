@@ -1,15 +1,26 @@
+import { Download } from "lucide-react";
 import type { FormEvent, ReactNode } from "react";
 import { useState } from "react";
 import { ThemeToggle } from "./ThemeToggle";
 
 export interface ConnectScreenProps {
+	defaultLink: string;
 	defaultName: string;
 	error: string | null;
+	installAvailable: boolean;
 	onConnect(link: string, name: string): void;
+	onInstall(): void;
 }
 
-export function ConnectScreen({ defaultName, error, onConnect }: ConnectScreenProps): ReactNode {
-	const [link, setLink] = useState("");
+export function ConnectScreen({
+	defaultLink,
+	defaultName,
+	error,
+	installAvailable,
+	onConnect,
+	onInstall,
+}: ConnectScreenProps): ReactNode {
+	const [link, setLink] = useState(defaultLink);
 	const [name, setName] = useState(defaultName);
 	const [localError, setLocalError] = useState<string | null>(null);
 
@@ -37,6 +48,12 @@ export function ConnectScreen({ defaultName, error, onConnect }: ConnectScreenPr
 					<ThemeToggle />
 				</div>
 				<div className="sh-connect-sub">live agent session, in your browser</div>
+				{installAvailable && (
+					<button className="sh-btn sh-connect-install" type="button" onClick={onInstall}>
+						<Download size={14} />
+						Install app
+					</button>
+				)}
 				<label className="sh-field">
 					<span className="sh-field-label">join link</span>
 					<input

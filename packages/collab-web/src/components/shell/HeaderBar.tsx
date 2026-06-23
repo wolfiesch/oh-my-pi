@@ -1,4 +1,4 @@
-import { LogOut, PanelRight } from "lucide-react";
+import { Download, LogOut, PanelRight } from "lucide-react";
 import type { ReactNode } from "react";
 import type { GuestSnapshot } from "../../lib/client";
 import { fmtPercent, shortenPath } from "../../lib/format";
@@ -8,11 +8,21 @@ export interface HeaderBarProps {
 	snapshot: GuestSnapshot;
 	subCount: number;
 	railOpen: boolean;
+	installAvailable: boolean;
+	onInstall(): void;
 	onToggleRail(): void;
 	onLeave(): void;
 }
 
-export function HeaderBar({ snapshot, subCount, railOpen, onToggleRail, onLeave }: HeaderBarProps): ReactNode {
+export function HeaderBar({
+	snapshot,
+	subCount,
+	railOpen,
+	installAvailable,
+	onInstall,
+	onToggleRail,
+	onLeave,
+}: HeaderBarProps): ReactNode {
 	const { header, state, phase, readOnly } = snapshot;
 	const title = header?.title ?? state?.sessionName ?? "session";
 	const usage = state?.contextUsage;
@@ -71,6 +81,11 @@ export function HeaderBar({ snapshot, subCount, railOpen, onToggleRail, onLeave 
 				)}
 				<span className={`sh-dot sh-dot-${phase}`} title={phase} />
 				<ThemeToggle />
+				{installAvailable && (
+					<button type="button" className="sh-btn sh-btn-icon" onClick={onInstall} title="install omp collab app">
+						<Download size={14} />
+					</button>
+				)}
 				<button
 					type="button"
 					className={railOpen ? "sh-btn sh-btn-icon sh-btn-on" : "sh-btn sh-btn-icon"}

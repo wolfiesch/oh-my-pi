@@ -61,6 +61,12 @@ interface AgentNode {
 	flare: number; // 0..1 red mix, decays to 0
 	spinRate: number;
 	pulsing: boolean;
+	collapse: number; // 0 = normal position, 1 = collapsed into parent
+	collapseTarget: number; // tween target: 0 or 1
+	compacting: number; // 0..1 compaction visual intensity, decays
+	retrying: number; // 0..1 retry stutter intensity, decays
+	noticeFlash: number; // 0..1 notice flash, decays
+	noticeColor: number; // hex color for notice
 }
 
 interface Lane {
@@ -109,6 +115,9 @@ export class Mechanism {
 	private hoverGroup: THREE.Group | null = null;
 	private hoveredId: string | null = null;
 	private readonly clock = new THREE.Clock();
+	/** Scratch vectors reused per frame to avoid per-node allocations. */
+	private readonly _scratchVec = new THREE.Vector3();
+	private readonly _scratchColor = new THREE.Color();
 
 	private readonly wheel = new THREE.Group();
 	private wheelSpeed = 0.05;
@@ -257,8 +266,16 @@ export class Mechanism {
 
 	// --- event bindings -----------------------------------------------------
 	applyRoster(agents: MechAgent[]): void {
-		for (const id of [...this.nodes.keys()]) this.removeAgent(id);
-		for (const a of agents) this.addAgent(a);
+		const present = new Set<string>();
+		for (const agent of agents) {
+			present.add(agent.id);
+			const existing = this.nodes.get(agent.id);
+			if (existing) this.updateAgent(existing, agent);
+			else this.addAgent(agent);
+		}
+		for (const id of [...this.nodes.keys()]) {
+			if (!present.has(id)) this.removeAgent(id);
+		}
 		this.emitHud();
 	}
 
@@ -299,6 +316,49 @@ export class Mechanism {
 		this.emitHud();
 	}
 
+	applyCompaction(id: string, phase: "start" | "end"): void {
+		const n = this.nodes.get(id);
+		if (!n) return;
+		n.compacting = phase === "start" ? 1.0 : 0.5; // start = full, end = brief pulse
+	}
+
+	applyRetry(id: string, phase: "start" | "end", _attempt?: number): void {
+		const n = this.nodes.get(id);
+		if (!n) return;
+		n.retrying = phase === "start" ? 1.0 : 0;
+	}
+
+	applyFallback(id: string, _fromModel: string, _toModel: string): void {
+		const n = this.nodes.get(id);
+		if (!n) return;
+		// The model/family change will come through applyRoster; just flash
+		n.flare = 0.8;
+	}
+
+	applyThinking(id: string, level: string): void {
+		const n = this.nodes.get(id);
+		if (!n) return;
+		// Map thinking levels to spin speed multipliers
+		const levels: Record<string, number> = {
+			off: 0.2,
+			none: 0.2,
+			minimal: 0.5,
+			low: 0.8,
+			medium: 1.6,
+			high: 2.4,
+			xhigh: 3.2,
+		};
+		n.spinRate = levels[level] ?? 1.6;
+	}
+
+	applyNotice(id: string, level: "info" | "warning" | "error"): void {
+		const n = this.nodes.get(id);
+		if (!n) return;
+		const colors: Record<string, number> = { info: PALETTE.accentBright, warning: 0xffa500, error: PALETTE.flare };
+		n.noticeColor = colors[level] ?? PALETTE.flare;
+		n.noticeFlash = 1.0;
+	}
+
 	// --- agents -------------------------------------------------------------
 	private addAgent(agent: MechAgent): void {
 		if (this.nodes.has(agent.id)) {
@@ -335,6 +395,12 @@ export class Mechanism {
 			flare: 0,
 			spinRate: 0.35,
 			pulsing: false,
+			collapse: 0,
+			collapseTarget: 0,
+			compacting: 0,
+			retrying: 0,
+			noticeFlash: 0,
+			noticeColor: 0,
 		};
 		this.nodes.set(agent.id, node);
 		this.buckets[depth].push(agent.id);
@@ -345,6 +411,30 @@ export class Mechanism {
 		node.cur.setHex(PALETTE.dim);
 		this.placeNode(node, node.slotTarget);
 		node.intensity = 0.1;
+	}
+
+	private updateAgent(node: AgentNode, agent: MechAgent): void {
+		const nextDepth = Math.max(0, Math.min(MAX_DEPTH, agent.depth));
+		if (node.depth !== nextDepth) {
+			const previousBucket = this.buckets[node.depth];
+			const previousIndex = previousBucket.indexOf(node.id);
+			if (previousIndex >= 0) previousBucket.splice(previousIndex, 1);
+			const previousDepth = node.depth;
+			node.depth = nextDepth;
+			this.buckets[nextDepth].push(node.id);
+			this.reflow(previousDepth);
+			this.reflow(nextDepth);
+		}
+
+		const nextFamily = familyKeyFromToken(agent.family);
+		if (node.family !== nextFamily) {
+			node.family = nextFamily;
+			node.mesh.geometry = geometryForFamily(nextFamily);
+		}
+
+		node.parentId = agent.parentId;
+		node.model = agent.model;
+		this.setStatus(node, agent.status);
 	}
 
 	private removeAgent(id: string): void {
@@ -365,9 +455,13 @@ export class Mechanism {
 
 	private reflow(depth: number): void {
 		const bucket = this.buckets[depth];
-		const count = bucket.length || 1;
-		for (let i = 0; i < bucket.length; i++) {
-			const n = this.nodes.get(bucket[i]);
+		const active = bucket.filter(id => {
+			const n = this.nodes.get(id);
+			return n && n.status !== "idle" && n.status !== "parked";
+		});
+		const count = active.length || 1;
+		for (let i = 0; i < active.length; i++) {
+			const n = this.nodes.get(active[i]);
 			if (n) n.slotTarget = (i / count) * Math.PI * 2;
 		}
 	}
@@ -385,6 +479,10 @@ export class Mechanism {
 		n.intensityTarget = s.intensity;
 		n.spinRate = s.spin;
 		n.pulsing = s.pulse;
+		if (n.id !== "Main") {
+			n.collapseTarget = status === "idle" || status === "parked" ? 1 : 0;
+		}
+		this.reflow(n.depth);
 		if (status === "aborted") n.flare = 1; // flare red, then heal toward dim base
 	}
 
@@ -586,7 +684,21 @@ export class Mechanism {
 		// Agents.
 		for (const n of this.nodes.values()) {
 			n.slot += (n.slotTarget - n.slot) * ease;
-			this.placeNode(n, n.slot);
+			n.collapse += (n.collapseTarget - n.collapse) * ease * 0.5; // slower tween
+
+			if (n.collapse > 0.01 && n.parentId) {
+				const parent = this.nodes.get(n.parentId);
+				if (parent) {
+					const angle = this.ringPhase[n.depth] + n.slot;
+					const r = RING_RADII[n.depth];
+					this._scratchVec.set(Math.cos(angle) * r, 0, Math.sin(angle) * r);
+					n.group.position.lerpVectors(this._scratchVec, parent.group.position, n.collapse);
+				} else {
+					this.placeNode(n, n.slot);
+				}
+			} else {
+				this.placeNode(n, n.slot);
+			}
 
 			if (!reduced) {
 				n.spin += n.spinRate * dt;
@@ -601,12 +713,30 @@ export class Mechanism {
 				n.mesh.scale.setScalar(1);
 			}
 
+			const collapseScale = 1 - n.collapse * 0.98; // shrink to 2% at full collapse
+			n.mesh.scale.multiplyScalar(collapseScale);
+
 			n.cur.lerp(n.base, ease);
 			n.intensity += (n.intensityTarget - n.intensity) * ease;
 			if (n.flare > 0) n.flare = Math.max(0, n.flare - dt / 1.4);
-			const shown = n.cur.clone().multiplyScalar(n.intensity).lerp(FLARE_COLOR, n.flare);
-			n.mat.color.copy(shown);
-			n.mat.opacity = 0.35 + n.intensity * 0.65 + n.flare * 0.5;
+			if (n.compacting > 0) {
+				n.compacting = Math.max(0, n.compacting - dt / 1.2);
+				// Scale squeeze effect
+				n.mesh.scale.multiplyScalar(1 - n.compacting * 0.3);
+			}
+			if (n.noticeFlash > 0) {
+				n.noticeFlash = Math.max(0, n.noticeFlash - dt / 0.8);
+				n.cur.lerp(this._scratchColor.setHex(n.noticeColor), n.noticeFlash * 0.6);
+			}
+			this._scratchColor.copy(n.cur).multiplyScalar(n.intensity).lerp(FLARE_COLOR, n.flare);
+			n.mat.color.copy(this._scratchColor);
+			n.mat.opacity = (0.35 + n.intensity * 0.65 + n.flare * 0.5) * (1 - n.collapse * 0.95);
+			if (n.retrying > 0) {
+				n.retrying = Math.max(0, n.retrying - dt / 2.0);
+				// Rapid flicker
+				const flicker = Math.sin(t * 30) * 0.5 + 0.5;
+				n.mat.opacity *= 0.5 + flicker * 0.5;
+			}
 		}
 
 		// Lanes.

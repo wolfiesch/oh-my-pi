@@ -39,6 +39,14 @@ export function parseMechanismArgs(args: string[]): MechanismCommandArgs | undef
 }
 
 export async function runMechanismCommand(cmd: MechanismCommandArgs): Promise<void> {
+	if (!cmd.sessionFile) {
+		console.log(chalk.red("Error: No session file specified."));
+		console.log(
+			`To view a live session, run the ${chalk.bold("/mechanism")} slash command inside your active session.`,
+		);
+		console.log(`To view an archived session, pass the ${chalk.bold("--session <file>")} flag.`);
+		process.exit(1);
+	}
 	// Dynamic import to avoid loading Three.js and starting server modules during bare CLI initialization
 	const { startServer } = await import("@oh-my-pi/omp-mechanism");
 

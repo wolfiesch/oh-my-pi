@@ -32,6 +32,10 @@ legendPanel.innerHTML = `
 		<li><b>Transients</b> — radial strike tool call, glowing arc IRC message, dim radial drop subagent spawn.</li>
 		<li><b>Hover an orb</b> — lineage to the main agent plus a line to its model lane.</li>
 		<li><b>Drag / scroll</b> — orbit and zoom the orrery.</li>
+		<li><b>Collapse</b> — idle/parked agents leave the ring and shrink into their parent; reappear on wake.</li>
+		<li><b>Spin speed</b> — thinking depth (faster spin = deeper reasoning).</li>
+		<li><b>Flash</b> — notice (blue info · orange warning · red error).</li>
+		<li><b>Squeeze</b> — context compaction. <b>Flicker</b> — retry. <b>Flare</b> — model fallback.</li>
 	</ul>
 `;
 document.body.appendChild(legendPanel);
@@ -84,6 +88,21 @@ function apply(ev: MechEvent): void {
 			break;
 		case "usage":
 			mech.applyUsage(ev.model, ev.costUsd, ev.tokensIn, ev.tokensOut);
+			break;
+		case "compaction":
+			mech.applyCompaction(ev.id, ev.phase);
+			break;
+		case "retry":
+			mech.applyRetry(ev.id, ev.phase, ev.attempt);
+			break;
+		case "fallback":
+			mech.applyFallback(ev.id, ev.fromModel, ev.toModel);
+			break;
+		case "thinking":
+			mech.applyThinking(ev.id, ev.level);
+			break;
+		case "notice":
+			mech.applyNotice(ev.id, ev.level);
 			break;
 	}
 }

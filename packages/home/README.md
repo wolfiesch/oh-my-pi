@@ -4,7 +4,7 @@ Profile-aware OMP Home web UI for routing, tool launchers, agents, providers, an
 
 ## Features
 
-- **Home hub**: profile KPIs plus launch/open/stop tiles for stats, mechanism, collab, and robomp.
+- **Home hub**: profile KPIs plus launch/open/stop tiles for stats, collab, and robomp.
 - **Routing graph**: full-frame canvas DAG with pan/zoom/fit/reset, minimap, search, filters, legend, keyboard controls, DOM node list, and role/agent edit-through inspector.
 - **Profile switcher**: discovers and selects registered OMP profile agent directories.
 - **Roles & cycle editor**: edits `modelRoles` and `cycleOrder` with an unsaved-changes tray and comment-preserving YAML writes.

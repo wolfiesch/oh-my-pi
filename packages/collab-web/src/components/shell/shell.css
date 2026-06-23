@@ -671,6 +671,11 @@
 	margin-top: 8px;
 }
 
+.sh-connect-install {
+	justify-content: center;
+	padding: 7px 10px;
+}
+
 /* ---- responsive mobile styles ---- */
 @media (max-width: 768px) {
 	.sh-main {

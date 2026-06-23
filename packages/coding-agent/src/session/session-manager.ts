@@ -409,11 +409,15 @@ export class SessionManager {
 	#draftOnlySessionCleanupArmed = false;
 
 	/**
-	 * Collab replication tap: invoked for every appended entry with the
-	 * in-memory (pre-blob-externalization) entry, so inline images survive.
+	 * Legacy single-callback collab replication tap. Prefer
+	 * {@link subscribeEntryAppended}: multiple subscribers can observe appended
+	 * entries without clobbering each other, and each is invoked in isolation so
+	 * one failing listener never breaks persistence or another listener. This
+	 * callback is still invoked in isolation for backwards compatibility.
 	 */
 	onEntryAppended?: (entry: SessionEntry) => void;
 
+	#entryAppendedListeners = new Set<(entry: SessionEntry) => void>();
 	#turnBudgetTotal: number | null = null;
 	#turnBudgetHard = false;
 	#turnOutputBaseline = 0;
@@ -763,6 +767,13 @@ export class SessionManager {
 				callback(entry);
 			} catch (err) {
 				logger.warn("collab entry hook failed", { error: String(err) });
+			}
+		}
+		for (const listener of [...this.#entryAppendedListeners]) {
+			try {
+				listener(entry);
+			} catch (err) {
+				logger.warn("session entry subscriber failed", { error: String(err) });
 			}
 		}
 	}
@@ -1397,6 +1408,20 @@ export class SessionManager {
 			this.#sessionNameChangedCallbacks.delete(cb);
 		};
 	}
+	/**
+	 * Subscribe to appended entries. The listener is invoked synchronously from
+	 * `#recordEntry` with the in-memory (pre-blob-externalization) entry, so
+	 * inline images survive — same contract as the legacy {@link onEntryAppended}
+	 * callback. Multiple subscribers are supported and each is invoked in
+	 * isolation: a throw from one listener is logged and never aborts persistence
+	 * or starves the other observers. Returns an unsubscribe function.
+	 */
+	subscribeEntryAppended(listener: (entry: SessionEntry) => void): () => void {
+		this.#entryAppendedListeners.add(listener);
+		return () => {
+			this.#entryAppendedListeners.delete(listener);
+		};
+	}
 
 	/**
 	 * Set the session display name.
@@ -1710,6 +1735,12 @@ export class SessionManager {
 	/** All session entries (excludes header). Returns a shallow copy. */
 	getEntries(): SessionEntry[] {
 		return [...this.#entries];
+	}
+
+	/** Last `n` session entries. Slices the internal array without copying the full transcript. */
+	getRecentEntries(n: number): SessionEntry[] {
+		if (n >= this.#entries.length) return [...this.#entries];
+		return this.#entries.slice(-n);
 	}
 
 	/**

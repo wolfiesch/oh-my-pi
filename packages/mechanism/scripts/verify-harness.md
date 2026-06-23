@@ -71,10 +71,10 @@ Every row of the brief's truth-binding table maps to one or more checks:
 | Model lanes → 5 Platonic-solid wireframes | `lanes-present`, `lanes-offscreen-documented` | every on-screen lane luminous at its projected rim point; off-frame lane projection recorded |
 | Subagent spawned → body accretes into orbit | `spawn-depth-0..3`, `hud-agent-count` | bright core appears at each ring; HUD agents = 4 |
 | Recursion depth (0–3) → which ring | `spawn-depth-0`, `-1`, `-2`, `-3` | a body lands at the projected screen point of **its** ring radius (11/19/27/35) |
-| running / idle | `status-running-to-idle` | node-box mean brightness drops ≥ 6 (intensity 1.0 → 0.55) |
-| parked | `status-parked` | parked node dimmer than idle |
+| running → idle (active-only reflow) | `status-running-to-idle` | idle agent's old slot clears (mean drops); remaining active agents redistribute into active-only even slots |
+| parked | `status-parked` | parked node's old-slot mean ≤ idle old-slot mean |
 | aborted → red flare, then heal | `aborted-flare`, `aborted-heal` | red px jumps ≥ 120 on abort, decays to ≤ 60 after the ~1.4 s heal |
-| IRC / inter-agent message → arc of light | `irc-arc` | white pulse px jumps ≥ 200 while the arc travels |
+| IRC / inter-agent message → arc of light | `irc-arc-main-to-agent`, `irc-arc-agent-to-main`, `irc-arc-agent-to-agent`, `irc-arc` | white pulse px jumps ≥ 200 for Main→agent, agent→Main, and agent→agent routes |
 | Tool call → compass-and-straightedge strike | `tool-strike` | luminous px rises during the strike, falls back after |
 | Token / cost → orbital mass (solid scales) | `usage-scaling`, `hud-cost` | dominant-spend lane's solid mean brightness rises ≥ 18; HUD cost = Σ usage |
 | (SSE binding functionality) | `sse-transport-contract`, `client-no-errors` | byte-exact ordered delivery of all pushed `MechEvent`s; zero client decode errors |
@@ -99,7 +99,7 @@ Flags: `--out <dir>` (default `./verify-out`), `--headful`, `--no-build` (reuse 
 `--keep-open`, `--chrome <path>`.
 
 Outputs to `verify-out/`: `report.html` (pass/fail table + screenshot gallery with a
-`100% COMPLIANCE` banner), `report.json` (machine-readable), and `shots/*.png` (20 keyframes).
+`100% COMPLIANCE` banner), `report.json` (machine-readable), and `shots/*.png` (keyframes).
 **Exit code is 0 iff every graded check passes**, so it drops straight into CI.
 
 ## Requirements

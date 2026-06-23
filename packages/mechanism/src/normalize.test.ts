@@ -120,6 +120,12 @@ describe("MechanismNormalizer", () => {
 		]);
 	});
 
+	test("pushIrc emits a direct IRC event without changing JSONL relay replay", () => {
+		const normalizer = new MechanismNormalizer();
+
+		expect(normalizer.pushIrc("Main", "Scout")).toEqual([{ t: "irc", from: "Main", to: "Scout" }]);
+	});
+
 	test("derives stale running agents as idle from the session tail", async () => {
 		let now = 1_000;
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mech-normalize-"));

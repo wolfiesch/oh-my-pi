@@ -47,6 +47,7 @@ import { buildContextReportText } from "./helpers/context-report";
 import { formatDuration } from "./helpers/format";
 import { createMarketplaceManager } from "./helpers/marketplace-manager";
 import { handleMcpAcp } from "./helpers/mcp";
+import { launchMechanismServer, parseMechanismArgs, stopMechanismServer } from "./helpers/mechanism";
 import { commandConsumed, errorMessage, parseSlashCommand, parseSubcommand, usage } from "./helpers/parse";
 import { describeRedeemOutcome, type ResetUsageAccount, toResetUsageAccounts } from "./helpers/reset-usage";
 import { handleSshAcp } from "./helpers/ssh";
@@ -1098,6 +1099,31 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				await runtime.output(result.message);
 			} catch (error) {
 				await runtime.output(`Stats dashboard failed: ${errorMessage(error)}`);
+			}
+			return commandConsumed();
+		},
+	},
+	{
+		name: "mechanism",
+		description: "Toggle mechanism live harness visualization",
+		inlineHint: "[on|off]",
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			const parsed = parseMechanismArgs(command.args);
+			if ("error" in parsed) return usage(parsed.error, runtime);
+
+			if (parsed.action === "off") {
+				const stopped = stopMechanismServer();
+				await runtime.output(stopped ? "Mechanism server stopped." : "Mechanism server is not running.");
+				return commandConsumed();
+			}
+
+			await runtime.output("Starting mechanism server...");
+			try {
+				const result = await launchMechanismServer(runtime.session, parsed.port);
+				await runtime.output(result.message);
+			} catch (error) {
+				await runtime.output(`Mechanism server failed: ${errorMessage(error)}`);
 			}
 			return commandConsumed();
 		},

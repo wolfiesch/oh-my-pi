@@ -1747,6 +1747,7 @@ export class AgentSession {
 	#freshProviderSessionId: string | undefined;
 	#inheritedProviderPromptCacheKey: string | undefined;
 	#isDisposed = false;
+	#disposeListeners: Array<() => void> = [];
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	#turnIndex = 0;
@@ -5762,6 +5763,27 @@ export class AgentSession {
 	}
 
 	/**
+	 * Register a one-shot callback invoked synchronously at the start of
+	 * `beginDispose()`. Listeners are invoked in registration order, each
+	 * wrapped in try/catch so one failure cannot block disposal or starve
+	 * later listeners. The listener array is cleared after invocation.
+	 * Returns an unsubscribe function.
+	 */
+	onDispose(listener: () => void): () => void {
+		if (this.#isDisposed) {
+			try {
+				listener();
+			} catch {}
+			return () => {};
+		}
+		this.#disposeListeners.push(listener);
+		return () => {
+			const idx = this.#disposeListeners.indexOf(listener);
+			if (idx >= 0) this.#disposeListeners.splice(idx, 1);
+		};
+	}
+
+	/**
 	 * Synchronously mark the session as disposing so new work is rejected
 	 * immediately: eval starts throw, queued asides are dropped, and the
 	 * aside provider is detached. Idempotent; `dispose()` runs it first.
@@ -5771,7 +5793,17 @@ export class AgentSession {
 	 * gap slips past the disposal guards.
 	 */
 	beginDispose(): void {
+		if (this.#isDisposed) return; // idempotent
 		this.#isDisposed = true;
+		// Fire one-shot dispose listeners before any other teardown so consumers
+		// (e.g. mechanism server) can clean up while the session is still coherent.
+		const listeners = this.#disposeListeners;
+		this.#disposeListeners = [];
+		for (const listener of listeners) {
+			try {
+				listener();
+			} catch {}
+		}
 		this.#flushPendingIrcAsides();
 		this.yieldQueue.clear();
 		this.agent.setAsideMessageProvider(undefined);

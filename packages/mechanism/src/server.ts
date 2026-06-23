@@ -5,10 +5,25 @@ import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import embeddedClientArchiveTxt from "./embedded-client.generated.txt";
-import { MechanismNormalizer, type MechEvent } from "./normalize";
+import type { MechFileEntry } from "./entries";
+import {
+	type AgentStatus,
+	MechanismNormalizer,
+	type MechEvent,
+	type RuntimeAgentEvent,
+	type RuntimeAgentSource,
+} from "./normalize";
 import { SessionTailer, type TailerRecord } from "./tail";
 
 const DEFAULT_PORT = 3848;
+/**
+ * SSE backpressure: close a client whose ReadableStream internal queue exceeds
+ * this depth. desiredSize starts at the high-water mark (default 1) and
+ * decrements per enqueued chunk; a negative value means the queue holds more
+ * bytes than the strategy intended. A floor of -MAX_SSE_QUEUE_DEPTH is
+ * forgiving enough to absorb normal bursts while capping truly stalled clients.
+ */
+const MAX_SSE_QUEUE_DEPTH = 500;
 const EMBEDDED_CLIENT_ARCHIVE = decodeEmbeddedClientArchive(embeddedClientArchiveTxt);
 const CLIENT_DIR = path.join(import.meta.dir, "client");
 const STATIC_DIR = path.join(import.meta.dir, "..", "dist", "client");
@@ -34,11 +49,31 @@ const CORS_HEADERS: Record<string, string> = {
 
 interface RuntimeState {
 	server: Bun.Server<unknown>;
-	tailer: SessionTailer;
 	normalizer: MechanismNormalizer;
-	unsubscribeStatus: () => void;
-	unsubscribeTailer: () => void;
+	cleanup: Array<() => void>;
 	heartbeat: NodeJS.Timeout;
+}
+
+export interface MechanismRuntimeServerOptions {
+	agents?: RuntimeAgentSource[];
+}
+
+export interface MechanismRuntimeController {
+	port: number;
+	stop: () => void;
+	reset: () => MechEvent[];
+	pushRoster: (agents: RuntimeAgentSource[]) => MechEvent[];
+	pushAgent: (agent: RuntimeAgentSource) => MechEvent[];
+	removeAgent: (agentId: string) => MechEvent[];
+	pushStatus: (agentId: string, status: AgentStatus) => MechEvent[];
+	pushEntry: (agent: RuntimeAgentSource, entry: MechFileEntry, observedAt?: number) => MechEvent[];
+	pushAgentEvent: (agentId: string, event: RuntimeAgentEvent) => MechEvent[];
+	pushIrc: (from: string, to: string) => MechEvent[];
+	pushCompaction: (agentId: string, phase: "start" | "end") => MechEvent[];
+	pushRetry: (agentId: string, phase: "start" | "end", attempt?: number) => MechEvent[];
+	pushFallback: (agentId: string, fromModel: string, toModel: string) => MechEvent[];
+	pushThinking: (agentId: string, level: string) => MechEvent[];
+	pushNotice: (agentId: string, level: "info" | "warning" | "error") => MechEvent[];
 }
 
 interface SseClient {
@@ -173,6 +208,18 @@ function sseFrame(event: MechEvent): Uint8Array {
 function writeEvent(client: SseClient, event: MechEvent): boolean {
 	if (client.closed) return false;
 	try {
+		// Backpressure: desiredSize drops below zero when the internal queue
+		// holds more data than the high-water mark. A deeply negative value
+		// means the client is truly stalled (backgrounded tab, dead socket).
+		// Close it to stop server-side queue growth.
+		const ds = client.controller.desiredSize;
+		if (ds !== null && ds <= -MAX_SSE_QUEUE_DEPTH) {
+			client.closed = true;
+			try {
+				client.controller.close();
+			} catch {}
+			return false;
+		}
 		client.controller.enqueue(sseFrame(event));
 		return true;
 	} catch {
@@ -195,6 +242,17 @@ function pingClients(): void {
 	const frame = encoder.encode(": hb\n\n");
 	for (const client of Array.from(clients)) {
 		if (client.closed) {
+			clients.delete(client);
+			continue;
+		}
+		// Apply the same backpressure check as writeEvent: a stalled client
+		// should not accumulate heartbeat frames indefinitely either.
+		const ds = client.controller.desiredSize;
+		if (ds !== null && ds <= -MAX_SSE_QUEUE_DEPTH) {
+			client.closed = true;
+			try {
+				client.controller.close();
+			} catch {}
 			clients.delete(client);
 			continue;
 		}
@@ -241,7 +299,7 @@ function createEventsResponse(req: Request, normalizer: MechanismNormalizer): Re
 			client = { controller, closed: false };
 			clients.add(client);
 			controller.enqueue(encoder.encode("retry: 1000\n\n"));
-			writeEvent(client, normalizer.snapshotRoster());
+			if (client) writeEvent(client, normalizer.snapshotRoster());
 			req.signal.addEventListener("abort", closeClient, { once: true });
 		},
 		cancel() {
@@ -271,22 +329,10 @@ async function handleStatic(requestPath: string): Promise<Response> {
 	return new Response("Not Found", { status: 404 });
 }
 
-export async function startServer(
-	port = DEFAULT_PORT,
-	options: { sessionFile?: string } = {},
-): Promise<{ port: number; stop: () => void }> {
-	if (runtime) closeServer();
-	clients.clear();
-	await ensureClientBuild();
-
-	const normalizer = new MechanismNormalizer();
-	const tailer = new SessionTailer(options.sessionFile ? { mainSessionFile: options.sessionFile } : {});
-	const unsubscribeStatus = normalizer.onEvent(broadcast);
-	const unsubscribeTailer = tailer.onRecord(record => handleTailerRecord(normalizer, record));
-	await tailer.start();
-	normalizer.startStatusPolling();
-	broadcastAll(await normalizer.checkStatuses());
-
+function createMechanismHttpServer(
+	port: number,
+	normalizer: MechanismNormalizer,
+): { server: Bun.Server<unknown>; heartbeat: NodeJS.Timeout } {
 	const server = Bun.serve({
 		port,
 		idleTimeout: 255,
@@ -309,15 +355,79 @@ export async function startServer(
 
 	const heartbeat = setInterval(pingClients, 15000);
 	heartbeat.unref?.();
-	runtime = { server, tailer, normalizer, unsubscribeStatus, unsubscribeTailer, heartbeat };
+	return { server, heartbeat };
+}
+
+function publishControllerEvents(events: MechEvent[]): MechEvent[] {
+	broadcastAll(events);
+	return events;
+}
+
+export async function startServer(
+	port = DEFAULT_PORT,
+	options: { sessionFile?: string } = {},
+): Promise<{ port: number; stop: () => void }> {
+	if (runtime) closeServer();
+	clients.clear();
+	await ensureClientBuild();
+
+	const normalizer = new MechanismNormalizer();
+	const cleanup: Array<() => void> = [];
+	if (options.sessionFile) {
+		const tailer = new SessionTailer({ mainSessionFile: options.sessionFile });
+		cleanup.push(normalizer.onEvent(broadcast));
+		cleanup.push(tailer.onRecord(record => handleTailerRecord(normalizer, record)));
+		cleanup.push(() => tailer.stop());
+		await tailer.start();
+		normalizer.startStatusPolling();
+		cleanup.push(() => normalizer.stopStatusPolling());
+		await normalizer.checkStatuses();
+	}
+
+	const { server, heartbeat } = createMechanismHttpServer(port, normalizer);
+	runtime = { server, normalizer, cleanup, heartbeat };
 	return {
 		port: server.port ?? port,
 		stop: closeServer,
 	};
 }
 
+export async function startRuntimeServer(
+	port = DEFAULT_PORT,
+	options: MechanismRuntimeServerOptions = {},
+): Promise<MechanismRuntimeController> {
+	if (runtime) closeServer();
+	clients.clear();
+	await ensureClientBuild();
+
+	const normalizer = new MechanismNormalizer();
+	if (options.agents) normalizer.pushRoster(options.agents);
+	const { server, heartbeat } = createMechanismHttpServer(port, normalizer);
+	runtime = { server, normalizer, cleanup: [], heartbeat };
+
+	return {
+		port: server.port ?? port,
+		stop: closeServer,
+		reset: () => publishControllerEvents(normalizer.reset()),
+		pushRoster: agents => publishControllerEvents(normalizer.pushRoster(agents)),
+		pushAgent: agent => publishControllerEvents(normalizer.pushAgent(agent)),
+		removeAgent: agentId => publishControllerEvents(normalizer.removeAgent(agentId)),
+		pushStatus: (agentId, status) => publishControllerEvents(normalizer.pushStatus(agentId, status)),
+		pushEntry: (agent, entry, observedAt) => publishControllerEvents(normalizer.pushEntry(agent, entry, observedAt)),
+		pushAgentEvent: (agentId, event) => publishControllerEvents(normalizer.pushAgentEvent(agentId, event)),
+		pushIrc: (from, to) => publishControllerEvents(normalizer.pushIrc(from, to)),
+		pushCompaction: (agentId, phase) => publishControllerEvents(normalizer.pushCompaction(agentId, phase)),
+		pushRetry: (agentId, phase, attempt) => publishControllerEvents(normalizer.pushRetry(agentId, phase, attempt)),
+		pushFallback: (agentId, fromModel, toModel) =>
+			publishControllerEvents(normalizer.pushFallback(agentId, fromModel, toModel)),
+		pushThinking: (agentId, level) => publishControllerEvents(normalizer.pushThinking(agentId, level)),
+		pushNotice: (agentId, level) => publishControllerEvents(normalizer.pushNotice(agentId, level)),
+	};
+}
+
 export function closeServer(): void {
 	if (!runtime) return;
+	const active = runtime;
 	for (const client of Array.from(clients)) {
 		client.closed = true;
 		try {
@@ -325,11 +435,13 @@ export function closeServer(): void {
 		} catch {}
 	}
 	clients.clear();
-	runtime.unsubscribeTailer();
-	runtime.unsubscribeStatus();
-	runtime.tailer.stop();
-	runtime.normalizer.stop();
-	runtime.server.stop();
-	clearInterval(runtime.heartbeat);
+	for (const cleanup of [...active.cleanup].reverse()) {
+		try {
+			cleanup();
+		} catch {}
+	}
+	active.normalizer.stop();
+	active.server.stop();
+	clearInterval(active.heartbeat);
 	runtime = null;
 }

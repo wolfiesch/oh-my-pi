@@ -13,6 +13,7 @@ export interface MechAgent {
 	status: AgentStatus;
 	depth: number;
 	label: string;
+	kind?: "main" | "sub" | "advisor";
 }
 
 export type MechEvent =
@@ -21,4 +22,9 @@ export type MechEvent =
 	| { t: "status"; id: string; status: AgentStatus }
 	| { t: "tool"; id: string; tool: string; phase: "start" | "update" | "end" }
 	| { t: "irc"; from: string; to: string }
-	| { t: "usage"; model: string; costUsd: number; tokensIn: number; tokensOut: number };
+	| { t: "usage"; model: string; costUsd: number; tokensIn: number; tokensOut: number }
+	| { t: "compaction"; id: string; phase: "start" | "end" }
+	| { t: "retry"; id: string; phase: "start" | "end"; attempt?: number }
+	| { t: "fallback"; id: string; fromModel: string; toModel: string }
+	| { t: "thinking"; id: string; level: string }
+	| { t: "notice"; id: string; level: "info" | "warning" | "error" };

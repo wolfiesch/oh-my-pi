@@ -1,4 +1,4 @@
-import { Activity, BarChart3, Bot, Boxes, type LucideIcon, Network, Radio } from "lucide-react";
+import { BarChart3, Bot, Boxes, type LucideIcon, Network, Radio } from "lucide-react";
 import { useState } from "react";
 import type { AgentRosterEntry, ProviderAuthEntry, ResolvedConfig, ToolId, ToolStatus } from "../../api-types";
 import { getAgents, getConfig, getProviders, getTools, launchTool, stopTool } from "../data/api";
@@ -17,7 +17,6 @@ export interface HomeRouteProps {
  */
 const TOOL_ICON: Record<ToolId, LucideIcon> = {
 	stats: BarChart3,
-	mechanism: Activity,
 	collab: Radio,
 	robomp: Bot,
 };
@@ -30,8 +29,8 @@ const TOOL_ICON: Record<ToolId, LucideIcon> = {
  * profile, and (3) a pointer to the full routing graph.
  *
  * The launcher uses the loopback `/api/tools*` endpoints only. Profile-scoped
- * tools (stats, mechanism) receive the active profile id; profile-agnostic
- * tools (collab, robomp) run on "main" and ignore the selector.
+ * tools receive the active profile id; profile-agnostic relay tools run on
+ * "main" and ignore the selector.
  */
 export function HomeRoute({ active, profile }: HomeRouteProps) {
 	const enabled = active && !!profile;
@@ -94,7 +93,7 @@ export function HomeRoute({ active, profile }: HomeRouteProps) {
 
 				<Panel
 					title="Tools"
-					subtitle="Launch OMP web tools scoped to this profile. Profile-scoped tools (stats, mechanism) read this profile's sessions and data; relay tools (collab, robomp) run on main and ignore the selector."
+					subtitle="Launch OMP web tools scoped to this profile. Stats reads this profile's sessions and data; relay tools (collab, robomp) run on main and ignore the selector."
 				>
 					<div className="home-tile-grid">
 						{(toolsData?.tools ?? []).map(tool => (

@@ -82,6 +82,8 @@ async function main(): Promise<void> {
 	// placeholders (stats client archive, docs index) even on failure.
 	try {
 		await runCommand(["bun", "--cwd=../stats", "run", "gen:stats"]);
+		await runCommand(["bun", "--cwd=../mechanism", "scripts/generate-client-bundle.ts", "--generate"]);
+		await runCommand(["bun", "--cwd=../home", "scripts/generate-client-bundle.ts", "--generate"]);
 		// The in-memory legacy Pi virtual module reaches the coding-agent
 		// `export/html` subpath, whose source imports `tool-views.generated.js`.
 		// Rebuild it before compilation so clean checkouts that skipped install
@@ -111,6 +113,8 @@ async function main(): Promise<void> {
 		}
 	} finally {
 		await runCommand(["bun", "--cwd=../stats", "run", "gen:stats:reset"]);
+		await runCommand(["bun", "--cwd=../mechanism", "scripts/generate-client-bundle.ts", "--reset"]);
+		await runCommand(["bun", "--cwd=../home", "scripts/generate-client-bundle.ts", "--reset"]);
 	}
 }
 

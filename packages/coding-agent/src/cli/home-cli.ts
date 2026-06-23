@@ -29,13 +29,14 @@ export async function runHomeCommand(cmd: HomeCommandArgs): Promise<void> {
 	const server = await startServer({ port: cmd.port, apiHandler });
 	const { port } = server;
 
-	const url = `http://localhost:${port}`;
-	writeStdout(`${chalk.green(`OMP Home available at: ${url}`)}\n`);
+	const baseUrl = `http://localhost:${port}`;
+	const openUrl = cmd.profile ? `${baseUrl}/#/home?profile=${encodeURIComponent(cmd.profile)}` : baseUrl;
+	writeStdout(`${chalk.green(`OMP Home available at: ${baseUrl}`)}\n`);
 	if (cmd.profile) {
-		writeStdout(`${chalk.dim(`Initial profile: ${cmd.profile} (select it in the top bar if different)`)}\n`);
+		writeStdout(`${chalk.dim(`Initial profile: ${cmd.profile}`)}\n`);
 	}
 	if (cmd.open) {
-		openPath(url);
+		openPath(openUrl);
 	}
 	writeStdout("Press Ctrl+C to stop\n\n");
 

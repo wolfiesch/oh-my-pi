@@ -18,15 +18,21 @@ export interface MechAgent {
 	status: AgentStatus;
 	depth: number;
 	label: string;
+	kind?: "main" | "sub" | "advisor";
 }
 
 export type MechEvent =
 	| { t: "roster"; agents: MechAgent[] }
 	| { t: "spawn"; agent: MechAgent }
 	| { t: "status"; id: string; status: AgentStatus }
-	| { t: "tool"; id: string; tool: string; phase: "start" | "end" }
+	| { t: "tool"; id: string; tool: string; phase: "start" | "update" | "end" }
 	| { t: "irc"; from: string; to: string }
-	| { t: "usage"; model: string; costUsd: number; tokensIn: number; tokensOut: number };
+	| { t: "usage"; model: string; costUsd: number; tokensIn: number; tokensOut: number }
+	| { t: "compaction"; id: string; phase: "start" | "end" }
+	| { t: "retry"; id: string; phase: "start" | "end"; attempt?: number }
+	| { t: "fallback"; id: string; fromModel: string; toModel: string }
+	| { t: "thinking"; id: string; level: string }
+	| { t: "notice"; id: string; level: "info" | "warning" | "error" };
 
 export interface AgentFileSource {
 	filePath: string;
@@ -37,6 +43,50 @@ export interface AgentFileSource {
 	mtimeMs?: number;
 }
 
+interface RuntimeAgentSourceFields {
+	parentId?: string | null;
+	model?: string;
+	family?: string;
+	status?: AgentStatus;
+	depth?: number;
+	label?: string;
+	isMain?: boolean;
+	kind?: "main" | "sub" | "advisor";
+}
+
+export type RuntimeAgentSource =
+	| (RuntimeAgentSourceFields & { id: string; agentId?: string })
+	| (RuntimeAgentSourceFields & { id?: string; agentId: string });
+
+type RuntimeAgentEventExtras = Record<string, unknown>;
+
+export type RuntimeAgentEvent =
+	| ({ type: "agent_start" } & RuntimeAgentEventExtras)
+	| ({ type: "agent_end"; messages?: unknown[]; telemetry?: unknown; coverage?: unknown } & RuntimeAgentEventExtras)
+	| ({
+			type: "tool_execution_start";
+			toolCallId?: string;
+			toolName: string;
+			args?: unknown;
+			intent?: string;
+	  } & RuntimeAgentEventExtras)
+	| ({
+			type: "tool_execution_update";
+			toolCallId?: string;
+			toolName: string;
+			args?: unknown;
+			partialResult?: unknown;
+	  } & RuntimeAgentEventExtras)
+	| ({
+			type: "tool_execution_end";
+			toolCallId?: string;
+			toolName: string;
+			result?: unknown;
+			isError?: boolean;
+	  } & RuntimeAgentEventExtras);
+
+export type StructuralAgentEvent = RuntimeAgentEvent;
+
 export interface MechanismNormalizerOptions {
 	activityThresholdMs?: number;
 	statusIntervalMs?: number;
@@ -45,7 +95,7 @@ export interface MechanismNormalizerOptions {
 
 interface AgentRecord {
 	agent: MechAgent;
-	filePath: string;
+	filePath: string | null;
 	lastAppendAt: number;
 }
 
@@ -65,6 +115,27 @@ function familyOf(model: string): string {
 
 function cloneAgent(agent: MechAgent): MechAgent {
 	return { ...agent };
+}
+
+function runtimeAgentId(source: RuntimeAgentSource): string {
+	const id = source.id ?? source.agentId;
+	if (!id) throw new Error("Runtime agent source requires id or agentId");
+	return id;
+}
+
+function isMainRuntimeAgent(source: RuntimeAgentSource, id: string): boolean {
+	return source.isMain === true || id === MAIN_AGENT_ID;
+}
+
+function agentMetadataChanged(previous: MechAgent, next: MechAgent): boolean {
+	return (
+		previous.parentId !== next.parentId ||
+		previous.model !== next.model ||
+		previous.family !== next.family ||
+		previous.depth !== next.depth ||
+		previous.label !== next.label ||
+		previous.kind !== next.kind
+	);
 }
 
 function isToolCallBlock(value: unknown): value is { type: "toolCall"; name: string } {
@@ -211,6 +282,80 @@ export class MechanismNormalizer {
 		return { t: "roster", agents: this.#snapshotAgents() };
 	}
 
+	pushRoster(agents: RuntimeAgentSource[], observedAt = this.#now()): MechEvent[] {
+		this.#agents.clear();
+		for (const source of agents) {
+			const agent = this.#runtimeAgentFromSource(source);
+			this.#agents.set(agent.id, { agent, filePath: null, lastAppendAt: observedAt });
+		}
+		return [this.snapshotRoster()];
+	}
+
+	pushAgent(agent: RuntimeAgentSource, observedAt = this.#now()): MechEvent[] {
+		return this.#upsertRuntimeAgent(agent, observedAt);
+	}
+
+	removeAgent(agentId: string): MechEvent[] {
+		if (!this.#agents.has(agentId)) return [];
+		const removeIds = new Set<string>([agentId]);
+		let changed = true;
+		while (changed) {
+			changed = false;
+			for (const [id, record] of this.#agents) {
+				const parentId = record.agent.parentId;
+				if (parentId && removeIds.has(parentId) && !removeIds.has(id)) {
+					removeIds.add(id);
+					changed = true;
+				}
+			}
+		}
+		for (const id of removeIds) this.#agents.delete(id);
+		return [this.snapshotRoster()];
+	}
+
+	pushStatus(agentId: string, status: AgentStatus, observedAt = this.#now()): MechEvent[] {
+		const events = this.#upsertRuntimeAgent({ id: agentId, status }, observedAt);
+		const record = this.#agents.get(agentId);
+		if (record && status === "running") record.lastAppendAt = Math.max(record.lastAppendAt, observedAt);
+		eventListWith(events, this.#setStatus(agentId, status));
+		return events;
+	}
+
+	pushEntry(agent: RuntimeAgentSource, entry: MechFileEntry, observedAt = this.#now()): MechEvent[] {
+		const events = this.#upsertRuntimeAgent(agent, observedAt);
+		events.push(...this.#eventsFromEntry(runtimeAgentId(agent), entry, observedAt));
+		return events;
+	}
+
+	pushAgentEvent(agentId: string, event: RuntimeAgentEvent, observedAt = this.#now()): MechEvent[] {
+		switch (event.type) {
+			case "agent_start":
+				return this.pushStatus(agentId, "running", observedAt);
+			case "agent_end":
+				return this.pushStatus(agentId, "idle", observedAt);
+			case "tool_execution_start": {
+				const events = this.pushStatus(agentId, "running", observedAt);
+				events.push({ t: "tool", id: agentId, tool: event.toolName, phase: "start" });
+				return events;
+			}
+			case "tool_execution_update": {
+				const events = this.pushStatus(agentId, "running", observedAt);
+				events.push({ t: "tool", id: agentId, tool: event.toolName, phase: "update" });
+				return events;
+			}
+			case "tool_execution_end": {
+				const events = this.#upsertRuntimeAgent({ id: agentId }, observedAt);
+				events.push({ t: "tool", id: agentId, tool: event.toolName, phase: "end" });
+				return events;
+			}
+		}
+		return [];
+	}
+
+	pushIrc(from: string, to: string): MechEvent[] {
+		return [{ t: "irc", from, to }];
+	}
+
 	registerAgentFile(source: AgentFileSource): MechEvent[] {
 		const existing = this.#agents.get(source.agentId);
 		if (existing) {
@@ -242,7 +387,51 @@ export class MechanismNormalizer {
 	processEntry(source: AgentFileSource, entry: MechFileEntry, observedAt = this.#now()): MechEvent[] {
 		const events: MechEvent[] = [];
 		events.push(...this.registerAgentFile({ ...source, mtimeMs: source.mtimeMs ?? observedAt }));
-		eventListWith(events, this.#touchAgent(source.agentId, observedAt));
+		events.push(...this.#eventsFromEntry(source.agentId, entry, observedAt));
+		return events;
+	}
+
+	#runtimeAgentFromSource(source: RuntimeAgentSource): MechAgent {
+		const id = runtimeAgentId(source);
+		const existing = this.#agents.get(id);
+		const parentId = source.parentId !== undefined ? source.parentId : (existing?.agent.parentId ?? null);
+		const parent = parentId ? this.#agents.get(parentId) : undefined;
+		const model = source.model ?? existing?.agent.model ?? "";
+		const existingFamily = existing?.agent.family ?? (model ? familyOf(model) : "");
+		const family = source.family ?? (source.model !== undefined ? (model ? familyOf(model) : "") : existingFamily);
+		return {
+			id,
+			parentId,
+			model,
+			family,
+			status: source.status ?? existing?.agent.status ?? "running",
+			depth: source.depth ?? existing?.agent.depth ?? (parent ? parent.agent.depth + 1 : parentId ? 1 : 0),
+			label: source.label ?? existing?.agent.label ?? id,
+			kind: source.kind ?? existing?.agent.kind,
+		};
+	}
+
+	#upsertRuntimeAgent(source: RuntimeAgentSource, observedAt: number): MechEvent[] {
+		const agent = this.#runtimeAgentFromSource(source);
+		const existing = this.#agents.get(agent.id);
+		if (!existing) {
+			this.#agents.set(agent.id, { agent, filePath: null, lastAppendAt: observedAt });
+			if (isMainRuntimeAgent(source, agent.id)) return [this.snapshotRoster()];
+			return [{ t: "spawn", agent: cloneAgent(agent) }];
+		}
+
+		const previous = cloneAgent(existing.agent);
+		existing.agent = agent;
+		existing.filePath = null;
+		existing.lastAppendAt = Math.max(existing.lastAppendAt, observedAt);
+		if (agentMetadataChanged(previous, agent)) return [this.snapshotRoster()];
+		if (previous.status !== agent.status) return [{ t: "status", id: agent.id, status: agent.status }];
+		return [];
+	}
+
+	#eventsFromEntry(agentId: string, entry: MechFileEntry, observedAt: number): MechEvent[] {
+		const events: MechEvent[] = [];
+		eventListWith(events, this.#touchAgent(agentId, observedAt));
 
 		switch (entry.type) {
 			case "session":
@@ -250,7 +439,7 @@ export class MechanismNormalizer {
 			case "session_init":
 				break;
 			case "model_change":
-				eventListWith(events, this.#setModel(source.agentId, entry.model));
+				eventListWith(events, this.#setModel(agentId, entry.model));
 				break;
 			case "custom_message":
 				if (entry.customType === "irc:relay") {
@@ -259,7 +448,7 @@ export class MechanismNormalizer {
 				}
 				break;
 			case "message":
-				events.push(...this.#eventsFromMessage(source.agentId, entry.message));
+				events.push(...this.#eventsFromMessage(agentId, entry.message));
 				break;
 		}
 
@@ -335,6 +524,7 @@ export class MechanismNormalizer {
 			if (parent?.agent.status === "aborted") return "aborted";
 		}
 		if (now - record.lastAppendAt <= this.#activityThresholdMs) return "running";
+		if (!record.filePath) return record.agent.status;
 		const scanned = await deriveStatusFromTail(record.filePath);
 		if (scanned === "unknown") return record.agent.status;
 		return scanned;
@@ -350,6 +540,34 @@ export class MechanismNormalizer {
 		for (const event of events) {
 			for (const listener of listeners) listener(event);
 		}
+	}
+
+	pushCompaction(agentId: string, phase: "start" | "end"): MechEvent[] {
+		const events = this.pushStatus(agentId, "running");
+		events.push({ t: "compaction", id: agentId, phase });
+		return events;
+	}
+
+	pushRetry(agentId: string, phase: "start" | "end", attempt?: number): MechEvent[] {
+		const events = this.pushStatus(agentId, "running");
+		events.push({ t: "retry", id: agentId, phase, ...(attempt !== undefined && { attempt }) });
+		return events;
+	}
+
+	pushFallback(agentId: string, fromModel: string, toModel: string): MechEvent[] {
+		const events: MechEvent[] = [{ t: "fallback", id: agentId, fromModel, toModel }];
+		// Also update the agent's model
+		const modelEvents = this.pushAgent({ id: agentId, model: toModel });
+		events.push(...modelEvents);
+		return events;
+	}
+
+	pushThinking(agentId: string, level: string): MechEvent[] {
+		return [{ t: "thinking", id: agentId, level }];
+	}
+
+	pushNotice(agentId: string, level: "info" | "warning" | "error"): MechEvent[] {
+		return [{ t: "notice", id: agentId, level }];
 	}
 }
 
@@ -448,7 +666,17 @@ export function createMockFeed(options: MockFeedOptions = {}): MockFeed {
 			{ t: "spawn", agent: scout },
 			{ t: "tool", id: MAIN_AGENT_ID, tool: "read", phase: "start" },
 			{ t: "usage", model: "openrouter/openai/gpt-5.5", costUsd: 0.0132, tokensIn: 1840, tokensOut: 392 },
+			{ t: "compaction", id: MAIN_AGENT_ID, phase: "start" },
 			{ t: "irc", from: "SchemaScout", to: MAIN_AGENT_ID },
+			{ t: "compaction", id: MAIN_AGENT_ID, phase: "end" },
+			{ t: "retry", id: "SchemaScout", phase: "start", attempt: 1 },
+			{ t: "retry", id: "SchemaScout", phase: "end", attempt: 1 },
+			{
+				t: "fallback",
+				id: "SchemaScout",
+				fromModel: "openrouter/anthropic/claude-sonnet-4.5",
+				toModel: "openrouter/openai/gpt-5.5",
+			},
 			{ t: "tool", id: MAIN_AGENT_ID, tool: "read", phase: "end" },
 			{ t: "status", id: "SchemaScout", status: "idle" },
 			{ t: "status", id: MAIN_AGENT_ID, status: "idle" },

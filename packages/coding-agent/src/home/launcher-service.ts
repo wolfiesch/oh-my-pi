@@ -20,13 +20,6 @@ export const TOOL_DESCRIPTORS: Record<ToolId, ToolDescriptor> = {
 		profileScoped: true,
 		defaultPort: 3847,
 	},
-	mechanism: {
-		id: "mechanism",
-		label: "Mechanism",
-		description: "View live session mechanism traces and event flow for the selected OMP profile.",
-		profileScoped: true,
-		defaultPort: 3848,
-	},
 	collab: {
 		id: "collab",
 		label: "Collab relay",
@@ -174,7 +167,7 @@ function formatLaunchFailure(
 }
 
 function launchHint(tool: ToolId, port: number): string {
-	if (tool === "stats" || tool === "mechanism") {
+	if (tool === "stats") {
 		const exec = resolveOmpExec();
 		return [exec.cmd, ...exec.argvPrefix, tool, "--port", String(port)].join(" ");
 	}
@@ -272,7 +265,7 @@ export function resolveRepoRoot(): string | null {
 }
 
 export function resolveToolLaunch(tool: ToolId, port: number, env: Record<string, string>): ToolLaunchSpec | null {
-	if (tool === "stats" || tool === "mechanism") {
+	if (tool === "stats") {
 		const exec = resolveOmpExec();
 		return { cmd: exec.cmd, args: [...exec.argvPrefix, tool, "--port", String(port)], env: { ...env } };
 	}

@@ -225,8 +225,16 @@ class MockMechServer {
 				if (url.pathname === "/favicon.ico") return new Response(null, { status: 204 });
 				const rel = url.pathname === "/" ? "index.html" : url.pathname.replace(/^\/+/, "");
 				const file = Bun.file(path.join(distDir, rel));
-				if (await file.exists()) return new Response(file);
-				return new Response("Not Found", { status: 404 });
+				if (!(await file.exists())) return new Response("Not Found", { status: 404 });
+				// Inject the SSE probe script into index.html so it runs before the
+				// client's own scripts — evaluateOnNewDocument is unreliable across
+				// puppeteer versions.
+				if (rel === "index.html") {
+					let html = await file.text();
+					html = html.replace("<head>", `<head><script>${PROBE_INIT}</script>`);
+					return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+				}
+				return new Response(file);
 			},
 		});
 		// Keepalive comments stop any idle reaper and keep the probe + client warm between keyframes.
@@ -440,14 +448,45 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
 	return false;
 }
 
-/** Inject a probe EventSource that records every frame BEFORE the client's own scripts run. */
+/**
+ * Evaluate an expression in the page's MAIN world (where inline <script> tags
+ * run). Puppeteer's page.evaluate runs in an isolated world that cannot see
+ * globals set by injected scripts; CDP Runtime.evaluate targets the main world.
+ */
+async function evalMainWorld<T>(page: Page, expression: string): Promise<T> {
+	const frame = page.mainFrame() as any;
+	const { result, exceptionDetails } = await frame.client.send("Runtime.evaluate", {
+		expression,
+		returnByValue: true,
+		awaitPromise: false,
+	});
+	if (exceptionDetails) throw new Error(`evalMainWorld failed: ${exceptionDetails.text}`);
+	return result.value as T;
+}
+
+/**
+ * Probe script injected into index.html via the mock server. Stores state in
+ * DOM attributes/elements instead of window globals so it's readable from any
+ * Puppeteer evaluation world (page.evaluate runs in an isolated world in some
+ * Chrome/Puppeteer versions).
+ */
 const PROBE_INIT = `
-	window.__mechEvents = [];
-	window.__mechProbeOpen = false;
+	document.documentElement.dataset.mechProbeOpen = "0";
 	(() => {
+		const store = document.createElement("script");
+		store.id = "mech-probe-events";
+		store.type = "application/json";
+		store.textContent = "[]";
+		document.head.appendChild(store);
 		const es = new EventSource("/events");
-		es.onopen = () => { window.__mechProbeOpen = true; };
-		es.onmessage = e => { try { window.__mechEvents.push(JSON.parse(e.data)); } catch {} };
+		es.onopen = () => { document.documentElement.dataset.mechProbeOpen = "1"; };
+		es.onmessage = e => {
+			try {
+				const arr = JSON.parse(store.textContent || "[]");
+				arr.push(JSON.parse(e.data));
+				store.textContent = JSON.stringify(arr);
+			} catch {}
+		};
 	})();
 `;
 
@@ -469,12 +508,14 @@ async function openClientPage(browser: Browser, server: MockMechServer, opts: Op
 		if (cm.type() === "error") consoleErrors.push(`console: ${cm.text()}`);
 	});
 	(page as Page & { __consoleErrors: string[] }).__consoleErrors = consoleErrors;
-	await page.evaluateOnNewDocument(PROBE_INIT);
 	server.resetPushLog();
 	await page.goto(`${server.url}/?profile=${encodeURIComponent(opts.profile)}`, { waitUntil: "domcontentloaded" });
 	// Both the probe and the client must be subscribed before we push (SSE does not replay).
-	await waitFor(() => server.clientCount() >= 2);
-	await page.waitForFunction("window.__mechProbeOpen === true", { timeout: 8000 });
+	await waitFor(() => server.clientCount() >= 2, 10000);
+	await waitFor(async () => {
+		const v = (await page.evaluate("document.documentElement.dataset.mechProbeOpen")) as string | undefined;
+		return v === "1";
+	}, 8000);
 	return page;
 }
 
@@ -614,35 +655,54 @@ async function suiteReducedMotion(h: Harness, browser: Browser): Promise<void> {
 		shots: [spawnShot.shot],
 	});
 
-	// --- A3: status running → idle dims; parked dims further ---
-	const idleTarget = ringBody(3);
-	const idleBox = boxAround("idle", idleTarget, 20);
+	// --- A3: status running → idle leaves the ring; active siblings reflow evenly ---
+	const reflowAgents = [
+		agent("ProbeWingA", "Reader", 3, "model/wing-a", "running", "openai"),
+		agent("ProbeWingB", "Reader", 3, "model/wing-b", "running", "google"),
+	];
+	for (const a of reflowAgents) h.server.push({ t: "spawn", agent: a });
+	await sleep(SETTLE_MS + 500);
+	const idleTarget = bodyAt(3, 1, 3);
+	const idleBox = boxAround("idle-old-slot", idleTarget, 20);
+	const activeReflowBoxes = [
+		boxAround("active-0", bodyAt(3, 0, 2), 20),
+		boxAround("active-1", bodyAt(3, 1, 2), 20),
+		boxAround("active-old-slot", bodyAt(3, 2, 3), 20),
+	];
 	const runShot = await h.shot(page, "reduced-status-running");
 	const runM = (await h.analyzer.measure(runShot.base64, [idleBox])).boxes[0];
-	h.server.push({ t: "status", id: "Probe", status: "idle" });
+	h.server.push({ t: "status", id: "ProbeWingA", status: "idle" });
 	await sleep(SETTLE_MS);
 	const idleShot = await h.shot(page, "reduced-status-idle");
-	const idleM = (await h.analyzer.measure(idleShot.base64, [idleBox])).boxes[0];
+	const idleMeasure = await h.analyzer.measure(idleShot.base64, [idleBox, ...activeReflowBoxes]);
+	const idleM = idleMeasure.boxes[0];
+	const [activeSlot0, activeSlot1, vacatedActiveSlot] = idleMeasure.boxes.slice(1);
+	const activeSlots = [activeSlot0, activeSlot1];
+	const oldIdleSlotDropped = runM.mean - idleM.mean >= TH.statusDimDelta && idleM.bright < TH.bodyBrightMin;
+	const activeSlotsLit = activeSlots.every(b => b.bright >= TH.bodyBrightMin);
+	const vacatedActiveSlotCleared = vacatedActiveSlot.bright < TH.bodyBrightMin;
 	h.record({
 		id: "status-running-to-idle",
-		binding: "Agent running → idle (bright+ ⇒ steady dim glow)",
-		expected: `mean brightness drops ≥ ${TH.statusDimDelta}`,
-		actual: `mean ${runM.mean.toFixed(1)} → ${idleM.mean.toFixed(1)} (Δ ${(runM.mean - idleM.mean).toFixed(1)})`,
-		pass: runM.mean - idleM.mean >= TH.statusDimDelta,
+		binding: "Agent running → idle leaves the orbit ring; active siblings reflow into clean even spacing",
+		expected: `old idle slot drops and clears; active slots bright-core px ≥ ${TH.bodyBrightMin}; vacated active slot clears`,
+		actual: `idle old slot mean ${runM.mean.toFixed(1)} → ${idleM.mean.toFixed(1)} (bright ${idleM.bright}); active slots [${activeSlots.map(b => `${b.label}:${b.bright}`).join(", ")}], vacated ${vacatedActiveSlot.label}:${vacatedActiveSlot.bright}`,
+		pass: oldIdleSlotDropped && activeSlotsLit && vacatedActiveSlotCleared,
 		shots: [runShot.shot, idleShot.shot],
 	});
-	h.server.push({ t: "status", id: "Probe", status: "parked" });
+	h.server.push({ t: "status", id: "ProbeWingA", status: "parked" });
 	await sleep(SETTLE_MS);
 	const parkedShot = await h.shot(page, "reduced-status-parked");
 	const parkedM = (await h.analyzer.measure(parkedShot.base64, [idleBox])).boxes[0];
 	h.record({
 		id: "status-parked",
-		binding: "Agent parked → cold dimmed (dimmer than idle)",
-		expected: "mean brightness ≤ idle mean",
-		actual: `parked mean ${parkedM.mean.toFixed(1)} vs idle ${idleM.mean.toFixed(1)}`,
+		binding: "Agent parked → cold dimmed (dimmer than idle) while staying out of the ring",
+		expected: "old-slot mean brightness ≤ idle mean",
+		actual: `parked old-slot mean ${parkedM.mean.toFixed(1)} vs idle ${idleM.mean.toFixed(1)}`,
 		pass: parkedM.mean <= idleM.mean + 0.5,
 		shots: [parkedShot.shot],
 	});
+	h.server.push({ t: "status", id: "ProbeWingB", status: "parked" });
+	await sleep(SETTLE_MS);
 
 	// --- A4: aborted → red flare, then heals ---
 	h.server.push({ t: "status", id: "Reader", status: "aborted" });
@@ -688,19 +748,72 @@ async function suiteReducedMotion(h: Harness, browser: Browser): Promise<void> {
 		shots: [toolDuring.shot, toolAfter.shot],
 	});
 
-	// --- A6: IRC → arc of light between two bodies ---
-	const ircBefore = await h.analyzer.measure((await h.shot(page, "reduced-irc-before")).base64, []);
-	h.server.push({ t: "irc", from: "Probe", to: "Main" });
-	await sleep(TRANSIENT_MS);
-	const ircShot = await h.shot(page, "reduced-irc-arc");
-	const ircM = await h.analyzer.measure(ircShot.base64, []);
+	// --- A6: IRC → arcs of light for every delivery route ---
+	const ircRoutes = [
+		{
+			id: "irc-arc-main-to-agent",
+			from: "Main",
+			to: "Scout",
+			label: "main-to-agent",
+			binding: "IRC Main→agent message → arc of light travelling between bodies",
+		},
+		{
+			id: "irc-arc-agent-to-main",
+			from: "Probe",
+			to: "Main",
+			label: "agent-to-main",
+			binding: "IRC agent→Main message → arc of light travelling between bodies",
+		},
+		{
+			id: "irc-arc-agent-to-agent",
+			from: "Scout",
+			to: "Reader",
+			label: "agent-to-agent",
+			binding: "IRC agent→agent message → arc of light travelling between bodies",
+		},
+	] as const;
+	const ircResults: Array<{
+		id: string;
+		from: string;
+		to: string;
+		before: number;
+		after: number;
+		pass: boolean;
+		shot: Shot;
+	}> = [];
+	for (const route of ircRoutes) {
+		const before = await h.analyzer.measure((await h.shot(page, `reduced-irc-${route.label}-before`)).base64, []);
+		h.server.push({ t: "irc", from: route.from, to: route.to });
+		await sleep(TRANSIENT_MS);
+		const shot = await h.shot(page, `reduced-irc-${route.label}-arc`);
+		const after = await h.analyzer.measure(shot.base64, []);
+		const pass = after.whole.white - before.whole.white >= TH.ircWhiteMin;
+		ircResults.push({
+			id: route.id,
+			from: route.from,
+			to: route.to,
+			before: before.whole.white,
+			after: after.whole.white,
+			pass,
+			shot: shot.shot,
+		});
+		h.record({
+			id: route.id,
+			binding: route.binding,
+			expected: `white pulse px jumps ≥ ${TH.ircWhiteMin}`,
+			actual: `white px ${before.whole.white} → ${after.whole.white}`,
+			pass,
+			shots: [shot.shot],
+		});
+		await sleep(900);
+	}
 	h.record({
 		id: "irc-arc",
-		binding: "IRC / inter-agent message → arc of light travelling between bodies",
-		expected: `white pulse px jumps ≥ ${TH.ircWhiteMin}`,
-		actual: `white px ${ircBefore.whole.white} → ${ircM.whole.white}`,
-		pass: ircM.whole.white - ircBefore.whole.white >= TH.ircWhiteMin,
-		shots: [ircShot.shot],
+		binding: "IRC delivery routes → arcs for Main→agent, agent→Main, and agent→agent messages",
+		expected: `all 3 routes have white pulse px jumps ≥ ${TH.ircWhiteMin}`,
+		actual: ircResults.map(r => `${r.from}→${r.to}: ${r.before}→${r.after} (Δ ${r.after - r.before})`).join("; "),
+		pass: ircResults.every(r => r.pass),
+		shots: ircResults.map(r => r.shot),
 	});
 
 	// --- A7: usage → lane solid scales with spend share ---
@@ -767,10 +880,13 @@ async function suiteReducedMotion(h: Harness, browser: Browser): Promise<void> {
 	// --- A8: SSE transport contract — probe received the exact pushed sequence ---
 	const expectedSeq = h.server.pushed;
 	await waitFor(async () => {
-		const n = (await page.evaluate("window.__mechEvents.length")) as number;
-		return n >= expectedSeq.length;
+		const text = (await page.evaluate('document.getElementById("mech-probe-events")?.textContent ?? "[]"')) as string;
+		return JSON.parse(text).length >= expectedSeq.length;
 	});
-	const probeEvents = (await page.evaluate("window.__mechEvents")) as MechEvent[];
+	const probeEventsText = (await page.evaluate(
+		'document.getElementById("mech-probe-events")?.textContent ?? "[]"',
+	)) as string;
+	const probeEvents = JSON.parse(probeEventsText) as MechEvent[];
 	const exactMatch = JSON.stringify(probeEvents) === JSON.stringify(expectedSeq);
 	h.record({
 		id: "sse-transport-contract",
@@ -835,11 +951,13 @@ async function suiteFamilySilhouettes(h: Harness, browser: Browser): Promise<voi
 		shots: [],
 	});
 
-	const debugAgents = (await page.evaluate("window.__mechDebug.agents()")) as {
-		id: string;
-		family: string;
-		vertices: number;
-	}[];
+	const debugAgents = await evalMainWorld<
+		{
+			id: string;
+			family: string;
+			vertices: number;
+		}[]
+	>(page, "window.__mechDebug.agents()");
 	const debugById = new Map(debugAgents.map(a => [a.id, a]));
 	const familyMatches = [...expectedFamilies].every(([id, family]) => debugById.get(id)?.family === family);
 	const vertexCounts = debugAgents.map(a => a.vertices);
@@ -964,9 +1082,16 @@ async function suiteLegend(h: Harness, browser: Browser): Promise<void> {
 	await page.mouse.move(4, 4);
 	await sleep(180);
 	const hidden = await readLegend();
-	const containsTerms = ["recursion depth", "model family", "model lanes", "aborted"].every(term =>
-		shown.text.toLowerCase().includes(term),
-	);
+	const containsTerms = [
+		"recursion depth",
+		"model family",
+		"model lanes",
+		"aborted",
+		"spin speed",
+		"thinking depth",
+		"flash",
+		"notice",
+	].every(term => shown.text.toLowerCase().includes(term));
 	h.record({
 		id: "legend-conceal-reveal",
 		binding: "Concealed info legend stays hidden at rest, reveals on hover, then conceals again",

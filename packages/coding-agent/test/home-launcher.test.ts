@@ -17,7 +17,7 @@ describe("home launcher contract", () => {
 
 	it("TOOL_DESCRIPTORS has correct profileScoped flags", () => {
 		expect(TOOL_DESCRIPTORS.stats.profileScoped).toBe(true);
-		expect(TOOL_DESCRIPTORS.mechanism.profileScoped).toBe(true);
+		expect(Object.hasOwn(TOOL_DESCRIPTORS, "mechanism")).toBe(false);
 		expect(TOOL_DESCRIPTORS.collab.profileScoped).toBe(false);
 		expect(TOOL_DESCRIPTORS.robomp.profileScoped).toBe(false);
 	});
@@ -55,7 +55,7 @@ describe("home launcher contract", () => {
 		});
 	});
 
-	it("resolveToolLaunch resolves valid launch spec for stats and mechanism", () => {
+	it("resolveToolLaunch resolves valid launch spec for stats only among profile tools", () => {
 		const env = { OMP_PROFILE: "test" };
 		const statsSpec = resolveToolLaunch("stats", 3847, env);
 		expect(statsSpec).not.toBeNull();
@@ -64,14 +64,6 @@ describe("home launcher contract", () => {
 		expect(statsSpec?.args).toContain("--port");
 		expect(statsSpec?.args).toContain("3847");
 		expect(statsSpec?.env).toEqual(env);
-
-		const mechanismSpec = resolveToolLaunch("mechanism", 3848, env);
-		expect(mechanismSpec).not.toBeNull();
-		expect(mechanismSpec?.cmd).toBe(process.execPath);
-		expect(mechanismSpec?.args).toContain("mechanism");
-		expect(mechanismSpec?.args).toContain("--port");
-		expect(mechanismSpec?.args).toContain("3848");
-		expect(mechanismSpec?.env).toEqual(env);
 	});
 
 	it("resolveToolLaunch returns valid spec for collab when repo structure is present", () => {

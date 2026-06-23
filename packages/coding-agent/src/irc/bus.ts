@@ -66,12 +66,29 @@ export class IrcBus {
 	readonly #lifecycle: () => AgentLifecycleManager;
 	readonly #mailboxes = new Map<string, IrcMessage[]>();
 	readonly #waiters = new Map<string, IrcWaiter[]>();
+	#deliveryObservers = new Set<(from: string, to: string) => void>();
 
 	constructor(registry: AgentRegistry = AgentRegistry.global(), lifecycle?: AgentLifecycleManager) {
 		this.#registry = registry;
 		// Lazy: the lifecycle global self-constructs against the global registry,
 		// so only touch it when a parked recipient actually needs reviving.
 		this.#lifecycle = () => lifecycle ?? AgentLifecycleManager.global();
+	}
+
+	/** Subscribe to every successful IRC delivery. Returns unsubscribe function. */
+	onDelivered(listener: (from: string, to: string) => void): () => void {
+		this.#deliveryObservers.add(listener);
+		return () => {
+			this.#deliveryObservers.delete(listener);
+		};
+	}
+
+	#notifyDelivered(from: string, to: string): void {
+		for (const listener of this.#deliveryObservers) {
+			try {
+				listener(from, to);
+			} catch {}
+		}
 	}
 
 	/**
@@ -147,6 +164,7 @@ export class IrcBus {
 		const waiter = this.#takeMatchingWaiter(message.to, message.from);
 		if (waiter) {
 			waiter.resolve(message);
+			this.#notifyDelivered(message.from, message.to);
 			if (!opts?.suppressRelay) this.#relayToMainUi(message);
 			return { to: message.to, outcome: revived ? "revived" : "injected" };
 		}
@@ -159,6 +177,7 @@ export class IrcBus {
 		try {
 			const delivery = await session.deliverIrcMessage(message, opts);
 			if (!opts?.suppressRelay) this.#relayToMainUi(message);
+			this.#notifyDelivered(message.from, message.to);
 			return { to: message.to, outcome: revived ? "revived" : delivery };
 		} catch (error) {
 			// Live hand-off failed (e.g. recipient disposed mid-shutdown): buffer
@@ -195,7 +214,10 @@ export class IrcBus {
 		if (options?.drainPending !== false) {
 			// Already-pending mail satisfies the wait without parking a waiter.
 			const pending = this.#takeFromMailbox(agentId, filter.from);
-			if (pending) return pending;
+			if (pending) {
+				this.#notifyDelivered(pending.from, pending.to);
+				return pending;
+			}
 		}
 
 		const { promise, resolve, reject } = Promise.withResolvers<IrcMessage | null>();
@@ -278,6 +300,9 @@ export class IrcBus {
 		if (!mailbox || mailbox.length === 0) return [];
 		if (opts?.peek) return [...mailbox];
 		this.#mailboxes.delete(agentId);
+		for (const message of mailbox) {
+			this.#notifyDelivered(message.from, message.to);
+		}
 		return mailbox;
 	}
 

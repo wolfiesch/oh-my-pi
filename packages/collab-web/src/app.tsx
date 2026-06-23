@@ -14,6 +14,24 @@ import type { ToolRenderHost } from "./tool-render";
 import "./components/shell/shell.css";
 
 const NAME_KEY = "omp.collab.name";
+const LAST_LINK_KEY = "omp.collab.lastLink";
+
+interface BeforeInstallPromptChoice {
+	outcome: "accepted" | "dismissed";
+	platform: string;
+}
+
+interface BeforeInstallPromptEvent extends Event {
+	readonly platforms: string[];
+	readonly userChoice: Promise<BeforeInstallPromptChoice>;
+	prompt(): Promise<void>;
+}
+
+interface PwaInstallState {
+	available: boolean;
+	standalone: boolean;
+	prompt(): void;
+}
 
 interface Creds {
 	link: string;
@@ -28,6 +46,20 @@ function storedName(): string {
 	}
 }
 
+function storedLastLink(): string | null {
+	try {
+		const value = localStorage.getItem(LAST_LINK_KEY)?.trim();
+		return value ? value : null;
+	} catch {
+		return null;
+	}
+}
+
+function isStandaloneDisplay(): boolean {
+	const navigatorWithStandalone = navigator as Navigator & { standalone?: boolean };
+	return window.matchMedia("(display-mode: standalone)").matches || navigatorWithStandalone.standalone === true;
+}
+
 /** Deep link = everything after the FIRST `#` (legacy links carry a second `#` inside the fragment). */
 function hashLink(): string | null {
 	const href = window.location.href;
@@ -36,10 +68,50 @@ function hashLink(): string | null {
 	return href.slice(i + 1);
 }
 
+function usePwaInstall(): PwaInstallState {
+	const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
+	const [standalone, setStandalone] = useState(() => isStandaloneDisplay());
+
+	useEffect(() => {
+		const onBeforeInstallPrompt = (event: Event): void => {
+			event.preventDefault();
+			setDeferredPrompt(event as BeforeInstallPromptEvent);
+		};
+		const onAppInstalled = (): void => {
+			setDeferredPrompt(null);
+			setStandalone(true);
+		};
+		const media = window.matchMedia("(display-mode: standalone)");
+		const onDisplayModeChange = (): void => setStandalone(isStandaloneDisplay());
+
+		window.addEventListener("beforeinstallprompt", onBeforeInstallPrompt);
+		window.addEventListener("appinstalled", onAppInstalled);
+		media.addEventListener("change", onDisplayModeChange);
+		return () => {
+			window.removeEventListener("beforeinstallprompt", onBeforeInstallPrompt);
+			window.removeEventListener("appinstalled", onAppInstalled);
+			media.removeEventListener("change", onDisplayModeChange);
+		};
+	}, []);
+
+	const prompt = useCallback((): void => {
+		const event = deferredPrompt;
+		if (!event) return;
+		setDeferredPrompt(null);
+		event.prompt().catch(() => {
+			// Browser rejected the prompt; the normal browser menu install path remains available.
+		});
+		event.userChoice.then(() => setStandalone(isStandaloneDisplay())).catch(() => {});
+	}, [deferredPrompt]);
+
+	return { available: deferredPrompt !== null && !standalone, standalone, prompt };
+}
+
 export function App(): ReactNode {
 	const [client, setClient] = useState<GuestClient | null>(null);
 	const [connectError, setConnectError] = useState<string | null>(null);
 	const credsRef = useRef<Creds | null>(null);
+	const install = usePwaInstall();
 
 	const connect = useCallback((link: string, name: string): void => {
 		let next: GuestClient;
@@ -52,6 +124,7 @@ export function App(): ReactNode {
 		next.connect();
 		try {
 			localStorage.setItem(NAME_KEY, name);
+			localStorage.setItem(LAST_LINK_KEY, link);
 		} catch {
 			// storage unavailable (private mode) — non-fatal
 		}
@@ -97,9 +170,10 @@ export function App(): ReactNode {
 		};
 	}, []);
 
-	// Deep link: a page load with a hash auto-connects.
+	// Deep link: a page load with a hash auto-connects. Installed/standalone launches
+	// start at `/`, so fall back to the last successful collab link for app-like use.
 	useEffect(() => {
-		const link = hashLink();
+		const link = hashLink() ?? storedLastLink();
 		if (link) connect(link, storedName());
 	}, [connect]);
 
@@ -108,18 +182,37 @@ export function App(): ReactNode {
 	}, [client]);
 
 	if (!client) {
-		return <ConnectScreen defaultName={storedName()} error={connectError} onConnect={connect} />;
+		return (
+			<ConnectScreen
+				defaultLink={storedLastLink() ?? ""}
+				defaultName={storedName()}
+				error={connectError}
+				installAvailable={install.available}
+				onConnect={connect}
+				onInstall={install.prompt}
+			/>
+		);
 	}
-	return <Session client={client} onLeave={leave} onRejoin={rejoin} />;
+	return (
+		<Session
+			client={client}
+			installAvailable={install.available}
+			onInstall={install.prompt}
+			onLeave={leave}
+			onRejoin={rejoin}
+		/>
+	);
 }
 
 interface SessionProps {
 	client: GuestClient;
+	installAvailable: boolean;
+	onInstall(): void;
 	onLeave(): void;
 	onRejoin(): void;
 }
 
-function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
+function Session({ client, installAvailable, onInstall, onLeave, onRejoin }: SessionProps): ReactNode {
 	const snap = useGuestSnapshot(client);
 	const [railOpen, setRailOpen] = useState(false);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -160,6 +253,8 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 				snapshot={snap}
 				subCount={subCount}
 				railOpen={railOpen}
+				installAvailable={installAvailable}
+				onInstall={onInstall}
 				onToggleRail={() => setRailOpen(open => !open)}
 				onLeave={onLeave}
 			/>
