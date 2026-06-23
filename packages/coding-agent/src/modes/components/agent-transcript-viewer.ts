@@ -335,6 +335,17 @@ export class AgentTranscriptViewer implements Component {
 
 	#messagesFromEntries(entries: readonly FileEntry[]): AgentMessage[] {
 		const sessionEntries = entries.filter(isSessionEntry);
+		// Display semantics differ from LLM context: a parked/advisor transcript must
+		// keep pending (resultless) tool calls visible. buildSessionContext strips
+		// dangling tool_use blocks, so only route through it when a compaction is
+		// present (where collapse is required); otherwise map messages verbatim.
+		if (!sessionEntries.some(entry => entry.type === "compaction")) {
+			const messages: AgentMessage[] = [];
+			for (const entry of sessionEntries) {
+				if (entry.type === "message") messages.push(entry.message);
+			}
+			return messages;
+		}
 		return buildSessionContext(sessionEntries, undefined, undefined, {
 			transcript: true,
 			collapseCompactedHistory: true,
