@@ -76,9 +76,12 @@ The advisor receives a hard-isolated read-only tool set:
 - `read`
 - `search`
 - `find`
+- `lsp` (read-only actions only)
 - `advise`
 
-The read/search/find tools are built against a distinct `ToolSession` whose session id is suffixed with `-advisor`. The advisor therefore does not share the primary agent's file snapshots, seen-lines tracking, conflict state, summary cache, or edit/yield capabilities.
+The read/search/find/lsp tools are built against a distinct `ToolSession` whose session id is suffixed with `-advisor`. The advisor therefore does not share the primary agent's file snapshots, seen-lines tracking, conflict state, summary cache, or edit/yield capabilities.
+
+`lsp` is allowlisted only for its read-only actions (`diagnostics`, `definition`, `type_definition`, `implementation`, `references`, `hover`, `symbols`, `status`, `capabilities`) and only loads when the primary session has LSP enabled. Each tool in the read-only toolset (`read`/`search`/`find`/`lsp`) is wrapped in a capability-tier guard that rejects any non-`read` action before it executes, so the advisor cannot invoke `lsp` write actions (`rename`, `rename_file`, applying a `code_action`, `reload`, raw `request`) even though the same tool exposes them to the primary. (`advise` is not part of this toolset and has no capability tier; it only records a note.) As a special case, the guard also rejects workspace diagnostics (`lsp` `action:"diagnostics"` with `file:"*"`) even though that classifies as `read`, because it shells out to the project's build/typecheck command — a side effect the passive advisor must not trigger; single-file diagnostics remain allowed. Tool selection is an explicit allowlist, not derived from approval tier: some `read`-tier tools (such as `checkpoint`/`rewind`) still mutate git or session state and are deliberately excluded.
 
 The `advise` tool accepts one note and an optional severity:
 

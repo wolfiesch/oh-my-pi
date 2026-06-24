@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- The advisor (watchdog) read-only toolset now includes `lsp` for its read-only actions (`diagnostics`, `definition`, `type_definition`, `implementation`, `references`, `hover`, `symbols`, `status`, `capabilities`), loaded only when the primary session has LSP enabled, so the advisor can ground its review on real diagnostics and symbol navigation. Each advisor tool is wrapped in a capability-tier guard that rejects any non-`read` action before it executes (so `lsp` write actions like `rename`/`code_action` apply/`reload`/raw `request` cannot run from the passive advisor), and the guard additionally rejects workspace diagnostics (`lsp` `action:"diagnostics"`, `file:"*"`) because that shells out to the project build/typecheck command. Tool selection remains an explicit allowlist rather than being derived from approval tier.
+
 ## [16.1.17] - 2026-06-24
 
 ### Fixed

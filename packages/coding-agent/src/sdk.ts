@@ -24,7 +24,7 @@ import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identit
 import type { Component } from "@oh-my-pi/pi-tui";
 import { $env, $flag, getAgentDir, getProjectDir, logger, postmortem, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
-import { ADVISOR_READONLY_TOOL_NAMES, discoverWatchdogFiles } from "./advisor";
+import { ADVISOR_READONLY_TOOL_NAMES, discoverWatchdogFiles, wrapAdvisorReadOnlyTool } from "./advisor";
 import { type AsyncJob, AsyncJobManager } from "./async";
 import { AutoLearnController, buildAutoLearnInstructions } from "./autolearn/controller";
 import { loadCapability } from "./capability";
@@ -181,6 +181,7 @@ import {
 	WriteTool,
 	warmupLspServers,
 } from "./tools";
+import { resolveToolTier } from "./tools/approval";
 import { ToolContextStore } from "./tools/context";
 import { getImageGenTools } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
@@ -2595,14 +2596,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			},
 			getAgentId: () => "advisor",
 		};
+		const advisorLspEnabled = advisorToolSession.enableLsp !== false && settings.get("lsp.enabled") === true;
 		const built = await Promise.all(
-			[...ADVISOR_READONLY_TOOL_NAMES].map(name =>
-				BUILTIN_TOOLS[name as keyof typeof BUILTIN_TOOLS](advisorToolSession),
-			),
+			[...ADVISOR_READONLY_TOOL_NAMES]
+				// `lsp` is allowlisted but only loads when the primary's LSP integration
+				// is on; the rest are unconditional read-only tools.
+				.filter(name => name !== "lsp" || advisorLspEnabled)
+				.map(name => BUILTIN_TOOLS[name as keyof typeof BUILTIN_TOOLS](advisorToolSession)),
 		);
+		// Tier guard (defense-in-depth): reject any non-read-tier call before it
+		// runs, so a partly-writable allowlisted tool (e.g. `lsp` rename/apply)
+		// cannot mutate state from the passive advisor. Applied before the meta
+		// wrapper so the guard sees the original execute.
 		const advisorReadOnlyTools: Tool[] = built
 			.filter((tool): tool is Tool => tool != null)
-			.map(wrapToolWithMetaNotice);
+			.map(tool => wrapToolWithMetaNotice(wrapAdvisorReadOnlyTool(tool, resolveToolTier)));
 
 		let advisorWatchdogPrompt: string | undefined;
 		if (watchdogFiles && watchdogFiles.length > 0) {

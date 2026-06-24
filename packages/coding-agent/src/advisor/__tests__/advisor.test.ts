@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
-import type { AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
+import type { AgentMessage, AgentTelemetryConfig, AgentTool } from "@oh-my-pi/pi-agent-core";
 import { type } from "arktype";
 import { createAdvisorMessageCard } from "../../modes/components/advisor-message";
 import { getThemeByName } from "../../modes/theme/theme";
@@ -18,6 +18,7 @@ import {
 	isAdvisorInterruptImmuneTurnActive,
 	isInterruptingSeverity,
 	resolveAdvisorDeliveryChannel,
+	wrapAdvisorReadOnlyTool,
 } from "..";
 
 describe("advisor", () => {
@@ -964,12 +965,73 @@ describe("advisor", () => {
 
 	describe("read-only tool allowlist", () => {
 		it("selects only the investigation tools from a mixed toolset", () => {
-			const toolset = ["read", "edit", "search", "bash", "find", "write", "advise"];
+			const toolset = ["read", "edit", "search", "bash", "find", "write", "lsp", "advise"];
 			const selected = toolset.filter(name => ADVISOR_READONLY_TOOL_NAMES.has(name));
-			expect(selected).toEqual(["read", "search", "find"]);
+			expect(selected).toEqual(["read", "search", "find", "lsp"]);
 			expect(ADVISOR_READONLY_TOOL_NAMES.has("edit")).toBe(false);
 			expect(ADVISOR_READONLY_TOOL_NAMES.has("bash")).toBe(false);
 			expect(ADVISOR_READONLY_TOOL_NAMES.has("write")).toBe(false);
+			expect(ADVISOR_READONLY_TOOL_NAMES.has("checkpoint")).toBe(false);
+			expect(ADVISOR_READONLY_TOOL_NAMES.has("rewind")).toBe(false);
+		});
+	});
+
+	describe("wrapAdvisorReadOnlyTool tier guard", () => {
+		const makeTool = (approval: unknown): AgentTool => {
+			const execute = vi.fn(async () => ({
+				content: [{ type: "text" as const, text: "ran" }],
+			}));
+			return {
+				name: "lsp",
+				label: "LSP",
+				description: "",
+				parameters: type({ action: "string" }),
+				approval,
+				execute,
+			} as unknown as AgentTool;
+		};
+		const resolveTier = (tool: AgentTool, args: unknown): "read" | "write" | "exec" => {
+			const a = (tool as { approval?: unknown }).approval;
+			const decision = typeof a === "function" ? (a as (x: unknown) => unknown)(args) : a;
+			return decision === "read" || decision === "write" || decision === "exec"
+				? (decision as "read" | "write" | "exec")
+				: "exec";
+		};
+
+		it("runs read-tier actions", async () => {
+			const tool = makeTool((args: { action?: string }) => (args.action === "diagnostics" ? "read" : "write"));
+			const original = tool.execute;
+			wrapAdvisorReadOnlyTool(tool, resolveTier);
+			const res = await tool.execute("c1", { action: "diagnostics" });
+			expect(res.isError).toBeUndefined();
+			expect(original).toHaveBeenCalledTimes(1);
+		});
+
+		it("rejects write-tier actions before execute", async () => {
+			const tool = makeTool((args: { action?: string }) => (args.action === "diagnostics" ? "read" : "write"));
+			const original = tool.execute;
+			wrapAdvisorReadOnlyTool(tool, resolveTier);
+			const res = await tool.execute("c2", { action: "rename" });
+			expect(res.isError).toBe(true);
+			expect(original).not.toHaveBeenCalled();
+		});
+
+		it("rejects workspace diagnostics (file:'*') even though it is read-tier", async () => {
+			const tool = makeTool((args: { action?: string }) => (args.action === "diagnostics" ? "read" : "write"));
+			const original = tool.execute;
+			wrapAdvisorReadOnlyTool(tool, resolveTier);
+			const res = await tool.execute("c3", { action: "diagnostics", file: "*" });
+			expect(res.isError).toBe(true);
+			expect(original).not.toHaveBeenCalled();
+		});
+
+		it("allows single-file diagnostics", async () => {
+			const tool = makeTool((args: { action?: string }) => (args.action === "diagnostics" ? "read" : "write"));
+			const original = tool.execute;
+			wrapAdvisorReadOnlyTool(tool, resolveTier);
+			const res = await tool.execute("c4", { action: "diagnostics", file: "src/foo.ts" });
+			expect(res.isError).toBeUndefined();
+			expect(original).toHaveBeenCalledTimes(1);
 		});
 	});
 

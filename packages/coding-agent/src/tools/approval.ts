@@ -156,6 +156,15 @@ export function requiresApproval(
 	return { required: false };
 }
 
+/**
+ * Resolve the capability tier a tool call exercises, independent of approval
+ * policy. Used by isolation boundaries (e.g. the advisor read-only toolset) that
+ * must reject a call exceeding a tier regardless of the user's approval mode.
+ */
+export function resolveToolTier(tool: ApprovalSubject, args: unknown): ToolTier {
+	return getToolDecision(tool, args).tier;
+}
+
 export function truncateForPrompt(value: string, maxChars = DEFAULT_PROMPT_TRUNCATE_CHARS): string {
 	if (value.length <= maxChars) return value;
 	const omitted = value.length - maxChars;

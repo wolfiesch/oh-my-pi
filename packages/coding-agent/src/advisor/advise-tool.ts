@@ -133,11 +133,76 @@ export function deriveAdvisorTelemetry(
 }
 
 /**
- * Side-effect-free investigation tools handed to the advisor agent so it can
- * inspect the workspace before weighing in. Names match the primary session's
- * tool instances, which the advisor reuses.
+ * Investigation tools handed to the advisor agent so it can inspect the
+ * workspace before weighing in. Names match the primary session's tool
+ * instances, which the advisor reuses against a distinct `-advisor` ToolSession.
+ *
+ * Selection is an EXPLICIT allowlist, never derived from approval tier: some
+ * `read`-tier tools (e.g. `checkpoint`/`rewind`) still mutate git/session state
+ * and are not advisor-safe. `read`/`search`/`find` are wholly read-only; `lsp`
+ * is only PARTLY read-only, so {@link wrapAdvisorReadOnlyTool} rejects any of its
+ * write-tier actions (rename, code-action apply, reload, raw request) at call
+ * time. The wrapper is applied uniformly as defense-in-depth.
  */
-export const ADVISOR_READONLY_TOOL_NAMES: ReadonlySet<string> = new Set(["read", "search", "find"]);
+export const ADVISOR_READONLY_TOOL_NAMES: ReadonlySet<string> = new Set(["read", "search", "find", "lsp"]);
+
+/**
+ * Workspace-wide LSP diagnostics (`lsp` with `action:"diagnostics"`, `file:"*"`)
+ * shell out to the project's build/typecheck command (`cargo check`, `tsc`,
+ * `go build`, `pyright`). `LspTool` classifies that as `read` tier because it
+ * does not mutate LSP state, but for the PASSIVE advisor it means spawning a
+ * build the user never asked for (and that may run build scripts or write
+ * caches). Reject this specific shape regardless of tier; single-file
+ * diagnostics (a concrete `file` path) stay allowed.
+ */
+function isAdvisorBlockedLspCall(tool: AgentTool, args: unknown): boolean {
+	if (tool.name !== "lsp") return false;
+	if (typeof args !== "object" || args === null) return false;
+	const { action, file } = args as { action?: unknown; file?: unknown };
+	return action === "diagnostics" && file === "*";
+}
+
+/**
+ * Wrap an advisor investigation tool so any call whose resolved capability tier
+ * exceeds `read` is rejected before {@link AgentTool.execute} runs. The advisor
+ * is a passive reviewer: it must never mutate the workspace or session, even if
+ * an allowlisted tool (e.g. `lsp`) also exposes write-tier actions. A few
+ * read-tier shapes with external side effects (workspace diagnostics) are also
+ * rejected explicitly. Returns an error tool-result instead of throwing so the
+ * advisor model gets a clear, self-correcting signal rather than a failed turn.
+ */
+export function wrapAdvisorReadOnlyTool<T extends AgentTool>(
+	tool: T,
+	resolveTier: (tool: AgentTool, args: unknown) => "read" | "write" | "exec",
+): T {
+	const originalExecute = tool.execute.bind(tool);
+	tool.execute = async function (this: T, toolCallId, args, signal, onUpdate, context) {
+		if (isAdvisorBlockedLspCall(tool, args)) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `The advisor cannot run workspace diagnostics (it spawns the project build/typecheck command). Pass a concrete file to "${tool.name}" instead of "*".`,
+					},
+				],
+				isError: true,
+			} as AgentToolResult;
+		}
+		if (resolveTier(tool, args) !== "read") {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `The advisor toolset is read-only; the "${tool.name}" call was rejected because it is not a read-only action.`,
+					},
+				],
+				isError: true,
+			} as AgentToolResult;
+		}
+		return originalExecute(toolCallId, args, signal, onUpdate, context);
+	} as T["execute"];
+	return tool;
+}
 
 export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails> {
 	readonly name = "advise";

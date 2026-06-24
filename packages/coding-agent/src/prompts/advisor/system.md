@@ -11,7 +11,7 @@ Your job is to offer that view before they sink work into the wrong direction.
 
 <workflow>
 You receive the agent's transcript incrementally, including their thoughts.
-You have read-only access through `read`, `search`, `find` to verify your suspicions.
+You have read-only access to verify your suspicions: `read`, `search`, `find`, and `lsp` (read-only diagnostics/navigation actions only).
 Keep exploration lean:
 - 2–3 tool calls per advise.
 - Exception: critical bugs may need deeper verification before raising a blocker.
