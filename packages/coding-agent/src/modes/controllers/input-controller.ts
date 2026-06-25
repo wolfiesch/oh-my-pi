@@ -534,6 +534,7 @@ export class InputController {
 	setupEditorSubmitHandler(): void {
 		this.ctx.editor.onSubmit = async (text: string) => {
 			text = text.trim();
+			const hasPendingImages = this.ctx.editor.pendingImages.length > 0;
 			if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
 
 			// Focused subagent session: the editor is a plain chat box for it.
@@ -546,7 +547,7 @@ export class InputController {
 
 			// Empty submit while streaming with queued messages: abort the active
 			// turn and let the post-unwind drain deliver the agent-core queue.
-			if (!text && this.ctx.session.isStreaming) {
+			if (!text && !hasPendingImages && this.ctx.session.isStreaming) {
 				if (this.ctx.session.queuedMessageCount > 0) {
 					const aborting = this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL });
 					await aborting;
@@ -556,7 +557,7 @@ export class InputController {
 				return;
 			}
 
-			if (!text) return;
+			if (!text && !hasPendingImages) return;
 
 			// Continue shortcuts: "." or "c" resume the agent with a hidden agent-authored
 			// developer directive (no visible user message) instead of an empty turn, so the
@@ -579,6 +580,7 @@ export class InputController {
 			let inputImages = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
 			let inputImageLinks =
 				this.ctx.editor.pendingImageLinks.length > 0 ? [...this.ctx.editor.pendingImageLinks] : undefined;
+			let hasInputImages = (inputImages?.length ?? 0) > 0;
 
 			if (runner?.hasHandlers("input")) {
 				const result = await runner.emitInput(text, inputImages, "interactive");
@@ -596,24 +598,27 @@ export class InputController {
 						this.ctx.sessionManager.putBlob.bind(this.ctx.sessionManager),
 					);
 				}
+				hasInputImages = (inputImages?.length ?? 0) > 0;
 			}
 
-			if (!text) return;
+			if (!text && !hasInputImages) return;
 
 			// Handle built-in slash commands
-			const slashResult = await executeBuiltinSlashCommand(text, {
-				ctx: this.ctx,
-			});
-			if (slashResult === true) {
-				if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
-				return;
-			}
-			if (typeof slashResult === "string") {
-				// Command handled but returned remaining text to use as prompt.
-				// Record the original slash command text so Up Arrow recalls
-				// "/loop 10 fix bug" rather than just "fix bug".
-				if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
-				text = slashResult;
+			if (text) {
+				const slashResult = await executeBuiltinSlashCommand(text, {
+					ctx: this.ctx,
+				});
+				if (slashResult === true) {
+					if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
+					return;
+				}
+				if (typeof slashResult === "string") {
+					// Command handled but returned remaining text to use as prompt.
+					// Record the original slash command text so Up Arrow recalls
+					// "/loop 10 fix bug" rather than just "fix bug".
+					if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
+					text = slashResult;
+				}
 			}
 
 			// Collab guest: prompts execute on the host; local slash/skill/bash/
@@ -647,7 +652,7 @@ export class InputController {
 			// free-text Enter semantics applied a few lines below at the streaming
 			// branch). Ctrl+Enter routes through `handleFollowUp` and dispatches the
 			// same helper with `"followUp"`.
-			if (await this.#invokeSkillCommand(text, "steer")) {
+			if (text && (await this.#invokeSkillCommand(text, "steer"))) {
 				return;
 			}
 
@@ -714,11 +719,25 @@ export class InputController {
 				// (a user-role `message_start` event) leaves any draft the user has
 				// typed since queuing intact. Same protection as #783, applied to
 				// the streaming/queue path.
-				await this.ctx.withLocalSubmission(
-					text,
-					() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
-					{ imageCount: images?.length ?? 0 },
-				);
+				try {
+					await this.ctx.withLocalSubmission(
+						text,
+						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
+						{ imageCount: images?.length ?? 0 },
+					);
+				} catch (error) {
+					// Don't lose the queued steer draft: restore text and images so
+					// the user can retry after dispatch validation/queue failures.
+					this.ctx.editor.setText(text);
+					if (images && images.length > 0) {
+						this.ctx.editor.pendingImages = [...images];
+						this.ctx.editor.pendingImageLinks = inputImageLinks
+							? [...inputImageLinks]
+							: images.map(() => undefined);
+						this.ctx.editor.imageLinks = this.ctx.editor.pendingImageLinks;
+					}
+					this.ctx.showError(error instanceof Error ? error.message : String(error));
+				}
 				this.ctx.updatePendingMessagesDisplay();
 				this.ctx.ui.requestRender();
 				return;
@@ -833,7 +852,10 @@ export class InputController {
 	/** Submit editor text to the focused subagent session (chat-only focus policy). */
 	async #submitToFocusedSession(text: string, streamingBehavior: "steer" | "followUp"): Promise<void> {
 		const target = this.ctx.viewSession;
-		if (!text) {
+		const images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
+		const imageLinks =
+			images && this.ctx.editor.pendingImageLinks.length > 0 ? [...this.ctx.editor.pendingImageLinks] : undefined;
+		if (!text && !images) {
 			if (target.isStreaming && target.queuedMessageCount > 0) {
 				const aborting = target.abort({ reason: USER_INTERRUPT_LABEL });
 				await aborting;
@@ -842,11 +864,10 @@ export class InputController {
 			}
 			return;
 		}
-		if (text.startsWith("/") || text.startsWith("!") || parsePythonCommandInput(text)) {
+		if (text && (text.startsWith("/") || text.startsWith("!") || parsePythonCommandInput(text))) {
 			this.ctx.showStatus("Commands run in the main session — press ←← to return first");
 			return; // editor text not cleared: Editor does not auto-clear on submit
 		}
-		const images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
 		this.ctx.editor.clearDraft(text);
 		try {
 			// prompt() handles idle (new turn) and streaming (queues per streamingBehavior).
@@ -854,7 +875,14 @@ export class InputController {
 				imageCount: images?.length ?? 0,
 			});
 		} catch (error) {
-			this.ctx.editor.setText(text); // hand the message back, mirroring the main submit error path
+			// Hand the message back, mirroring the main submit error path: restore
+			// pasted images so the user can retry an image-only or text+image draft.
+			this.ctx.editor.setText(text);
+			if (images && images.length > 0) {
+				this.ctx.editor.pendingImages = [...images];
+				this.ctx.editor.pendingImageLinks = imageLinks ? [...imageLinks] : images.map(() => undefined);
+				this.ctx.editor.imageLinks = this.ctx.editor.pendingImageLinks;
+			}
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 		}
 		this.ctx.updatePendingMessagesDisplay();
@@ -902,19 +930,19 @@ export class InputController {
 	}
 
 	handleCtrlZ(): void {
-		// SIGTSTP is POSIX job-control: Windows has no equivalent and
-		// `process.kill(_, "SIGTSTP")` throws `TypeError: Unknown signal:
-		// SIGTSTP` there, taking the whole agent down via an uncaught
-		// exception (issue #2036). No-op on platforms that cannot suspend.
+		// Job-control suspend is POSIX-only: on Windows `process.kill(_, "SIGSTOP")`
+		// throws `TypeError: Unknown signal: SIGSTOP` and takes the whole agent down
+		// via an uncaught exception (issue #2036, originally for SIGTSTP — same
+		// shape for SIGSTOP). No-op on platforms that cannot suspend.
 		if (process.platform === "win32") {
 			this.ctx.showStatus("Suspend (Ctrl+Z) is not supported on this platform");
 			return;
 		}
 
-		// Capture the listener so we can detach it if the signal never
-		// fires; otherwise a failed suspend would leave a stale SIGCONT
-		// handler that fires on the next unrelated continue and tries to
-		// re-`start()` an already-running TUI.
+		// Capture the listener so we can detach it if the signal never fires;
+		// otherwise a failed suspend would leave a stale SIGCONT handler that
+		// fires on the next unrelated continue and tries to re-`start()` an
+		// already-running TUI.
 		const onResume = (): void => {
 			this.ctx.ui.start();
 			this.ctx.ui.requestRender(true);
@@ -926,14 +954,41 @@ export class InputController {
 		this.ctx.ui.stop();
 
 		try {
-			// pid=0 → entire foreground process group; the shell receives
-			// SIGTSTP and parks the job.
-			process.kill(0, "SIGTSTP");
+			// SIGSTOP — not SIGTSTP — to the foreground process group (pid=0).
+			//
+			// SIGTSTP: brush-core (the embedded shell behind every bash tool call)
+			// installs a tokio SIGTSTP listener on `Process::wait` to detect when
+			// its children have been stopped (`crates/brush-core-vendored/src/sys/
+			// unix/signal.rs::tstp_signal_listener` → `tokio::signal::unix::
+			// signal(SIGTSTP)`). Per tokio's documented contract, the first call
+			// for a given SignalKind permanently replaces the kernel-default
+			// handler for the lifetime of the process. So once the user has
+			// issued even one bash command — e.g. `/usr/bin/true` — SIGTSTP no
+			// longer stops omp: tokio swallows it and the TUI ends up torn down
+			// while the process keeps running with no live terminal (issue
+			// [#3461]). SIGSTOP cannot be caught, blocked, or ignored, so the
+			// kernel stops the process regardless of installed handlers.
+			//
+			// pid=0 (foreground process group, not just our PID): omp is not
+			// always the shell's direct child. Package-manager launchers (`npx`,
+			// `pnpm exec`, `bunx`, …) wait on the real CLI from a parent shim
+			// that shares omp's process group, and a `omp … | tee log` style
+			// pipeline puts a sibling foreground job member in the same group
+			// too. The shell sees the job as stopped only when its direct
+			// child / pipeline leader is stopped, so suspending only our PID
+			// leaves wrappers and pipeline peers running and the terminal
+			// hung — exactly the failure shape we're fixing. Stopping the whole
+			// group keeps the shell's job-control view consistent. Long-lived
+			// children that must survive the suspend (MCP stdio servers via
+			// the `detached: true` spawn in `mcp/transports/stdio.ts`, every
+			// brush external command via brush's per-child `setsid` in
+			// `crates/brush-core-vendored/src/commands.rs`) are already in
+			// their own sessions, so pgid=0 does not reach them.
+			process.kill(0, "SIGSTOP");
 		} catch (err) {
-			// Either the runtime refused the signal or the kernel rejected
-			// it (some sandboxes block sending to pid=0). Tear the resume
-			// hook down and bring the TUI back so the user is not stranded
-			// on a frozen prompt.
+			// The runtime refused the signal (e.g. seccomp filter blocks SIGSTOP
+			// delivery to the process group). Tear the resume hook down and
+			// bring the TUI back so the user is not stranded on a frozen prompt.
 			process.removeListener("SIGCONT", onResume);
 			this.ctx.ui.start();
 			this.ctx.ui.requestRender(true);
@@ -1024,7 +1079,10 @@ export class InputController {
 	/** Send editor text as a follow-up message (queued behind current stream). */
 	async handleFollowUp(): Promise<void> {
 		let text = this.ctx.editor.getText().trim();
-		if (!text) return;
+		const images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
+		const imageLinks =
+			images && this.ctx.editor.pendingImageLinks.length > 0 ? [...this.ctx.editor.pendingImageLinks] : undefined;
+		if (!text && !images) return;
 
 		// Focused subagent session: follow-ups go to it; non-chat input is gated.
 		if (this.ctx.focusedAgentId) {
@@ -1044,38 +1102,53 @@ export class InputController {
 			return;
 		}
 
-		const slashResult = await executeBuiltinSlashCommand(text, {
-			ctx: this.ctx,
-		});
-		if (slashResult === true) {
-			if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
-			return;
-		}
-		if (typeof slashResult === "string") {
-			// Command handled but returned remaining text to use as prompt.
-			// Record the original slash command text so Up Arrow recalls it.
-			if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
-			text = slashResult;
+		if (text) {
+			const slashResult = await executeBuiltinSlashCommand(text, {
+				ctx: this.ctx,
+			});
+			if (slashResult === true) {
+				if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
+				return;
+			}
+			if (typeof slashResult === "string") {
+				// Command handled but returned remaining text to use as prompt.
+				// Record the original slash command text so Up Arrow recalls it.
+				if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
+				text = slashResult;
+			}
 		}
 
 		// Skill commands invoke through the custom-message path regardless of
 		// which keybinding submitted them. Enter routes them as `steer`;
 		// Ctrl+Enter (this handler) routes them as `followUp`.
-		if (await this.#invokeSkillCommand(text, "followUp")) {
+		if (text && (await this.#invokeSkillCommand(text, "followUp"))) {
 			return;
 		}
 
-		// Forward any pending clipboard-pasted images alongside the queued text;
-		// otherwise the follow-up would drop the image (mirrors the Enter/steer path).
-		const images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
+		// Hand the message back on dispatch failure (model/API-key validation,
+		// queue rejection): restore both text AND pending images so an image-only
+		// or text+image draft can be retried, mirroring the main submit error path.
+		const restoreOnError = (error: unknown) => {
+			this.ctx.editor.setText(text);
+			if (images && images.length > 0) {
+				this.ctx.editor.pendingImages = [...images];
+				this.ctx.editor.pendingImageLinks = imageLinks ? [...imageLinks] : images.map(() => undefined);
+				this.ctx.editor.imageLinks = this.ctx.editor.pendingImageLinks;
+			}
+			this.ctx.showError(error instanceof Error ? error.message : String(error));
+		};
 
 		if (this.ctx.session.isStreaming) {
 			this.ctx.editor.clearDraft(text);
-			await this.ctx.withLocalSubmission(
-				text,
-				() => this.ctx.session.prompt(text, { streamingBehavior: "followUp", images }),
-				{ imageCount: images?.length ?? 0 },
-			);
+			try {
+				await this.ctx.withLocalSubmission(
+					text,
+					() => this.ctx.session.prompt(text, { streamingBehavior: "followUp", images }),
+					{ imageCount: images?.length ?? 0 },
+				);
+			} catch (error) {
+				restoreOnError(error);
+			}
 			this.ctx.updatePendingMessagesDisplay();
 			this.ctx.ui.requestRender();
 			return;
@@ -1083,9 +1156,13 @@ export class InputController {
 
 		// Not streaming — just submit normally
 		this.ctx.editor.clearDraft(text);
-		await this.ctx.withLocalSubmission(text, () => this.ctx.session.prompt(text, { images }), {
-			imageCount: images?.length ?? 0,
-		});
+		try {
+			await this.ctx.withLocalSubmission(text, () => this.ctx.session.prompt(text, { images }), {
+				imageCount: images?.length ?? 0,
+			});
+		} catch (error) {
+			restoreOnError(error);
+		}
 	}
 
 	restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {

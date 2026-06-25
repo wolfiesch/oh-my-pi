@@ -7,7 +7,7 @@
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentTelemetryConfig, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
-import type { Api, Model, Usage } from "@oh-my-pi/pi-ai";
+import type { Api, Model, ServiceTier, Usage } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Rule } from "../capability/rule";
 import { ModelRegistry } from "../config/model-registry";
@@ -18,6 +18,7 @@ import {
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
+import { resolveSubagentServiceTier } from "../config/service-tier";
 import { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
@@ -50,12 +51,12 @@ import {
 	type OutputValidator,
 	summarizeValidationFailure,
 } from "../tools/output-schema-validator";
-
 import { type ReportFindingDetails, toReviewFinding } from "../tools/review";
 import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
+import { Semaphore } from "./parallel";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import {
 	type AgentDefinition,
@@ -192,6 +193,51 @@ function installSubagentRetryFallbackChain(args: {
 	}
 	settings.override("retry.fallbackChains", fallbackChains);
 	return role;
+}
+
+const PROVIDER_MAX_CONCURRENCY_SETTINGS: Record<string, SettingPath> = {
+	"ollama-cloud": "providers.ollama-cloud.maxConcurrency",
+};
+
+interface ProviderSemaphoreEntry {
+	limit: number;
+	semaphore: Semaphore;
+}
+
+const providerSemaphores = new Map<string, ProviderSemaphoreEntry>();
+
+/**
+ * Resolve the configured concurrency ceiling for a provider, or `undefined`
+ * when the provider has no cap concept at all. A configured value `<= 0` means
+ * "unlimited" and maps to `Infinity` — still a tracked ceiling, so every run
+ * holds a slot and a later finite resize counts work started while unlimited.
+ */
+function getProviderConcurrencyLimit(settings: Settings, provider: string): number | undefined {
+	const settingPath = PROVIDER_MAX_CONCURRENCY_SETTINGS[provider];
+	if (!settingPath) return undefined;
+	const raw = settings.get(settingPath);
+	const limit = Number.isFinite(raw) ? Math.trunc(raw) : 0;
+	return limit > 0 ? limit : Number.POSITIVE_INFINITY;
+}
+
+function getProviderSemaphore(settings: Settings, provider: string): Semaphore | undefined {
+	const limit = getProviderConcurrencyLimit(settings, provider);
+	if (limit === undefined) return undefined;
+	// Always hand out (and acquire on) the single shared limiter, even when
+	// unlimited (Infinity). Resizing it in place — rather than replacing it —
+	// keeps every in-flight slot counted, so a runtime or mixed limit change can
+	// never push concurrency past the cap (issue #3464 review feedback).
+	const existing = providerSemaphores.get(provider);
+	if (existing) {
+		if (existing.limit !== limit) {
+			existing.limit = limit;
+			existing.semaphore.resize(limit);
+		}
+		return existing.semaphore;
+	}
+	const semaphore = new Semaphore(limit);
+	providerSemaphores.set(provider, { limit, semaphore });
+	return semaphore;
 }
 
 function renderIrcPeerRoster(selfId: string): string {
@@ -339,6 +385,13 @@ export interface ExecutorOptions {
 	authStorage?: AuthStorage;
 	modelRegistry?: ModelRegistry;
 	settings?: Settings;
+	/**
+	 * Parent session's live effective service tier, the source of truth for a
+	 * subagent whose `serviceTierSubagent` is `"inherit"`. `null` = the parent
+	 * explicitly has no tier (e.g. `/fast off`); omitted = no live session, so
+	 * inherit falls back to the configured `serviceTier` setting.
+	 */
+	parentServiceTier?: ServiceTier | null;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -732,11 +785,21 @@ export function createMCPProxyTools(mcpManager: MCPManager): CustomTool[] {
 export function createSubagentSettings(
 	baseSettings: Settings,
 	overrides?: Partial<Record<SettingPath, unknown>>,
+	inheritedServiceTier?: ServiceTier | null,
 ): Settings {
 	const snapshot: Partial<Record<SettingPath, unknown>> = {};
 	for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 		snapshot[key] = baseSettings.get(key);
 	}
+	// Resolve the subagent's service tier from `serviceTierSubagent` ("inherit" =
+	// match the parent's live tier when a live session supplied one, else the
+	// configured `serviceTier`). The result is stamped back onto the snapshot so
+	// createAgentSession's `settings.get("serviceTier")` read picks it up.
+	snapshot.serviceTier = resolveSubagentServiceTier(
+		baseSettings.get("serviceTierSubagent"),
+		baseSettings.get("serviceTier"),
+		inheritedServiceTier,
+	);
 	return Settings.isolated({
 		...snapshot,
 		"async.enabled": false,
@@ -1747,6 +1810,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const subagentSettings = createSubagentSettings(
 		settings,
 		agent.readSummarize === false ? { "read.summarize.enabled": false } : undefined,
+		options.parentServiceTier,
 	);
 	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
 	// Tailored specialist identity for this spawn. `subagentRole` is the full
@@ -1889,6 +1953,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		let sessionOpenedAt: number | undefined;
 		let sessionCreatedAt: number | undefined;
 		let readyAt: number | undefined;
+		let providerSemaphore: Semaphore | undefined;
+		let providerSemaphoreAcquired = false;
 
 		try {
 			checkAbort();
@@ -1957,6 +2023,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? resolvedThinkingLevel
 				: (thinkingLevel ?? resolvedThinkingLevel);
 			resolvedAt = performance.now();
+			if (model) {
+				providerSemaphore = getProviderSemaphore(settings, model.provider);
+				if (providerSemaphore) {
+					await providerSemaphore.acquire(abortSignal);
+					providerSemaphoreAcquired = true;
+				}
+			}
 
 			const effectiveCwd = worktree ?? cwd;
 			const sessionManager = sessionFile
@@ -2246,6 +2319,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					abortReasonText ??= monitor.resolveAbortReasonText();
 				}
 				if (exitCode === 0) exitCode = 1;
+			}
+			if (providerSemaphoreAcquired) {
+				providerSemaphore?.release();
+				providerSemaphoreAcquired = false;
 			}
 			sessionAbortController.abort();
 			if (unsubscribe) {
