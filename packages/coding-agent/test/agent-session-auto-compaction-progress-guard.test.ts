@@ -256,7 +256,6 @@ describe("AgentSession auto-compaction progress guard", () => {
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(1);
 	});
-
 	it("drains queued messages when no-headroom compaction pauses auto-continue", async () => {
 		session.agent.followUp({
 			role: "custom",
@@ -292,6 +291,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(1);
 	});
+
 	it("auto-continues (no warning) when compaction creates headroom", async () => {
 		// The auto-continue path runs #scheduleAutoContinuePrompt → #promptWithMessage
 		// → agent.prompt. Stub both prompt and continue so no real agent loop runs.
