@@ -11020,6 +11020,36 @@ export class AgentSession {
 	}
 
 	/**
+	 * Retry-side counterpart to {@link #compactionCreatedHeadroom}. An
+	 * overflow/incomplete recovery only needs the rebuilt prompt to *fit* the
+	 * window again — it does not have to land under the compaction threshold, let
+	 * alone the stricter `COMPACTION_RECOVERY_BAND × threshold` hysteresis the
+	 * auto-continue thrash guard uses. Reusing the band here turned recoverable
+	 * overflows into manual dead-ends: a 200k-window prompt compacted from
+	 * overflow down to ~150k is comfortably retryable, but sits above
+	 * `0.8 × 170k = 136k` and was wrongly refused (PR #3412 review).
+	 *
+	 * Measures residual context against the usable budget
+	 * (`contextWindow - effectiveReserveTokens`). Callers MUST invoke this AFTER
+	 * dropping the failed assistant from `this.messages`, so the just-failed turn
+	 * (which the retry prompt will not include) is excluded from the estimate.
+	 *
+	 * When the model/window is unknown we cannot evaluate the budget, so we
+	 * optimistically allow the retry (preserving prior behavior).
+	 */
+	#compactionCreatedRetryFit(): boolean {
+		const contextWindow = this.model?.contextWindow ?? 0;
+		if (contextWindow <= 0) return true;
+		const compactionSettings = this.settings.getGroup("compaction");
+		const residualTokens = compactionContextTokens(
+			this.getContextUsage({ contextWindow })?.tokens ?? 0,
+			this.#estimateStoredContextTokens(),
+		);
+		const fitBudget = contextWindow - effectiveReserveTokens(contextWindow, compactionSettings);
+		return residualTokens <= fitBudget;
+	}
+
+	/**
 	 * Internal: Run auto-compaction with events.
 	 *
 	 * @param allowDefer If true (default), threshold-driven handoff strategy is allowed to
