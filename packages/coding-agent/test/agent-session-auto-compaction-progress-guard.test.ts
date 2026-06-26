@@ -256,6 +256,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(1);
 	});
+
 	it("drains queued messages when no-headroom compaction pauses auto-continue", async () => {
 		session.agent.followUp({
 			role: "custom",
