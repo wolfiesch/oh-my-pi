@@ -61,6 +61,8 @@ export interface SettingsOptions {
 	agentDir?: string;
 	/** Don't persist to disk (for tests) */
 	inMemory?: boolean;
+	/** Read config sources without opening storage or writing migrations */
+	readOnly?: boolean;
 	/** Initial overrides */
 	overrides?: Partial<Record<SettingPath, unknown>>;
 	/** Extra config.yml-style overlays loaded after global/project settings */
@@ -136,11 +138,17 @@ function stringArrayFromUnknown(value: unknown): string[] {
 	return [];
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
 function shallowStringRecord(value: unknown): Record<string, string> {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	if (!isRecord(value)) return {};
 
 	const result: Record<string, string> = {};
-	for (const [key, item] of Object.entries(value)) {
+	for (const key in value) {
+		if (!Object.hasOwn(value, key)) continue;
+		const item = value[key];
 		if (typeof item === "string") {
 			result[key] = item;
 		}
@@ -228,7 +236,7 @@ export class Settings {
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
 		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, "config.yml");
 		this.#configFiles = options.configFiles?.map(file => path.resolve(this.#cwd, expandTilde(file))) ?? [];
-		this.#persist = !options.inMemory;
+		this.#persist = !options.inMemory && options.readOnly !== true;
 
 		if (options.overrides) {
 			for (const [key, value] of Object.entries(options.overrides)) {
@@ -268,6 +276,23 @@ export class Settings {
 				throw error;
 			},
 		);
+	}
+
+	/**
+	 * Load effective settings from config.yml and project providers without
+	 * opening agent.db, migrating legacy settings, or writing marker files.
+	 */
+	static loadReadOnly(options: SettingsOptions = {}): Promise<Settings> {
+		const instance = new Settings({ ...options, readOnly: true });
+		return instance.#loadReadOnly();
+	}
+
+	/**
+	 * Load a persisted settings instance without touching the global singleton.
+	 */
+	static loadIsolated(options: SettingsOptions = {}): Promise<Settings> {
+		const instance = new Settings(options);
+		return instance.#load();
 	}
 
 	/**
@@ -481,10 +506,10 @@ export class Settings {
 	 */
 	getEditVariantForModel(model: string | undefined): EditMode | null {
 		if (!model) return null;
-		const variants = (this.#merged.edit as { modelVariants?: Record<string, string> })?.modelVariants;
-		if (!variants) return null;
+		const variants = shallowStringRecord(getByPath(this.#merged, ["edit", "modelVariants"]));
+		const modelLower = model.toLowerCase();
 		for (const pattern in variants) {
-			if (model.includes(pattern)) {
+			if (modelLower.includes(pattern.toLowerCase())) {
 				const value = normalizeEditMode(variants[pattern]);
 				if (value) {
 					return value;
@@ -580,6 +605,19 @@ export class Settings {
 		// Build merged view (global → project → overrides; project wins over global)
 		this.#rebuildMerged();
 		this.#fireAllHooks();
+		return this;
+	}
+
+	async #loadReadOnly(): Promise<Settings> {
+		const projectPromise = this.#loadProjectSettings();
+
+		if (this.#configPath) {
+			this.#global = await this.#loadYaml(this.#configPath);
+		}
+
+		this.#project = await projectPromise;
+		this.#configOverlay = await this.#loadConfigOverlays();
+		this.#rebuildMerged();
 		return this;
 	}
 
