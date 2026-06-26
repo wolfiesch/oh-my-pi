@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { resolveThresholdTokens, shouldCompact } from "@oh-my-pi/pi-agent-core/compaction";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -143,6 +144,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 			timestamp: Date.now(),
 		};
 	}
+
 	/** Build a context-overflow assistant turn (input exceeds the 200k window). */
 	function overflowAssistant() {
 		return {
@@ -223,6 +225,23 @@ describe("AgentSession auto-compaction progress guard", () => {
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(1);
 		expect(noProgress[0].level).toBe("warning");
+	});
+
+	it("clamps default reserve for small-window threshold recovery bands", () => {
+		const settings = {
+			enabled: true,
+			strategy: "context-full" as const,
+			thresholdTokens: -1,
+			thresholdPercent: -1,
+			reserveTokens: 16384,
+			keepRecentTokens: 10000,
+			autoContinue: true,
+		};
+		const threshold = resolveThresholdTokens(4096, settings);
+
+		expect(threshold).toBe(3482);
+		expect(Math.floor(threshold * 0.8)).toBe(2785);
+		expect(shouldCompact(3600, 4096, settings)).toBe(true);
 	});
 
 	it("blocks todo continuations after no-headroom compaction when auto-continue is disabled", async () => {

@@ -260,10 +260,15 @@ export function resolveThresholdTokens(contextWindow: number, settings: Compacti
 		return Math.min(contextWindow - 1, Math.max(1, thresholdTokens));
 	}
 
-	// Percentage-based threshold
+	// Percentage-based threshold. The default absolute reserve can exceed bundled
+	// small-context windows; in that impossible configuration, fall back to the
+	// proportional default reserve so threshold/recovery-band checks stay usable.
 	const thresholdPercent = settings.thresholdPercent;
 	if (typeof thresholdPercent !== "number" || !Number.isFinite(thresholdPercent) || thresholdPercent <= 0) {
-		return contextWindow - effectiveReserveTokens(contextWindow, settings);
+		const reserveTokens = effectiveReserveTokens(contextWindow, settings);
+		const defaultReserveTokens = Math.floor(contextWindow * 0.15);
+		const thresholdReserveTokens = reserveTokens >= contextWindow ? defaultReserveTokens : reserveTokens;
+		return Math.max(0, contextWindow - thresholdReserveTokens);
 	}
 	const clampedThresholdPercent = Math.min(99, Math.max(1, thresholdPercent));
 	return Math.floor(contextWindow * (clampedThresholdPercent / 100));
