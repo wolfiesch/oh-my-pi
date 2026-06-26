@@ -486,12 +486,11 @@ mod tests {
 		assert_eq!(rc, 0);
 		assert_eq!(
 			deps.get_output_as_string(),
-			fix_up_slashes(concat!(
-				"./test_data/simple/abbbc\n",
-				"./test_data/simple/subdir/ABBBC\n",
-				"./test_data/simple/subdir\n",
-				"./test_data/simple\n",
-			))
+			fix_up_slashes(
+				"./test_data/simple/abbbc\n./test_data/simple/subdir/ABBBC\n./test_data/simple/subdir\\
+				 \
+				 n./test_data/simple\n"
+			)
 		);
 	}
 
@@ -1269,17 +1268,13 @@ mod tests {
 		assert_eq!(rc, 1);
 		assert_eq!(
 			deps.get_output_as_string(),
-			fix_up_slashes(concat!(
-				"./test_data/links\n",
-				"./test_data/links/abbbc\n",
-				"./test_data/links/link-d\n",
-				"./test_data/links/link-d/test\n",
-				"./test_data/links/link-f\n",
-				"./test_data/links/link-missing\n",
-				"./test_data/links/link-notdir\n",
-				"./test_data/links/subdir\n",
-				"./test_data/links/subdir/test\n",
-			))
+			fix_up_slashes(
+				"./test_data/links\n./test_data/links/abbbc\n./test_data/links/link-d\n./test_data/\
+				 links/link-d/test\n./test_data/links/link-f\n./test_data/links/link-missing\n./\
+				 test_data/links/link-notdir\n./test_data/links/subdir\n./test_data/links/subdir/test\\
+				 \
+				 n"
+			)
 		);
 	}
 
