@@ -383,6 +383,7 @@ const RETRY_BACKOFF_MAX_DELAY_MS = 8_000;
 type CompactionCheckResult = Readonly<{
 	deferredHandoff: boolean;
 	continuationScheduled: boolean;
+	automaticContinuationBlocked?: boolean;
 }>;
 
 const COMPACTION_CHECK_NONE: CompactionCheckResult = {
@@ -396,6 +397,11 @@ const COMPACTION_CHECK_DEFERRED_HANDOFF: CompactionCheckResult = {
 const COMPACTION_CHECK_CONTINUATION: CompactionCheckResult = {
 	deferredHandoff: false,
 	continuationScheduled: true,
+};
+const COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION: CompactionCheckResult = {
+	deferredHandoff: false,
+	continuationScheduled: false,
+	automaticContinuationBlocked: true,
 };
 
 /**
@@ -3098,10 +3104,15 @@ export class AgentSession {
 				this.#trackPostPromptTask(compactionTask);
 				compactionResult = await compactionTask;
 				checkedCompaction = true;
-				if (compactionResult.deferredHandoff || compactionResult.continuationScheduled) {
-					maintenanceRoute("active-goal-pre-empt-continuation-scheduled", {
+				if (
+					compactionResult.deferredHandoff ||
+					compactionResult.continuationScheduled ||
+					compactionResult.automaticContinuationBlocked
+				) {
+					maintenanceRoute("active-goal-pre-empt-compaction-handled", {
 						deferredHandoff: compactionResult.deferredHandoff,
 						continuationScheduled: compactionResult.continuationScheduled,
+						automaticContinuationBlocked: compactionResult.automaticContinuationBlocked === true,
 					});
 					this.#resolveRetry();
 					await emitAgentEndNotification();
@@ -3162,11 +3173,15 @@ export class AgentSession {
 				await emitAgentEndNotification();
 				return;
 			}
-			// When compaction queued recovery, skip the rewind/todo/session_stop passes:
-			// any reminder or hook continuation we append here would race the handoff,
-			// retry, auto-continue prompt, or queued-message drain that already owns the
-			// next turn.
-			if (compactionResult.deferredHandoff || compactionResult.continuationScheduled) {
+			// When compaction queued recovery or hit a deliberate dead-end, skip the
+			// rewind/todo/session_stop passes: any reminder or hook continuation we append
+			// here would race the handoff, retry, auto-continue prompt, queued-message
+			// drain, or the explicit pause that is preventing a compaction loop.
+			if (
+				compactionResult.deferredHandoff ||
+				compactionResult.continuationScheduled ||
+				compactionResult.automaticContinuationBlocked
+			) {
 				await emitAgentEndNotification();
 				return;
 			}
@@ -10137,10 +10152,13 @@ export class AgentSession {
 	 * overflow down to ~150k is comfortably retryable, but sits above
 	 * `0.8 × 170k = 136k` and was wrongly refused (PR #3412 review).
 	 *
-	 * Measures residual context against the usable budget
-	 * (`contextWindow - effectiveReserveTokens`). Callers MUST invoke this AFTER
-	 * dropping the failed assistant from `this.messages`, so the just-failed turn
-	 * (which the retry prompt will not include) is excluded from the estimate.
+	 * Measures residual context against the usable budget (`contextWindow - reserve`).
+	 * The default absolute reserve can exceed bundled small-context windows, so
+	 * the retry path clamps that reserve back to the proportional 15% default
+	 * before comparing; otherwise a prompt that fits the model window would still
+	 * see a negative budget and dead-end. Callers MUST invoke this AFTER dropping
+	 * the failed assistant from `this.messages`, so the just-failed turn (which
+	 * the retry prompt will not include) is excluded from the estimate.
 	 *
 	 * When the model/window is unknown we cannot evaluate the budget, so we
 	 * optimistically allow the retry (preserving prior behavior).
@@ -10153,7 +10171,10 @@ export class AgentSession {
 			this.getContextUsage({ contextWindow })?.tokens ?? 0,
 			this.#estimateStoredContextTokens(),
 		);
-		const fitBudget = contextWindow - effectiveReserveTokens(contextWindow, compactionSettings);
+		const reserveTokens = effectiveReserveTokens(contextWindow, compactionSettings);
+		const defaultReserveTokens = Math.floor(contextWindow * 0.15);
+		const fitReserveTokens = Math.min(reserveTokens, defaultReserveTokens);
+		const fitBudget = Math.max(0, contextWindow - fitReserveTokens);
 		return residualTokens <= fitBudget;
 	}
 
@@ -10692,14 +10713,19 @@ export class AgentSession {
 				} else {
 					noProgressDeadEnd = true;
 				}
-			} else if (reason !== "idle" && shouldAutoContinue) {
+			} else if (reason !== "idle") {
 				// Mirror the shake recovery-band check: only auto-continue when compaction
 				// landed residual context under `COMPACTION_RECOVERY_BAND × threshold`.
 				// Re-firing on a history that still sits just over the line is the
-				// snapcompact thrash, so require genuine headroom, not a bare fit.
+				// snapcompact thrash, so require genuine headroom, not a bare fit. Even
+				// when auto-continue is disabled, a no-headroom threshold pass must still
+				// block later automatic continuations (todo reminders/session_stop hooks)
+				// from re-entering the same oversized context.
 				if (this.#compactionCreatedHeadroom()) {
-					this.#scheduleAutoContinuePrompt(generation);
-					continuationScheduled = true;
+					if (shouldAutoContinue) {
+						this.#scheduleAutoContinuePrompt(generation);
+						continuationScheduled = true;
+					}
 				} else {
 					noProgressDeadEnd = true;
 				}
@@ -10723,7 +10749,8 @@ export class AgentSession {
 					"compaction",
 				);
 			}
-			return continuationScheduled ? COMPACTION_CHECK_CONTINUATION : COMPACTION_CHECK_NONE;
+			if (continuationScheduled) return COMPACTION_CHECK_CONTINUATION;
+			return noProgressDeadEnd ? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION : COMPACTION_CHECK_NONE;
 		} catch (error) {
 			if (autoCompactionSignal.aborted) {
 				await this.#emitSessionEvent({
