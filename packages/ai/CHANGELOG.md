@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added branded wordmark and logo animation to authentication flow
+
+### Changed
+
+- Redesigned the OAuth callback page (`oauth.html`) to match the oh-my-pi web brand language: OKLCH purple-tinted dark neutrals, magenta→iris→cyan brand gradient on the wordmark, frosted-glass card over an ascii grid backdrop, and a colored status halo around the success/error icon. All assets are inlined; the `__OAUTH_STATE__` injection contract and success/error JS logic are unchanged.
+
+### Fixed
+
+- Fixed local llama.cpp (and any local OpenAI-compatible server rendering the Qwen3.6+ chat template) re-processing the full prompt every new user message even with `replayReasoningContent` enabled (#3541 follow-up to #3528). Sending `reasoning_content` alone wasn't enough: Qwen3's chat template strips `<think>...</think>` from any assistant turn whose index is `<= last_query_index`, so the moment a new user message (the user's next prompt, or the auto-learn capture-at-stop nudge) lands, every prior assistant turn becomes "older" and is re-rendered without the `<think>` block — diverging from the generation tokens still in the slot's KV cache. The chat-completions encoder now emits `preserve_thinking: true` for Qwen thinking dialects on local servers, route-split the same way the existing `enable_thinking` emission is: the `qwen` dialect rides the top-level field (llama.cpp's `--jinja` hook and Alibaba Cloud Model Studio's compatible-mode), the `qwen-chat-template` dialect (NVIDIA NIM, vLLM/SGLang's chat-template-kwargs path) rides only `chat_template_kwargs.preserve_thinking` because NIM's request schema is `additionalProperties: false` and rejects unknown top-level fields (#2299). The emission is hoisted above the `reasoning.enabled` gate so it fires for THREE cases the original gating missed: (1) runtime-discovered local Qwen models that ship with `reasoning: false` because the upstream `/v1/models` doesn't advertise the capability (same gotcha #3532 fixed for `replayReasoningContent`), (2) caller-disabled reasoning (`/think off`) — the kwarg is a history-rendering knob, not a per-turn thinking switch, and the slot still holds `<think>` tokens from earlier turns, and (3) forced-tool-choice / DeepSeek-style auto-disable. Qwen3.6+ then renders `<think>...</think>` for every assistant turn regardless of position, and the next-turn render matches the cached generation tokens. ([#3541](https://github.com/can1357/oh-my-pi/issues/3541))
+
+## [16.1.22] - 2026-06-26
+
+### Fixed
+
+- Fixed llama.cpp / LM Studio / vLLM (and any local OpenAI-compatible server on a loopback or RFC1918 baseUrl) re-processing the full prompt on every assistant continuation when the prior turn produced `reasoning_content`: the `openai-completions` encoder dropped the preserved `thinking` block on re-serialization for compat profiles without `requiresReasoningContentForToolCalls` / `thinkingFormat: "zai"`, so the chat template re-rendered the assistant turn without `<think>…</think>` and the rendered tokens diverged from the slot's KV cache state. The auto-learn capture-at-stop nudge made it reproduce on every turn. The encoder now replays preserved thinking as `reasoning_content` (honoring the streamed signature when it identifies a recognized wire field — `reasoning_content` / `reasoning` / `reasoning_text` — and falling back to the configured `reasoningContentField` for opaque signatures) whenever the new `compat.replayReasoningContent` flag is set, and the cross-API `transformMessages` predicate (`openAICompletionsReplaysUnsignedThinking`) honors the same flag ahead of the `model.reasoning` gate so a switch into a discovered local target (where the spec carries `reasoning: false` because the upstream `/models` endpoints don't advertise the capability) still preserves the prior turn's thinking block as signature-stripped reasoning instead of demoting it to conversation text. The chat-template-rendered prefix stays byte-stable across turns and llama.cpp's prefix KV cache survives. ([#3528](https://github.com/can1357/oh-my-pi/issues/3528))
+
+## [16.1.21] - 2026-06-26
+
+### Fixed
+
+- Restored the `pollOAuthDeviceCodeFlow` export from `@oh-my-pi/pi-ai/oauth` so legacy provider extensions can reuse the host OAuth device-code poller. ([#3508](https://github.com/can1357/oh-my-pi/issues/3508))
+
 ## [16.1.20] - 2026-06-25
 
 ### Fixed

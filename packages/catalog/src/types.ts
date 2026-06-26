@@ -222,6 +222,42 @@ export interface OpenAICompat {
 	requiresReasoningContentForAllAssistantTurns?: boolean;
 	/** Whether the provider accepts a synthetic placeholder (e.g. ".") for missing reasoning_content on tool-call turns. Default: true. Set to false for providers like DeepSeek that validate the exact reasoning_content value. */
 	allowsSyntheticReasoningContentForToolCalls?: boolean;
+	/**
+	 * Replay preserved thinking blocks as `reasoning_content` (or the configured
+	 * `reasoningContentField`) on EVERY assistant turn that carried reasoning,
+	 * regardless of whether the upstream provider validates the field. Local
+	 * llama.cpp-style servers (llama.cpp, LM Studio, vLLM, sglang, Ollama in
+	 * openai-completions mode) re-tokenize the full chat-template prompt every
+	 * request; Qwen3 / DeepSeek-R1 / GLM templates reconstruct the `<think>`
+	 * block from `reasoning_content`. Dropping the field re-renders the
+	 * assistant turn without `<think>`, diverging from the slot's KV cache state
+	 * and forcing full prompt re-processing (#3528). Default: auto-detected
+	 * (loopback/private baseUrl or local provider id with thinking-enabled
+	 * models).
+	 */
+	replayReasoningContent?: boolean;
+	/**
+	 * Send `preserve_thinking: true` so the Qwen3.6+ chat template renders
+	 * `<think>...</think>` markup for EVERY assistant turn (not just turns
+	 * after the last user message). Without it, the template strips the think
+	 * block from older assistant turns:
+	 *
+	 * ```jinja
+	 * {%- if (preserve_thinking is defined and preserve_thinking is true)
+	 *        or (loop.index0 > ns.last_query_index) %}
+	 *   <|im_start|>assistant\n<think>\n{rc}\n</think>\n\n{content}
+	 * {%- else %}
+	 *   <|im_start|>assistant\n{content}
+	 * ```
+	 *
+	 * The cache from the original generation has `<think>...</think>` tokens,
+	 * so once a new user message arrives the prior assistant turns become
+	 * "older" and the stripped re-render diverges — full prompt re-processing
+	 * on SWA models (#3541). Default: auto-detected (Qwen thinking format on
+	 * a local llama.cpp-style backend, paired with `replayReasoningContent`).
+	 * Non-Qwen templates ignore the flag, so the auto-detection is safe.
+	 */
+	qwenPreserveThinking?: boolean;
 	/** Whether assistant tool-call messages must include non-empty content. Default: false. */
 	requiresAssistantContentForToolCalls?: boolean;
 	/** Whether the provider supports the `tool_choice` parameter. Default: true. */
@@ -433,6 +469,8 @@ export interface ResolvedOpenAISharedCompat {
 	requiresReasoningContentForToolCalls: boolean;
 	requiresReasoningContentForAllAssistantTurns: boolean;
 	allowsSyntheticReasoningContentForToolCalls: boolean;
+	replayReasoningContent: boolean;
+	qwenPreserveThinking: boolean;
 	requiresThinkingAsText: boolean;
 	requiresMistralToolIds: boolean;
 	requiresToolResultName: boolean;
@@ -482,6 +520,8 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "requiresReasoningContentForToolCalls"
 			| "requiresReasoningContentForAllAssistantTurns"
 			| "allowsSyntheticReasoningContentForToolCalls"
+			| "replayReasoningContent"
+			| "qwenPreserveThinking"
 			| "requiresThinkingAsText"
 			| "requiresMistralToolIds"
 			| "requiresToolResultName"

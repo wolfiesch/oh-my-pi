@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `OpenAICompat.qwenPreserveThinking` — auto-enabled when the resolved `thinkingFormat` is `"qwen"` or `"qwen-chat-template"` AND `replayReasoningContent` is on (i.e. the four built-in local OpenAI-compatible providers, or a custom provider pointed at a loopback / RFC1918 / `*.local` baseUrl). Pairs with the chat-completions encoder change so the request body carries `preserve_thinking: true` (twin top-level + `chat_template_kwargs` emission), keeping Qwen3.6+ from stripping `<think>...</think>` off older assistant turns and breaking the local slot's KV cache between user messages. Non-Qwen chat templates ignore the parameter, so the flag stays a no-op outside the Qwen path; users on a cloud Qwen host (Alibaba Dashscope / Qwen Portal) can opt in with `compat.qwenPreserveThinking: true`. ([#3541](https://github.com/can1357/oh-my-pi/issues/3541))
+
+## [16.1.22] - 2026-06-26
+
+### Added
+
+- Added `OpenAICompat.replayReasoningContent` — auto-enabled for the built-in local OpenAI-compatible providers (`llama.cpp`, `lm-studio`, `vllm`, `ollama` on `openai-completions`) and for any provider pointed at a loopback / RFC1918 / `*.local` baseUrl. NOT gated on `spec.reasoning`: the runtime discovery paths for `llama.cpp` / `lm-studio` / `openai-models-list` hardcode `reasoning: false` because the upstream `/models` endpoints don't advertise the capability, while the stream parser still records incoming `reasoning_content` deltas as thinking blocks — gating on the spec flag would leave every discovered local Qwen / DeepSeek model re-triggering #3528. The encoder only writes `reasoning_content` when a thinking block actually exists on the turn, so the flag is a no-op on pure-text histories. Built-in proxy providers (currently `litellm`) are excluded from both checks because they forward to an unrelated upstream that gains no KV-cache benefit and may 400 on the extra field; users running a custom proxy in front of a llama.cpp-style backend can opt in via the sparse `compat.replayReasoningContent: true` override. Signals to the `openai-completions` encoder that preserved `thinking` blocks must be re-emitted as `reasoning_content` on every assistant turn so chat templates that reconstruct `<think>…</think>` from the field (Qwen3, DeepSeek-R1, GLM-5.x) keep the prior turn's tokens byte-stable and llama.cpp's prefix KV cache survives. ([#3528](https://github.com/can1357/oh-my-pi/issues/3528))
+
 ## [16.1.20] - 2026-06-25
 
 ### Fixed
