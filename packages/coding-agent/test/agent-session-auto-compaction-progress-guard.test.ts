@@ -531,7 +531,6 @@ describe("AgentSession auto-compaction progress guard", () => {
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(0);
 	});
-
 	/**
 	 * Seed a single large `useless` tool result (plus tiny follow-up turns that
 	 * keep its suffix inside the cache-warm window) so the per-turn maintenance
@@ -661,6 +660,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(0);
 	});
+
 	it("pauses (single warning) when an overflow recovery still does not fit the window", async () => {
 		// The genuine dead-end the retry guard must still catch: even after dropping
 		// the failed turn the rebuilt prompt is over the window, so retrying would
