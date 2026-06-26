@@ -11099,7 +11099,10 @@ export class AgentSession {
 			this.getContextUsage({ contextWindow })?.tokens ?? 0,
 			this.#estimateStoredContextTokens(),
 		);
-		const fitBudget = contextWindow - effectiveReserveTokens(contextWindow, compactionSettings);
+		const reserveTokens = effectiveReserveTokens(contextWindow, compactionSettings);
+		const defaultReserveTokens = Math.floor(contextWindow * 0.15);
+		const fitReserveTokens = Math.min(reserveTokens, defaultReserveTokens);
+		const fitBudget = Math.max(0, contextWindow - fitReserveTokens);
 		return residualTokens <= fitBudget;
 	}
 

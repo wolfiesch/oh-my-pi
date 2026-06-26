@@ -477,7 +477,6 @@ describe("AgentSession auto-compaction progress guard", () => {
 			}),
 		);
 	});
-
 	it("retries a small-window overflow when the default reserve exceeds the model window", async () => {
 		// Bundled 4k/8k models can be smaller than the default absolute reserve
 		// (16,384). Retry fit must clamp that reserve; otherwise the budget goes
@@ -531,6 +530,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(0);
 	});
+
 	/**
 	 * Seed a single large `useless` tool result (plus tiny follow-up turns that
 	 * keep its suffix inside the cache-warm window) so the per-turn maintenance
