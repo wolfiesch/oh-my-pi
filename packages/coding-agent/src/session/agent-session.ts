@@ -10153,12 +10153,13 @@ export class AgentSession {
 	 * `0.8 × 170k = 136k` and was wrongly refused (PR #3412 review).
 	 *
 	 * Measures residual context against the usable budget (`contextWindow - reserve`).
-	 * The default absolute reserve can exceed bundled small-context windows, so
-	 * the retry path clamps that reserve back to the proportional 15% default
-	 * before comparing; otherwise a prompt that fits the model window would still
-	 * see a negative budget and dead-end. Callers MUST invoke this AFTER dropping
-	 * the failed assistant from `this.messages`, so the just-failed turn (which
-	 * the retry prompt will not include) is excluded from the estimate.
+	 * The default absolute reserve can exceed bundled small-context windows; only
+	 * that impossible configuration falls back to the proportional 15% reserve.
+	 * Otherwise respect the configured reserve so retries do not re-enter an
+	 * overflow the user intentionally reserved headroom to avoid. Callers MUST
+	 * invoke this AFTER dropping the failed assistant from `this.messages`, so
+	 * the just-failed turn (which the retry prompt will not include) is excluded
+	 * from the estimate.
 	 *
 	 * When the model/window is unknown we cannot evaluate the budget, so we
 	 * optimistically allow the retry (preserving prior behavior).
@@ -10173,7 +10174,7 @@ export class AgentSession {
 		);
 		const reserveTokens = effectiveReserveTokens(contextWindow, compactionSettings);
 		const defaultReserveTokens = Math.floor(contextWindow * 0.15);
-		const fitReserveTokens = Math.min(reserveTokens, defaultReserveTokens);
+		const fitReserveTokens = reserveTokens >= contextWindow ? defaultReserveTokens : reserveTokens;
 		const fitBudget = Math.max(0, contextWindow - fitReserveTokens);
 		return residualTokens <= fitBudget;
 	}

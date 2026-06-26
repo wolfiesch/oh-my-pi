@@ -436,6 +436,38 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(noProgress.length).toBe(0);
 	});
 
+	it("pauses an overflow retry when it only fits after ignoring a configured reserve", async () => {
+		// Retry fit may clamp an impossible reserve that exceeds the model window,
+		// but must respect a valid user reserve above the 15% default. Otherwise a
+		// prompt in the reserved headroom band can retry straight into overflow.
+		seedPriorTurns();
+		const currentModel = session.agent.state.model;
+		session.agent.setModel({ ...currentModel, contextWindow: 20000, maxTokens: 1024 });
+		session.settings.set("contextPromotion.enabled", false);
+		session.settings.set("compaction.reserveTokens", 5000);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 16000, contextWindow: 20000, percent: 80 });
+
+		const notices = collectNotices();
+
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") onCompactionDone();
+		});
+
+		const assistantMsg = overflowAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await compactionDone;
+		await session.waitForIdle();
+
+		expect(continueSpy).not.toHaveBeenCalled();
+		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
+		expect(noProgress.length).toBe(1);
+	});
+
 	/**
 	 * Seed a single large `useless` tool result (plus tiny follow-up turns that
 	 * keep its suffix inside the cache-warm window) so the per-turn maintenance
