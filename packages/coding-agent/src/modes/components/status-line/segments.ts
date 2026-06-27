@@ -21,7 +21,7 @@ function withIcon(icon: string, text: string): string {
 }
 
 function stripDisplayRoot(pwd: string): string {
-	for (const root of ["/work", path.join(os.homedir(), "Projects")]) {
+	for (const root of [path.join(os.homedir(), "Projects"), "/work"]) {
 		const relative = relativePathWithinRoot(root, pwd);
 		if (relative) return relative;
 	}
@@ -202,7 +202,7 @@ const pathSegment: StatusLineSegment = {
 	render(ctx) {
 		const opts = ctx.options.path ?? {};
 
-		const projectDir = getProjectDir();
+		const projectDir = ctx.activeRepo?.cwd ?? getProjectDir();
 		const { scratch, relative } = classifyProjectDir(projectDir);
 		let pwd = projectDir;
 
@@ -213,6 +213,7 @@ const pathSegment: StatusLineSegment = {
 				pwd = stripDisplayRoot(pwd);
 			}
 		}
+		const repoSuffix = ctx.activeRepo ? ` ↳ ${ctx.activeRepo.relativeRepoRoot}` : "";
 		if (opts.abbreviate !== false) {
 			pwd = shortenPath(pwd);
 		}
@@ -222,6 +223,9 @@ const pathSegment: StatusLineSegment = {
 			const ellipsis = "…";
 			const sliceLen = Math.max(0, maxLen - ellipsis.length);
 			pwd = `${ellipsis}${pwd.slice(-sliceLen)}`;
+		}
+		if (repoSuffix) {
+			pwd = `${pwd}${repoSuffix}`;
 		}
 
 		const showScratchIcon = scratch && opts.stripWorkPrefix !== false;

@@ -421,6 +421,12 @@ export interface ExecutorOptions {
 	 * passes its own `getAgentId()`).
 	 */
 	parentAgentId?: string;
+	/**
+	 * Keep the finished subagent addressable in the registry for IRC/revival.
+	 * Defaults to true. Eval bridge agents are programmatic one-shot helpers and
+	 * set this false so disposal unregisters them instead of leaving idle peers.
+	 */
+	keepAlive?: boolean;
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -854,6 +860,8 @@ interface SubagentRunMonitor {
 	/** Whether the (attempted) abort counts as a cancelled run rather than an internal failure. */
 	isAbortedRun(): boolean;
 	requestAbort(reason: AbortReason): void;
+	abortActiveSession(): Promise<void>;
+	waitForActiveSessionAbort(): Promise<void>;
 	resolveSignalAbortReason(): string;
 	resolveAbortReasonText(): string;
 	setActiveSession(session: AgentSession | null): void;
@@ -923,6 +931,22 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let budgetSteerSent = false;
 	let budgetLimitExceeded = false;
 	let lastAssistantSalvageText: string | undefined;
+	let activeSessionAbortPromise: Promise<void> | undefined;
+
+	const abortActiveSession = (): Promise<void> => {
+		const session = activeSession;
+		if (!session) return Promise.resolve();
+		activeSessionAbortPromise ??= session.abort().catch(error => {
+			logger.debug("Subagent session abort cleanup failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+		return activeSessionAbortPromise;
+	};
+
+	const waitForActiveSessionAbort = async (): Promise<void> => {
+		if (activeSessionAbortPromise) await activeSessionAbortPromise;
+	};
 
 	const requestAbort = (reason: AbortReason) => {
 		if (reason === "timeout") {
@@ -941,9 +965,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		abortSent = true;
 		abortReason = reason;
 		abortController.abort();
-		if (activeSession) {
-			void activeSession.abort();
-		}
+		void abortActiveSession();
 	};
 
 	// Handle abort signal
@@ -1423,6 +1445,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		isAbortedRun: () =>
 			abortReason === "signal" || runtimeLimitExceeded || budgetLimitExceeded || abortReason === undefined,
 		requestAbort,
+		abortActiveSession,
+		waitForActiveSessionAbort,
 		resolveSignalAbortReason,
 		resolveAbortReasonText,
 		setActiveSession: session => {
@@ -1750,6 +1774,59 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		retryFailure: progress.retryFailure,
 		outputMeta,
 	};
+}
+
+export async function finalizeSubagentLifecycle(args: {
+	id: string;
+	session: AgentSession;
+	aborted: boolean;
+	keepAlive: boolean;
+	isolated: boolean;
+	agentIdleTtlMs: number;
+	reviveSession: (() => Promise<AgentSession>) | null;
+}): Promise<void> {
+	const registry = AgentRegistry.global();
+	const disposeSession = async (): Promise<void> => {
+		try {
+			await untilAborted(AbortSignal.timeout(5000), () => args.session.dispose());
+		} catch {
+			// Ignore cleanup errors
+		}
+	};
+
+	if (args.aborted) {
+		// Hard abort (caller signal / wall-clock / budget): terminal teardown.
+		registry.setStatus(args.id, "aborted");
+		await disposeSession();
+		return;
+	}
+
+	if (!args.keepAlive) {
+		// One-shot helper: dispose and unregister. No IRC, no revival.
+		await disposeSession();
+		registry.unregister(args.id);
+		return;
+	}
+
+	if (args.isolated) {
+		// Isolated run: the worktree is merged + cleaned after the run, so
+		// the session is not resumable. Park the ref WITHOUT adopting — the
+		// transcript stays reachable (history://), but ensureLive will throw.
+		// Status must flip to "parked" before dispose so the sdk dispose
+		// wrapper skips unregister.
+		registry.setStatus(args.id, "parked");
+		await disposeSession();
+		registry.detachSession(args.id);
+		return;
+	}
+
+	// Keep-alive: finished and failed subagents both stay interrogable.
+	// The lifecycle manager owns idle-TTL parking + revival from here on.
+	registry.setStatus(args.id, "idle");
+	AgentLifecycleManager.global().adopt(args.id, {
+		idleTtlMs: args.agentIdleTtlMs,
+		revive: args.reviveSession ?? undefined,
+	});
 }
 
 /**
@@ -2211,7 +2288,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			abortSignal.addEventListener(
 				"abort",
 				() => {
-					void session.abort();
+					void monitor.abortActiveSession();
 				},
 				{ once: true, signal: sessionAbortController.signal },
 			);
@@ -2219,7 +2296,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// the awaited setup above, the listener registration races the dispatch
 			// and may not observe the already-fired abort event. Mirror it manually.
 			if (abortSignal.aborted) {
-				void session.abort();
+				void monitor.abortActiveSession();
 			}
 
 			const pendingExtensionMessages: Array<Promise<unknown>> = [];
@@ -2325,6 +2402,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				providerSemaphoreAcquired = false;
 			}
 			sessionAbortController.abort();
+			try {
+				await untilAborted(AbortSignal.timeout(5000), () => monitor.waitForActiveSessionAbort());
+			} catch {
+				// Ignore abort cleanup timeouts/errors; terminal disposal below is still best-effort.
+			}
 			if (unsubscribe) {
 				try {
 					unsubscribe();
@@ -2336,37 +2418,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const session = monitor.takeActiveSession();
 			if (session) {
 				monitor.captureSalvage(session);
-				const registry = AgentRegistry.global();
-				if (aborted) {
-					// Hard abort (caller signal / wall-clock / budget): terminal teardown.
-					registry.setStatus(id, "aborted");
-					try {
-						await untilAborted(AbortSignal.timeout(5000), () => session.dispose());
-					} catch {
-						// Ignore cleanup errors
-					}
-				} else if (worktree !== undefined) {
-					// Isolated run: the worktree is merged + cleaned after the run, so
-					// the session is not resumable. Park the ref WITHOUT adopting — the
-					// transcript stays reachable (history://), but ensureLive will throw.
-					// Status must flip to "parked" before dispose so the sdk dispose
-					// wrapper skips unregister.
-					registry.setStatus(id, "parked");
-					try {
-						await untilAborted(AbortSignal.timeout(5000), () => session.dispose());
-					} catch {
-						// Ignore cleanup errors
-					}
-					registry.detachSession(id);
-				} else {
-					// Keep-alive: finished and failed subagents both stay interrogable.
-					// The lifecycle manager owns idle-TTL parking + revival from here on.
-					registry.setStatus(id, "idle");
-					AgentLifecycleManager.global().adopt(id, {
-						idleTtlMs: agentIdleTtlMs,
-						revive: reviveSession ?? undefined,
-					});
-				}
+				await finalizeSubagentLifecycle({
+					id,
+					session,
+					aborted,
+					keepAlive: options.keepAlive !== false,
+					isolated: worktree !== undefined,
+					agentIdleTtlMs,
+					reviveSession,
+				});
 			}
 		}
 

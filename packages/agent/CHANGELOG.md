@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [16.2.2] - 2026-06-27
+
+### Added
+
+- Added optional AgentTool.matcherPaths(args) and AgentTool.matcherEntries(args) hooks to allow tools to surface target file paths and isolate file evaluations for path-scoped stream matchers (e.g., when handling multi-file payloads or embedded paths in streamed arguments).
+
+### Removed
+
+- Removed support for Pi dialect integration.
+
+## [16.2.0] - 2026-06-27
+
+### Added
+
+- Added an optional `cwdResolver` to `Agent` and `getCwd` to `AgentLoopConfig` to dynamically resolve the working directory per LLM call, allowing workspace-scoped provider discovery (such as GitLab Duo Agent) to follow live directory changes without reconstructing the agent.
+
+### Fixed
+
+- Fixed an issue where API-level provider refusals were replayed as assistant dialogue on subsequent requests, preventing repeated refusals after a single blocked turn.
+- Fixed a bug where internal streaming state (`partialJson`) could leak onto the final `AssistantMessage` if a stream ended without a `toolcall_end` event.
+- Fixed `Agent` to correctly forward the working directory (`cwd`) into provider stream options, enabling providers like GitLab Duo Agent to scope local tool execution to the workspace.
+- Enabled custom OpenAI-compatible providers to use native remote compaction instead of falling back to local summarization.
+
 ## [16.1.23] - 2026-06-26
 
 ### Changed

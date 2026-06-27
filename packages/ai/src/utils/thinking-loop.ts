@@ -10,11 +10,9 @@
  *
  * This guard watches the streamed `thinking` deltas and, on a match, terminates
  * the stream with a synthetic `error` {@link AssistantMessage} that carries
- * **no observable content**. An empty-content `stopReason: "error"` whose
- * message hits the transient-transport pattern is what `AgentSession`
- * classifies as a *retryable* stop (a contentful error stop is treated as
- * replay-unsafe and is never retried), so the turn is discarded and re-sampled
- * instead of committing the garbage transcript.
+ * **no observable content**. An empty-content `stopReason: "error"` message tagged
+ * with `AIError.Flag.ThinkingLoop` lets result consumers and `AgentSession` discard
+ * the runaway and re-sample instead of committing garbage transcript.
  *
  * Three failure shapes are detected:
  * 1. **Verbatim tail repetition** — a short unit repeated back-to-back (e.g.
@@ -33,12 +31,13 @@
  *
  * Scope is narrow: guarded Gemini/DeepSeek streams before any tool call. Native
  * thinking is checked first; assistant text can also be checked for providers
- * that surface reasoning as visible prose. On a hit, the failed turn is emitted
- * as an empty retryable stream-stall error so the session drops and re-samples
- * it instead of committing the runaway transcript. Disable with
- * `PI_NO_THINKING_LOOP_GUARD=1`.
+ * that surface reasoning as visible prose. On a hit the failed turn is emitted as
+ * an empty retryable stream-stall error; result-awaiting callers (`complete`,
+ * `completeSimple`) re-sample it a few times and then let a stubborn loop cook
+ * through one unguarded pass. Disable detection with `PI_NO_THINKING_LOOP_GUARD=1`.
  */
 import { logger } from "@oh-my-pi/pi-utils";
+import * as AIError from "../error";
 import type { Api, AssistantMessage, Model, StreamOptions } from "../types";
 import { AssistantMessageEventStream } from "./event-stream";
 
@@ -103,6 +102,22 @@ const OPENAI_COMPAT_GUARDED_APIS: Partial<Record<Api, true>> = {
 };
 
 /**
+ * True when `model` is a Gemini model whose native thinking stream surfaces the
+ * "thought summary" titles this module's header guard counts.
+ *
+ * OpenAI-compat transports can serve Gemini under an arbitrary provider/id, so they
+ * carry the explicit `compat.enableGeminiThinkingLoopGuard` flag; direct Gemini
+ * transports carry a clearly shaped id/provider, so a string match is sufficient.
+ */
+export function isGeminiThinkingModel(model: Model<Api>): boolean {
+	if (OPENAI_COMPAT_GUARDED_APIS[model.api]) {
+		const compat = model.compat as { enableGeminiThinkingLoopGuard?: boolean } | undefined;
+		return compat?.enableGeminiThinkingLoopGuard === true;
+	}
+	return /gemini/i.test(`${model.provider}/${model.id}`);
+}
+
+/**
  * True when `model` should be guarded for thinking/response loops (Gemini & DeepSeek).
  *
  * OpenAI-compat transports can serve Gemini or DeepSeek under an arbitrary provider/id.
@@ -110,20 +125,9 @@ const OPENAI_COMPAT_GUARDED_APIS: Partial<Record<Api, true>> = {
  * is sufficient.
  */
 export function isLoopGuardedModel(model: Model<Api>, options?: StreamOptions): boolean {
-	const optEnabled = options?.loopGuard?.enabled;
-	if (optEnabled === false) return false;
-
-	let isTargetModel = false;
-	if (OPENAI_COMPAT_GUARDED_APIS[model.api]) {
-		const compat = model.compat as { enableGeminiThinkingLoopGuard?: boolean } | undefined;
-		const isGemini = compat?.enableGeminiThinkingLoopGuard === true;
-		const isDeepseek = /deepseek/i.test(`${model.provider}/${model.id}`);
-		isTargetModel = isGemini || isDeepseek;
-	} else {
-		isTargetModel = /gemini|deepseek/i.test(`${model.provider}/${model.id}`);
-	}
-
-	return isTargetModel;
+	if (options?.loopGuard?.enabled === false) return false;
+	const isDeepseek = /deepseek/i.test(`${model.provider}/${model.id}`);
+	return isGeminiThinkingModel(model) || isDeepseek;
 }
 
 /** @deprecated Use isLoopGuardedModel instead. */
@@ -279,6 +283,76 @@ export class ThinkingLoopDetector {
 }
 
 /**
+ * Consecutive Gemini thought-summary headers in one uninterrupted reasoning
+ * stream that trips the tool-call reminder. Gemini occasionally narrates a long
+ * chain of titled summaries ("Examining Result Handling", "Refining Result
+ * Rendering", …) without ever calling a tool, burning the whole budget on
+ * planning; at this many distinct titles it has almost certainly stalled. This
+ * is the over-planning shape {@link ThinkingLoopDetector} misses — those titles
+ * are stripped before its similarity analysis precisely because their wording
+ * keeps changing, so a genuinely-distinct planning runaway never trips it.
+ */
+export const GEMINI_HEADER_RUNAWAY_THRESHOLD = 10;
+
+/**
+ * True when a single trimmed line is a Gemini reasoning-summary title: a markdown
+ * ATX heading (`## …`) or a whole-line bold / bold-italic run (`**Title**`,
+ * `***Title***`). Inline emphasis inside prose never matches — the bold run must
+ * span the entire line. Mirrors the title shapes {@link ThinkingLoopDetector}
+ * strips before similarity analysis.
+ */
+export function isReasoningSummaryHeader(line: string): boolean {
+	return /^#{1,6}[ \t]+\S/.test(line) || /^\*{2,3}.+\*{2,3}$/.test(line);
+}
+
+/**
+ * Counts consecutive Gemini reasoning-summary headers across a streamed thinking
+ * block. {@link push} returns true exactly once — when the running header count
+ * first reaches {@link GEMINI_HEADER_RUNAWAY_THRESHOLD} — and the caller then
+ * interrupts the stream and reminds the model to issue a tool call. Paragraph
+ * lines between titles do NOT reset the run (Gemini emits header + paragraph per
+ * thought, so the run IS the number of summaries); leaving the reasoning channel
+ * does, via {@link reset} on a new thinking block / prose / tool call.
+ */
+export class GeminiHeaderRunDetector {
+	/** Thinking text not yet split into completed lines. */
+	#pending = "";
+	/** Summary-title lines seen in the current run. */
+	#count = 0;
+	/** Latches after the first threshold hit so each run fires at most once. */
+	#fired = false;
+
+	/** Feed a thinking delta. Returns true the first time the run hits the threshold. */
+	push(delta: string): boolean {
+		if (this.#fired || !delta) return false;
+		this.#pending += delta;
+		let nl = this.#pending.indexOf("\n");
+		while (nl !== -1) {
+			const line = this.#pending.slice(0, nl).trim();
+			this.#pending = this.#pending.slice(nl + 1);
+			if (line !== "" && isReasoningSummaryHeader(line) && ++this.#count >= GEMINI_HEADER_RUNAWAY_THRESHOLD) {
+				this.#fired = true;
+				return true;
+			}
+			nl = this.#pending.indexOf("\n");
+		}
+		return false;
+	}
+
+	/** Number of summary titles counted in the current run (for the reminder/log). */
+	get count(): number {
+		return this.#count;
+	}
+
+	/** Re-arm for a fresh reasoning block: clears the buffer, count, and latch. */
+	reset(): void {
+		this.#pending = "";
+		this.#count = 0;
+		this.#fired = false;
+	}
+}
+
+/**
  * Wrap a provider stream with the loop guard. `controller` is the guard's own
  * abort handle: aborting it (after wiring it into the provider's signal via
  * {@link withGeminiThinkingLoopGuard}) tears down the upstream once a loop
@@ -328,7 +402,9 @@ export function guardThinkingLoopStream(
 						provider: model.provider,
 						detail,
 					});
-					controller.abort(new Error(THINKING_LOOP_ERROR_MARKER));
+					controller.abort(
+						AIError.attach(new Error(THINKING_LOOP_ERROR_MARKER), AIError.create(AIError.Flag.ThinkingLoop)),
+					);
 					outer.push({
 						type: "error",
 						reason: "error",
@@ -358,7 +434,9 @@ export function guardThinkingLoopStream(
  * Apply the loop guard around a provider dispatch. For non-guarded models
  * (or when disabled) this is a transparent pass-through. For guarded models it injects a
  * guard abort signal into the provider call so a detected loop tears down the
- * upstream, then wraps the returned stream.
+ * upstream, then wraps the returned stream. The guard only raises the retryable
+ * stall; bounding the re-samples and the final cook pass lives in the
+ * result-awaiting caller.
  */
 export function withGeminiThinkingLoopGuard<
 	O extends { signal?: AbortSignal; loopGuard?: { enabled?: boolean; checkAssistantContent?: boolean } },
@@ -399,6 +477,7 @@ function buildThinkingLoopError(model: Model<Api>, detail: string): AssistantMes
 		// "stream stall" makes the transport/session retry classifiers treat this
 		// as a transient (retryable) failure with no bespoke rule.
 		errorMessage: `${THINKING_LOOP_ERROR_MARKER}: the model repeated near-identical content (${detail}). Treating as a stream stall and retrying.`,
+		errorId: AIError.create(AIError.Flag.ThinkingLoop),
 		timestamp: Date.now(),
 	};
 }

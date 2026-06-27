@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [16.2.0] - 2026-06-27
+
+### Added
+
+- Added `REM` (remove) and `MV` (move/rename) section operations to hashline patches, allowing files to be deleted or relocated (with snapshot history migration) directly within the edit tool.
+
 ## [16.1.23] - 2026-06-26
 
 ### Added

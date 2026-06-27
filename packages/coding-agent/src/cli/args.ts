@@ -4,7 +4,7 @@
 import { APP_NAME, CONFIG_DIR_NAME, logger } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import { CLI_THINKING_LEVELS, type ConfiguredThinkingLevel, parseCliThinkingLevel } from "../thinking";
-import { BUILTIN_TOOL_NAMES } from "../tools/builtin-names";
+import { BUILTIN_TOOL_NAMES, normalizeToolNames } from "../tools/builtin-names";
 import {
 	OPTIONAL_FLAGS,
 	OPTIONAL_VALUE_FLAGS,
@@ -90,6 +90,7 @@ const PARSE_DEPS: ParseDeps = {
 	logger,
 	parseThinking: parseCliThinkingLevel,
 	builtinToolNames: BUILTIN_TOOL_NAMES,
+	normalizeToolNames,
 	thinkingEfforts: CLI_THINKING_LEVELS,
 };
 
@@ -310,6 +311,8 @@ export function getExtraHelpText(): string {
   PERPLEXITY_API_KEY         - Perplexity web search API key (optional; anonymous fallback)
   PERPLEXITY_COOKIES         - Perplexity web search (session cookie)
   TAVILY_API_KEY             - Tavily web search
+  TINYFISH_API_KEY           - TinyFish web search
+  FIRECRAWL_API_KEY          - Firecrawl web search
   ANTHROPIC_SEARCH_API_KEY   - Anthropic web search (override; isolates search from main ANTHROPIC_API_KEY)
   ANTHROPIC_SEARCH_BASE_URL  - Anthropic web search base URL (override; pairs with ANTHROPIC_SEARCH_API_KEY)
 
@@ -330,7 +333,7 @@ ${chalk.bold("Available Tools (default-enabled unless noted):")}
   edit          - Edit files with find/replace
   write         - Write files (creates/overwrites)
   grep          - Search file contents
-  find          - Find files by glob pattern
+  glob          - Find files by glob pattern
   lsp           - Language server protocol (code intelligence)
   python        - Execute Python code (requires: ${APP_NAME} setup python)
   notebook      - Edit Jupyter notebooks

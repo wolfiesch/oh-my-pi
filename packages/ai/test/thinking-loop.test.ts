@@ -1,12 +1,18 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { scheduler } from "node:timers/promises";
 import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { createMockModel, type MockContent, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
-import { stream, streamSimple } from "@oh-my-pi/pi-ai/stream";
+import { complete, completeSimple, stream, streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { Api, AssistantMessage, AssistantMessageEvent, Context, Model } from "@oh-my-pi/pi-ai/types";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import {
+	GEMINI_HEADER_RUNAWAY_THRESHOLD,
+	GeminiHeaderRunDetector,
 	isGeminiThinkingLoopModel,
+	isGeminiThinkingModel,
 	isLoopGuardedModel,
+	isReasoningSummaryHeader,
 	THINKING_LOOP_ERROR_MARKER,
 	ThinkingLoopDetector,
 	withGeminiThinkingLoopGuard,
@@ -354,6 +360,7 @@ describe("gemini thinking-loop guard (stream wrapper)", () => {
 			expect(result.stopReason).toBe("error");
 			expect(result.content).toEqual([]);
 			expect(result.errorMessage).toContain(THINKING_LOOP_ERROR_MARKER);
+			expect(AIError.is(result.errorId, AIError.Flag.ThinkingLoop)).toBe(true);
 			// Empty content + transient phrasing is what makes the turn auto-retry.
 			expect(result.errorMessage).toContain("stream stall");
 			expect(isRetryableError(new Error(result.errorMessage))).toBe(true);
@@ -444,6 +451,7 @@ describe("gemini thinking-loop guard (stream wrapper)", () => {
 			expect(result.stopReason).toBe("error");
 			expect(result.content).toEqual([]);
 			expect(result.errorMessage).toContain(THINKING_LOOP_ERROR_MARKER);
+			expect(AIError.is(result.errorId, AIError.Flag.ThinkingLoop)).toBe(true);
 			expect(isRetryableError(new Error(result.errorMessage))).toBe(true);
 		} finally {
 			clearCustomApis();
@@ -473,6 +481,7 @@ describe("withGeminiThinkingLoopGuard (Vertex transport)", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.content.length).toBe(0);
 		expect(result.errorMessage).toContain(THINKING_LOOP_ERROR_MARKER);
+		expect(AIError.is(result.errorId, AIError.Flag.ThinkingLoop)).toBe(true);
 		expect(isRetryableError(new Error(result.errorMessage))).toBe(true);
 	});
 });
@@ -525,6 +534,7 @@ describe("loop guard assistant prose/text loops", () => {
 		// drop it so AgentSession can retry with a clean assistant turn.
 		expect(result.content).toEqual([]);
 		expect(result.errorMessage).toContain(THINKING_LOOP_ERROR_MARKER);
+		expect(AIError.is(result.errorId, AIError.Flag.ThinkingLoop)).toBe(true);
 		expect(result.errorMessage).toContain("stream stall");
 		expect(isRetryableError(new Error(result.errorMessage))).toBe(true);
 	});
@@ -553,5 +563,194 @@ describe("loop guard assistant prose/text loops", () => {
 
 		const result = await guarded.result();
 		expect(result.stopReason).toBe("stop");
+	});
+});
+
+/** Stream `text` through a fresh header detector in small chunks; returns true if
+ *  the consecutive-header run tripped the runaway threshold. */
+function feedHeaders(text: string, step = 13): boolean {
+	const detector = new GeminiHeaderRunDetector();
+	for (let i = 0; i < text.length; i += step) {
+		if (detector.push(text.slice(i, i + step))) return true;
+	}
+	return false;
+}
+
+/** A genuinely-distinct planning runaway: each thought summary introduces a new
+ *  title + a paragraph naming fresh code anchors, so it never trips the
+ *  similarity/lexicon loop guard — only the header-count guard catches it. */
+function distinctPlanningRunaway(headers: number): string {
+	const out: string[] = [];
+	for (let i = 0; i < headers; i++) {
+		out.push(
+			`**Refining Stage ${i}**\n\nI am now reworking module_${i} so that handler_${i} routes Stage${i}Result through render_${i}.`,
+		);
+	}
+	return out.join("\n\n");
+}
+
+describe("isReasoningSummaryHeader", () => {
+	test("matches markdown and whole-line bold titles", () => {
+		expect(isReasoningSummaryHeader("## Examining Result Handling")).toBe(true);
+		expect(isReasoningSummaryHeader("### Refining Grammar Expansion")).toBe(true);
+		expect(isReasoningSummaryHeader("**Defining ApplyResult Details**")).toBe(true);
+		expect(isReasoningSummaryHeader("***Adapting Renderer***")).toBe(true);
+	});
+
+	test("rejects prose, inline emphasis, and bare markers", () => {
+		expect(isReasoningSummaryHeader("I'm now incorporating **targetPath** into the result.")).toBe(false);
+		expect(isReasoningSummaryHeader("**bold start** but the rest is prose")).toBe(false);
+		expect(isReasoningSummaryHeader("*single asterisk italic*")).toBe(false);
+		expect(isReasoningSummaryHeader("#hashtag-not-a-heading")).toBe(false);
+		expect(isReasoningSummaryHeader("plain reasoning line")).toBe(false);
+	});
+});
+
+describe("GeminiHeaderRunDetector", () => {
+	test("trips on a distinct planning runaway the loop guard misses", () => {
+		const runaway = distinctPlanningRunaway(GEMINI_HEADER_RUNAWAY_THRESHOLD + 2);
+		// The existing similarity/lexicon guard does NOT fire on distinct progress...
+		expect(feed(runaway)).toBeNull();
+		// ...but the header-count guard does.
+		expect(feedHeaders(runaway)).toBe(true);
+	});
+
+	test("counts headers across intervening paragraphs (one summary = one header)", () => {
+		const detector = new GeminiHeaderRunDetector();
+		let tripped = false;
+		for (let i = 0; i < GEMINI_HEADER_RUNAWAY_THRESHOLD; i++) {
+			tripped = detector.push(`**Summary ${i}**\n`) || detector.push("Some distinct reasoning paragraph here.\n\n");
+			if (tripped) break;
+		}
+		expect(tripped).toBe(true);
+		expect(detector.count).toBe(GEMINI_HEADER_RUNAWAY_THRESHOLD);
+	});
+
+	test("does not trip below the threshold", () => {
+		expect(feedHeaders(distinctPlanningRunaway(GEMINI_HEADER_RUNAWAY_THRESHOLD - 1))).toBe(false);
+	});
+
+	test("does not count plain reasoning paragraphs as headers", () => {
+		expect(feedHeaders(distinctReasoning())).toBe(false);
+	});
+
+	test("fires once per run then stays quiet until reset re-arms it", () => {
+		const detector = new GeminiHeaderRunDetector();
+		const runaway = distinctPlanningRunaway(GEMINI_HEADER_RUNAWAY_THRESHOLD);
+		expect(detector.push(runaway)).toBe(true);
+		// Latched: more headers on the same run do not re-fire.
+		expect(detector.push("**Another Header**\n")).toBe(false);
+		// A new reasoning block re-arms the detector.
+		detector.reset();
+		expect(detector.count).toBe(0);
+		expect(detector.push(runaway)).toBe(true);
+	});
+});
+
+describe("isGeminiThinkingModel", () => {
+	test("is true for Gemini and false for DeepSeek / other guarded peers", () => {
+		const gemini = createMockModel({ provider: "openrouter", id: "google/gemini-3.5-flash" }).model;
+		const deepseek = createMockModel({ provider: "openrouter", id: "deepseek/deepseek-r1" }).model;
+		const claude = createMockModel({ provider: "anthropic", id: "claude-sonnet-4" }).model;
+		expect(isGeminiThinkingModel(gemini)).toBe(true);
+		expect(isGeminiThinkingModel(deepseek)).toBe(false);
+		expect(isGeminiThinkingModel(claude)).toBe(false);
+		// DeepSeek is still loop-guarded for the similarity guard, just not the header guard.
+		expect(isLoopGuardedModel(deepseek)).toBe(true);
+		expect(isLoopGuardedModel(gemini)).toBe(true);
+	});
+});
+
+describe("thinking-loop cook fallback (result path)", () => {
+	function loopResponse(): { content: MockContent[] } {
+		return { content: [{ type: "thinking", thinking: nearDuplicateLoop(12) }] };
+	}
+
+	test("completeSimple re-samples a loop then cooks through with the guard disabled", async () => {
+		registerMockApi();
+		const waitSpy = spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		try {
+			const mock = createMockModel({ provider: "openrouter", id: "google/gemini-3.5-flash" });
+			for (let i = 0; i < 4; i++) mock.push(loopResponse());
+
+			const result = await completeSimple(mock.model, context());
+
+			// Three guarded attempts raise the stall; the fourth (guard disabled) cooks through.
+			expect(mock.calls).toHaveLength(4);
+			expect(result.stopReason).toBe("stop");
+			expect(result.content.some(block => block.type === "thinking")).toBe(true);
+			expect(result.errorMessage).toBeUndefined();
+			// First three dispatches are guarded; only the final cook pass disables it.
+			expect(mock.calls[0]?.options?.loopGuard?.enabled).toBeUndefined();
+			expect(mock.calls[3]?.options?.loopGuard?.enabled).toBe(false);
+		} finally {
+			waitSpy.mockRestore();
+			clearCustomApis();
+		}
+	});
+
+	test("complete (non-simple) also cooks through after the abort budget", async () => {
+		registerMockApi();
+		const waitSpy = spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		try {
+			const mock = createMockModel({ provider: "openrouter", id: "google/gemini-3.5-flash" });
+			for (let i = 0; i < 4; i++) mock.push(loopResponse());
+
+			const result = await complete(mock.model, context());
+
+			expect(mock.calls).toHaveLength(4);
+			expect(result.stopReason).toBe("stop");
+			expect(result.errorMessage).toBeUndefined();
+			expect(mock.calls[0]?.options?.loopGuard?.enabled).toBeUndefined();
+			expect(mock.calls[3]?.options?.loopGuard?.enabled).toBe(false);
+		} finally {
+			waitSpy.mockRestore();
+			clearCustomApis();
+		}
+	});
+
+	test("a caller abort during backoff rejects instead of returning the stall", async () => {
+		registerMockApi();
+		const controller = new AbortController();
+		const waitSpy = spyOn(scheduler, "wait").mockImplementation(async (_delay, opts) => {
+			controller.abort(new Error("user cancelled"));
+			opts?.signal?.throwIfAborted();
+		});
+		try {
+			const mock = createMockModel({ provider: "openrouter", id: "google/gemini-3.5-flash" });
+			mock.push(loopResponse());
+
+			await expect(completeSimple(mock.model, context(), { signal: controller.signal })).rejects.toThrow(
+				"user cancelled",
+			);
+			// Only the first guarded attempt ran; the abort pre-empted re-sampling.
+			expect(mock.calls).toHaveLength(1);
+		} finally {
+			waitSpy.mockRestore();
+			clearCustomApis();
+		}
+	});
+
+	test("does not retry a contentful marker error (replay-unsafe output)", async () => {
+		registerMockApi();
+		const waitSpy = spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		try {
+			const mock = createMockModel({ provider: "openrouter", id: "google/gemini-3.5-flash" });
+			mock.push({
+				content: ["Looping visible reasoning garbage."],
+				stopReason: "error",
+				errorMessage: `${THINKING_LOOP_ERROR_MARKER}: already streamed, non-retryable`,
+			});
+
+			const result = await completeSimple(mock.model, context());
+
+			// Visible content already escaped: the marker error is returned as-is, never re-sampled.
+			expect(mock.calls).toHaveLength(1);
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain(THINKING_LOOP_ERROR_MARKER);
+		} finally {
+			waitSpy.mockRestore();
+			clearCustomApis();
+		}
 	});
 });

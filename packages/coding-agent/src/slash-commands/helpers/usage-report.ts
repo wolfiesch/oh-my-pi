@@ -27,9 +27,14 @@ function formatUsageAmount(limit: UsageLimit): string {
 function formatUsageReportAccount(report: UsageReport, limit: UsageLimit, index: number): string {
 	const email = report.metadata?.email;
 	if (typeof email === "string" && email) return email;
-	const accountId = report.metadata?.accountId ?? limit.scope.accountId;
+	// Guard metadata values for truthiness before using, then fall back to scope.
+	// ?? won't help here: empty string is not null/undefined, so it would suppress
+	// a valid scoped fallback (e.g. metadata.accountId="" hides limit.scope.accountId).
+	const metaAccountId = report.metadata?.accountId;
+	const accountId = typeof metaAccountId === "string" && metaAccountId ? metaAccountId : limit.scope.accountId;
 	if (typeof accountId === "string" && accountId) return accountId;
-	const projectId = report.metadata?.projectId ?? limit.scope.projectId;
+	const metaProjectId = report.metadata?.projectId;
+	const projectId = typeof metaProjectId === "string" && metaProjectId ? metaProjectId : limit.scope.projectId;
 	if (typeof projectId === "string" && projectId) return projectId;
 	return `account ${index + 1}`;
 }
@@ -70,6 +75,22 @@ function renderUsageReports(
 				lines.push(
 					`- ${resetLabel}: ${savedResets} saved rate-limit reset${savedResets === 1 ? "" : "s"} available — /usage reset to spend`,
 				);
+				const credits = report.resetCredits?.credits;
+				if (credits) {
+					for (const credit of credits) {
+						if (credit.expiresAt) {
+							const expiryMs = Date.parse(credit.expiresAt);
+							if (!Number.isNaN(expiryMs)) {
+								const remaining = expiryMs - nowMs;
+								if (remaining > 0) {
+									lines.push(`  expires in ${formatDuration(remaining)} (${credit.expiresAt.slice(0, 10)})`);
+								} else {
+									lines.push(`  expired (${credit.expiresAt.slice(0, 10)})`);
+								}
+							}
+						}
+					}
+				}
 			}
 			if (report.limits.length === 0) {
 				const email = typeof report.metadata?.email === "string" ? report.metadata.email : "account";

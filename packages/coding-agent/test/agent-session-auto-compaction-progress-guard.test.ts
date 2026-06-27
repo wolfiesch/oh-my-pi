@@ -243,7 +243,6 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(Math.floor(threshold * 0.8)).toBe(2785);
 		expect(shouldCompact(3600, 4096, settings)).toBe(true);
 	});
-
 	it("blocks todo continuations after no-headroom compaction when auto-continue is disabled", async () => {
 		session.settings.set("compaction.autoContinue", false);
 		session.setTodoPhases([{ name: "Work", tasks: [{ content: "Finish task", status: "in_progress" }] }]);
@@ -486,7 +485,6 @@ describe("AgentSession auto-compaction progress guard", () => {
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(1);
 	});
-
 	/**
 	 * Seed a single large `useless` tool result (plus tiny follow-up turns that
 	 * keep its suffix inside the cache-warm window) so the per-turn maintenance
@@ -499,7 +497,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		const bigCallId = "call-big-useless";
 		sessionManager.appendMessage({
 			role: "assistant",
-			content: [{ type: "toolCall", id: bigCallId, name: "search", arguments: { pattern: "TODO" } }],
+			content: [{ type: "toolCall", id: bigCallId, name: "grep", arguments: { pattern: "TODO" } }],
 			api: "anthropic-messages",
 			provider: "anthropic",
 			model: "claude-sonnet-4-5",
@@ -517,7 +515,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		sessionManager.appendMessage({
 			role: "toolResult",
 			toolCallId: bigCallId,
-			toolName: "search",
+			toolName: "grep",
 			content: [{ type: "text", text: "match line\n".repeat(20000) }], // ~40k+ tokens
 			isError: false,
 			useless: true,

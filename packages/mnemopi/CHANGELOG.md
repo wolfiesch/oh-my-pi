@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [16.2.2] - 2026-06-27
+
+### Fixed
+
+- Improved resilience during API extraction calls by enhancing the handling of rate limits and transient errors.
+
 ## [16.1.17] - 2026-06-24
 
 ### Fixed

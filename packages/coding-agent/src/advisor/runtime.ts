@@ -5,12 +5,23 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { obfuscateToolArguments, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatSessionHistoryMarkdown, PRIMARY_CONTEXT_CUSTOM_TYPES } from "../session/session-history-format";
 
-/** Minimal slice of `Agent` the runtime drives — satisfied by pi-agent-core `Agent`. */
+/**
+ * Minimal slice of `Agent` the runtime drives — satisfied by pi-agent-core
+ * `Agent`. `state.error` mirrors `Agent.state.error`: provider/stream failures
+ * the loop catches internally never reject `prompt()`, so the runtime reads
+ * this field after every prompt to detect a failed turn.
+ */
 export interface AdvisorAgent {
 	prompt(input: string): Promise<void>;
 	abort(reason?: unknown): void;
 	reset(): void;
-	readonly state: { messages: AgentMessage[] };
+	/**
+	 * Drop messages appended past `count`. Called after a failed `prompt()` so a
+	 * retry doesn't replay the failed user batch + synthetic assistant-error
+	 * turn `Agent.#runLoop` records on its internal state.
+	 */
+	rollbackTo?(count: number): void;
+	readonly state: { messages: AgentMessage[]; error?: string };
 }
 
 export interface AdvisorRuntimeHost {
@@ -30,6 +41,15 @@ export interface AdvisorRuntimeHost {
 	 * the primary's next compaction triggers {@link AdvisorRuntime.reset}).
 	 */
 	maintainContext?(incomingTokens: number): Promise<boolean>;
+	/**
+	 * Called immediately before each `agent.prompt(batch)` cycle. Lets the host
+	 * clear per-update advisor state — currently the one-advise-per-update gate
+	 * in {@link AdvisorEmissionGuard}, which the host owns because it is the
+	 * one that routes `advise()` results back to the primary.
+	 */
+	beginAdvisorUpdate?(): void;
+	/** Surface a non-recovering advisor failure to the host UI without adding model-visible context. */
+	notifyFailure?(error: unknown): void;
 }
 
 interface PendingDelta {
@@ -56,6 +76,7 @@ export class AdvisorRuntime {
 	#busy = false;
 	#backlog = 0;
 	#consecutiveFailures = 0;
+	#failureNotified = false;
 	#latestMessages?: AgentMessage[];
 	#waiters: CatchupWaiter[] = [];
 	/** Bumped by every external {@link reset}/{@link dispose}. A drain iteration
@@ -114,6 +135,7 @@ export class AdvisorRuntime {
 		this.#pending = [];
 		this.#backlog = 0;
 		this.#consecutiveFailures = 0;
+		this.#failureNotified = false;
 		this.#wakeAllWaiters();
 		try {
 			this.agent.abort("advisor disposed");
@@ -124,6 +146,7 @@ export class AdvisorRuntime {
 		this.#lastCount = 0;
 		this.#pending = [];
 		this.#consecutiveFailures = 0;
+		this.#failureNotified = false;
 		this.#seenContext.clear();
 		if (clearBacklog) {
 			this.#backlog = 0;
@@ -161,6 +184,7 @@ export class AdvisorRuntime {
 		this.#pending = [];
 		this.#backlog = 0;
 		this.#consecutiveFailures = 0;
+		this.#failureNotified = false;
 		this.#seenContext.clear();
 		this.#wakeAllWaiters();
 	}
@@ -226,6 +250,28 @@ export class AdvisorRuntime {
 		}
 	}
 
+	/**
+	 * Drop the user batch + synthetic assistant-error turn `Agent.#runLoop`
+	 * appended for a failed prompt so a retry replays a clean baseline and the
+	 * dropped-after-3 path never leaks orphan failures into the next successful
+	 * run. Prefers the agent's own `rollbackTo` (which also re-syncs its
+	 * append-only context); falls back to truncating `state.messages` for tests
+	 * that hand-roll a minimal facade.
+	 */
+	#rollbackFailedTurn(snapshot: number): void {
+		const messages = this.agent.state.messages;
+		if (messages.length <= snapshot) return;
+		try {
+			if (this.agent.rollbackTo) {
+				this.agent.rollbackTo(snapshot);
+				return;
+			}
+			messages.length = snapshot;
+		} catch (err) {
+			logger.debug("advisor rollback failed", { err: String(err) });
+		}
+	}
+
 	async #drain(): Promise<void> {
 		if (this.#busy) return;
 		this.#busy = true;
@@ -274,20 +320,48 @@ export class AdvisorRuntime {
 				}
 
 				let success = false;
+				// Capture the advisor's message count BEFORE the prompt so a failure can
+				// roll back the user batch + synthetic assistant-error turn `Agent.#runLoop`
+				// appends to internal state. Without this, a retry would replay the
+				// failed batch on top of the stale turns and the dropped-after-3 path
+				// would leak orphan failures into the next successful run's context.
+				const messageSnapshot = this.agent.state.messages.length;
 				try {
+					// Reset the host's per-update advisor state (one-advise-per-update
+					// gate) before each model cycle, so the new batch starts with a
+					// fresh budget. Dedupe history persists across cycles.
+					this.host.beginAdvisorUpdate?.();
 					await this.agent.prompt(batch);
+					// `Agent.#runLoop` catches provider/stream failures internally and
+					// resolves `prompt()` cleanly with the assistant turn ending in
+					// `stopReason: "error"` and the message recorded on `state.error`.
+					// Treat that as a failed turn so OpenRouter ZDR-style endpoint
+					// rejections trip the retry/notify path instead of looking like a
+					// successful empty cycle.
+					const promptError = this.agent.state.error;
+					if (promptError) throw new Error(promptError);
 					success = true;
 					this.#consecutiveFailures = 0;
+					this.#failureNotified = false;
 				} catch (err) {
 					// reset()/dispose() aborts the in-flight prompt; the rejection is the
 					// reset itself, not a transient advisor failure. Drop the stale batch
 					// (reset already cleared #pending and rewound the cursor) instead of
 					// requeuing it into the post-reset conversation.
 					if (this.#epoch !== epoch) continue;
+					this.#rollbackFailedTurn(messageSnapshot);
 					logger.debug("advisor turn failed", { err: String(err) });
 					this.#consecutiveFailures++;
 					if (this.#consecutiveFailures >= 3) {
 						logger.warn("advisor failed consecutively 3 times; dropping backlog to prevent stall");
+						if (!this.#failureNotified) {
+							this.#failureNotified = true;
+							try {
+								this.host.notifyFailure?.(err);
+							} catch (notifyErr) {
+								logger.warn("advisor failure notification failed", { err: String(notifyErr) });
+							}
+						}
 						this.#consecutiveFailures = 0;
 						// The dropped batch may carry primary-context we never delivered; drop
 						// the seen-state too so the next turn re-expands it instead of marking

@@ -1,0 +1,5 @@
+[allowlist]
+paths = [
+  '''packages/ai/src/registry/oauth/gitlab-duo-workflow.ts''',
+  '''packages/ai/test/gitlab-duo-workflow-provider.test.ts''',
+]

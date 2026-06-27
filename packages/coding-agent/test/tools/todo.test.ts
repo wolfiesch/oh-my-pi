@@ -5,16 +5,14 @@ import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import {
 	resolveTodoMarkdownPath,
-	selectStickyTodoWindow,
 	TODO_STRIKE_HOLD_FRAMES,
-	type TodoItem,
 	type TodoPhase,
-	type TodoStatus,
 	TodoTool,
 	todoMatchesAnyDescription,
 	todoToolRenderer,
 } from "@oh-my-pi/pi-coding-agent/tools";
 import type { Component } from "@oh-my-pi/pi-tui";
+import { type } from "arktype";
 
 function createSession(initialPhases: TodoPhase[] = []): ToolSession {
 	let phases = initialPhases;
@@ -284,57 +282,26 @@ describe("TodoTool lenient init shapes", () => {
 	});
 });
 
-describe("selectStickyTodoWindow", () => {
-	const makeTasks = (statuses: TodoStatus[]): TodoItem[] =>
-		statuses.map((status, i) => ({ content: `task-${i + 1}`, status }));
-
-	it("returns first 5 of 7 pending tasks with hiddenOpenCount = 2", () => {
-		const tasks = makeTasks(["pending", "pending", "pending", "pending", "pending", "pending", "pending"]);
-		const { visible, hiddenOpenCount } = selectStickyTodoWindow(tasks, 5);
-		expect(visible.map(t => t.content)).toEqual(["task-1", "task-2", "task-3", "task-4", "task-5"]);
-		expect(hiddenOpenCount).toBe(2);
+describe("TodoTool empty items tolerance", () => {
+	// Regression: a stray `items: []` on an op that ignores items (here `view`)
+	// must not be a hard schema rejection. The top-level `items` array dropped
+	// its `atLeastLength(1)` so callers don't get "items must be tasks to append"
+	// for an irrelevant empty array; length is enforced per-op at runtime.
+	it("accepts op:view with an empty items array at the schema boundary", () => {
+		const schema = new TodoTool(createSession()).parameters;
+		expect(schema({ op: "view", items: [] }) instanceof type.errors).toBe(false);
 	});
 
-	it("slides the window past completed tasks so the next pending fills the top", () => {
-		const tasks = makeTasks(["completed", "completed", "completed", "in_progress", "pending", "pending", "pending"]);
-		const { visible, hiddenOpenCount } = selectStickyTodoWindow(tasks, 5);
-		expect(visible.map(t => t.content)).toEqual(["task-4", "task-5", "task-6", "task-7"]);
-		expect(hiddenOpenCount).toBe(0);
-	});
+	it("defers empty append items to an op-specific runtime error", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["First"] }] });
 
-	it("slides all the way down to the final two pending tasks", () => {
-		const tasks = makeTasks(["completed", "completed", "completed", "completed", "completed", "pending", "pending"]);
-		const { visible, hiddenOpenCount } = selectStickyTodoWindow(tasks, 5);
-		expect(visible.map(t => t.content)).toEqual(["task-6", "task-7"]);
-		expect(hiddenOpenCount).toBe(0);
-	});
+		const result = await tool.execute("call-2", { op: "append", phase: "Work", items: [] });
 
-	it("falls back to the trailing window when every task is closed", () => {
-		const tasks = makeTasks([
-			"completed",
-			"abandoned",
-			"completed",
-			"completed",
-			"abandoned",
-			"completed",
-			"completed",
-		]);
-		const { visible, hiddenOpenCount } = selectStickyTodoWindow(tasks, 5);
-		expect(visible.map(t => t.content)).toEqual(["task-3", "task-4", "task-5", "task-6", "task-7"]);
-		expect(hiddenOpenCount).toBe(0);
-	});
-
-	it("returns an empty window for an empty task list", () => {
-		const { visible, hiddenOpenCount } = selectStickyTodoWindow([], 5);
-		expect(visible).toEqual([]);
-		expect(hiddenOpenCount).toBe(0);
-	});
-
-	it("honours a custom maxVisible cap", () => {
-		const tasks = makeTasks(["pending", "pending", "pending", "pending", "pending", "pending", "pending"]);
-		const { visible, hiddenOpenCount } = selectStickyTodoWindow(tasks, 3);
-		expect(visible.map(t => t.content)).toEqual(["task-1", "task-2", "task-3"]);
-		expect(hiddenOpenCount).toBe(4);
+		expect(result.isError).toBe(true);
+		const summary = result.content.find(part => part.type === "text");
+		if (summary?.type !== "text") throw new Error("Expected text summary");
+		expect(summary.text).toContain("Missing items for append operation");
 	});
 });
 
