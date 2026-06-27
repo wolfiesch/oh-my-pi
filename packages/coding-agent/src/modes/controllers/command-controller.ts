@@ -10,8 +10,8 @@ import {
 	type UsageLimit,
 	type UsageReport,
 } from "@oh-my-pi/pi-ai";
-import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@oh-my-pi/pi-tui";
-import { formatDuration, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
+import { type Component, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@oh-my-pi/pi-tui";
+import { APP_NAME, formatDuration, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
 import { shareSession } from "../../export/share";
@@ -47,6 +47,7 @@ import { limitMatchesActiveAccount } from "../../slash-commands/helpers/active-o
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
 import { replaceTabs, truncateToWidth } from "../../tools/render-utils";
+import { fileHyperlink } from "../../tui";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
@@ -60,6 +61,77 @@ function showMarkdownPanel(ctx: InteractiveModeContext, title: string, markdown:
 	block.addChild(new Markdown(markdown.trim(), 1, 1, getMarkdownTheme()));
 	block.addChild(new DynamicBorder());
 	ctx.present(block);
+}
+
+/**
+ * Build the shell command that resumes a session in another terminal.
+ *
+ * Prefers the session id when `idResolvable` is set: a UUIDv7 (`[0-9a-f-]`
+ * only) carries no shell metacharacters, so a bare `omp --resume <id>` pastes
+ * safely into bash, zsh, cmd.exe, and PowerShell alike — no per-shell quoting
+ * needed. `--resume <id>` prefix-matches the session list, but that lookup only
+ * scans the cwd's default-managed dir plus the global buckets, so the id form
+ * is used only when the session lives there (`idResolvable`).
+ *
+ * Otherwise (custom `--session-dir`, or a legacy session without a UUIDv7 id)
+ * it falls back to a POSIX single-quoted absolute path. That quoting is only
+ * safe in POSIX shells — cmd.exe passes single quotes through literally and
+ * PowerShell expands `$()`/backticks inside double quotes — so the path
+ * fallback is suppressed on Windows, where no single quoting is safe for both
+ * shells. Returns `undefined` when no safe command can be built; the caller
+ * still shows the clickable `file://` path in that case.
+ */
+export function buildResumeCommand(
+	opts: {
+		sessionId?: string;
+		sessionFile?: string;
+		idResolvable?: boolean;
+	},
+	platform: NodeJS.Platform = process.platform,
+): string | undefined {
+	const id = opts.sessionId?.trim();
+	if (opts.idResolvable && id && /^[0-9a-z-]+$/i.test(id)) {
+		return `${APP_NAME} --resume ${id}`;
+	}
+	if (opts.sessionFile && platform !== "win32") {
+		const quoted = `'${opts.sessionFile.replace(/'/g, "'\\''")}'`;
+		return `${APP_NAME} --resume ${quoted}`;
+	}
+	return undefined;
+}
+
+/** Components for the `/fork` success card plus the resume command to copy, if any. */
+export interface ForkCard {
+	components: Component[];
+	/** Shell command that resumes the forked session, or `undefined` when none is safe to emit. */
+	resumeCommand: string | undefined;
+}
+
+/**
+ * Build the `/fork` success card. Pure (no clipboard/render side effects) so it
+ * is unit-testable; the caller copies `resumeCommand` and presents `components`.
+ */
+export function buildForkCard(opts: {
+	sessionFile: string | undefined;
+	sessionId: string;
+	idResolvable: boolean;
+}): ForkCard {
+	const { sessionFile } = opts;
+	const shortPath = sessionFile ? sessionFile.split("/").pop()! : "new session";
+	const displayShort = sessionFile ? fileHyperlink(sessionFile, shortPath) : "new session";
+	const components: Component[] = [
+		new Spacer(1),
+		new Text(`${theme.fg("accent", `${theme.status.success} Session forked to ${displayShort}`)}`, 1, 1),
+	];
+	const resumeCommand = sessionFile
+		? buildResumeCommand({ sessionId: opts.sessionId, sessionFile, idResolvable: opts.idResolvable })
+		: undefined;
+	if (resumeCommand) {
+		components.push(
+			new Text(`  ${theme.fg("muted", "Resume in another terminal:")} ${theme.fg("accent", resumeCommand)}`, 1, 1),
+		);
+	}
+	return { components, resumeCommand };
 }
 
 export class CommandController {
@@ -926,11 +998,27 @@ export class CommandController {
 		this.ctx.updateEditorTopBorder();
 
 		const sessionFile = this.ctx.session.sessionFile;
-		const shortPath = sessionFile ? sessionFile.split("/").pop() : "new session";
-		this.ctx.present([
-			new Spacer(1),
-			new Text(`${theme.fg("accent", `${theme.status.success} Session forked to ${shortPath}`)}`, 1, 1),
-		]);
+		const cwd = this.ctx.sessionManager.getCwd();
+		// A bare `--resume <id>` only resolves when the session lives in the cwd's
+		// default-managed dir (the dir resolveResumableSession scans); custom
+		// --session-dir sessions fall back to the quoted path form.
+		const idResolvable =
+			sessionFile !== undefined &&
+			this.ctx.sessionManager.getSessionDir() === SessionManager.getDefaultSessionDir(cwd);
+		const { components, resumeCommand } = buildForkCard({
+			sessionFile,
+			sessionId: this.ctx.sessionManager.getSessionId(),
+			idResolvable,
+		});
+		if (resumeCommand) {
+			try {
+				await copyToClipboard(resumeCommand);
+				this.ctx.showStatus("Resume command copied to clipboard");
+			} catch {
+				// Clipboard is best-effort: the command is still shown in the card.
+			}
+		}
+		this.ctx.present(components);
 	}
 
 	/**

@@ -83,6 +83,9 @@
 
 - Added a new `tiny` model role for consolidated online task handling.
 - Added a `textVerbosity` setting to control OpenAI and Codex response detail.
+- Added Loop Guard "Tool-Call Reminder" to automatically interrupt Gemini reasoning loops that generate excessive planning headers without acting
+- Added support for file deletion and moving within file editing operations
+- Added a copy-on-resume affordance to the `/fork` success card: forking now shows a ready-to-run `omp --resume <session>` command and copies it to the clipboard so the forked session can be opened in another terminal. The command prefers the shell-safe session id (a UUIDv7 with no shell metacharacters) when the session lives in its default-managed directory, and falls back to a POSIX single-quoted path otherwise (suppressed on Windows, where no single quoting is safe for both cmd.exe and PowerShell).
 
 ### Changed
 
