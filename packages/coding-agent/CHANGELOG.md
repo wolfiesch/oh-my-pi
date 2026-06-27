@@ -99,6 +99,9 @@
 - Fixed marketplace-installed plugins incorrectly appearing in both the npm plugin list and the extension-package status provider.
 - Fixed inconsistent OpenRouter prompt-cache hits on `/advisor` turns by ensuring advisor agents inherit the same provider-shaping options, hooks, and settings as the main agent.
 - Fixed path-scoped TTSR (Targeted Tool Safety Rules) evaluation for `hashline` and `apply_patch` edit streams, ensuring rules are correctly applied to file paths parsed from section headers and envelope markers without leaking across file scopes.
+### Added
+
+- Added run-state prefixes to interactive terminal titles so background tabs show when the agent is running, waiting for input, or blocked on a question/approval. ([#3587](https://github.com/can1357/oh-my-pi/issues/3587))
 
 ## [16.2.1] - 2026-06-27
 

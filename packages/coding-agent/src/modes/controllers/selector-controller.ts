@@ -1002,12 +1002,7 @@ export class SelectorController {
 	}
 
 	#refreshSessionTerminalTitle(): void {
-		const sessionManager = this.ctx.sessionManager as {
-			getSessionName?: () => string | undefined;
-			getCwd: () => string;
-			titleSource?: "auto" | "user" | undefined;
-		};
-		setSessionTerminalTitle(sessionManager.getSessionName?.(), sessionManager.getCwd());
+		this.ctx.refreshTerminalTitle();
 	}
 
 	async #detachActiveSessionBeforeDeletion(sessionPath: string): Promise<boolean> {

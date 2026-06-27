@@ -50,7 +50,6 @@ import { replaceTabs, truncateToWidth } from "../../tools/render-utils";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
-import { setSessionTerminalTitle } from "../../utils/title-generator";
 
 function showMarkdownPanel(ctx: InteractiveModeContext, title: string, markdown: string): void {
 	const block = new TranscriptBlock();
@@ -863,7 +862,7 @@ export class CommandController {
 		}
 		if (!(await this.ctx.session.newSession(options))) return;
 		this.ctx.resetObserverRegistry();
-		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+		this.ctx.refreshTerminalTitle();
 
 		this.ctx.statusLine.invalidate();
 		this.ctx.statusLine.resetActiveTime();
@@ -1029,7 +1028,7 @@ export class CommandController {
 				return;
 			}
 			const name = this.ctx.sessionManager.getSessionName()!;
-			setSessionTerminalTitle(name, this.ctx.sessionManager.getCwd());
+			this.ctx.refreshTerminalTitle();
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
 			this.ctx.showStatus(`Session renamed to "${name}".`);

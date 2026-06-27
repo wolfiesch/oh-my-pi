@@ -24,7 +24,7 @@ import { HookSelectorComponent, type HookSelectorSlider } from "../../modes/comp
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "../../modes/types";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
-import { setSessionTerminalTitle, setTerminalTitle } from "../../utils/title-generator";
+import { setTerminalTitle } from "../../utils/title-generator";
 
 const MAX_WIDGET_LINES = 10;
 
@@ -161,7 +161,7 @@ export class ExtensionUiController {
 				if (!success) {
 					return { cancelled: true };
 				}
-				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+				this.ctx.refreshTerminalTitle();
 
 				// Call setup callback if provided
 				if (options?.setup) {
@@ -230,7 +230,7 @@ export class ExtensionUiController {
 				if (!result) {
 					return { cancelled: true };
 				}
-				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+				this.ctx.refreshTerminalTitle();
 				this.ctx.chatContainer.clear();
 				this.ctx.renderInitialMessages({ clearTerminalHistory: true });
 				await this.ctx.reloadTodos();
@@ -799,7 +799,7 @@ export class ExtensionUiController {
 
 	async #updateSessionName(name: string): Promise<void> {
 		await this.ctx.sessionManager.setSessionName(name, "user");
-		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+		this.ctx.refreshTerminalTitle();
 	}
 
 	#sendExtensionUserMessage: SendUserMessageHandler = (content, options) => {
@@ -841,6 +841,7 @@ export class ExtensionUiController {
 		let settled = false;
 		let started = false;
 		let hide: (() => void) | undefined;
+		let releaseTitleAttention: (() => void) | undefined;
 
 		function onAbort(): void {
 			settle(undefined);
@@ -852,6 +853,8 @@ export class ExtensionUiController {
 			signal?.removeEventListener("abort", onAbort);
 			if (started) {
 				hide?.();
+				releaseTitleAttention?.();
+				releaseTitleAttention = undefined;
 				this.#dialogActive = false;
 				this.#advanceDialogQueue();
 			}
@@ -868,10 +871,13 @@ export class ExtensionUiController {
 			this.#dialogActive = true;
 			try {
 				hide = present(settle);
+				releaseTitleAttention = this.ctx.pushTerminalTitleAttention();
 			} catch (error) {
 				settled = true;
 				signal?.removeEventListener("abort", onAbort);
 				this.#dialogActive = false;
+				releaseTitleAttention?.();
+				releaseTitleAttention = undefined;
 				reject(error);
 				this.#advanceDialogQueue();
 			}

@@ -98,6 +98,7 @@ function createFixture(streamingMessage?: AssistantMessage) {
 		updateEditorTopBorder: vi.fn(),
 		updatePendingMessagesDisplay: vi.fn(),
 		ensureLoadingAnimation: vi.fn(),
+		refreshTerminalTitle: vi.fn(),
 		statusContainer,
 		loadingAnimation: undefined,
 		autoCompactionLoader: undefined,

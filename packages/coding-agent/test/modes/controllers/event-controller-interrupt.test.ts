@@ -23,6 +23,7 @@ function createContext() {
 		setWorkingMessage,
 		clearPinnedError: vi.fn(),
 		ensureLoadingAnimation,
+		refreshTerminalTitle: vi.fn(),
 		ui: { requestRender: vi.fn() },
 		session,
 		viewSession: session,

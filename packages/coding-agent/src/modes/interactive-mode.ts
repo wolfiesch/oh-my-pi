@@ -113,7 +113,12 @@ import type { EventBus } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
 import { messageHasDisplayableThinking } from "../utils/thinking-display";
-import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
+import {
+	popTerminalTitle,
+	pushTerminalTitle,
+	setSessionTerminalTitle,
+	type TerminalTitleRunState,
+} from "../utils/title-generator";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import { ChatBlock, type ChatBlockHost } from "./components/chat-block";
@@ -324,6 +329,11 @@ class AnchoredLiveContainer extends Container implements NativeScrollbackLiveReg
 /** How long the ctrl+p model-role cycle chip track lingers above the editor
  *  before it auto-clears, mirroring the todo HUD's auto-clear timer. */
 const MODEL_CYCLE_TRACK_CLEAR_MS = 4000;
+const TERMINAL_TITLE_STATE_SYMBOL_KEYS = {
+	running: "status.running",
+	waiting: "status.pending",
+	needs_attention: "status.warning",
+} as const;
 
 /**
  * Build the anchored subagent HUD block: a bold accent "Subagents" header plus
@@ -447,6 +457,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	loadingAnimation: Loader | undefined = undefined;
 	autoCompactionLoader: Loader | undefined = undefined;
 	retryLoader: Loader | undefined = undefined;
+	#terminalTitleAttentionDepth = 0;
+	#planReviewTitleAttentionRelease: (() => void) | undefined;
 	#pendingWorkingMessage: string | undefined;
 	#workingMessageAccentCacheKey?: WorkingMessageAccentCacheKey;
 	#workingMessageAccentCacheValue?: WorkingMessageAccent;
@@ -893,7 +905,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// the initial welcome frame does not append over the previous run's scrollback.
 		this.ui.start({ clearScrollback: options.clearInitialTerminalHistory === true });
 		pushTerminalTitle();
-		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
+		this.refreshTerminalTitle();
 		this.updateEditorBorderColor();
 		this.#syncEditorMaxHeight();
 		this.isInitialized = true;
@@ -1060,9 +1072,59 @@ export class InteractiveMode implements InteractiveModeContext {
 		resetCapabilities();
 		await this.refreshSlashCommandState(newCwd);
 		await this.session.refreshSshTool({ activateIfAvailable: true });
-		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
+		this.refreshTerminalTitle();
 		this.statusLine.invalidate();
 		this.updateEditorTopBorder();
+	}
+
+	#terminalTitleBaseState(): Exclude<TerminalTitleRunState, "needs_attention"> {
+		if (
+			this.session.isStreaming ||
+			this.viewSession.isStreaming ||
+			this.loadingAnimation ||
+			this.autoCompactionLoader ||
+			this.retryLoader
+		) {
+			return "running";
+		}
+		if (this.onInputCallback) {
+			return "waiting";
+		}
+		return "idle";
+	}
+
+	#terminalTitleState(): TerminalTitleRunState {
+		if (this.#terminalTitleAttentionDepth > 0) {
+			return "needs_attention";
+		}
+		return this.#terminalTitleBaseState();
+	}
+
+	#terminalTitleStateSymbol(state: TerminalTitleRunState): string | undefined {
+		if (state === "idle") {
+			return undefined;
+		}
+		return theme.symbol(TERMINAL_TITLE_STATE_SYMBOL_KEYS[state]);
+	}
+
+	refreshTerminalTitle(): void {
+		const state = this.settings.get("terminal.showTitleState") ? this.#terminalTitleState() : "idle";
+		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd(), {
+			state,
+			stateSymbol: this.#terminalTitleStateSymbol(state),
+		});
+	}
+
+	pushTerminalTitleAttention(): () => void {
+		let released = false;
+		this.#terminalTitleAttentionDepth += 1;
+		this.refreshTerminalTitle();
+		return () => {
+			if (released) return;
+			released = true;
+			this.#terminalTitleAttentionDepth = Math.max(0, this.#terminalTitleAttentionDepth - 1);
+			this.refreshTerminalTitle();
+		};
 	}
 
 	async getUserInput(): Promise<SubmittedUserInput> {
@@ -1072,8 +1134,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		const { promise, resolve } = Promise.withResolvers<SubmittedUserInput>();
 		this.onInputCallback = input => {
 			this.onInputCallback = undefined;
+			this.refreshTerminalTitle();
 			resolve(input);
 		};
+		this.refreshTerminalTitle();
 		this.#scheduleLoopAutoSubmit();
 		this.#scheduleGoalContinuation();
 
@@ -2368,11 +2432,14 @@ export class InteractiveMode implements InteractiveModeContext {
 			fullscreen: true,
 		});
 		this.ui.setFocus(overlay);
+		this.#planReviewTitleAttentionRelease = this.pushTerminalTitleAttention();
 		this.ui.requestRender();
 		return promise;
 	}
 
 	#hidePlanReview(): void {
+		this.#planReviewTitleAttentionRelease?.();
+		this.#planReviewTitleAttentionRelease = undefined;
 		this.#planReviewOverlayHandle?.hide();
 		this.#planReviewOverlayHandle = undefined;
 		this.#planReviewOverlay = undefined;
@@ -2625,7 +2692,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (seededName && !this.sessionManager.getSessionName()) {
 			const applied = await this.sessionManager.setSessionName(seededName, "auto");
 			if (applied) {
-				setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
+				this.refreshTerminalTitle();
 				this.updateEditorBorderColor();
 			}
 		}

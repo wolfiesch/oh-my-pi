@@ -318,6 +318,7 @@ export class EventController {
 		this.ctx.statusLine.markActivityStart();
 		this.#setTerminalProgress(true);
 		this.ctx.ensureLoadingAnimation();
+		this.ctx.refreshTerminalTitle();
 		this.ctx.ui.requestRender();
 	}
 
@@ -1036,6 +1037,7 @@ export class EventController {
 		this.#resolveDisplaceablePoll();
 		this.#resolveDisplaceableTodo();
 		this.#lastAssistantComponent = undefined;
+		this.ctx.refreshTerminalTitle();
 		this.ctx.ui.requestRender();
 		this.#scheduleIdleCompaction();
 		this.#scheduleIdleRecap();
@@ -1112,6 +1114,7 @@ export class EventController {
 			getSymbolTheme().spinnerFrames,
 		);
 		this.ctx.statusContainer.addChild(this.ctx.autoCompactionLoader);
+		this.ctx.refreshTerminalTitle();
 		this.ctx.ui.requestRender();
 	}
 
@@ -1181,6 +1184,7 @@ export class EventController {
 		}
 		await this.ctx.flushCompactionQueue({ willRetry: event.willRetry });
 		this.#ensureWorkingLoaderWhileStreaming();
+		this.ctx.refreshTerminalTitle();
 		this.ctx.ui.requestRender();
 	}
 
@@ -1203,6 +1207,7 @@ export class EventController {
 			getSymbolTheme().spinnerFrames,
 		);
 		this.ctx.statusContainer.addChild(this.ctx.retryLoader);
+		this.ctx.refreshTerminalTitle();
 		this.ctx.ui.requestRender();
 	}
 
@@ -1216,6 +1221,7 @@ export class EventController {
 			this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
 		}
 		this.#ensureWorkingLoaderWhileStreaming();
+		this.ctx.refreshTerminalTitle();
 		this.ctx.ui.requestRender();
 	}
 
