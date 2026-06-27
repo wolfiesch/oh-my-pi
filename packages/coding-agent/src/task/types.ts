@@ -278,6 +278,7 @@ export interface YieldItem {
 export interface AgentProgress {
 	index: number;
 	id: string;
+	sessionFile?: string;
 	agent: string;
 	agentSource: AgentSource;
 	status: "pending" | "running" | "completed" | "failed" | "aborted";

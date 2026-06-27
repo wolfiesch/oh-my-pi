@@ -834,6 +834,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	const progress: AgentProgress = {
 		index,
 		id,
+		sessionFile: args.sessionFile,
 		agent: agent.name,
 		agentSource: agent.source,
 		status: "running",

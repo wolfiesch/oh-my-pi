@@ -21,6 +21,10 @@ describe("detectTerminalId", () => {
 
 		expect(detectTerminalId(env)).toBe("trueColor");
 	});
+
+	it("recognizes Orca before the true-color fallback", () => {
+		expect(detectTerminalId({ TERM_PROGRAM: "Orca", COLORTERM: "truecolor" })).toBe("orca");
+	});
 });
 
 describe("synchronizedOutputUserOverride", () => {
@@ -235,7 +239,7 @@ describe("hyperlinksUserOverride", () => {
 
 describe("shouldEnableHyperlinksByDefault", () => {
 	it("enables hyperlinks on every known direct terminal", () => {
-		for (const id of ["kitty", "ghostty", "wezterm", "iterm2", "alacritty", "vscode"] as const) {
+		for (const id of ["kitty", "ghostty", "wezterm", "iterm2", "alacritty", "vscode", "orca"] as const) {
 			expect(shouldEnableHyperlinksByDefault({}, id)).toBe(true);
 		}
 	});

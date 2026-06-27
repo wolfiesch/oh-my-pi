@@ -33,6 +33,7 @@ export interface AsyncJob {
 	status: "running" | "completed" | "failed" | "cancelled";
 	startTime: number;
 	label: string;
+	linkPath?: string;
 	abortController: AbortController;
 	promise: Promise<void>;
 	resultText?: string;
@@ -79,6 +80,7 @@ export interface AsyncJobRegisterOptions {
 	id?: string;
 	/** Registry id of the agent that owns this job; used to scope cancelAll. */
 	ownerId?: string;
+	linkPath?: string;
 	onProgress?: (text: string, details?: Record<string, unknown>) => void | Promise<void>;
 	/** Register the job in queued state; see {@link AsyncJob.queued}. */
 	queued?: boolean;
@@ -192,6 +194,7 @@ export class AsyncJobManager {
 			abortController,
 			promise: Promise.resolve(),
 			ownerId: options?.ownerId,
+			linkPath: options?.linkPath,
 			queued: options?.queued === true,
 		};
 

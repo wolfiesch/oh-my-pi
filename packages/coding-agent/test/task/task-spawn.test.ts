@@ -29,12 +29,16 @@ const taskAgent: AgentDefinition = {
 	source: "bundled",
 };
 
-function createSession(options: { manager?: AsyncJobManager; settings?: Record<string, unknown> }): ToolSession {
+function createSession(options: {
+	manager?: AsyncJobManager;
+	settings?: Record<string, unknown>;
+	sessionFile?: string | null;
+}): ToolSession {
 	return {
 		cwd: "/tmp",
 		hasUI: false,
 		settings: Settings.isolated(options.settings ?? {}),
-		getSessionFile: () => null,
+		getSessionFile: () => options.sessionFile ?? null,
 		getSessionSpawns: () => "*",
 		asyncJobManager: options.manager,
 	} as unknown as ToolSession;
@@ -144,6 +148,35 @@ describe("task spawn routing", () => {
 		expect(job!.resultText).toContain("message it via `irc` to follow up");
 		expect(job!.resultText).toContain("history://Spawnling");
 		expect(runSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("registers spawned task jobs with the parent session link target", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [taskAgent],
+			projectAgentsDir: null,
+		});
+		const gate = deferred();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			await gate.promise;
+			return makeResult(options.id ?? "?");
+		});
+
+		const sessionFile = "/tmp/omp-parent-session.json";
+		const manager = createManager();
+		const tool = await TaskTool.create(createSession({ manager, sessionFile }));
+
+		const result = await tool.execute("tc-spawn-link", {
+			agent: "task",
+			id: "Linkable",
+			assignment: "Do the linked thing.",
+		} as TaskParams);
+
+		const jobId = result.details?.async?.jobId;
+		expect(jobId).toBeTruthy();
+		expect(manager.getJob(jobId!)?.linkPath).toBe(sessionFile);
+
+		gate.resolve();
+		await manager.getJob(jobId!)!.promise;
 	});
 
 	it("bounds concurrent job bodies with the session spawn semaphore", async () => {

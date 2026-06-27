@@ -301,7 +301,13 @@ describe("task progress rendering", () => {
 			projectAgentsDir: null,
 			results: [],
 			totalDurationMs: 0,
-			progress: [runningProgress({ id: "Live.Agent", status: "running" })],
+			progress: [
+				runningProgress({
+					id: "Live.Agent",
+					status: "running",
+					sessionFile: path.join(os.tmpdir(), "Live.Agent.jsonl"),
+				}),
+			],
 		};
 		const resultDetails: TaskToolDetails = {
 			projectAgentsDir: null,
@@ -340,7 +346,9 @@ describe("task progress rendering", () => {
 
 		expect(stripOsc8(linkedProgress)).toBe(renderProgress());
 		expect(stripOsc8(linkedResult)).toBe(renderResult());
-		expect(extractLinkUris(linkedProgress)).toContain("history://Live.Agent");
+		expect(extractLinkUris(linkedProgress)).toContain(
+			url.pathToFileURL(path.join(os.tmpdir(), "Live.Agent.jsonl")).href,
+		);
 		expect(extractLinkTexts(linkedProgress)).toContain("Live>Agent");
 		expect(extractLinkUris(linkedResult)).toContain(url.pathToFileURL(outputPath).href);
 		expect(extractLinkUris(linkedResult)).toContain(url.pathToFileURL(patchPath).href);

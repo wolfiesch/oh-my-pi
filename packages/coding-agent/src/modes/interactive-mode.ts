@@ -108,6 +108,7 @@ import { type ResolveToolDetails, runResolveInvocation } from "../tools/resolve"
 import { formatPhaseDisplayName, todoMatchesAnyDescription } from "../tools/todo";
 import { ToolError } from "../tools/tool-errors";
 import { vocalizer } from "../tts/vocalizer";
+import { fileHyperlink } from "../tui";
 import { renderTreeList } from "../tui/tree-list";
 import type { EventBus } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
@@ -2090,7 +2091,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#applyPlanModeModel();
 		this.#updatePlanModeStatus();
 		this.sessionManager.appendModeChange("plan", { planFilePath });
-		this.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
+		const displayPlanFile = fileHyperlink(this.#resolvePlanFilePath(planFilePath), planFilePath);
+		this.showStatus(`Plan mode enabled. Plan file: ${displayPlanFile}`);
 	}
 
 	/** Standing resolve dispatcher registered while plan mode is active. The agent

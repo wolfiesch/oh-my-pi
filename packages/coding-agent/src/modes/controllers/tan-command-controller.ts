@@ -160,7 +160,7 @@ export class TanCommandController {
 						}
 					}
 				},
-				{ ownerId },
+				{ ownerId, linkPath: cloneFile },
 			);
 		} catch (error) {
 			if (cloneFile) await removeCloneSession(cloneFile);

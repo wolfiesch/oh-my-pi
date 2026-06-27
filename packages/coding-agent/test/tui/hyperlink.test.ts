@@ -236,6 +236,7 @@ describe("uriHyperlink", () => {
 	it("leaves text plain for URI targets containing control bytes", () => {
 		setHyperlinkMode("always");
 		expect(uriHyperlink("https://example.com/\x07bad", "bad")).toBe("bad");
+		expect(uriHyperlink("https://example.com/\x90bad", "bad")).toBe("bad");
 	});
 });
 
@@ -303,6 +304,12 @@ describe("urlHyperlink", () => {
 		setHyperlinkMode("always");
 		expect(urlHyperlink("ftp://example.com/file", "file")).toBe("file");
 	});
+
+	it("leaves text plain for HTTP URLs containing control bytes", () => {
+		setHyperlinkMode("always");
+		expect(urlHyperlink("https://example.com/\x07bad", "bad")).toBe("bad");
+		expect(urlHyperlink("https://example.com/\x90bad", "bad")).toBe("bad");
+	});
 });
 
 describe("urlHyperlinkAlways", () => {
@@ -325,6 +332,12 @@ describe("urlHyperlinkAlways", () => {
 	it("does not wrap non-HTTP URL schemes", () => {
 		setHyperlinkMode("always");
 		expect(urlHyperlinkAlways("ftp://example.com/file", "file")).toBe("file");
+	});
+
+	it("leaves text plain for HTTP URLs containing control bytes", () => {
+		setHyperlinkMode("always");
+		expect(urlHyperlinkAlways("https://example.com/\x07bad", "bad")).toBe("bad");
+		expect(urlHyperlinkAlways("https://example.com/\x90bad", "bad")).toBe("bad");
 	});
 });
 

@@ -152,7 +152,8 @@ export class CommandController {
 
 		try {
 			const filePath = await this.ctx.session.exportToHtml(arg);
-			this.ctx.showStatus(`Session exported to: ${filePath}`);
+			const filePathDisplay = fileHyperlink(filePath, filePath);
+			this.ctx.showStatus(`Session exported to: ${filePathDisplay}`);
 			this.openInBrowser(filePath);
 		} catch (error: unknown) {
 			this.ctx.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
@@ -320,7 +321,8 @@ export class CommandController {
 		const normalizedPremiumRequests = Math.round((premiumRequests + Number.EPSILON) * 100) / 100;
 
 		let info = `${theme.bold("Session Info")}\n\n`;
-		info += `${theme.fg("dim", "File:")} ${stats.sessionFile ?? "In-memory"}\n`;
+		const displayFile = stats.sessionFile ? fileHyperlink(stats.sessionFile, stats.sessionFile) : "In-memory";
+		info += `${theme.fg("dim", "File:")} ${displayFile}\n`;
 		info += `${theme.fg("dim", "ID:")} ${stats.sessionId}\n\n`;
 		info += `\n${theme.bold("Provider")}\n`;
 		const model = this.ctx.session.model;
@@ -1103,9 +1105,10 @@ export class CommandController {
 		await this.ctx.reloadTodos();
 		this.ctx.ui.requestRender();
 
+		const displayMoved = fileHyperlink(resolvedPath, resolvedPath);
 		this.ctx.present([
 			new Spacer(1),
-			new Text(`${theme.fg("accent", `${theme.status.success} Moved to ${resolvedPath}`)}`, 1, 1),
+			new Text(`${theme.fg("accent", `${theme.status.success} Session moved to ${displayMoved}`)}`, 1, 1),
 		]);
 	}
 

@@ -18,7 +18,7 @@ import { highlightCode, type Theme } from "../modes/theme/theme";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
 import type { ClientBridgeTerminalExitStatus, ClientBridgeTerminalOutput } from "../session/client-bridge";
 import { DEFAULT_MAX_BYTES, enforceInlineByteCap, streamTailUpdates, TailBuffer } from "../session/streaming-output";
-import { renderStatusLine } from "../tui";
+import { internalResourceHyperlink, renderStatusLine } from "../tui";
 import { CachedOutputBlock, markFramedBlockComponent, outputBlockContentWidth } from "../tui/output-block";
 import { getSixelLineMask } from "../utils/sixel";
 import type { ToolSession } from ".";
@@ -1297,7 +1297,11 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 						);
 					}
 					if (rawOutputArtifact.artifactId) {
-						statsParts.push(`Artifact: ${rawOutputArtifact.artifactId}`);
+						const displayArtifactId = internalResourceHyperlink(
+							`artifact://${rawOutputArtifact.artifactId}`,
+							rawOutputArtifact.artifactId,
+						);
+						statsParts.push(`Artifact: ${displayArtifactId}`);
 					}
 					if (isError && typeof details?.exitCode === "number") {
 						statsParts.push(`Exit: ${details.exitCode}`);

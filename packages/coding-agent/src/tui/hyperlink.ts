@@ -59,7 +59,7 @@ export function isHyperlinkEnabled(): boolean {
 }
 
 function safeHyperlinkUri(uri: string): string | undefined {
-	if (!uri || /[\x00-\x1f\x7f]/.test(uri)) return undefined;
+	if (!uri || /[\x00-\x1f\x7f-\x9f]/.test(uri)) return undefined;
 	return uri;
 }
 
@@ -90,6 +90,7 @@ export function uriHyperlink(uri: string, displayText: string): string {
 /** Normalize a `www.`/bare HTTP(S) URL to its canonical href, or `undefined` if not HTTP(S). */
 function parseHttpUrl(input: string): string | undefined {
 	const normalized = input.match(/^www\./i) ? `https://${input}` : input;
+	if (!safeHyperlinkUri(normalized)) return undefined;
 	try {
 		const parsed = new URL(normalized);
 		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
@@ -103,8 +104,8 @@ function parseHttpUrl(input: string): string | undefined {
  * Wrap `displayText` in an OSC 8 hyperlink pointing at an HTTP(S) URL.
  * `www.example.com` inputs are linked as `https://www.example.com`.
  */
-export function urlHyperlink(url: string, displayText: string): string {
-	const href = parseHttpUrl(url);
+export function urlHyperlink(input: string, displayText: string): string {
+	const href = parseHttpUrl(input);
 	return href ? wrapHyperlink(href, displayText) : displayText;
 }
 
@@ -115,10 +116,10 @@ export function urlHyperlink(url: string, displayText: string): string {
  * not advertised. Still returns plain text before settings initialization or
  * when the user has explicitly opted out via `tui.hyperlinks=off`.
  */
-export function urlHyperlinkAlways(url: string, displayText: string): string {
+export function urlHyperlinkAlways(input: string, displayText: string): string {
 	if (!isSettingsInitialized()) return displayText;
 	if (settings.get("tui.hyperlinks") === "off") return displayText;
-	const href = parseHttpUrl(url);
+	const href = parseHttpUrl(input);
 	return href ? wrapHyperlinkCore(href, displayText, BEL) : displayText;
 }
 

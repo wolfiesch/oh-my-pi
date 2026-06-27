@@ -293,7 +293,9 @@ export function formatTaskId(id: string): string {
 }
 
 function formatLiveProgressId(progress: AgentProgress): string {
-	return internalResourceHyperlink(`history://${progress.id}`, formatTaskId(progress.id));
+	return internalResourceHyperlink(`history://${progress.id}`, formatTaskId(progress.id), {
+		resolvedPath: progress.sessionFile,
+	});
 }
 
 function formatFinalResultId(result: SingleResult): string {

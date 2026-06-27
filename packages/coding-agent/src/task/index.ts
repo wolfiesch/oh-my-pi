@@ -872,6 +872,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				id: agentId,
 				queued: true,
 				ownerId: this.session.getAgentId?.() ?? undefined,
+				linkPath: this.session.getSessionFile() ?? undefined,
 				onProgress: (text, details) => {
 					const progressDetails = (details as TaskToolDetails | undefined) ?? buildDetails("running", agentId);
 					onUpdate?.({ content: [{ type: "text", text }], details: progressDetails });

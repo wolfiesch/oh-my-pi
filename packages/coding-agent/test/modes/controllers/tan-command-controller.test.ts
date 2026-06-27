@@ -163,6 +163,7 @@ describe("TanCommandController", () => {
 		);
 		expect(harness.register).toHaveBeenCalledWith("task", "/tan write the release note", expect.any(Function), {
 			ownerId: MAIN_AGENT_ID,
+			linkPath: expect.stringMatching(/Tan-.+\.jsonl$/),
 		});
 		expect(harness.capturedOptions?.ownerId).toBe(MAIN_AGENT_ID);
 		expect(harness.sequence).toEqual(["register", "sendCustomMessage"]);

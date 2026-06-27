@@ -11,7 +11,7 @@ import { jobToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/job";
 import { prompt } from "@oh-my-pi/pi-utils";
 import taskSummaryTemplate from "../src/prompts/tools/task-summary.md" with { type: "text" };
 
-function renderLines(resultText: string): string {
+function renderLines(resultText: string, linkPath?: string): string {
 	const result = {
 		content: [{ type: "text", text: "" }],
 		details: {
@@ -23,6 +23,7 @@ function renderLines(resultText: string): string {
 					label: "SpawnProbe",
 					durationMs: 8_700,
 					resultText,
+					...(linkPath ? { linkPath } : {}),
 				},
 			],
 		},

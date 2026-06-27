@@ -30,6 +30,7 @@ export type TerminalId =
 	| "vscode"
 	| "alacritty"
 	| "warp"
+	| "orca"
 	| "base"
 	| "trueColor";
 
@@ -423,11 +424,12 @@ const KNOWN_TERMINALS = Object.freeze({
 	vscode: new TerminalInfo("vscode", null, true, true, NotifyProtocol.Bell),
 	alacritty: new TerminalInfo("alacritty", null, true, true, NotifyProtocol.Bell),
 	// Warp identifies via TERM_PROGRAM=WarpTerminal and ships the Kitty graphics
-	// protocol on macOS/Linux (direct placement only — no Unicode placeholders, so
+	// protocol on macOS/Linux (direct placement only - no Unicode placeholders, so
 	// detectKittyUnicodePlaceholdersSupport correctly excludes it). It does not
 	// honor OSC 8 yet (the escape renders as visible text), so hyperlinks stay off,
 	// but it does support OSC 9 notifications.
-	warp: new TerminalInfo("warp", ImageProtocol.Kitty, true, false, NotifyProtocol.Osc9),
+	warp: getWarpTerminalInfo(process.platform),
+	orca: new TerminalInfo("orca", null, true, true, NotifyProtocol.Bell),
 });
 
 /** Resolve terminal identity from environment markers used by common emulators. */
@@ -462,7 +464,8 @@ export function detectTerminalId(env: NodeJS.ProcessEnv = Bun.env): TerminalId {
 		if (caseEq(TERM_PROGRAM, "iterm.app")) return "iterm2";
 		if (caseEq(TERM_PROGRAM, "vscode")) return "vscode";
 		if (caseEq(TERM_PROGRAM, "alacritty")) return "alacritty";
-		if (caseEq(TERM_PROGRAM, "warpterminal")) return "warp";
+	if (caseEq(TERM_PROGRAM, "WarpTerminal")) return "warp";
+	if (caseEq(TERM_PROGRAM, "Orca")) return "orca";
 	}
 
 	if (TERM?.toLowerCase().includes("ghostty")) return "ghostty";
