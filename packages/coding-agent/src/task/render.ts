@@ -31,7 +31,7 @@ import {
 	type ReportFindingDetails,
 	type SubmitReviewDetails,
 } from "../tools/review";
-import { framedBlock, renderStatusLine } from "../tui";
+import { fileHyperlink, framedBlock, internalResourceHyperlink, renderStatusLine } from "../tui";
 import { repairDoubleEncodedJsonString } from "./repair-args";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import type { AgentProgress, SingleResult, TaskItem, TaskParams, TaskToolDetails, YieldItem } from "./types";
@@ -290,6 +290,20 @@ export function formatTaskId(id: string): string {
 	// (e.g. "Anna.Bob"). Render the hierarchy with a ">" breadcrumb.
 	const segments = id.split(".");
 	return segments.length < 2 ? id : segments.join(">");
+}
+
+function formatLiveProgressId(progress: AgentProgress): string {
+	return internalResourceHyperlink(`history://${progress.id}`, formatTaskId(progress.id));
+}
+
+function formatFinalResultId(result: SingleResult): string {
+	const displayId = formatTaskId(result.id);
+	if (!result.outputPath) return displayId;
+	return internalResourceHyperlink(`agent://${result.id}`, displayId, { resolvedPath: result.outputPath });
+}
+
+function formatPatchPath(patchPath: string): string {
+	return fileHyperlink(patchPath, patchPath);
 }
 
 const MISSING_YIELD_WARNING_PREFIX = "SYSTEM WARNING: Subagent exited without calling yield tool";
@@ -822,7 +836,7 @@ function renderAgentProgress(
 	// Main status line: id: description [status] · stats · ⟨agent⟩
 	const trimmedDescription = progress.description?.trim();
 	const description = trimmedDescription ? previewLine(trimmedDescription, 64) : undefined;
-	const displayId = formatTaskId(progress.id);
+	const displayId = formatLiveProgressId(progress);
 	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
 	const indent = prefix ? `${prefix} ` : "";
 	let statusLine: string;
@@ -1164,7 +1178,7 @@ function renderAgentResult(
 	// Main status line: id: description [status] · stats · ⟨agent⟩
 	const trimmedDescription = result.description?.trim();
 	const description = trimmedDescription ? previewLine(trimmedDescription, 64) : undefined;
-	const displayId = formatTaskId(result.id);
+	const displayId = formatFinalResultId(result);
 	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
 	let statusLine = `${prefix ? `${prefix} ` : ""}${theme.fg(iconColor, icon)} ${theme.fg(
 		success && !needsWarning ? "text" : "accent",
@@ -1317,7 +1331,7 @@ function renderAgentResult(
 	}
 
 	if (result.patchPath && !aborted && result.exitCode === 0) {
-		lines.push(`${continuePrefix}${theme.fg("dim", `Patch: ${result.patchPath}`)}`);
+		lines.push(`${continuePrefix}${theme.fg("dim", `Patch: ${formatPatchPath(result.patchPath)}`)}`);
 	} else if (result.branchName && !aborted && result.exitCode === 0) {
 		lines.push(`${continuePrefix}${theme.fg("dim", `Branch: ${result.branchName}`)}`);
 	}

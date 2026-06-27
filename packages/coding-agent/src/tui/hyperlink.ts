@@ -87,19 +87,25 @@ export function uriHyperlink(uri: string, displayText: string): string {
 	return wrapHyperlink(uri, displayText);
 }
 
+/** Normalize a `www.`/bare HTTP(S) URL to its canonical href, or `undefined` if not HTTP(S). */
+function parseHttpUrl(input: string): string | undefined {
+	const normalized = input.match(/^www\./i) ? `https://${input}` : input;
+	try {
+		const parsed = new URL(normalized);
+		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+		return parsed.href;
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Wrap `displayText` in an OSC 8 hyperlink pointing at an HTTP(S) URL.
  * `www.example.com` inputs are linked as `https://www.example.com`.
  */
 export function urlHyperlink(url: string, displayText: string): string {
-	const normalized = url.match(/^www\./i) ? `https://${url}` : url;
-	try {
-		const parsed = new URL(normalized);
-		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return displayText;
-		return wrapHyperlink(parsed.href, displayText);
-	} catch {
-		return displayText;
-	}
+	const href = parseHttpUrl(url);
+	return href ? wrapHyperlink(href, displayText) : displayText;
 }
 
 /**
@@ -112,14 +118,8 @@ export function urlHyperlink(url: string, displayText: string): string {
 export function urlHyperlinkAlways(url: string, displayText: string): string {
 	if (!isSettingsInitialized()) return displayText;
 	if (settings.get("tui.hyperlinks") === "off") return displayText;
-	const normalized = url.match(/^www\./i) ? `https://${url}` : url;
-	try {
-		const parsed = new URL(normalized);
-		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return displayText;
-		return wrapHyperlinkCore(parsed.href, displayText, BEL);
-	} catch {
-		return displayText;
-	}
+	const href = parseHttpUrl(url);
+	return href ? wrapHyperlinkCore(href, displayText, BEL) : displayText;
 }
 
 /**
@@ -136,6 +136,27 @@ export function urlHyperlinkAlways(url: string, displayText: string): string {
  */
 export function fileHyperlink(filePath: string, displayText: string, opts?: { line?: number; col?: number }): string {
 	return wrapHyperlink(buildFileUri(filePath, opts), displayText);
+}
+
+export interface InternalResourceHyperlinkOptions {
+	resolvedPath?: string;
+	line?: number;
+	col?: number;
+}
+
+export function internalResourceHyperlink(
+	uri: string,
+	displayText: string,
+	opts: InternalResourceHyperlinkOptions = {},
+): string {
+	if (opts.resolvedPath) {
+		return fileHyperlink(opts.resolvedPath, displayText, { line: opts.line, col: opts.col });
+	}
+	const resolvedPath = tryResolveInternalUrlSync(uri);
+	if (resolvedPath) {
+		return fileHyperlink(resolvedPath, displayText, { line: opts.line, col: opts.col });
+	}
+	return uriHyperlink(uri, displayText);
 }
 
 /**

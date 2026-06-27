@@ -1,6 +1,7 @@
 import { Text } from "@oh-my-pi/pi-tui";
 import type { BackgroundTanDispatchDetails, CustomMessage } from "../../session/messages";
 import { replaceTabs } from "../../tools/render-utils";
+import { internalResourceHyperlink } from "../../tui/hyperlink";
 import { theme } from "../theme/theme";
 import { TranscriptBlock } from "./transcript-container";
 
@@ -12,6 +13,11 @@ function previewWork(work: string): string {
 	return `${singleLine.slice(0, TAN_WORK_PREVIEW_LENGTH - 1)}…`;
 }
 
+function jobIdDisplayText(jobId: string, sessionFile: string | undefined): string {
+	if (!sessionFile) return jobId;
+	return internalResourceHyperlink(sessionFile, jobId, { resolvedPath: sessionFile });
+}
+
 /**
  * Single-line transcript pill for a `/tan` background-dispatch breadcrumb,
  * styled as a sibling of the "Background job completed" line. The full
@@ -21,11 +27,12 @@ function previewWork(work: string): string {
 export function createBackgroundTanDispatchBlock(message: CustomMessage<unknown>): TranscriptBlock {
 	const details = (message as CustomMessage<Partial<BackgroundTanDispatchDetails>>).details;
 	const jobId = details?.jobId ?? "unknown";
+	const displayedJobId = jobIdDisplayText(jobId, details?.sessionFile);
 	const work = details?.work ? previewWork(details.work) : undefined;
 	const line = [
 		theme.fg("muted", `${theme.icon.output} Tangent dispatched`),
 		theme.fg("dim", "[task]"),
-		theme.fg("accent", jobId),
+		theme.fg("accent", displayedJobId),
 		work ? theme.fg("dim", `${theme.format.dash} ${work}`) : undefined,
 	]
 		.filter(Boolean)
