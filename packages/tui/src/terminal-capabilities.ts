@@ -464,8 +464,8 @@ export function detectTerminalId(env: NodeJS.ProcessEnv = Bun.env): TerminalId {
 		if (caseEq(TERM_PROGRAM, "iterm.app")) return "iterm2";
 		if (caseEq(TERM_PROGRAM, "vscode")) return "vscode";
 		if (caseEq(TERM_PROGRAM, "alacritty")) return "alacritty";
-	if (caseEq(TERM_PROGRAM, "WarpTerminal")) return "warp";
-	if (caseEq(TERM_PROGRAM, "Orca")) return "orca";
+		if (caseEq(TERM_PROGRAM, "WarpTerminal")) return "warp";
+		if (caseEq(TERM_PROGRAM, "Orca")) return "orca";
 	}
 
 	if (TERM?.toLowerCase().includes("ghostty")) return "ghostty";

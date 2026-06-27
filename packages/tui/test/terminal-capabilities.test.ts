@@ -117,10 +117,6 @@ describe("shouldEnableSynchronizedOutputByDefault", () => {
 });
 
 describe("Warp terminal capabilities", () => {
-	it("recognizes TERM_PROGRAM=WarpTerminal before the true-color fallback", () => {
-		expect(detectTerminalId({ TERM_PROGRAM: "WarpTerminal", COLORTERM: "truecolor" })).toBe("warp");
-	});
-
 	it("resolves the process-wide Warp terminal id and image protocol from TERM_PROGRAM", async () => {
 		const env: Record<string, string | undefined> = {
 			...Bun.env,
@@ -166,7 +162,7 @@ console.log(JSON.stringify({ id: TERMINAL_ID, imageProtocol: TERMINAL.imageProto
 	});
 
 	it("is Kitty-capable with true color but no OSC 8 hyperlinks", () => {
-		const warp = getTerminalInfo("warp");
+		const warp = getTerminalInfo("warp", "darwin", {});
 		expect(warp.imageProtocol).toBe(ImageProtocol.Kitty);
 		expect(warp.trueColor).toBe(true);
 		expect(warp.hyperlinks).toBe(false);
