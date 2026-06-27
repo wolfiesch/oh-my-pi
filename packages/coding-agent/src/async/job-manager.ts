@@ -162,6 +162,8 @@ export class AsyncJobManager {
 			reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
 			/** Clear the queued flag once the job actually starts executing. */
 			markRunning: () => void;
+			/** Attach a file-backed result target once the running job allocates one. */
+			setLinkPath: (linkPath: string | undefined) => void;
 		}) => Promise<string>,
 		options?: AsyncJobRegisterOptions,
 	): string {
@@ -209,6 +211,10 @@ export class AsyncJobManager {
 				});
 			}
 		};
+		const setLinkPath = (linkPath: string | undefined): void => {
+			job.linkPath = linkPath;
+		};
+
 		job.promise = (async () => {
 			try {
 				const text = await run({
@@ -218,6 +224,7 @@ export class AsyncJobManager {
 					markRunning: () => {
 						job.queued = false;
 					},
+					setLinkPath,
 				});
 				if (job.status === "cancelled") {
 					job.resultText = text;

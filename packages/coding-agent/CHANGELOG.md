@@ -76,6 +76,9 @@
 ### Removed
 
 - Removed history URI support for reading agent transcripts
+### Fixed
+
+- Fixed async/backgrounded bash commands not associating their output with the allocated artifact path, enabling proper OSC 8 hyperlink navigation in the TUI.
 
 ## [16.2.2] - 2026-06-27
 
