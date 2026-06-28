@@ -139,25 +139,60 @@ export function fileHyperlink(filePath: string, displayText: string, opts?: { li
 	return wrapHyperlink(buildFileUri(filePath, opts), displayText);
 }
 
+/** Options for linking an OMP-internal resource to its best available target. */
 export interface InternalResourceHyperlinkOptions {
+	/**
+	 * Absolute filesystem path already resolved by the caller. When present, it
+	 * wins over the internal URI so async-resolved schemes (`agent://`,
+	 * `artifact://`) can still open as `file://` links.
+	 */
 	resolvedPath?: string;
 	line?: number;
 	col?: number;
 }
 
+/** Linked display text plus the filesystem target, when one was resolved. */
+export interface InternalResourceHyperlinkResult {
+	text: string;
+	resolvedPath?: string;
+}
+
+/**
+ * Build an OSC 8 hyperlink for an OMP-internal URI.
+ *
+ * Resolution order: caller-provided `resolvedPath`, synchronous filesystem
+ * resolution for `local://` / `memory://`, then a raw URI hyperlink. Returns
+ * plain `displayText` through the same disabled-hyperlink and safety guards as
+ * `fileHyperlink` / `uriHyperlink`.
+ */
+export function internalResourceHyperlinkResult(
+	uri: string,
+	displayText: string,
+	opts: InternalResourceHyperlinkOptions = {},
+): InternalResourceHyperlinkResult {
+	if (opts.resolvedPath) {
+		return {
+			text: fileHyperlink(opts.resolvedPath, displayText, { line: opts.line, col: opts.col }),
+			resolvedPath: opts.resolvedPath,
+		};
+	}
+	const resolvedPath = tryResolveInternalUrlSync(uri);
+	if (resolvedPath) {
+		return {
+			text: fileHyperlink(resolvedPath, displayText, { line: opts.line, col: opts.col }),
+			resolvedPath,
+		};
+	}
+	return { text: uriHyperlink(uri, displayText) };
+}
+
+/** Return only the hyperlink text for callers that do not need the resolved path. */
 export function internalResourceHyperlink(
 	uri: string,
 	displayText: string,
 	opts: InternalResourceHyperlinkOptions = {},
 ): string {
-	if (opts.resolvedPath) {
-		return fileHyperlink(opts.resolvedPath, displayText, { line: opts.line, col: opts.col });
-	}
-	const resolvedPath = tryResolveInternalUrlSync(uri);
-	if (resolvedPath) {
-		return fileHyperlink(resolvedPath, displayText, { line: opts.line, col: opts.col });
-	}
-	return uriHyperlink(uri, displayText);
+	return internalResourceHyperlinkResult(uri, displayText, opts).text;
 }
 
 /**

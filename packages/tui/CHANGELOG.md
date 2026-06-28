@@ -12,6 +12,9 @@
 
 - Fixed slash skill autocomplete not opening when there is existing prompt text, ensuring mid-prompt slash lookups correctly display and insert skill commands.
 - Fixed modified Enter and keyboard shortcuts in fullscreen overlays for terminals using the xterm modifyOtherKeys fallback (such as iTerm2 when Kitty keyboard negotiation is unavailable).
+### Fixed
+
+- Kept Orca's null image protocol authoritative under tmux/screen fallback terms so unsupported Kitty image sequences are not emitted.
 
 ## [16.2.0] - 2026-06-27
 

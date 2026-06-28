@@ -385,10 +385,15 @@ export function shouldEnableHyperlinksByDefault(
 	return true;
 }
 
-function getFallbackImageProtocol(terminalId: TerminalId): ImageProtocol | null {
-	if (!process.stdout.isTTY) return null;
-	if (terminalId === "vscode" || terminalId === "alacritty") return null;
-	const term = Bun.env.TERM?.toLowerCase() ?? "";
+/** Resolve the multiplexer/TERM fallback image protocol while preserving terminal-specific opt-outs. */
+export function resolveFallbackImageProtocol(
+	terminalId: TerminalId,
+	env: NodeJS.ProcessEnv = Bun.env,
+	stdoutIsTTY: boolean | undefined = process.stdout.isTTY,
+): ImageProtocol | null {
+	if (!stdoutIsTTY) return null;
+	if (terminalId === "vscode" || terminalId === "alacritty" || terminalId === "orca") return null;
+	const term = env.TERM?.toLowerCase() ?? "";
 	if (term.includes("screen") || term.includes("tmux") || term.includes("ghostty")) {
 		return ImageProtocol.Kitty;
 	}
@@ -502,7 +507,7 @@ export const TERMINAL: RuntimeTerminal = (() => {
 		// Warp advertises Kitty graphics on macOS/Linux only; drop it on win32.
 		resolved.imageProtocol = resolveWarpImageProtocol();
 	} else if (!resolved.imageProtocol) {
-		const fallbackImageProtocol = getFallbackImageProtocol(resolved.id);
+		const fallbackImageProtocol = resolveFallbackImageProtocol(resolved.id);
 		if (fallbackImageProtocol) resolved.imageProtocol = fallbackImageProtocol;
 	}
 	// Hyperlink (OSC 8) capability. The static per-terminal flag lives on

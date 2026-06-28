@@ -9,7 +9,7 @@ import { type Component, Text } from "@oh-my-pi/pi-tui";
 import { formatBytes, formatDuration } from "@oh-my-pi/pi-utils";
 import { type CustomMessage, type FileMentionMessage, isSilentAbort, resolveAbortLabel } from "../../session/messages";
 import { createIrcMessageCard } from "../../tools/irc";
-import { internalResourceHyperlink } from "../../tui";
+import { fileHyperlink } from "../../tui";
 import { canonicalizeMessage } from "../../utils/thinking-display";
 import { TranscriptBlock } from "../components/transcript-container";
 import { theme } from "../theme/theme";
@@ -61,7 +61,7 @@ export function buildAsyncResultBlock(message: CustomOrHookMessage): TranscriptB
 			theme.fg("dim", typeLabel),
 			theme.fg(
 				"accent",
-				job.linkPath ? internalResourceHyperlink(`job://${jobId}`, jobId, { resolvedPath: job.linkPath }) : jobId,
+				job.linkPath ? fileHyperlink(job.linkPath, jobId) : jobId,
 			),
 			duration ? theme.fg("dim", `(${duration})`) : undefined,
 		]

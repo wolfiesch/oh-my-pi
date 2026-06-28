@@ -57,6 +57,7 @@ import {
 	prepareIsolationContext,
 	runIsolatedSubprocess,
 } from "./isolation-runner";
+import { spawnedAgentSessionLinkPath } from "./link-path";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
@@ -872,7 +873,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				id: agentId,
 				queued: true,
 				ownerId: this.session.getAgentId?.() ?? undefined,
-				linkPath: this.session.getSessionFile() ?? undefined,
+				linkPath: spawnedAgentSessionLinkPath(this.session.getSessionFile(), agentId),
 				onProgress: (text, details) => {
 					const progressDetails = (details as TaskToolDetails | undefined) ?? buildDetails("running", agentId);
 					onUpdate?.({ content: [{ type: "text", text }], details: progressDetails });

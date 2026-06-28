@@ -1,7 +1,7 @@
 import { Text } from "@oh-my-pi/pi-tui";
 import type { BackgroundTanDispatchDetails, CustomMessage } from "../../session/messages";
 import { replaceTabs } from "../../tools/render-utils";
-import { internalResourceHyperlink } from "../../tui/hyperlink";
+import { fileHyperlink } from "../../tui/hyperlink";
 import { theme } from "../theme/theme";
 import { TranscriptBlock } from "./transcript-container";
 
@@ -15,7 +15,7 @@ function previewWork(work: string): string {
 
 function jobIdDisplayText(jobId: string, sessionFile: string | undefined): string {
 	if (!sessionFile) return jobId;
-	return internalResourceHyperlink(sessionFile, jobId, { resolvedPath: sessionFile });
+	return fileHyperlink(sessionFile, jobId);
 }
 
 /**

@@ -293,15 +293,14 @@ export function formatTaskId(id: string): string {
 }
 
 function formatLiveProgressId(progress: AgentProgress): string {
-	return internalResourceHyperlink(`history://${progress.id}`, formatTaskId(progress.id), {
-		resolvedPath: progress.sessionFile,
-	});
+	const displayId = formatTaskId(progress.id);
+	return progress.sessionFile ? fileHyperlink(progress.sessionFile, displayId) : displayId;
 }
 
 function formatFinalResultId(result: SingleResult): string {
 	const displayId = formatTaskId(result.id);
 	if (!result.outputPath) return displayId;
-	return internalResourceHyperlink(`agent://${result.id}`, displayId, { resolvedPath: result.outputPath });
+	return fileHyperlink(result.outputPath, displayId);
 }
 
 function formatPatchPath(patchPath: string): string {

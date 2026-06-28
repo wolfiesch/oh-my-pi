@@ -76,6 +76,10 @@
 ### Removed
 
 - Removed history URI support for reading agent transcripts
+### Added
+
+- Added OSC 8 hyperlinks for TUI-rendered task ids, task output paths, patch paths, and `/tan` background job ids when terminal hyperlink support is enabled.
+
 ### Fixed
 
 - Fixed async/backgrounded bash commands not associating their output with the allocated artifact path, enabling proper OSC 8 hyperlink navigation in the TUI.

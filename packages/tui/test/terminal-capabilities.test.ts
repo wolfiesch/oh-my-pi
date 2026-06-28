@@ -5,6 +5,7 @@ import {
 	hyperlinksUserOverride,
 	ImageProtocol,
 	NotifyProtocol,
+	resolveFallbackImageProtocol,
 	resolveWarpImageProtocol,
 	shouldEnableHyperlinksByDefault,
 	shouldEnableSynchronizedOutputByDefault,
@@ -205,6 +206,14 @@ console.log(JSON.stringify({ id: TERMINAL_ID, imageProtocol: TERMINAL.imageProto
 		expect(shouldEnableHyperlinksByDefault({ PI_FORCE_HYPERLINKS: "1" }, "warp")).toBe(true);
 	});
 });
+
+describe("Orca terminal capabilities", () => {
+	it("keeps the fallback image protocol null under tmux fallback terms", () => {
+		expect(resolveFallbackImageProtocol("orca", { TERM: "tmux-256color" }, true)).toBeNull();
+		expect(resolveFallbackImageProtocol("orca", { TERM: "screen-256color" }, true)).toBeNull();
+	});
+});
+
 
 describe("hyperlinksUserOverride", () => {
 	it("returns null when neither override is set", () => {
