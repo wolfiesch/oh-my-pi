@@ -226,6 +226,9 @@ describe("AgentSession auto-compaction progress guard", () => {
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(1);
 		expect(noProgress[0].level).toBe("warning");
+		expect(noProgress[0].message).toContain("residual context 190,000/200,000 tokens");
+		expect(noProgress[0].message).toContain("threshold 170,000");
+		expect(noProgress[0].message).toContain("recovery band 136,000");
 	});
 
 	it("clamps default reserve for small-window threshold recovery bands", () => {
@@ -680,12 +683,12 @@ describe("AgentSession auto-compaction progress guard", () => {
 		// prompt in the reserved headroom band can retry straight into overflow.
 		seedPriorTurns();
 		const currentModel = session.agent.state.model;
-		session.agent.setModel({ ...currentModel, contextWindow: 20000, maxTokens: 1024 });
+		session.agent.setModel({ ...currentModel, contextWindow: 30000, maxTokens: 1024 });
 		session.settings.set("contextPromotion.enabled", false);
-		session.settings.set("compaction.reserveTokens", 5000);
+		session.settings.set("compaction.reserveTokens", 7000);
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
-		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 16000, contextWindow: 20000, percent: 80 });
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 24000, contextWindow: 30000, percent: 80 });
 
 		const notices = collectNotices();
 
@@ -704,6 +707,12 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(continueSpy).not.toHaveBeenCalled();
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(1);
+		expect(noProgress[0].message).toContain("residual context");
+		expect(noProgress[0].message).toContain("/30,000 tokens");
+		expect(noProgress[0].message).toContain("threshold 23,000");
+		expect(noProgress[0].message).toContain("recovery band 18,400");
+		expect(noProgress[0].message).toContain("retry fit budget 23,000");
+		expect(noProgress[0].message).toContain("lower the configured reserve");
 	});
 
 	it("pauses an overflow retry when a large valid configured reserve leaves a small usable budget", async () => {

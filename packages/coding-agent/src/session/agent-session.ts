@@ -417,6 +417,20 @@ type CompactionCheckResult = Readonly<{
 	automaticContinuationBlocked?: boolean;
 }>;
 
+type CompactionHeadroomStatus = Readonly<{
+	contextWindow: number;
+	residualTokens: number;
+	thresholdTokens: number;
+	recoveryBand: number;
+	retryFitBudget: number;
+	retryFits: boolean;
+	createdHeadroom: boolean;
+}>;
+
+function formatTokenCount(tokens: number): string {
+	return tokens.toLocaleString("en-US");
+}
+
 const COMPACTION_CHECK_NONE: CompactionCheckResult = {
 	deferredHandoff: false,
 	continuationScheduled: false,
@@ -10947,25 +10961,22 @@ export class AgentSession {
 	}
 
 	/**
-	 * Post-maintenance progress check for the context-full / snapcompact tail.
+	 * Post-compaction context measurement shared by the retry and threshold
+	 * maintenance guards.
 	 *
 	 * After `appendCompaction` rewrote history and `replaceMessages` swapped in the
-	 * compacted context, measure the residual context off the live message set and
-	 * decide whether maintenance actually created headroom. Mirrors the shake
-	 * recovery-band logic (#2275): a session whose single most-recent turn already
-	 * blows the threshold cannot be reduced by compaction (findCutPoint keeps that
-	 * turn verbatim), so re-firing on the next agent_end just thrashes. We only
-	 * report progress when residual context lands at or below
-	 * `COMPACTION_RECOVERY_BAND × threshold` — a band that sits strictly under the
-	 * compaction threshold, so reaching it guarantees the next turn cannot
-	 * re-trip threshold compaction.
+	 * compacted context, measure residual context off the live message set. Threshold
+	 * maintenance needs residual context at or below `COMPACTION_RECOVERY_BAND ×
+	 * threshold` so the next turn cannot re-trip threshold compaction. Retry recovery
+	 * only needs the rebuilt prompt to fit the usable model budget, so it checks the
+	 * looser `contextWindow - reserve` budget (#3412 review).
 	 *
-	 * When the model/window is unknown we cannot evaluate the band, so we
-	 * optimistically allow the continuation (preserving prior behavior).
+	 * When the model/window is unknown we cannot evaluate either budget, so callers
+	 * preserve prior optimistic behavior.
 	 */
-	#compactionCreatedHeadroom(): boolean {
+	#compactionHeadroomStatus(): CompactionHeadroomStatus | null {
 		const contextWindow = this.model?.contextWindow ?? 0;
-		if (contextWindow <= 0) return true;
+		if (contextWindow <= 0) return null;
 		const compactionSettings = this.settings.getGroup("compaction");
 		const residualTokens = compactionContextTokens(
 			this.getContextUsage({ contextWindow })?.tokens ?? 0,
@@ -10973,50 +10984,18 @@ export class AgentSession {
 		);
 		const thresholdTokens = resolveThresholdTokens(contextWindow, compactionSettings);
 		const recoveryBand = Math.floor(thresholdTokens * COMPACTION_RECOVERY_BAND);
-		// Residual at/below the band is authoritative headroom: the band sits
-		// strictly under the compaction threshold, so the next turn cannot
-		// re-trip threshold compaction regardless of how little this pass shaved.
-		// Don't add a secondary "smaller than the trigger" guard — when stale/
-		// tool-output pruning already dropped context under the band before this
-		// pass, the trigger is itself sub-band, and requiring a strict reduction
-		// would suppress a valid continuation and emit a false no-progress warning
-		// even though compaction left the session safe.
-		return residualTokens <= recoveryBand;
-	}
-
-	/**
-	 * Retry-side counterpart to {@link #compactionCreatedHeadroom}. An
-	 * overflow/incomplete recovery only needs the rebuilt prompt to *fit* the
-	 * window again — it does not have to land under the compaction threshold, let
-	 * alone the stricter `COMPACTION_RECOVERY_BAND × threshold` hysteresis the
-	 * auto-continue thrash guard uses. Reusing the band here turned recoverable
-	 * overflows into manual dead-ends: a 200k-window prompt compacted from
-	 * overflow down to ~150k is comfortably retryable, but sits above
-	 * `0.8 × 170k = 136k` and was wrongly refused (PR #3412 review).
-	 *
-	 * Measures residual context against the usable budget (`contextWindow - reserve`).
-	 * The default absolute reserve can exceed bundled small-context windows, or
-	 * nearly consume a 16k-class window; those known-impossible defaults fall
-	 * back to the proportional 15% reserve. Explicit valid reserves still define
-	 * the usable prompt budget so retries do not enter headroom the user
-	 * intentionally reserved. Callers MUST
-	 * invoke this AFTER dropping the failed assistant from `this.messages`, so
-	 * the just-failed turn (which the retry prompt will not include) is excluded
-	 * from the estimate.
-	 *
-	 * When the model/window is unknown we cannot evaluate the budget, so we
-	 * optimistically allow the retry (preserving prior behavior).
-	 */
-	#compactionCreatedRetryFit(): boolean {
-		const contextWindow = this.model?.contextWindow ?? 0;
-		if (contextWindow <= 0) return true;
-		const compactionSettings = this.settings.getGroup("compaction");
-		const residualTokens = compactionContextTokens(
-			this.getContextUsage({ contextWindow })?.tokens ?? 0,
-			this.#estimateStoredContextTokens(),
-		);
-		const fitBudget = Math.max(0, contextWindow - resolveBudgetReserveTokens(contextWindow, compactionSettings));
-		return residualTokens <= fitBudget;
+		const retryFitBudget = Math.max(0, contextWindow - resolveBudgetReserveTokens(contextWindow, compactionSettings));
+		// Residual at/below the band is authoritative threshold headroom; retry
+		// recovery is looser and only needs the prompt to fit the usable window.
+		return {
+			contextWindow,
+			residualTokens,
+			thresholdTokens,
+			recoveryBand,
+			retryFitBudget,
+			createdHeadroom: residualTokens <= recoveryBand,
+			retryFits: residualTokens <= retryFitBudget,
+		};
 	}
 
 	/**
@@ -11532,6 +11511,7 @@ export class AgentSession {
 			// too little for that path to proceed is a dead-end: warn once so the user
 			// understands why maintenance paused instead of silently looping.
 			let noProgressDeadEnd = false;
+			let compactionHeadroomStatus: CompactionHeadroomStatus | null = null;
 
 			if (willRetry) {
 				const messages = this.agent.state.messages;
@@ -11550,12 +11530,13 @@ export class AgentSession {
 					}
 				}
 
-				// Retry only needs the rebuilt prompt to fit the window again — measured
+				// Retry only needs the rebuilt prompt to fit the window again - measured
 				// AFTER the drop above so the just-failed turn (which the retry prompt
 				// won't include) is excluded. Reusing the auto-continue recovery band
 				// here turned recoverable overflows into manual dead-ends (#3412 review),
 				// so use the looser fit budget.
-				if (this.#compactionCreatedRetryFit()) {
+				compactionHeadroomStatus = this.#compactionHeadroomStatus();
+				if (compactionHeadroomStatus?.retryFits ?? true) {
 					this.#scheduleAgentContinue({ delayMs: 100, generation });
 					continuationScheduled = true;
 				} else {
@@ -11569,7 +11550,8 @@ export class AgentSession {
 				// when auto-continue is disabled, a no-headroom threshold pass must still
 				// block later automatic continuations (todo reminders/session_stop hooks)
 				// from re-entering the same oversized context.
-				if (this.#compactionCreatedHeadroom()) {
+				compactionHeadroomStatus = this.#compactionHeadroomStatus();
+				if (compactionHeadroomStatus?.createdHeadroom ?? true) {
 					if (shouldAutoContinue) {
 						this.#scheduleAutoContinuePrompt(generation);
 						continuationScheduled = true;
@@ -11591,9 +11573,12 @@ export class AgentSession {
 			}
 
 			if (noProgressDeadEnd) {
+				const headroomDiagnostic = compactionHeadroomStatus
+					? ` Current residual context ${formatTokenCount(compactionHeadroomStatus.residualTokens)}/${formatTokenCount(compactionHeadroomStatus.contextWindow)} tokens; threshold ${formatTokenCount(compactionHeadroomStatus.thresholdTokens)}; recovery band ${formatTokenCount(compactionHeadroomStatus.recoveryBand)}; retry fit budget ${formatTokenCount(compactionHeadroomStatus.retryFitBudget)}.`
+					: "";
 				this.emitNotice(
 					"warning",
-					"Compaction freed too little context to make progress — pausing automatic maintenance to avoid a compaction loop. The most recent turn alone is too large to reduce further; shrink it (e.g. clear large tool output) or switch to a larger-context model.",
+					`Compaction freed too little context to make progress - pausing automatic maintenance to avoid a compaction loop.${headroomDiagnostic} Residual context still exceeds the required budget for this maintenance path; reduce recent context, lower the configured reserve, or switch to a larger-context model.`,
 					"compaction",
 				);
 			}
