@@ -63,6 +63,7 @@ import {
 	prepareCompaction,
 	renderHandoffPrompt,
 	resolveThresholdTokens,
+	resolveBudgetReserveTokens,
 	type SessionEntry,
 	type SessionMessageEntry,
 	type ShakeConfig,
@@ -10994,10 +10995,11 @@ export class AgentSession {
 	 * `0.8 × 170k = 136k` and was wrongly refused (PR #3412 review).
 	 *
 	 * Measures residual context against the usable budget (`contextWindow - reserve`).
-	 * The default absolute reserve can exceed bundled small-context windows; only
-	 * that impossible configuration falls back to the proportional 15% reserve.
-	 * Otherwise respect the configured reserve so retries do not re-enter an
-	 * overflow the user intentionally reserved headroom to avoid. Callers MUST
+	 * The default absolute reserve can exceed bundled small-context windows, or
+	 * nearly consume a 16k-class window; those known-impossible defaults fall
+	 * back to the proportional 15% reserve. Explicit valid reserves still define
+	 * the usable prompt budget so retries do not enter headroom the user
+	 * intentionally reserved. Callers MUST
 	 * invoke this AFTER dropping the failed assistant from `this.messages`, so
 	 * the just-failed turn (which the retry prompt will not include) is excluded
 	 * from the estimate.
@@ -11013,10 +11015,7 @@ export class AgentSession {
 			this.getContextUsage({ contextWindow })?.tokens ?? 0,
 			this.#estimateStoredContextTokens(),
 		);
-		const reserveTokens = effectiveReserveTokens(contextWindow, compactionSettings);
-		const defaultReserveTokens = Math.floor(contextWindow * 0.15);
-		const fitReserveTokens = reserveTokens >= contextWindow ? defaultReserveTokens : reserveTokens;
-		const fitBudget = Math.max(0, contextWindow - fitReserveTokens);
+		const fitBudget = Math.max(0, contextWindow - resolveBudgetReserveTokens(contextWindow, compactionSettings));
 		return residualTokens <= fitBudget;
 	}
 

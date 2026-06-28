@@ -551,6 +551,61 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(noProgress.length).toBe(0);
 	});
 
+	it("retries a near-16k-window overflow when the default reserve leaves no usable budget", async () => {
+		// GPT-3.5 variants ship with a 16,385-token context window; the default
+		// absolute reserve is 16,384. Retry fit must treat that reserve as
+		// effectively impossible for the window, otherwise any realistic compacted
+		// prompt dead-ends behind a one-token budget.
+		session.settings.set("compaction.keepRecentTokens", 100);
+		const smallText = "lorem ipsum ".repeat(100);
+		for (let i = 0; i < 4; i++) {
+			sessionManager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: smallText }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				stopReason: "stop",
+				usage: {
+					input: 100,
+					output: 10,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 110,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			});
+			sessionManager.appendMessage({ role: "user", content: "next", timestamp: Date.now() });
+		}
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		const currentModel = session.agent.state.model;
+		session.agent.setModel({ ...currentModel, contextWindow: 16385, maxTokens: 1024 });
+		session.settings.set("contextPromotion.enabled", false);
+		session.settings.set("compaction.reserveTokens", 16384);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 10000, contextWindow: 16385, percent: 61 });
+
+		const notices = collectNotices();
+
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") onCompactionDone();
+		});
+
+		const assistantMsg = overflowAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await compactionDone;
+		await session.waitForIdle();
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
+		expect(noProgress.length).toBe(0);
+	});
+
 	it("pauses an overflow retry when it only fits after ignoring a configured reserve", async () => {
 		// Retry fit may clamp an impossible reserve that exceeds the model window,
 		// but must respect a valid user reserve above the 15% default. Otherwise a
@@ -583,6 +638,37 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(noProgress.length).toBe(1);
 	});
 
+	it("pauses an overflow retry when a large valid configured reserve leaves a small usable budget", async () => {
+		// A 90k reserve on a 100k model is valid: the retry prompt must fit inside
+		// the remaining ~10k usable budget. The proportional fallback is only for
+		// default/impossible reserves, not explicit large reserves.
+		seedPriorTurns();
+		const currentModel = session.agent.state.model;
+		session.agent.setModel({ ...currentModel, contextWindow: 100000, maxTokens: 1024 });
+		session.settings.set("contextPromotion.enabled", false);
+		session.settings.set("compaction.reserveTokens", 90000);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 15000, contextWindow: 100000, percent: 15 });
+
+		const notices = collectNotices();
+
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") onCompactionDone();
+		});
+
+		const assistantMsg = overflowAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await compactionDone;
+		await session.waitForIdle();
+
+		expect(continueSpy).not.toHaveBeenCalled();
+		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
+		expect(noProgress.length).toBe(1);
+	});
 	/**
 	 * Seed a single large `useless` tool result (plus tiny follow-up turns that
 	 * keep its suffix inside the cache-warm window) so the per-turn maintenance

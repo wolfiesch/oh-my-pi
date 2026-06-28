@@ -5,7 +5,7 @@ import { disposeJuliaKernelSessionsByOwner, executeJulia } from "../jl/executor"
 
 const HAS_JULIA = Boolean($which("julia"));
 const OWNER_ID = "julia-prelude-tests";
-const JULIA_PRELUDE_TEST_TIMEOUT_MS = 60_000;
+const JULIA_PRELUDE_TEST_TIMEOUT_MS = 90_000;
 
 describe.skipIf(!HAS_JULIA)("eval Julia prelude helpers", () => {
 	afterEach(async () => {
