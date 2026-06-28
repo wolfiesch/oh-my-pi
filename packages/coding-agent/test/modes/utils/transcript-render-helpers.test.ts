@@ -7,8 +7,8 @@ import { buildAsyncResultBlock } from "@oh-my-pi/pi-coding-agent/modes/utils/tra
 
 const OSC8 = /\x1b\]8;[^;]*;([^\x1b\x07]+)(?:\x1b\\|\x07)/;
 
-beforeAll(() => {
-	initTheme();
+beforeAll(async () => {
+	await initTheme();
 });
 
 beforeEach(async () => {

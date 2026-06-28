@@ -150,7 +150,7 @@ describe("task spawn routing", () => {
 		expect(runSpy).toHaveBeenCalledTimes(1);
 	});
 
-	it("registers spawned task jobs with the parent session link target", async () => {
+	it("registers spawned task jobs with the spawned transcript link target", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
 			agents: [taskAgent],
 			projectAgentsDir: null,
@@ -161,7 +161,7 @@ describe("task spawn routing", () => {
 			return makeResult(options.id ?? "?");
 		});
 
-		const sessionFile = "/tmp/omp-parent-session.json";
+		const sessionFile = "/tmp/omp-parent-session.jsonl";
 		const manager = createManager();
 		const tool = await TaskTool.create(createSession({ manager, sessionFile }));
 
@@ -173,7 +173,7 @@ describe("task spawn routing", () => {
 
 		const jobId = result.details?.async?.jobId;
 		expect(jobId).toBeTruthy();
-		expect(manager.getJob(jobId!)?.linkPath).toBe(sessionFile);
+		expect(manager.getJob(jobId!)?.linkPath).toBe("/tmp/omp-parent-session/Linkable.jsonl");
 
 		gate.resolve();
 		await manager.getJob(jobId!)!.promise;
