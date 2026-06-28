@@ -456,6 +456,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	lastAssistantUsage: Usage | undefined = undefined;
 	loadingAnimation: Loader | undefined = undefined;
 	autoCompactionLoader: Loader | undefined = undefined;
+	compactionLoader: Loader | undefined = undefined;
 	retryLoader: Loader | undefined = undefined;
 	#terminalTitleAttentionDepth = 0;
 	#planReviewTitleAttentionRelease: (() => void) | undefined;
@@ -553,6 +554,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.autoCompactionLoader) {
 			this.autoCompactionLoader.stop();
 			this.autoCompactionLoader = undefined;
+		}
+		if (this.compactionLoader) {
+			this.compactionLoader.stop();
+			this.compactionLoader = undefined;
 		}
 		if (this.retryLoader) {
 			this.retryLoader.stop();
@@ -1080,8 +1085,11 @@ export class InteractiveMode implements InteractiveModeContext {
 	#terminalTitleBaseState(): Exclude<TerminalTitleRunState, "needs_attention"> {
 		if (
 			this.session.isStreaming ||
+			this.session.isCompacting ||
 			this.viewSession.isStreaming ||
+			this.viewSession.isCompacting ||
 			this.loadingAnimation ||
+			this.compactionLoader ||
 			this.autoCompactionLoader ||
 			this.retryLoader
 		) {

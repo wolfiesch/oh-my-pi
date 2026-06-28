@@ -37,13 +37,16 @@ function buildCtx(compact: InteractiveModeContext["session"]["compact"]) {
 		statusChildrenAtRebuild = statusContainer.children.length;
 	});
 	const showError = vi.fn();
+	const refreshTerminalTitle = vi.fn();
 	const ctx = {
 		loadingAnimation: undefined,
+		compactionLoader: undefined,
 		chatContainer,
 		statusContainer,
 		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
 		session: { compact },
 		rebuildChatFromMessages,
+		refreshTerminalTitle,
 		statusLine: { invalidate: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
 		showError,
@@ -55,6 +58,7 @@ function buildCtx(compact: InteractiveModeContext["session"]["compact"]) {
 		chatContainer,
 		statusContainer,
 		rebuildChatFromMessages,
+		refreshTerminalTitle,
 		showError,
 		statusAtRebuild: () => statusChildrenAtRebuild,
 	};
@@ -79,6 +83,31 @@ describe("executeCompaction UI lifecycle", () => {
 
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+
+	it("refreshes the terminal title while the manual compaction loader is active", async () => {
+		let ctx: InteractiveModeContext | undefined;
+		let refreshTerminalTitle: { mock: { calls: unknown[][] } } | undefined;
+		let loaderDuringCompact: unknown;
+		let refreshCountDuringCompact = 0;
+		const compact = vi.fn(async (): Promise<CompactionResult<unknown>> => {
+			if (!ctx || !refreshTerminalTitle) throw new Error("Expected context");
+			loaderDuringCompact = ctx.compactionLoader;
+			refreshCountDuringCompact = refreshTerminalTitle.mock.calls.length;
+			return { summary: "", firstKeptEntryId: "", tokensBefore: 0 };
+		});
+		const built = buildCtx(compact);
+		ctx = built.ctx;
+		refreshTerminalTitle = built.refreshTerminalTitle;
+
+		const controller = new CommandController(ctx);
+		const outcome = await controller.executeCompaction();
+
+		expect(outcome).toBe("ok");
+		expect(loaderDuringCompact).toBeDefined();
+		expect(refreshCountDuringCompact).toBe(1);
+		expect(ctx.compactionLoader).toBeUndefined();
+		expect(built.refreshTerminalTitle).toHaveBeenCalledTimes(2);
 	});
 
 	it("leaves the transcript untouched and drains the loader when compaction is cancelled", async () => {

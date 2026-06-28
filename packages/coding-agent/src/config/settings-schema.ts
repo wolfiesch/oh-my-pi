@@ -815,7 +815,7 @@ export const SETTINGS_SCHEMA = {
 
 	"terminal.showTitleState": {
 		type: "boolean",
-		default: true,
+		default: false,
 		ui: {
 			tab: "appearance",
 			group: "Display",

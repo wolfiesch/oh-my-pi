@@ -1194,7 +1194,9 @@ export class CommandController {
 			label,
 			getSymbolTheme().spinnerFrames,
 		);
+		this.ctx.compactionLoader = compactingLoader;
 		this.ctx.statusContainer.addChild(compactingLoader);
+		this.ctx.refreshTerminalTitle();
 		this.ctx.ui.requestRender();
 
 		let outcome: CompactionOutcome = "ok";
@@ -1214,7 +1216,11 @@ export class CommandController {
 			await this.ctx.session.compact(instructions, options);
 
 			compactingLoader.stop();
+			if (this.ctx.compactionLoader === compactingLoader) {
+				this.ctx.compactionLoader = undefined;
+			}
 			this.ctx.statusContainer.clear();
+			this.ctx.refreshTerminalTitle();
 			this.ctx.rebuildChatFromMessages();
 
 			this.ctx.statusLine.invalidate();
@@ -1230,6 +1236,10 @@ export class CommandController {
 			}
 		} finally {
 			compactingLoader.stop();
+			if (this.ctx.compactionLoader === compactingLoader) {
+				this.ctx.compactionLoader = undefined;
+				this.ctx.refreshTerminalTitle();
+			}
 			this.ctx.statusContainer.clear();
 		}
 		// Run the caller's pre-flush hook (e.g. the plan-approval model transition)

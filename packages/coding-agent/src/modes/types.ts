@@ -188,6 +188,7 @@ export interface InteractiveModeContext {
 	lastAssistantUsage: Usage | undefined;
 	loadingAnimation: Loader | undefined;
 	autoCompactionLoader: Loader | undefined;
+	compactionLoader: Loader | undefined;
 	retryLoader: Loader | undefined;
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
