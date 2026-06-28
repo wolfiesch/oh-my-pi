@@ -11285,15 +11285,25 @@ export class AgentSession {
 					willRetry: false,
 					skipped: true,
 				});
-				if (!willRetry && this.agent.hasQueuedMessages()) {
+				const noProgressDeadEnd = reason !== "idle";
+				let continuationScheduled = false;
+				if (!suppressContinuation && this.agent.hasQueuedMessages()) {
 					this.#scheduleAgentContinue({
 						delayMs: 100,
 						generation,
 						shouldContinue: () => this.agent.hasQueuedMessages(),
 					});
-					return COMPACTION_CHECK_CONTINUATION;
+					continuationScheduled = true;
 				}
-				return COMPACTION_CHECK_NONE;
+				if (noProgressDeadEnd) {
+					this.emitNotice(
+						"warning",
+						"Compaction freed too little context to make progress — pausing automatic maintenance to avoid a compaction loop. The most recent turn alone is too large to reduce further; shrink it (e.g. clear large tool output) or switch to a larger-context model.",
+						"compaction",
+					);
+				}
+				if (continuationScheduled) return COMPACTION_CHECK_CONTINUATION;
+				return noProgressDeadEnd ? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION : COMPACTION_CHECK_NONE;
 			}
 
 			let hookCompaction: CompactionResult | undefined;
