@@ -39,6 +39,17 @@ function limiterDir(provider: string): string {
 	return __providerInFlightForTesting.providerDir(provider);
 }
 
+async function readWakeupState(providerDir: string): Promise<{ mtimeMs: number; content: string } | undefined> {
+	const wakeupPath = path.join(providerDir, ".wakeup");
+	try {
+		const [stat, content] = await Promise.all([fs.stat(wakeupPath), fs.readFile(wakeupPath, "utf-8")]);
+		return { mtimeMs: stat.mtimeMs, content };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
 describe("provider in-flight request limits", () => {
 	beforeEach(async () => {
 		await useIsolatedLimiterRoot();
@@ -165,8 +176,9 @@ describe("provider in-flight request limits", () => {
 			signal: controller.signal,
 		});
 
+		const beforeWakeup = await readWakeupState(providerDir);
 		await Bun.sleep(50);
-		expect(await Bun.file(path.join(providerDir, ".wakeup")).exists()).toBe(false);
+		expect(await readWakeupState(providerDir)).toEqual(beforeWakeup);
 		expect(mock.calls).toHaveLength(0);
 
 		controller.abort(new Error("cancel saturated waiter"));

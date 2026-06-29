@@ -625,6 +625,11 @@ describe("AgentSession auto-compaction progress guard", () => {
 					}),
 				}),
 			);
+			expect(session.agent.state.messages.at(-1)).toMatchObject({
+				role: "assistant",
+				stopReason: "error",
+				errorMessage: assistantMsg.errorMessage,
+			});
 			session.agent.clearAllQueues();
 		});
 
@@ -650,6 +655,55 @@ describe("AgentSession auto-compaction progress guard", () => {
 					role: "assistant",
 					stopReason: "error",
 					errorMessage: assistantMsg.errorMessage,
+				}),
+			}),
+		);
+	});
+
+	it("does not restore a length stop after handoff recovery commits", async () => {
+		session.settings.set("compaction.strategy", "handoff");
+		session.settings.set("contextPromotion.enabled", false);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const handoffSpy = vi.spyOn(session, "handoff").mockResolvedValue({ document: "handoff document" });
+
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") onCompactionDone();
+		});
+
+		const assistantMsg = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "unfinished" }],
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			stopReason: "length" as const,
+			usage: {
+				input: 10_000,
+				output: 1_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 11_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await compactionDone;
+		await session.waitForIdle();
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(handoffSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(sessionManager.getBranch()).not.toContainEqual(
+			expect.objectContaining({
+				type: "message",
+				message: expect.objectContaining({
+					role: "assistant",
+					stopReason: "length",
 				}),
 			}),
 		);

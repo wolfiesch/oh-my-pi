@@ -419,6 +419,7 @@ type CompactionCheckResult = Readonly<{
 	deferredHandoff: boolean;
 	continuationScheduled: boolean;
 	automaticContinuationBlocked?: boolean;
+	historyRewritten?: boolean;
 }>;
 
 const COMPACTION_CHECK_NONE: CompactionCheckResult = {
@@ -9895,9 +9896,10 @@ export class AgentSession {
 	 * Compaction has to see a clean branch — otherwise its `prepareCompaction`
 	 * pass would keep the failed turn in the kept region and the retry would
 	 * replay it. But a return that was not paired with a fresh compaction
-	 * summary means no recovery is in progress, even if queued user input gets
-	 * drained next. Restoring the failed turn before that continuation preserves
-	 * the visible stop reason without replaying it as recovery context.
+	 * summary or a successful history rewrite means no recovery is in progress,
+	 * even if queued user input gets drained next. Restoring the failed turn
+	 * before that continuation preserves the visible stop reason and rebuilds the
+	 * active assistant tail that `Agent.continue()` needs to dequeue follow-ups.
 	 */
 	async #runRecoveryCompactionWithRollback(
 		reason: "overflow" | "incomplete",
@@ -9909,10 +9911,22 @@ export class AgentSession {
 		await this.#dropPersistedAssistantTurn(assistantMessage);
 		const result = await this.#runAutoCompaction(reason, true, false, allowDefer, options);
 		const compactionEntryAfter = getLatestCompactionEntry(this.sessionManager.getBranch());
-		if (compactionEntryAfter === compactionEntryBefore) {
-			this.sessionManager.appendMessage(assistantMessage);
+		if (result.historyRewritten !== true && compactionEntryAfter === compactionEntryBefore) {
+			this.#restoreFailedAssistantTurn(assistantMessage);
 		}
 		return result;
+	}
+
+	#restoreFailedAssistantTurn(assistantMessage: AssistantMessage): void {
+		this.sessionManager.appendMessage(assistantMessage);
+		const lastMessage = this.agent.state.messages.at(-1);
+		if (
+			lastMessage?.role === "assistant" &&
+			this.#isSameAssistantMessage(lastMessage as AssistantMessage, assistantMessage)
+		) {
+			return;
+		}
+		this.agent.appendMessage(assistantMessage);
 	}
 
 	/**
@@ -11204,7 +11218,10 @@ export class AgentSession {
 					if (continuationScheduled) {
 						this.#scheduleAutoContinuePrompt(generation);
 					}
-					return continuationScheduled ? COMPACTION_CHECK_CONTINUATION : COMPACTION_CHECK_NONE;
+					return {
+						...(continuationScheduled ? COMPACTION_CHECK_CONTINUATION : COMPACTION_CHECK_NONE),
+						historyRewritten: true,
+					};
 				}
 			}
 
