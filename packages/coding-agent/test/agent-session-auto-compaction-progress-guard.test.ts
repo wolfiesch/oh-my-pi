@@ -601,6 +601,60 @@ describe("AgentSession auto-compaction progress guard", () => {
 		);
 	});
 
+	it("restores the persisted overflow error before draining queued no-op recovery", async () => {
+		// A queued user turn still deserves a follow-up, but no-op recovery has not
+		// written a compaction summary. Restore the failed assistant before the queue
+		// drains so the transcript keeps the reason recovery stopped.
+		session.agent.followUp({
+			role: "custom",
+			customType: "test",
+			content: [{ type: "text", text: "Queued while recovering" }],
+			display: false,
+			timestamp: Date.now(),
+		});
+		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(undefined);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			expect(sessionManager.getBranch()).toContainEqual(
+				expect.objectContaining({
+					type: "message",
+					message: expect.objectContaining({
+						role: "assistant",
+						stopReason: "error",
+						errorMessage: assistantMsg.errorMessage,
+					}),
+				}),
+			);
+			session.agent.clearAllQueues();
+		});
+
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") onCompactionDone();
+		});
+
+		const assistantMsg = overflowAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await compactionDone;
+		await session.waitForIdle();
+
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+		expect(sessionManager.getBranch()).toContainEqual(
+			expect.objectContaining({
+				type: "message",
+				message: expect.objectContaining({
+					role: "assistant",
+					stopReason: "error",
+					errorMessage: assistantMsg.errorMessage,
+				}),
+			}),
+		);
+	});
+
 	it("retries a small-window overflow when the default reserve exceeds the model window", async () => {
 		// Bundled 4k/8k models can be smaller than the default absolute reserve
 		// (16,384). Retry fit must clamp that reserve; otherwise the budget goes

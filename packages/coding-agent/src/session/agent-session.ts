@@ -9895,10 +9895,9 @@ export class AgentSession {
 	 * Compaction has to see a clean branch — otherwise its `prepareCompaction`
 	 * pass would keep the failed turn in the kept region and the retry would
 	 * replay it. But a return that was not paired with a fresh compaction
-	 * summary means no recovery is in progress, and leaving the branch
-	 * reparented would erase the only user-visible explanation for why the turn
-	 * stopped. Reverting the drop in that case preserves the transcript while
-	 * still letting a real recovery path own the rewrite.
+	 * summary means no recovery is in progress, even if queued user input gets
+	 * drained next. Restoring the failed turn before that continuation preserves
+	 * the visible stop reason without replaying it as recovery context.
 	 */
 	async #runRecoveryCompactionWithRollback(
 		reason: "overflow" | "incomplete",
@@ -9909,12 +9908,9 @@ export class AgentSession {
 		const compactionEntryBefore = getLatestCompactionEntry(this.sessionManager.getBranch());
 		await this.#dropPersistedAssistantTurn(assistantMessage);
 		const result = await this.#runAutoCompaction(reason, true, false, allowDefer, options);
-		const recoveryCommitted = result.continuationScheduled || result.deferredHandoff;
-		if (!recoveryCommitted) {
-			const compactionEntryAfter = getLatestCompactionEntry(this.sessionManager.getBranch());
-			if (compactionEntryAfter === compactionEntryBefore) {
-				this.sessionManager.appendMessage(assistantMessage);
-			}
+		const compactionEntryAfter = getLatestCompactionEntry(this.sessionManager.getBranch());
+		if (compactionEntryAfter === compactionEntryBefore) {
+			this.sessionManager.appendMessage(assistantMessage);
 		}
 		return result;
 	}
