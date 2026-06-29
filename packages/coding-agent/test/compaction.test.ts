@@ -11,8 +11,8 @@ import {
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
-	shouldCompact,
 	resolveThresholdTokens,
+	shouldCompact,
 } from "@oh-my-pi/pi-agent-core/compaction/compaction";
 import * as ai from "@oh-my-pi/pi-ai";
 import { encodeTextSignatureV1 } from "@oh-my-pi/pi-ai/providers/openai-shared";
