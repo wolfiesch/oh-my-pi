@@ -9888,11 +9888,13 @@ export class AgentSession {
 	 * Drop the failed assistant turn from persisted history, run
 	 * {@link #runAutoCompaction} for an `overflow` / `incomplete` recovery, and
 	 * restore the assistant entry if compaction did not actually commit
-	 * anything (no usable model/preparation, hook cancel, or compaction error).
+	 * anything (no usable model/preparation, hook cancel, compaction error,
+	 * or a no-progress automatic-continuation block before any summary was
+	 * written).
 	 *
 	 * Compaction has to see a clean branch — otherwise its `prepareCompaction`
 	 * pass would keep the failed turn in the kept region and the retry would
-	 * replay it. But a NONE return that was not paired with a fresh compaction
+	 * replay it. But a return that was not paired with a fresh compaction
 	 * summary means no recovery is in progress, and leaving the branch
 	 * reparented would erase the only user-visible explanation for why the turn
 	 * stopped. Reverting the drop in that case preserves the transcript while
@@ -9907,8 +9909,7 @@ export class AgentSession {
 		const compactionEntryBefore = getLatestCompactionEntry(this.sessionManager.getBranch());
 		await this.#dropPersistedAssistantTurn(assistantMessage);
 		const result = await this.#runAutoCompaction(reason, true, false, allowDefer, options);
-		const recoveryCommitted =
-			result.continuationScheduled || result.deferredHandoff || result.automaticContinuationBlocked === true;
+		const recoveryCommitted = result.continuationScheduled || result.deferredHandoff;
 		if (!recoveryCommitted) {
 			const compactionEntryAfter = getLatestCompactionEntry(this.sessionManager.getBranch());
 			if (compactionEntryAfter === compactionEntryBefore) {
