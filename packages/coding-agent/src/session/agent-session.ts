@@ -11831,7 +11831,11 @@ export class AgentSession {
 				});
 				continuationScheduled = true;
 			}
-			return continuationScheduled ? COMPACTION_CHECK_CONTINUATION : COMPACTION_CHECK_NONE;
+			if (!reclaimed) return continuationScheduled ? COMPACTION_CHECK_CONTINUATION : COMPACTION_CHECK_NONE;
+			return {
+				...(continuationScheduled ? COMPACTION_CHECK_CONTINUATION : COMPACTION_CHECK_NONE),
+				historyRewritten: true,
+			};
 		} catch (error) {
 			if (signal.aborted) {
 				await this.#emitSessionEvent({
