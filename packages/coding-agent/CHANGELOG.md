@@ -24,6 +24,7 @@
 - Resolved status inconsistencies between `/extensions`, `/mcp list`, and the dashboard, ensuring MCP server states, allowlists/denylists, and configuration files (like `mcp.json`) stay fully synchronized.
 - Improved branch-mode task merges to preserve the agent's original commit history (messages and authors) and fixed a bug where merges were rejected due to unrelated dirty changes in the parent checkout.
 - Fixed an issue where the `Working...` loader spinner would prematurely disappear or fail to re-arm after a subagent (`task`) tool completed or during transient overlays (such as auto-compaction or auto-retry).
+- Fixed auto-compaction recovery for oversized turns that cannot produce a compaction summary: overflow/incomplete recovery now restores the failed assistant explanation before blocking automatic continuation, while the oversized-turn continuation/retry guards still pause with a warning when compaction frees too little context and continue to respect explicit compaction reserve settings.
 
 ## [16.2.6] - 2026-06-29
 
@@ -46,7 +47,6 @@
 - Fixed Windows --extension paths with spaces or \\?\ prefixes being truncated or incorrectly passed to Bun import/spawn APIs.
 - Fixed /mcp reauth compatibility with Cloudflare by aligning OAuth prompt behavior with the reference MCP SDK and updating the client label to oh-my-pi.
 - Fixed the bash interceptor blocking `echo` / `printf` redirects to `/dev/null`, `/dev/tty`, `/dev/stdout`, and `/dev/stderr` device sinks while still directing real file writes to the write tool. ([#3763](https://github.com/can1357/oh-my-pi/issues/3763))
-- Fixed auto-compaction recovery for oversized turns that cannot produce a compaction summary: overflow/incomplete recovery now restores the failed assistant explanation before blocking automatic continuation, while the oversized-turn continuation/retry guards still pause with a warning when compaction frees too little context and continue to respect explicit compaction reserve settings.
 
 ## [16.2.5] - 2026-06-28
 

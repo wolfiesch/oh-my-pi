@@ -571,7 +571,8 @@ describe("OpenAI-family first-event timeouts", () => {
 		const fetchMock: FetchImpl = (input: string | URL | Request, init?: RequestInit) =>
 			Promise.resolve(createNoProgressOpenAIResponsesStream(getRequestSignal(input, init)));
 		const controller = new AbortController();
-		const abortTimer = setTimeout(() => controller.abort(new Error("fallback abort")), 200);
+		// This watchdog covers a hung stream reader; fake timers do not drive ReadableStream pulls.
+		const abortTimer = setTimeout(() => controller.abort(new Error("fallback abort")), 2_000);
 		abortTimer.unref();
 
 		try {
@@ -581,7 +582,7 @@ describe("OpenAI-family first-event timeouts", () => {
 				azureApiVersion: "v1",
 				signal: controller.signal,
 				streamFirstEventTimeoutMs: 1_000,
-				streamIdleTimeoutMs: 20,
+				streamIdleTimeoutMs: 100,
 				fetch: fetchMock,
 			}).result();
 
