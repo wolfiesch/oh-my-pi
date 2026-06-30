@@ -250,6 +250,63 @@ describe("AgentSession shake", () => {
 			);
 		});
 
+		it("keeps a no-op incomplete shake retry committed before rollback can restore the length tail", async () => {
+			session.settings.set("compaction.strategy", "shake");
+			session.settings.set("contextPromotion.enabled", false);
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			vi.spyOn(session.agent, "continue").mockResolvedValue();
+			vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 1000, contextWindow: 200000, percent: 0.5 });
+			const shakeSpy = vi
+				.spyOn(session, "shake")
+				.mockResolvedValue({ mode: "elide", toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 });
+
+			const assistantMessage: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "partial response" }],
+				...apiInfo,
+				stopReason: "length",
+				usage: {
+					input: 20_000,
+					output: 5_000,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 25_000,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			};
+			const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+			session.subscribe(event => {
+				if (event.type === "auto_compaction_end" && event.action === "shake") onCompactionDone();
+			});
+			session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
+			session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+
+			await compactionDone;
+			await session.waitForIdle();
+
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			const shakeEnd = events.find(event => event.type === "auto_compaction_end" && event.action === "shake");
+			expect(shakeEnd).toMatchObject({ type: "auto_compaction_end", action: "shake", willRetry: true });
+			expect(sessionManager.getBranch()).not.toContainEqual(
+				expect.objectContaining({
+					type: "message",
+					message: expect.objectContaining({
+						role: "assistant",
+						stopReason: "length",
+						timestamp: assistantMessage.timestamp,
+					}),
+				}),
+			);
+			expect(session.agent.state.messages).not.toContainEqual(
+				expect.objectContaining({
+					role: "assistant",
+					stopReason: "length",
+					timestamp: assistantMessage.timestamp,
+				}),
+			);
+		});
+
 		it("has isCompacting true when the shake auto_compaction_start event fires", async () => {
 			// Defect 1 parity for the shake strategy: the controller backing isCompacting
 			// must be installed before auto_compaction_start is emitted, so a message
