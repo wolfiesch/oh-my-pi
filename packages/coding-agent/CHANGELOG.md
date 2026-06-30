@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed auto-compaction recovery for oversized turns that cannot produce a compaction summary: overflow/incomplete recovery now restores the failed assistant explanation before blocking automatic continuation, while the oversized-turn continuation/retry guards still pause with a warning when compaction frees too little context and continue to respect explicit compaction reserve settings.
+
 ## [16.2.7] - 2026-06-30
 
 ### Breaking Changes
@@ -24,7 +28,6 @@
 - Resolved status inconsistencies between `/extensions`, `/mcp list`, and the dashboard, ensuring MCP server states, allowlists/denylists, and configuration files (like `mcp.json`) stay fully synchronized.
 - Improved branch-mode task merges to preserve the agent's original commit history (messages and authors) and fixed a bug where merges were rejected due to unrelated dirty changes in the parent checkout.
 - Fixed an issue where the `Working...` loader spinner would prematurely disappear or fail to re-arm after a subagent (`task`) tool completed or during transient overlays (such as auto-compaction or auto-retry).
-- Fixed auto-compaction recovery for oversized turns that cannot produce a compaction summary: overflow/incomplete recovery now restores the failed assistant explanation before blocking automatic continuation, while the oversized-turn continuation/retry guards still pause with a warning when compaction frees too little context and continue to respect explicit compaction reserve settings.
 
 ## [16.2.6] - 2026-06-29
 
