@@ -2,10 +2,12 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { unlink } from "node:fs/promises";
 import {
   DefaultAuthorizationGuard,
-  InMemoryDeviceRegistry,
   DefaultRedactor,
+  DeviceRecord,
+  DeviceMetadata,
   JsonlAuditSink,
   LeaseRegistry,
+  RemotePeerIdentity,
   OutboundQueue,
   SecureConfirmationStore,
   SqliteDeviceRegistry,
@@ -16,6 +18,16 @@ import {
 let dbPath = "";
 const identity = { nodeId: "node-a", login: "alice@example.com", hostId: "host-a", tailnetIp: "100.64.0.2" };
 const clock = { value: 1_000, now() { return this.value; } };
+class FakeRegistry {
+  readonly records = new Map<string, DeviceRecord>();
+  get(id: string): DeviceRecord | null { return this.records.get(id) ?? null; }
+  create(record: DeviceRecord, token: string) { this.records.set(record.deviceId, record); }
+  updateMetadata(id: string, metadata: DeviceMetadata, capabilities: readonly DeviceRecord["capabilities"][number][]) { const old = this.records.get(id); if (old) this.records.set(id, { ...old, metadata, capabilities }); }
+  authenticate(id: string, token: string, identity: RemotePeerIdentity, connectionId: string) { const record = this.records.get(id); if (!record || token !== "token") throw new Error("denied"); return { ...record, authenticatedAt: clock.now(), connectionId }; }
+  revoke(id: string) { const record = this.records.get(id); if (record) this.records.set(id, { ...record, revokedAt: clock.now(), epoch: record.epoch + 1 }); }
+  list(): readonly DeviceRecord[] { return [...this.records.values()]; }
+  close() {}
+}
 
 beforeAll(() => { dbPath = `/tmp/omp-security-${process.pid}.sqlite`; });
 afterAll(async () => { await unlink(dbPath).catch(() => undefined); });
@@ -33,7 +45,7 @@ describe("security core", () => {
 
   it("binds authorization to the authenticated capability intersection", () => {
     const principal = { deviceId: "d", identityKey: "i", capabilities: ["sessions.read"] as const, metadata: { label: "d" }, createdAt: 1, lastSeenAt: 1, revokedAt: null, epoch: 0, authenticatedAt: 1, connectionId: "c" };
-    const registry = new InMemoryDeviceRegistry();
+    const registry = new FakeRegistry();
     registry.create(principal, "token");
     const guard = new DefaultAuthorizationGuard(registry);
     const base = { principal, connectionId: "c", capabilities: ["sessions.read"] as const, args: {} };
@@ -79,7 +91,7 @@ describe("security core", () => {
 });
 it("rejects expired or replayed pairing and mismatched identity", () => {
   const localClock = { value: 100, now() { return this.value; } };
-  const registry = new InMemoryDeviceRegistry(localClock);
+  const registry = new FakeRegistry();
   const pairing = new SqlitePairingService(registry, localClock, { bytes: (n) => new Uint8Array(n).fill(9) });
   const grant = pairing.start("c", ["sessions.read"], 10);
   localClock.value = 111;
@@ -88,7 +100,7 @@ it("rejects expired or replayed pairing and mismatched identity", () => {
 
 it("invalidates an authenticated principal after revoke epoch change", () => {
   const localClock = { value: 100, now() { return this.value; } };
-  const registry = new InMemoryDeviceRegistry(localClock);
+  const registry = new FakeRegistry();
   const record = { deviceId: "d2", identityKey: JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]), capabilities: ["sessions.read"] as const, metadata: { label: "x" }, createdAt: 1, lastSeenAt: 1, revokedAt: null, epoch: 0 };
   registry.create(record, "token");
   const principal = registry.authenticate("d2", "token", identity, "c");
