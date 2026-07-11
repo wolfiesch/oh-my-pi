@@ -77,9 +77,9 @@ test("pair CLI admin ticket reaches the in-process issuer and is one-use across 
 	const connection = {
 		connectionId: "connection-1",
 		peer: { address: "100.64.0.2", source: "direct" as const, identity: { nodeId: "node-1", addresses: ["100.64.0.2"], source: "direct" as const } },
-		socket: { send: () => true, close: () => undefined },
+		socket: { connectionId: "connection-1", peer: { address: "100.64.0.2", source: "direct" as const, identity: { nodeId: "node-1", addresses: ["100.64.0.2"], source: "direct" as const } }, send: () => true, close: () => undefined },
 	};
-	const hello: HelloFrame = { v: "omp-app/1", type: "hello", protocol: { min: "1", max: "1" }, client: { name: "test", version: "1", build: "test" }, requestedFeatures: [], savedCursors: [] };
+	const hello: HelloFrame = { v: "omp-app/1", type: "hello", protocol: { min: "1", max: "1" }, client: { name: "test", version: "1", build: "test", platform: "linux" }, requestedFeatures: [], savedCursors: [] };
 	expect(policy.authenticate(connection, hello).authentication).toBe("pairing-required");
 	const frame: PairStartFrame = { v: "omp-app/1", type: "pair.start", requestId: requestId("pair-request"), code: ticket.code, deviceId: "device-1", deviceName: "test", platform: "test", requestedCapabilities: ["sessions.read"] };
 	expect(policy.pairStart(connection, frame)?.type).toBe("pair.ok");

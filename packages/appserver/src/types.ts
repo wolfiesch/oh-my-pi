@@ -50,6 +50,7 @@ export interface RemoteConnectionPolicy {
 		connection: RemoteConnection,
 		frame: ServerFrame,
 	): ServerFrame | string | undefined | Promise<ServerFrame | string | undefined>;
+	isClosed?(connection: RemoteConnection): boolean;
 	disconnected?(connection: RemoteConnection): void | Promise<void>;
 }
 

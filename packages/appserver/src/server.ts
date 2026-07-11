@@ -1003,7 +1003,7 @@ export class LocalAppserver implements AppserverHandle {
 					...(frame.type === "command" ? { command: frame } : {}),
 				});
 				if (!allowed) {
-					ws.close(1008, "remote policy denied");
+					if (!this.#remotePolicy.isClosed?.(connection)) ws.close(1008, "remote policy denied");
 					return;
 				}
 			}
@@ -1239,12 +1239,17 @@ export class LocalAppserver implements AppserverHandle {
 		return transport;
 	}
 #remoteConnected(connection: RemoteConnection): void {
+		let closed = false;
 		const transport: AppWs = {
 			connectionId: connection.connectionId,
 			deviceId: connection.peer.identity.nodeId,
 			remote: true,
 			send: text => connection.socket.send(text),
-			close: (code, reason) => connection.socket.close(code, reason),
+			close: (code, reason) => {
+				if (closed) return;
+				closed = true;
+				connection.socket.close(code, reason);
+			},
 		};
 		this.#remoteConnections.set(transport, connection);
 		this.#remoteTransports.set(transport.connectionId, transport);
