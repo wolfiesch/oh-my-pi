@@ -9,7 +9,7 @@ import type { FileSystem, SessionDiscovery, SessionRecord } from "./types.ts";
 const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_SNAPSHOT_ENTRIES = 1000;
-const MAX_SNAPSHOT_BYTES = 768 * 1024;
+const MAX_SNAPSHOT_BYTES = 512 * 1024;
 const MAX_TEXT_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 64 * 1024;
 const encoder = new TextEncoder();
@@ -45,17 +45,18 @@ function cleanText(value: string, maxBytes: number, collapseWhitespace = false):
 }
 
 function isSensitiveKey(key: string): boolean {
-  return /(?:secret|token|password|api[_-]?key|authorization|cookie|credential)/iu.test(key);
+  return /(?:secret|token|password|api[_-]?key|authorization|cookie|credential|auth)/iu.test(key);
 }
 
-function safeValue(value: unknown, key = ""): unknown {
+function safeValue(value: unknown, key = "", depth = 0): unknown {
   if (isSensitiveKey(key)) return "[redacted]";
+  if (depth >= 8) return "[omitted]";
   if (typeof value === "string") return cleanText(value, MAX_TEXT_BYTES);
   if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
-  if (Array.isArray(value)) return value.map(item => safeValue(item));
+  if (Array.isArray(value)) return value.slice(0, 64).map(item => safeValue(item, "", depth + 1));
   if (typeof value === "object") {
     const output: Record<string, unknown> = {};
-    for (const [name, item] of Object.entries(value)) output[name] = safeValue(item, name);
+    for (const [name, item] of Object.entries(value).slice(0, 64)) output[name] = safeValue(item, name, depth + 1);
     return output;
   }
   return undefined;
@@ -88,7 +89,7 @@ function uniqueEntryId(base: string, used: Set<string>): EntryId {
   return entryId(`snapshot-${suffix}-${used.size}`);
 }
 
-interface ToolResultProjection { ok: boolean; result: string }
+interface ToolResultProjection { ok: boolean; text: string }
 
 function normalizeEntries(values: Record<string, unknown>[], host: HostId, sid: SessionId, headerTimestamp: string): {
   entries: DurableEntry[];
@@ -151,11 +152,11 @@ function normalizeEntries(values: Record<string, unknown>[], host: HostId, sid: 
       if (role === "user" && text && firstUserText === undefined) firstUserText = text;
       aliases.set(raw.id, primary ?? parentId);
       for (const call of toolCalls) {
-        const toolId = add(raw, "tool-use", { toolCallId: call.id, toolName: call.name, title: call.title, args: call.args ?? {}, ok: false, result: "" }, primary ?? parentId, `${raw.id}:tool:${call.id}`);
+        const toolId = add(raw, "tool-use", { toolCallId: call.id, tool: call.name, title: call.title, args: call.args ?? {}, ok: false, result: { output: "" } }, primary ?? parentId, `${raw.id}:tool:${call.id}`);
         toolRows.set(call.id, { index: entries.length - 1, id: toolId });
         const pending = pendingResults.get(call.id);
         if (pending) {
-          entries[entries.length - 1] = { ...entries[entries.length - 1], data: { ...entries[entries.length - 1].data, ok: pending.ok, result: pending.result } };
+          entries[entries.length - 1] = { ...entries[entries.length - 1], data: { ...entries[entries.length - 1].data, ok: pending.ok, result: { output: pending.text } } };
           pendingResults.delete(call.id);
         }
       }
@@ -165,9 +166,9 @@ function normalizeEntries(values: Record<string, unknown>[], host: HostId, sid: 
     if (raw.type === "message" && role === "toolResult") {
       const callId = typeof message.toolCallId === "string" ? message.toolCallId : undefined;
       if (callId) {
-        const result: ToolResultProjection = { ok: message.isError !== true, result: contentText(message.content) };
+        const result: ToolResultProjection = { ok: message.isError !== true, text: contentText(message.content) };
         const row = toolRows.get(callId);
-        if (row) entries[row.index] = { ...entries[row.index], data: { ...entries[row.index].data, ok: result.ok, result: boundUtf8(result.result, MAX_RESULT_BYTES) } };
+        if (row) entries[row.index] = { ...entries[row.index], data: { ...entries[row.index].data, ok: result.ok, result: { output: boundUtf8(result.text, MAX_RESULT_BYTES) } } };
         else pendingResults.set(callId, result);
       }
       aliases.set(raw.id, parentId);

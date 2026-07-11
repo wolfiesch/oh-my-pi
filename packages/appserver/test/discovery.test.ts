@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { hostId } from "@oh-my-pi/app-wire";
+import { hostId, parseBounded } from "@oh-my-pi/app-wire";
 import type { FileSystem } from "../src/types.ts";
 import { FileSessionDiscovery } from "../src/discovery.ts";
+import { SessionProjection } from "../src/projection.ts";
 
 const stamp = "2026-07-11T00:00:00.000Z";
 const host = hostId("discovery-test");
@@ -46,7 +47,7 @@ function transcript(entries: Record<string, unknown>[], title?: string): string 
     const message = session?.entries[0];
     expect(message?.data).toEqual({ role: "user", text: "Please inspect the project" });
     const tool = session?.entries[2];
-    expect(tool?.data).toMatchObject({ toolName: "read", title: "read", ok: true, result: "file contents" });
+    expect(tool?.data).toMatchObject({ tool: "read", title: "read", ok: true, result: { output: "file contents" } });
     expect(JSON.stringify(session?.entries)).not.toContain("systemPrompt");
     expect(JSON.stringify(session?.entries)).not.toContain("/home/lycaon");
     expect(session?.entries[1]?.data).toEqual({ role: "assistant", text: "", reasoning: "I should inspect safely." });
@@ -66,13 +67,18 @@ function transcript(entries: Record<string, unknown>[], title?: string): string 
 
   test("limits snapshots to 1000 entries with an omission notice", async () => {
     const entries: Record<string, unknown>[] = [];
-    for (let i = 0; i < 1001; i++) entries.push({ type: "message", id: `m-${i}`, parentId: i === 0 ? null : `m-${i - 1}`, timestamp: stamp, message: { role: "user", content: `message ${i}` } });
+    for (let i = 0; i < 1001; i++) entries.push({ type: "message", id: `m-${i}`, parentId: i === 0 ? null : `m-${i - 1}`, timestamp: stamp, message: { role: "user", content: `${"x".repeat(8192)} ${i}` } });
     const discovery = new FileSessionDiscovery("/root", fakeFs({ "/root/session.jsonl": transcript(entries) }, ["/root"]), host);
     const [session] = await discovery.list();
-    expect(session?.entries).toHaveLength(1000);
+    expect(session?.entries.length).toBeLessThanOrEqual(1000);
     expect(session?.entries[0]?.kind).toBe("compaction");
     expect(session?.entries[0]?.data.summary).toContain("Older transcript entries were omitted");
-    expect(new Set(session?.entries.map(entry => entry.id)).size).toBe(1000);
+    expect(new Set(session?.entries.map(entry => entry.id)).size).toBe(session?.entries.length);
     expect(session?.entries.every(entry => entry.parentId === null || session?.entries.some(parent => parent.id === entry.parentId))).toBe(true);
+    if (!session) throw new Error("session not discovered");
+    const snapshot = new SessionProjection(host, session, "epoch-test").snapshot();
+    const snapshotText = JSON.stringify(snapshot);
+    expect(new TextEncoder().encode(snapshotText).byteLength).toBeLessThan(1_048_576);
+    expect(() => parseBounded(snapshotText)).not.toThrow();
   });
 });
