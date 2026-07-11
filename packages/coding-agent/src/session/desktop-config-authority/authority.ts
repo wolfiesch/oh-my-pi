@@ -264,18 +264,18 @@ export class DesktopConfigAuthority {
 			const def = settingDefinition(path);
 			if (!def) continue;
 			const sensitive = settingSensitive(path);
-			settings[path] = {
+			settings[path] = safeMetadata({
 				...controlMetadata(def),
 				...(sensitive
 					? {}
 					: {
-							default: safeMetadata(def.default),
-							effective: safeMetadata(this.#settings.get(path as SettingPath)),
+							default: def.default,
+							effective: this.#settings.get(path as SettingPath),
 						}),
 				effectiveSource: sourceFor(this.#settings, path as SettingPath),
 				configured: this.#settings.isConfigured?.(path as SettingPath) ?? false,
 				sensitive,
-			};
+			}) as Record<string, unknown>;
 		}
 		return { settings };
 	}

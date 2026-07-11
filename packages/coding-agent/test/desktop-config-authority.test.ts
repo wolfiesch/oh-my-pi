@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { decodeCatalog } from "@oh-my-pi/app-wire";
+import { decodeCatalog, decodeCommandResult } from "@oh-my-pi/app-wire";
 import type { SettingPath } from "../src/config/settings-schema.ts";
 import { Settings, type SettingsDesktopSnapshot } from "../src/config/settings.ts";
 import { DesktopConfigAuthority, type DesktopSettingsPort } from "../src/session/desktop-config-authority/index.ts";
@@ -37,6 +37,7 @@ describe("DesktopConfigAuthority", () => {
 		expect(first.settings["auth.broker.token"]).not.toHaveProperty("effective");
 		expect(first.settings["auth.broker.token"]).not.toHaveProperty("default");
 		expect(JSON.stringify(first)).not.toContain("do-not-return");
+		expect(() => decodeCommandResult("settings.read", first)).not.toThrow();
 	});
 
 	test("validates writes, session override, reset, and revision conflicts", async () => {
