@@ -92,7 +92,14 @@ async function* lines(stream: AsyncIterable<string | Uint8Array>): AsyncGenerato
 }
 
 export class RpcChildSupervisor {
-  #child?: ChildHandle; #pending = new Map<string, { resolve: (value: RpcResponse) => void; reject: (error: Error) => void }>(); #closed = false; #readyReject?: (error: Error) => void; #counter = 0; #stderr = ""; #ready = false;
+	#child?: ChildHandle;
+	#pending = new Map<string, { resolve: (value: RpcResponse) => void; reject: (error: Error) => void }>();
+	#ignoredResponses = new Set<string>();
+	#closed = false;
+	#readyReject?: (error: Error) => void;
+	#counter = 0;
+	#stderr = "";
+	#ready = false;
   constructor(private readonly factory: RpcChildFactory, private readonly session: SessionRecord, private readonly callbacks: ChildCallbacks, private readonly argv = ["omp", "--mode", "rpc"]) {}
   async start(): Promise<void> {
     if (this.#child) throw new Error("child already started");
@@ -103,17 +110,39 @@ export class RpcChildSupervisor {
     const timer = setTimeout(() => ready.reject(new Error("rpc child ready timeout")), 10_000);
     try { await ready.promise; } catch (error) { this.stop(); throw error; } finally { clearTimeout(timer); this.#readyReject = undefined; }
   }
-  async call(command: Record<string, unknown>, requestId: string): Promise<RpcResponse> {
-    if (!this.#child || this.#closed || !this.#ready) throw new Error("rpc child unavailable");
-    const internalId = `${requestId}:${++this.#counter}`; const promise = Promise.withResolvers<RpcResponse>(); this.#pending.set(internalId, promise);
-    try {
-      const line = `${JSON.stringify({ ...command, id: internalId })}\n`;
-      if (stringBytes(line) > MAX_LINE_BYTES) throw new Error("rpc command exceeds 1MiB");
-      await this.#child.stdin.write(line); return await promise.promise;
-    } catch (error) { this.#pending.delete(internalId); throw error; }
-  }
-  async prompt(id: string, message: string): Promise<RpcResponse> { return this.call({ type: "prompt", message }, id); }
-  async cancel(id: string): Promise<RpcResponse> { return this.call({ type: "abort" }, id); }
+	async call(command: Record<string, unknown>, requestId: string, signal?: AbortSignal): Promise<RpcResponse> {
+		if (!this.#child || this.#closed || !this.#ready) throw new Error("rpc child unavailable");
+		const internalId = `${requestId}:${++this.#counter}`;
+		const promise = Promise.withResolvers<RpcResponse>();
+		this.#pending.set(internalId, promise);
+		const onAbort = () => {
+			const pending = this.#pending.get(internalId);
+			if (!pending) return;
+			this.#pending.delete(internalId);
+			this.#ignoredResponses.add(internalId);
+			pending.reject(new Error("rpc call aborted"));
+			void this.cancel(`${requestId}:cancel`).catch(() => undefined);
+		};
+		if (signal?.aborted) onAbort();
+		else signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			const line = `${JSON.stringify({ ...command, id: internalId })}\n`;
+			if (stringBytes(line) > MAX_LINE_BYTES) throw new Error("rpc command exceeds 1MiB");
+			await this.#child.stdin.write(line);
+			return await promise.promise;
+		} catch (error) {
+			this.#pending.delete(internalId);
+			throw error;
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
+	}
+	async prompt(id: string, message: string, signal?: AbortSignal): Promise<RpcResponse> {
+		return this.call({ type: "prompt", message }, id, signal);
+	}
+	async cancel(id: string): Promise<RpcResponse> {
+		return this.call({ type: "abort" }, id);
+	}
   stop(): void { const child = this.#child; this.#closed = true; child?.kill(); this.fail(new Error("rpc child stopped")); this.#child = undefined; }
   child(): ChildHandle | undefined { return this.#child; }
   private async readStdout(ready: { resolve: () => void; reject: (error: Error) => void }): Promise<void> {
@@ -144,7 +173,11 @@ export class RpcChildSupervisor {
   private dispatch(value: Record<string, unknown>): void {
     if (value.type === "response") {
       if (typeof value.id !== "string" || typeof value.command !== "string" || typeof value.success !== "boolean") throw new Error("malformed rpc response");
-      const pending = this.#pending.get(value.id); if (!pending) throw new Error("rpc response has unknown id");
+      const pending = this.#pending.get(value.id);
+      if (!pending) {
+        if (this.#ignoredResponses.delete(value.id)) return;
+        throw new Error("rpc response has unknown id");
+      }
       this.#pending.delete(value.id);
       if (!value.success && typeof value.error !== "string") pending.reject(new Error("rpc response missing error"));
       else pending.resolve(value as unknown as RpcResponse);

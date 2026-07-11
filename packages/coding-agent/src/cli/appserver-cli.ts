@@ -1,7 +1,8 @@
 import * as http from "node:http";
-import { defaultSocketPath } from "@oh-my-pi/appserver";
 import type { AppserverHandle } from "@oh-my-pi/appserver";
+import { defaultSocketPath } from "@oh-my-pi/appserver";
 import { postmortem } from "@oh-my-pi/pi-utils";
+import type { Settings as SettingsType } from "../config/settings";
 
 export type AppserverAction = "serve" | "status";
 
@@ -41,12 +42,12 @@ function byteLength(value: string): number {
 function validIdentifier(value: unknown): value is string {
 	return (
 		typeof value === "string" &&
-	value.length > 0 &&
-	byteLength(value) <= MAX_ID_BYTES &&
-	[...value].every(char => {
-		const code = char.codePointAt(0) ?? 0;
-		return code >= 0x20 && code !== 0x7f;
-	})
+		value.length > 0 &&
+		byteLength(value) <= MAX_ID_BYTES &&
+		[...value].every(char => {
+			const code = char.codePointAt(0) ?? 0;
+			return code >= 0x20 && code !== 0x7f;
+		})
 	);
 }
 
@@ -109,62 +110,129 @@ async function readUnixHealth(socketPath: string, timeoutMs: number): Promise<un
 	return gate.promise;
 }
 
-// Keep the private appserver graph out of unrelated CLI commands; the command
-// loader is intentionally the runtime-selected boundary for this package.
+// This is intentionally a lazy boundary: `status` must not load the native PTY graph.
 async function defaultCreateAppserver(): Promise<AppserverHandle> {
-  const [{ createAppserver }, { createAppserverAuthority, appserverLockCheck }] = await Promise.all([import("@oh-my-pi/appserver"), import("../session/appserver-authority")]);
-  const authority = createAppserverAuthority();
-  return createAppserver({ sessionAuthority: authority, discovery: authority, lockCheck: appserverLockCheck });
-}
-
-function defaultOnSignal(signal: NodeJS.Signals, handler: () => void): void {
-	process.on(signal, handler);
-}
-
-function defaultRemoveSignal(signal: NodeJS.Signals, handler: () => void): void {
-	process.off(signal, handler);
+	const [
+		{ createAppserver },
+		{ createAppserverRuntime },
+		{ Settings },
+		sdk,
+		modelModule,
+		registryModule,
+		pluginModule,
+	] = await Promise.all([
+		import("@oh-my-pi/appserver"),
+		import("../session/appserver-authority"),
+		import("../config/settings"),
+		import("../sdk"),
+		import("../config/model-registry"),
+		import("../registry/agent-registry"),
+		import("../extensibility/plugins/manager"),
+	]);
+	const cwd = process.cwd();
+	let settings: SettingsType | undefined;
+	try {
+		settings = await Settings.init({ cwd });
+	} catch {
+		/* catalog reports unavailable settings */
+	}
+	const runtimeOptions: Parameters<typeof createAppserverRuntime>[0] = {};
+	if (settings) runtimeOptions.settings = settings;
+	try {
+		const authStorage = await sdk.discoverAuthStorage();
+		const modelRegistry = new modelModule.ModelRegistry(authStorage);
+		runtimeOptions.modelRegistry = modelRegistry;
+		if (settings) {
+			try {
+				await sdk.loadCliExtensionProviders(modelRegistry, settings, cwd);
+			} catch {
+				/* provider discovery is fail-soft */
+			}
+		}
+	} catch {
+		/* credentials/model discovery is optional for the local authority */
+	}
+	try {
+		runtimeOptions.agentRegistry = registryModule.AgentRegistry.global();
+	} catch {
+		/* fail-soft catalog adapter */
+	}
+	try {
+		runtimeOptions.skillsLoader = async () => {
+			try {
+				return (await sdk.discoverSkills(cwd)).skills;
+			} catch {
+				return [];
+			}
+		};
+	} catch {
+		/* fail-soft catalog adapter */
+	}
+	try {
+		runtimeOptions.pluginManager = new pluginModule.PluginManager(cwd);
+	} catch {
+		/* fail-soft catalog adapter */
+	}
+	const runtime = createAppserverRuntime(runtimeOptions);
+	return createAppserver({
+		sessionAuthority: runtime.sessionAuthority,
+		discovery: runtime.discovery,
+		operationsAuthority: runtime.operationsAuthority,
+		projectRootForProject: runtime.projectRootForProject,
+		lockCheck: runtime.lockCheck,
+	});
 }
 
 export async function runAppserverServe(deps: AppserverRunnerDeps = {}): Promise<void> {
-  const create = deps.createAppserver ?? defaultCreateAppserver;
-  const registerCleanup = deps.registerCleanup ?? ((id: string, callback: (reason: unknown) => void | Promise<void>) => postmortem.register(id, callback));
-  const stopped = Promise.withResolvers<void>();
-  let appserver: AppserverHandle | undefined;
-  let stopRequested = false;
-  let stopStarted = false;
-  let cleanupRequested = false;
-  const stopOnce = (): void => {
-    if (stopStarted || !appserver) return;
-    stopStarted = true;
-    void appserver.stop().then(stopped.resolve, stopped.reject);
-  };
-  const shutdown = (): void => { cleanupRequested = true; stopRequested = true; stopOnce(); };
-  const unregister = registerCleanup("omp-appserver", async reason => {
-    if (reason !== "sigint" && reason !== "sigterm") return;
-    shutdown();
-    if (appserver) await stopped.promise;
-  });
-  if (deps.onSignal) {
-    deps.onSignal("SIGINT", shutdown);
-    deps.onSignal("SIGTERM", shutdown);
-  }
-  try {
-    appserver = await create();
-    try {
-      await appserver.start();
-    } catch (error) {
-      if (cleanupRequested) { stopOnce(); if (stopStarted) await stopped.promise; return; }
-      throw error;
-    }
-    if (stopRequested) stopOnce();
-    await stopped.promise;
-  } finally {
-    if (deps.removeSignal && deps.onSignal) {
-      deps.removeSignal("SIGINT", shutdown);
-      deps.removeSignal("SIGTERM", shutdown);
-    }
-    unregister();
-  }
+	const create = deps.createAppserver ?? defaultCreateAppserver;
+	const registerCleanup =
+		deps.registerCleanup ??
+		((id: string, callback: (reason: unknown) => void | Promise<void>) => postmortem.register(id, callback));
+	const stopped = Promise.withResolvers<void>();
+	let appserver: AppserverHandle | undefined;
+	let stopRequested = false;
+	let stopStarted = false;
+	let cleanupRequested = false;
+	const stopOnce = (): void => {
+		if (stopStarted || !appserver) return;
+		stopStarted = true;
+		void appserver.stop().then(stopped.resolve, stopped.reject);
+	};
+	const shutdown = (): void => {
+		cleanupRequested = true;
+		stopRequested = true;
+		stopOnce();
+	};
+	const unregister = registerCleanup("omp-appserver", async reason => {
+		if (reason !== "sigint" && reason !== "sigterm") return;
+		shutdown();
+		if (appserver) await stopped.promise;
+	});
+	if (deps.onSignal) {
+		deps.onSignal("SIGINT", shutdown);
+		deps.onSignal("SIGTERM", shutdown);
+	}
+	try {
+		appserver = await create();
+		try {
+			await appserver.start();
+		} catch (error) {
+			if (cleanupRequested) {
+				stopOnce();
+				if (stopStarted) await stopped.promise;
+				return;
+			}
+			throw error;
+		}
+		if (stopRequested) stopOnce();
+		await stopped.promise;
+	} finally {
+		if (deps.removeSignal && deps.onSignal) {
+			deps.removeSignal("SIGINT", shutdown);
+			deps.removeSignal("SIGTERM", shutdown);
+		}
+		unregister();
+	}
 }
 
 export async function runAppserverStatus(deps: AppserverRunnerDeps = {}): Promise<AppserverStatus> {

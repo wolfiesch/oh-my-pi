@@ -393,10 +393,7 @@ export class CodingAgentDesktopAuthority {
 		}
 	}
 	#session(context?: OperationContextLike): string {
-		const sessionId = context?.sessionId ?? this.#context.sessionManager.getSessionId();
-		if (context?.sessionId !== undefined && context.sessionId !== this.#context.sessionManager.getSessionId())
-			throw protocolError("FORBIDDEN");
-		return sessionId;
+		return context?.sessionId ?? this.#context.sessionManager.getSessionId();
 	}
 	#signal(request: { signal?: AbortSignal }, context?: OperationContextLike): AbortSignal | undefined {
 		if (request.signal?.aborted || context?.abortSignal?.aborted) throw protocolError("ABORTED");
@@ -608,22 +605,23 @@ export class CodingAgentDesktopAuthority {
 			return mapNative(error);
 		}
 	}
-	async cancelAgent(agentId: string): Promise<{ cancelled: boolean }> {
+	async cancelAgent(agentId: string, context?: OperationContextLike): Promise<{ cancelled: boolean }> {
 		if (!this.#context.agentAuthority) throw new Error("agent cancellation authority unavailable");
 		return {
-			cancelled: await this.#context.agentAuthority.cancel(agentId, this.#context.sessionManager.getSessionId()),
+			cancelled: await this.#context.agentAuthority.cancel(
+				agentId,
+				context?.sessionId ?? this.#context.sessionManager.getSessionId(),
+			),
 		};
 	}
-	async runBash(request: {
-		command: string;
-		timeout?: number;
-		signal?: AbortSignal;
-		env?: Record<string, string>;
-	}): Promise<ProcessResult & { output: string }> {
+	async runBash(
+		request: { command: string; timeout?: number; signal?: AbortSignal; env?: Record<string, string> },
+		context?: OperationContextLike,
+	): Promise<ProcessResult & { output: string }> {
 		const result = await runArgv(
 			["/bin/sh", "-c", boundedText(request.command)],
-			this.#getRoot(),
-			request.signal,
+			this.#getRoot(context?.sessionId),
+			this.#signal(request, context),
 			request.timeout ?? MAX_COMMAND_MS,
 			safeEnv(request.env),
 		);
@@ -641,7 +639,10 @@ export class CodingAgentDesktopAuthority {
 			throw protocolError("FORBIDDEN");
 		}
 	}
-	async openTerminal(request: DesktopTerminalRequest = {}): Promise<{ terminalId: string }> {
+	async openTerminal(
+		request: DesktopTerminalRequest = {},
+		context?: OperationContextLike,
+	): Promise<{ terminalId: string }> {
 		const shell = request.shell ?? process.env.SHELL ?? "/bin/sh";
 		if (!ALLOWED_SHELLS.has(shell)) throw new Error("shell is not allowed");
 		await access(shell, fsConstants.X_OK);
@@ -654,7 +655,8 @@ export class CodingAgentDesktopAuthority {
 			throw new Error("invalid terminal rows");
 		if (request.timeoutMs !== undefined && (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0))
 			throw new Error("invalid terminal timeout");
-		const root = this.#getRoot(),
+		const signal = this.#signal(request, context);
+		const root = this.#getRoot(context?.sessionId),
 			cwd = await this.#terminalCwd(root, request.cwd),
 			terminalId = randomUUID(),
 			pty = new PtySession(),
@@ -671,7 +673,7 @@ export class CodingAgentDesktopAuthority {
 					rows: request.rows ?? 24,
 					timeoutMs: request.timeoutMs,
 					env: safeEnv(request.env),
-					signal: request.signal,
+					signal,
 				},
 				(error, chunk) => {
 					if (handle.closed || error || !chunk || outputBytes >= MAX_OUTPUT_BYTES) return;
