@@ -1,27 +1,144 @@
-import { hostId, pairingId, requestId, sessionId, type HostId, type PairingId, type RequestId, type SessionId } from "./ids.ts";
-import { inputObject, string } from "./guards.ts";
-import { PROTOCOL_VERSION } from "./limits.ts";
+import { decodeFeatureList, decodeCapabilities } from "./capabilities.ts";
 import { fail } from "./errors.ts";
-
-export interface PairingFrame {
-  v: typeof PROTOCOL_VERSION; type: "pairing"; pairingId: PairingId; hostId: HostId; code: string; expiresAt: string;
+import {
+	confirmationId,
+	hostId,
+	pairingId,
+	commandId,
+	requestId,
+	revision,
+	sessionId,
+	type ConfirmationId,
+	type HostId,
+	type PairingId,
+	type CommandId,
+	type RequestId,
+	type Revision,
+	type SessionId,
+} from "./ids.ts";
+import { boundedMap, controlFree, inputObject, string } from "./guards.ts";
+import { PROTOCOL_VERSION } from "./limits.ts";
+export interface ConfirmationChallenge {
+	v: typeof PROTOCOL_VERSION;
+	type: "confirmation";
+	confirmationId: ConfirmationId;
+	commandId: CommandId;
+	hostId: HostId;
+	sessionId: SessionId;
+	commandHash: string;
+	revision: Revision;
+	expiresAt: string;
+	summary: string;
+	preview?: string;
 }
 export interface ConfirmFrame {
-  v: typeof PROTOCOL_VERSION; type: "confirm"; requestId: RequestId; pairingId: PairingId; hostId: HostId; sessionId?: SessionId; approved: boolean;
+	v: typeof PROTOCOL_VERSION;
+	type: "confirm";
+	requestId: RequestId;
+	confirmationId: ConfirmationId;
+	commandId: CommandId;
+	hostId: HostId;
+	sessionId: SessionId;
+	decision: "approve" | "deny";
 }
-export function decodePairing(input: unknown): PairingFrame {
-  const frame = inputObject(input);
-  if (frame.v !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v");
-  if (frame.type !== "pairing") fail("INVALID_FRAME", "expected pairing frame", "type");
-  pairingId(frame.pairingId); hostId(frame.hostId); string(frame.code, "code", 64); string(frame.expiresAt, "expiresAt", 128);
-  return frame as unknown as PairingFrame;
+export interface PairStartFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "pair.start";
+	requestId: RequestId;
+	code: string;
+	deviceId: string;
+	deviceName: string;
+	platform: string;
+	requestedCapabilities: string[];
+}
+export interface PairOkFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "pair.ok";
+	requestId: RequestId;
+	pairingId: PairingId;
+	deviceId: string;
+	deviceName: string;
+	platform: string;
+	requestedCapabilities: string[];
+	grantedCapabilities: string[];
+	deviceToken: string;
+	expiresAt: string;
+}
+export interface PairErrorFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "pair.error";
+	code: string;
+	message: string;
+	requestId?: RequestId;
+}
+export type PairingFrame = PairStartFrame | PairOkFrame | PairErrorFrame;
+function version(frame: Record<string, unknown>): void {
+	if (frame.v !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v");
+}
+function device(frame: Record<string, unknown>): void {
+	controlFree(frame.deviceId, "deviceId", 256);
+	controlFree(frame.deviceName, "deviceName", 256);
+	controlFree(frame.platform, "platform", 128);
+	const requested = decodeFeatureList(frame.requestedCapabilities, "requestedCapabilities");
+	decodeCapabilities({ client: requested });
+}
+function pairingCode(value: unknown, path: string): string {
+	const code = controlFree(value, path, 6);
+	if (!/^\d{6}$/u.test(code)) fail("PAIRING_INVALID", "pairing code must be six digits", path);
+	return code;
+}
+export function decodeConfirmation(input: unknown): ConfirmationChallenge {
+	const frame = inputObject(input);
+	version(frame);
+	if (frame.type !== "confirmation") fail("INVALID_FRAME", "expected confirmation challenge", "type");
+	confirmationId(frame.confirmationId);
+	commandId(frame.commandId);
+	hostId(frame.hostId);
+	sessionId(frame.sessionId);
+	controlFree(frame.commandHash, "commandHash", 256);
+	revision(frame.revision);
+	controlFree(frame.expiresAt, "expiresAt", 128);
+	string(frame.summary, "summary", 2048);
+	if (frame.preview !== undefined) string(frame.preview, "preview", 8192);
+	return frame as unknown as ConfirmationChallenge;
 }
 export function decodeConfirm(input: unknown): ConfirmFrame {
-  const frame = inputObject(input);
-  if (frame.v !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v");
-  if (frame.type !== "confirm") fail("INVALID_FRAME", "expected confirm frame", "type");
-  requestId(frame.requestId); pairingId(frame.pairingId); hostId(frame.hostId);
-  if (frame.sessionId !== undefined) sessionId(frame.sessionId);
-  if (typeof frame.approved !== "boolean") fail("INVALID_FRAME", "approved must be boolean", "approved");
-  return frame as unknown as ConfirmFrame;
+	const frame = inputObject(input);
+	version(frame);
+	if (frame.type !== "confirm") fail("INVALID_FRAME", "expected confirmation decision", "type");
+	requestId(frame.requestId);
+	confirmationId(frame.confirmationId);
+	commandId(frame.commandId);
+	hostId(frame.hostId);
+	sessionId(frame.sessionId);
+	if (frame.decision !== "approve" && frame.decision !== "deny")
+		fail("CONFIRMATION_INVALID", "decision must approve or deny", "decision");
+	return frame as unknown as ConfirmFrame;
+}
+export function decodePairing(input: unknown): PairingFrame {
+	const frame = inputObject(input);
+	version(frame);
+	if (frame.type === "pair.start") {
+		requestId(frame.requestId);
+		pairingCode(frame.code, "code");
+		device(frame);
+		return frame as unknown as PairStartFrame;
+	}
+	if (frame.type === "pair.ok") {
+		requestId(frame.requestId);
+		pairingId(frame.pairingId);
+		device(frame);
+		const granted = decodeFeatureList(frame.grantedCapabilities, "grantedCapabilities");
+		decodeCapabilities({ client: granted });
+		controlFree(frame.deviceToken, "deviceToken", 512);
+		controlFree(frame.expiresAt, "expiresAt", 128);
+		return frame as unknown as PairOkFrame;
+	}
+	if (frame.type === "pair.error") {
+		controlFree(frame.code, "code", 128);
+		string(frame.message, "message", 1024);
+		if (frame.requestId !== undefined) requestId(frame.requestId);
+		return frame as unknown as PairErrorFrame;
+	}
+	fail("INVALID_FRAME", "expected pairing frame", "type");
 }

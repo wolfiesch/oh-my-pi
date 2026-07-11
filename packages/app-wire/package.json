@@ -17,7 +17,7 @@
       "import": "./src/*.ts"
     }
   },
-  "files": ["src", "fixtures/v1", "README.md"],
+  "files": ["src", "fixtures/v1", "README.md", "LICENSE"],
   "scripts": {
     "build": "bunx tsc -p tsconfig.json --noEmit",
     "test": "bun test test/*.test.ts"

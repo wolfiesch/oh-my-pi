@@ -9,6 +9,7 @@ export * from "./errors.ts";
 export * from "./event.ts";
 export * from "./files-review.ts";
 export * from "./gap.ts";
+export * from "./heartbeat.ts";
 export * from "./guards.ts";
 export * from "./hello.ts";
 export * from "./ids.ts";

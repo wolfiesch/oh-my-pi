@@ -1,32 +1,33 @@
 import { decodeCursor, type Cursor } from "./cursor.ts";
 import { hostId, sessionId, type HostId, type SessionId } from "./ids.ts";
-import { boundedMap, inputObject, string } from "./guards.ts";
+import { boundedMap, inputObject, controlFree } from "./guards.ts";
 import { PROTOCOL_VERSION } from "./limits.ts";
 import { fail } from "./errors.ts";
-
 export interface SessionEvent {
-  type: string;
-  [key: string]: unknown;
+	type: string;
+	[key: string]: unknown;
 }
 export interface LiveEventFrame {
-  v: typeof PROTOCOL_VERSION;
-  type: "event";
-  cursor: Cursor;
-  hostId: HostId;
-  sessionId: SessionId;
-  event: SessionEvent;
+	v: typeof PROTOCOL_VERSION;
+	type: "event";
+	cursor: Cursor;
+	hostId: HostId;
+	sessionId: SessionId;
+	event: SessionEvent;
 }
 export function decodeEvent(input: unknown): LiveEventFrame {
-  const frame = inputObject(input);
-  if (frame.v !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v");
-  if (frame.type !== "event") fail("INVALID_FRAME", "expected event frame", "type");
-  decodeCursor(frame.cursor); hostId(frame.hostId); sessionId(frame.sessionId);
-  const event = boundedMap(frame.event, "event");
-  string(event.type, "event.type", 128);
-  return frame as unknown as LiveEventFrame;
+	const frame = inputObject(input);
+	if (frame.v !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v");
+	if (frame.type !== "event") fail("INVALID_FRAME", "expected event frame", "type");
+	const cursor = decodeCursor(frame.cursor);
+	hostId(frame.hostId);
+	sessionId(frame.sessionId);
+	const event = boundedMap(frame.event, "event");
+	controlFree(event.type, "event.type", 128);
+	return { ...frame, cursor, event } as unknown as LiveEventFrame;
 }
 export function isSessionEvent(value: unknown): value is SessionEvent {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-  const event = value as Record<string, unknown>;
-  return typeof event.type === "string" && event.type.length > 0 && event.type.length <= 128;
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	const event = value as Record<string, unknown>;
+	return typeof event.type === "string" && event.type.length > 0 && event.type.length <= 128;
 }

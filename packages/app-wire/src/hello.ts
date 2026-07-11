@@ -1,43 +1,120 @@
-import { decodeCapabilities, type Capabilities } from "./capabilities.ts";
+import { decodeFeatureList, decodeCapabilities, type Capabilities } from "./capabilities.ts";
 import { decodeCursor, type Cursor } from "./cursor.ts";
 import { fail } from "./errors.ts";
-import { inputObject, object, string } from "./guards.ts";
-import { PROTOCOL_VERSION } from "./limits.ts";
-
+import { hostId, sessionId, type HostId, type SessionId } from "./ids.ts";
+import { boundedArray, boundedMap, controlFree, inputObject } from "./guards.ts";
+import { MAX_SAVED_CURSORS, PROTOCOL_VERSION } from "./limits.ts";
+export interface ProtocolRange {
+	min: string;
+	max: string;
+}
+export interface ClientIdentity {
+	name: string;
+	version: string;
+	build: string;
+	platform: string;
+}
+export interface SavedCursor {
+	hostId: HostId;
+	sessionId: SessionId;
+	cursor: Cursor;
+}
 export interface HelloFrame {
-  v: typeof PROTOCOL_VERSION;
-  type: "hello";
-  client: string;
-  capabilities: Capabilities;
-  resume?: Cursor;
+	v: typeof PROTOCOL_VERSION;
+	type: "hello";
+	protocol: ProtocolRange;
+	client: ClientIdentity;
+	requestedFeatures: string[];
+	savedCursors: SavedCursor[];
+	capabilities?: Capabilities;
 }
 export interface WelcomeFrame {
-  v: typeof PROTOCOL_VERSION;
-  type: "welcome";
-  server: string;
-  epoch: number;
-  capabilities: Capabilities;
-  resumed: boolean;
+	v: typeof PROTOCOL_VERSION;
+	type: "welcome";
+	selectedProtocol: string;
+	hostId: HostId;
+	ompVersion: string;
+	ompBuild: string;
+	appserverVersion: string;
+	appserverBuild: string;
+	epoch: string;
+	grantedCapabilities: string[];
+	grantedFeatures: string[];
+	negotiatedLimits: Record<string, unknown>;
+	resumed: boolean;
 }
-function version(value: unknown): void {
-  if (value !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v");
+function version(frame: Record<string, unknown>): void {
+	if (frame.v !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v");
+}
+function protocolMajor(value: unknown, path: string): { text: string; major: number } {
+	const text = controlFree(value, path, 64);
+	const match = /^omp-app\/([1-9]\d*)$/u.exec(text);
+	if (!match) fail("UNSUPPORTED_PROTOCOL", "protocol must be omp-app/<positive integer>", path);
+	const major = Number(match[1]);
+	if (!Number.isSafeInteger(major)) fail("UNSUPPORTED_PROTOCOL", "protocol major is unsafe", path);
+	return { text, major };
+}
+function range(value: unknown, path: string): ProtocolRange {
+	const x = boundedMap(value, path);
+	const min = protocolMajor(x.min, `${path}.min`);
+	const max = protocolMajor(x.max, `${path}.max`);
+	if (min.major > max.major) fail("UNSUPPORTED_PROTOCOL", "protocol range is inverted", path);
+	return { min: min.text, max: max.text };
+}
+function identity(value: unknown, path: string): ClientIdentity {
+	const x = boundedMap(value, path);
+	return {
+		name: controlFree(x.name, `${path}.name`, 128),
+		version: controlFree(x.version, `${path}.version`, 64),
+		build: controlFree(x.build, `${path}.build`, 128),
+		platform: controlFree(x.platform, `${path}.platform`, 128),
+	};
 }
 export function decodeHello(input: unknown): HelloFrame {
-  const frame = inputObject(input);
-  version(frame.v);
-  if (frame.type !== "hello") fail("INVALID_FRAME", "expected hello frame", "type");
-  string(frame.client, "client", 256);
-  decodeCapabilities(frame.capabilities);
-  if (frame.resume !== undefined) decodeCursor(frame.resume, "resume");
-  return frame as unknown as HelloFrame;
+	const frame = inputObject(input);
+	version(frame);
+	if (frame.type !== "hello") fail("INVALID_FRAME", "expected hello frame", "type");
+	const protocol = range(frame.protocol, "protocol");
+	const minMajor = protocolMajor(protocol.min, "protocol.min").major;
+	const maxMajor = protocolMajor(protocol.max, "protocol.max").major;
+	if (minMajor > 1 || maxMajor < 1) fail("UNSUPPORTED_PROTOCOL", "no supported protocol in range", "protocol");
+	const client = identity(frame.client, "client");
+	const requestedFeatures = decodeFeatureList(frame.requestedFeatures, "requestedFeatures");
+	const raw = boundedArray(frame.savedCursors, "savedCursors", MAX_SAVED_CURSORS);
+	const savedCursors: SavedCursor[] = [];
+	for (let i = 0; i < raw.length; i++) {
+		const x = boundedMap(raw[i], `savedCursors[${i}]`);
+		savedCursors.push({
+			hostId: hostId(x.hostId, `savedCursors[${i}].hostId`),
+			sessionId: sessionId(x.sessionId, `savedCursors[${i}].sessionId`),
+			cursor: decodeCursor(x.cursor, `savedCursors[${i}].cursor`),
+		});
+	}
+	if (frame.capabilities !== undefined) decodeCapabilities(frame.capabilities);
+	return { ...frame, protocol, client, requestedFeatures, savedCursors } as unknown as HelloFrame;
 }
 export function decodeWelcome(input: unknown): WelcomeFrame {
-  const frame = object(input);
-  version(frame.v);
-  if (frame.type !== "welcome") fail("INVALID_FRAME", "expected welcome frame", "type");
-  string(frame.server, "server", 256);
-  if (typeof frame.epoch !== "number" || !Number.isSafeInteger(frame.epoch) || frame.epoch < 0) fail("UNSAFE_SEQUENCE", "epoch must be safe", "epoch");
-  decodeCapabilities(frame.capabilities);
-  if (typeof frame.resumed !== "boolean") fail("INVALID_FRAME", "resumed must be boolean", "resumed");
-  return frame as unknown as WelcomeFrame;
+	const frame = inputObject(input);
+	version(frame);
+	if (frame.type !== "welcome") fail("INVALID_FRAME", "expected welcome frame", "type");
+	const selectedProtocol = controlFree(frame.selectedProtocol, "selectedProtocol", 64);
+	if (selectedProtocol !== PROTOCOL_VERSION)
+		fail("UNSUPPORTED_PROTOCOL", "unsupported selected protocol", "selectedProtocol");
+	hostId(frame.hostId);
+	controlFree(frame.ompVersion, "ompVersion", 64);
+	controlFree(frame.ompBuild, "ompBuild", 128);
+	controlFree(frame.appserverVersion, "appserverVersion", 64);
+	controlFree(frame.appserverBuild, "appserverBuild", 128);
+	controlFree(frame.epoch, "epoch", 128);
+	const grantedCapabilities = decodeFeatureList(frame.grantedCapabilities, "grantedCapabilities");
+	const grantedFeatures = decodeFeatureList(frame.grantedFeatures, "grantedFeatures");
+	const negotiatedLimits = boundedMap(frame.negotiatedLimits, "negotiatedLimits");
+	if (typeof frame.resumed !== "boolean") fail("INVALID_FRAME", "resumed must be boolean", "resumed");
+	return {
+		...frame,
+		selectedProtocol,
+		grantedCapabilities,
+		grantedFeatures,
+		negotiatedLimits,
+	} as unknown as WelcomeFrame;
 }
