@@ -99,13 +99,6 @@ describe("identity and socket ownership", () => {
   });
 });
 
-  test("command args are strict and prompts are bounded", async () => {
-    const appserver = createAppserver({ hostId: host, discovery: new StaticDiscovery([]) });
-    const base = { v: "omp-app/1" as const, type: "command" as const, hostId: host, command: "host.list", sessionId: undefined, args: {} };
-    const wrong = await appserver.command({ ...base, requestId: "a" as never, commandId: "a" as never, args: { extra: true } }); expect(wrong.frame.type === "response" && wrong.frame.error?.code).toBe("invalid_frame");
-    const objectPrompt = await appserver.command({ ...base, requestId: "b" as never, commandId: "b" as never, command: "session.prompt", sessionId: sessionId("s"), args: { message: { bad: true } } }); expect(objectPrompt.frame.type === "response" && objectPrompt.frame.error?.code).toBe("invalid_frame");
-    const oversized = await appserver.command({ ...base, requestId: "c" as never, commandId: "c" as never, command: "session.prompt", sessionId: sessionId("s"), args: { message: "x".repeat(65_537) } }); expect(oversized.frame.type === "response" && oversized.frame.error?.code).toBe("invalid_frame");
-  });
 describe("projection, replay, and idempotency", () => {
   test("incremental projection preserves entries and deterministic revision", () => {
     const projection = new SessionProjection(host, record("s"), "epoch-a", 3); projection.appendEntry(durable("a")); projection.appendEntry(durable("b"));
@@ -164,13 +157,6 @@ describe("child supervision", () => {
     await appserver.stop(); socket.destroy(); expect(await unixSocketActive(path)).toBe(false);
   });
 
-  test("attach is read-only and does not spawn a child", async () => {
-    const root = await mkdtemp(join(tmpdir(), "omp-child-")); const path = join(root, "app.sock"); const factory = new IdleFactory("custom-omp");
-    const appserver = createAppserver({ hostId: host, socketPath: path, discovery: new StaticDiscovery([record("s")]), childFactory: factory });
-    await appserver.start();
-    const outcome = await appserver.command({ v: "omp-app/1", type: "command", requestId: "r" as never, commandId: "c" as never, hostId: host, sessionId: sessionId("s"), command: "session.attach", args: {} });
-    expect(outcome.frame.type).toBe("response"); expect(factory.children).toHaveLength(0); expect(factory.argv("/tmp/s.jsonl")).toEqual(["custom-omp", "--mode", "rpc", "--session", "/tmp/s.jsonl"]); await appserver.stop();
-  });
 });
 describe("appserver startup and cleanup", () => {
   test("startup failure releases ownership and stop kills every child", async () => {

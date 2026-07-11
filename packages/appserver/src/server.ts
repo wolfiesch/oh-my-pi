@@ -100,7 +100,7 @@ export class LocalAppserver implements AppserverHandle {
   snapshot(sessionId: SessionId) { return this.#projections.get(sessionId)?.value; }
   replay(sessionId: SessionId, cursor: { epoch: string; seq: number }): ServerFrame[] { return this.#projections.get(sessionId)?.replay(cursor) ?? []; }
   childFor(sessionId: SessionId): ChildHandle | undefined { return this.#supervisors.get(sessionId)?.child(); }
-  async command(command: CommandFrame, capabilities?: Set<string>, approved = false): Promise<CommandOutcome> {
+  async #command(command: CommandFrame, capabilities?: Set<string>, approved = false): Promise<CommandOutcome> {
     if (command.hostId !== this.hostId) return { frame: response(this.hostId, command, false, undefined, { code: "host_mismatch", message: "command targets another host" }) };
     const descriptor = COMMAND_DESCRIPTORS[command.command]; if (!descriptor) return { frame: response(this.hostId, command, false, undefined, { code: "unsupported", message: "unknown command" }) };
     const required = requiredCapability(command.command); if (capabilities && required && !capabilities.has(required)) return { frame: response(this.hostId, command, false, undefined, { code: "capability_denied", message: "client capability was not granted" }) };
@@ -193,7 +193,7 @@ export class LocalAppserver implements AppserverHandle {
       if (frame.type !== "command") { ws.send(JSON.stringify({ v: "omp-app/1", type: "error", code: "unsupported", message: "frame is not supported" })); return; }
       const descriptor = COMMAND_DESCRIPTORS[frame.command];
       if (descriptor?.confirmation === "challenge" && frame.confirmationId === undefined) { ws.send(JSON.stringify(this.challenge(ws, frame))); return; }
-      const outcome = await this.command(frame, this.#clientCapabilities.get(ws));
+      const outcome = await this.#command(frame, this.#clientCapabilities.get(ws));
       ws.send(JSON.stringify(outcome.frame));
       if (frame.command === "session.attach" && frame.sessionId && outcome.frame.type === "response" && outcome.frame.ok) {
         this.#attached.get(ws)?.add(frame.sessionId);
@@ -215,7 +215,7 @@ export class LocalAppserver implements AppserverHandle {
     if (!pending || pending.ws !== ws || pending.expiresAt < Date.now() || pending.command.commandId !== frame.commandId || pending.command.hostId !== frame.hostId || pending.command.sessionId !== frame.sessionId) return { frame: response(this.hostId, { ...pending?.command ?? frame, requestId: frame.requestId, commandId: frame.commandId, hostId: this.hostId } as CommandFrame, false, undefined, { code: "confirmation_invalid", message: "confirmation is invalid or expired" }) };
     this.#challenges.delete(String(frame.confirmationId));
     if (frame.decision === "deny") return { frame: response(this.hostId, pending.command, false, undefined, { code: "confirmation_denied", message: "command was denied" }) };
-    return this.command({ ...pending.command, confirmationId: frame.confirmationId }, this.#clientCapabilities.get(ws), true);
+    return this.#command({ ...pending.command, confirmationId: frame.confirmationId }, this.#clientCapabilities.get(ws), true);
   }
   private hello(ws: AppWs, frame: HelloFrame): void { const requestedCapabilities = new Set(frame.capabilities?.client ?? this.#supportedCapabilities); const grantedCapabilities = [...this.#supportedCapabilities].filter(capability => requestedCapabilities.has(capability)); this.#clientCapabilities.set(ws, new Set(grantedCapabilities)); const welcome = { v: "omp-app/1", type: "welcome", selectedProtocol: "omp-app/1", hostId: this.hostId, ompVersion: this.#ompVersion, ompBuild: this.#ompBuild, appserverVersion: this.#appserverVersion, appserverBuild: this.#appserverBuild, epoch: this.epoch, grantedCapabilities, grantedFeatures: frame.requestedFeatures.filter(feature => this.#supportedFeatures.has(feature)), negotiatedLimits: { maxPayloadLength: 1024 * 1024, ringSize: this.#ringSize }, resumed: frame.savedCursors.some(cursor => cursor.hostId === this.hostId && cursor.cursor.epoch === this.epoch) }; ws.send(JSON.stringify(welcome)); ws.send(JSON.stringify(this.sessionsFrame())); }
   private async loadSessions(): Promise<void> { const records = await this.#discovery.list(); records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.sessionId.localeCompare(b.sessionId)); for (const record of records) { if (this.#records.has(record.sessionId)) throw new Error(`duplicate session id: ${record.sessionId}`); this.#records.set(record.sessionId, record); this.#projections.set(record.sessionId, new SessionProjection(this.hostId, record, this.epoch, this.#ringSize)); } }
