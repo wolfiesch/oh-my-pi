@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { SecureFsAdapter } from "@oh-my-pi/pi-coding-agent/session/desktop-operations-authority";
 import { CodingAgentDesktopAuthority } from "@oh-my-pi/pi-coding-agent/session/desktop-operations-authority";
 
 const roots: string[] = [];
@@ -40,6 +41,32 @@ describe("CodingAgentDesktopAuthority jailed files", () => {
 			{ path: "nested/bin", kind: "file", size: 3 },
 			{ path: "nested/hello.txt", kind: "file", size: 5 },
 		]);
+	});
+	test("omits native entries that cannot cross the app-wire listing protocol", async () => {
+		const root = await mkdtemp(join(process.cwd(), ".desktop-authority-"));
+		roots.push(root);
+		const secureFs: SecureFsAdapter = {
+			secureReadFile: () => {
+				throw new Error("unused");
+			},
+			secureWriteFileAtomic: () => {
+				throw new Error("unused");
+			},
+			secureListDirectory: () => ({
+				entries: [
+					{ name: "ok.txt", path: "ok.txt", kind: "file", size: 1 },
+					{ name: "~", path: "~", kind: "file", size: 1 },
+					{ name: "~name", path: "~name", kind: "file", size: 1 },
+					{ name: "bad\nname", path: "bad\nname", kind: "file", size: 1 },
+				],
+			}),
+		};
+		const value = new CodingAgentDesktopAuthority({
+			sessionManager: { getCwd: () => root, getSessionId: () => "session-test" },
+			projectRootForSession: () => root,
+			secureFs,
+		});
+		await expect(value.filesList()).resolves.toEqual({ entries: [{ path: "ok.txt", kind: "file", size: 1 }] });
 	});
 	test("rejects absolute, drive, traversal, symlink, and root escape paths without exposing paths", async () => {
 		const { root, value } = await authority();

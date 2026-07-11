@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
-import { decodeCatalog } from "@oh-my-pi/app-wire";
+import { decodeCatalog, safeRelativePath as appWireSafeRelativePath } from "@oh-my-pi/app-wire";
 import {
 	Process as NativeProcess,
 	PtySession,
@@ -177,6 +177,22 @@ function safeRelativePath(value: string): string {
 	const result = parts.filter(Boolean).join("/");
 	if (!result) throw protocolError("FORBIDDEN");
 	return result;
+}
+interface ProtocolSafeDirectoryEntry {
+	path: string;
+	kind: "file" | "directory" | "symlink";
+	size?: number;
+}
+function protocolSafeDirectoryEntry(entry: SecureDirectoryEntry): ProtocolSafeDirectoryEntry | undefined {
+	const kind = entry.kind === "file" || entry.kind === "directory" || entry.kind === "symlink" ? entry.kind : undefined;
+	if (!kind || !entry.name || entry.name.includes("/") || entry.name.includes("\\") || /[\u0000-\u001f\u007f]/.test(entry.name))
+		return undefined;
+	try {
+		const path = appWireSafeRelativePath(entry.path);
+		return { path, kind, ...(entry.size === undefined ? {} : { size: entry.size }) };
+	} catch {
+		return undefined;
+	}
 }
 function freeze<T>(value: T): T {
 	if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
@@ -436,27 +452,9 @@ export class CodingAgentDesktopAuthority {
 			const entries = result.entries
 				.slice()
 				.sort((left, right) => left.name.localeCompare(right.name))
-				.map((entry: SecureDirectoryEntry) => {
-					if (
-						!entry.name ||
-						entry.name.includes("/") ||
-						entry.name.includes("\\") ||
-						isAbsolute(entry.path) ||
-						/^[A-Za-z]:/.test(entry.path)
-					)
-						throw protocolError("OPERATION_FAILED");
-					const kind =
-						entry.kind === "file" || entry.kind === "directory" || entry.kind === "symlink"
-							? entry.kind
-							: (() => {
-									throw protocolError("OPERATION_FAILED");
-								})();
-					return freeze({
-						path: safeRelativePath(entry.path),
-						kind,
-						...(entry.size === undefined ? {} : { size: entry.size }),
-					});
-				});
+				.map(protocolSafeDirectoryEntry)
+				.filter((entry): entry is ProtocolSafeDirectoryEntry => entry !== undefined)
+				.map(entry => freeze(entry));
 			return freeze({ entries });
 		} catch (error) {
 			if (error && typeof error === "object" && "code" in error) throw error;
