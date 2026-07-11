@@ -55,11 +55,14 @@
     },
     "packages/app-wire": {
       "name": "@oh-my-pi/app-wire",
-      "version": "0.1.0",
+      "version": "0.1.2",
     },
     "packages/appserver": {
       "name": "@oh-my-pi/appserver",
       "version": "0.1.0",
+      "bin": {
+        "ompd": "./bin/ompd.ts",
+      },
       "dependencies": {
         "@oh-my-pi/app-wire": "workspace:*",
       },
@@ -127,6 +130,7 @@
         "zod": "catalog:",
       },
       "devDependencies": {
+        "@oh-my-pi/appserver": "workspace:*",
         "@types/bun": "catalog:",
       },
       "optionalDependencies": {
@@ -795,6 +799,7 @@
     "@octokit/types": ["@octokit/types@16.0.0", "", { "dependencies": { "@octokit/openapi-types": "^27.0.0" } }, "sha512-sKq+9r1Mm4efXW1FCk7hFSeJo4QKreL/tTbR0rz/qx/r1Oa2VV83LTA/H/MuCOX7uCIJmQVRKBcbmWoySjAnSg=="],
 
     "@oh-my-pi/app-wire": ["@oh-my-pi/app-wire@workspace:packages/app-wire"],
+
     "@oh-my-pi/appserver": ["@oh-my-pi/appserver@workspace:packages/appserver"],
 
     "@oh-my-pi/collab-web": ["@oh-my-pi/collab-web@workspace:packages/collab-web"],

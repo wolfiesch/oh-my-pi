@@ -8,13 +8,50 @@ const VALID_EVENTS = new Set(["session_entry", "subagent_lifecycle", "subagent_p
 
 export interface ChildCallbacks { entry(frame: RpcSessionEntryFrame): void; event(frame: Record<string, unknown>): void; crashed(error: Error): void; }
 
+export interface RpcChildInvocation {
+  executable: string;
+  prefixArgv: readonly string[];
+}
+
+export interface RpcChildInvocationOverrides {
+  compiled?: boolean;
+  executable?: string;
+  main?: string;
+}
+
+export function resolveRpcChildInvocation(overrides: RpcChildInvocationOverrides = {}): RpcChildInvocation {
+  const executable = overrides.executable ?? process.execPath;
+  if (typeof executable !== "string" || executable.trim().length === 0) throw new Error("rpc child executable is empty");
+  const compiled = overrides.compiled ?? process.env.PI_COMPILED === "true";
+  const main = overrides.main ?? Bun.main;
+  if (!compiled && (typeof main !== "string" || main.trim().length === 0)) throw new Error("rpc child CLI entry is empty");
+  return { executable, prefixArgv: Object.freeze(compiled ? [] : [main]) };
+}
+
 export class BunRpcChildFactory implements RpcChildFactory {
-  constructor(private readonly executable = "omp") {}
+  #executable: string;
+  #prefixArgv: readonly string[];
+
+  constructor(invocation: string | RpcChildInvocation = resolveRpcChildInvocation()) {
+    const resolved = typeof invocation === "string" ? { executable: invocation, prefixArgv: [] } : invocation;
+    if (typeof resolved.executable !== "string" || resolved.executable.trim().length === 0) {
+      throw new Error("rpc child executable is empty");
+    }
+    if (!Array.isArray(resolved.prefixArgv) || resolved.prefixArgv.some(arg => typeof arg !== "string" || arg.length === 0)) {
+      throw new Error("rpc child prefix argv is invalid");
+    }
+    this.#executable = resolved.executable;
+    this.#prefixArgv = Object.freeze([...resolved.prefixArgv]);
+  }
+
   spawn(spec: { session: SessionRecord; argv: string[]; cwd: string }): ChildHandle {
     const child = Bun.spawn(spec.argv, { cwd: spec.cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     return { stdin: { write: data => Promise.resolve(child.stdin.write(data)).then(() => undefined) }, stdout: child.stdout as unknown as AsyncIterable<Uint8Array>, stderr: child.stderr as unknown as AsyncIterable<Uint8Array>, exited: child.exited, kill: signal => child.kill(signal as never) };
   }
-  argv(sessionPath: string): string[] { return [this.executable, "--mode", "rpc", ...(sessionPath ? ["--session", sessionPath] : [])]; }
+
+  argv(sessionPath: string): string[] {
+    return [this.#executable, ...this.#prefixArgv, "--mode", "rpc", "--session", sessionPath];
+  }
 }
 
 function stringBytes(value: string): number {
