@@ -1,6 +1,6 @@
 import { fail } from "./errors.ts";
 import { commandId, confirmationId, hostId, leaseId, requestId, revision, sessionId, terminalId, type CommandId, type ConfirmationId, type HostId, type RequestId, type Revision, type SessionId } from "./ids.ts";
-import { boundedArray, boundedMap, boundedMetadata, boundedText, controlFree, inputObject, safeRelativePath, safeSeq } from "./guards.ts";
+import { boundedArray, boundedMap, boundedMetadata, boundedText, controlFree, inputObject, isSecretLikeKey, safeRelativePath, safeSeq } from "./guards.ts";
 import { MAX_FILE_BYTES, PROTOCOL_VERSION } from "./limits.ts";
 import { decodeCursor, type Cursor } from "./cursor.ts";
 import { decodeSessionRef, type SessionRef } from "./session-index.ts";
@@ -20,8 +20,7 @@ export type CommandArguments=Record<string,unknown>; export type CommandResult=R
 function args(value:unknown,path="args"):Record<string,unknown>{return boundedMap(value,path);} function result(value:unknown):Record<string,unknown>{return boundedMap(value,"result");}
 function absPath(value:unknown,path:string):string { const text=controlFree(value,path,4096); if(!text.startsWith("/")) fail("UNSAFE_PATH","cwd must be absolute",path); return text; }
 function url(value:unknown,path:string):string { const text=controlFree(value,path,4096); let parsed:URL; try{parsed=new URL(text);}catch{fail("INVALID_FRAME","invalid URL",path);} if((parsed.protocol!=="http:"&&parsed.protocol!=="https:")||parsed.username!==""||parsed.password!=="") fail("INVALID_FRAME","URL must be http(s) without credentials",path); return text; }
-const SECRET=/password|passwd|secret|token|credential|api[_-]?key|private[_-]?key/iu;
-function metadata(value:unknown,path:string):Record<string,unknown>{return boundedMetadata(value,path,key=>SECRET.test(key));}
+function metadata(value:unknown,path:string):Record<string,unknown>{return boundedMetadata(value,path,isSecretLikeKey);}
 function decodeSessions(value:unknown):CommandResult{const x=result(value), cursor=decodeCursor(x.cursor,"result.cursor"), values=boundedArray(x.sessions,"result.sessions"); const sessions=values.map((v,i)=>decodeSessionRef(v,`result.sessions[${i}]`)); return {...x,cursor,sessions};}
 function decodeCreate(value:unknown):CommandResult{const x=result(value);return {...x,session:decodeSessionRef(x.session,"result.session")};}
 function decodeAttach(value:unknown):CommandResult{const x=result(value);if(typeof x.attached!=="boolean")fail("INVALID_FRAME","attached must be boolean","result.attached");return {...x,attached:x.attached,cursor:decodeCursor(x.cursor,"result.cursor")};}

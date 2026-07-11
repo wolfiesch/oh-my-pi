@@ -34,7 +34,7 @@ describe("app-wire authority", () => {
 		savedCursors: [{ hostId: "h", sessionId: "s", cursor: { epoch: "e1", seq: 1 } }],
 	};
 	test("every canonical golden decodes through public guards", async () => {
-		const files = (await Array.fromAsync(new Bun.Glob("*.json").scan({ cwd: new URL(".", root).pathname }))).sort();
+		const files = (await Array.fromAsync(new Bun.Glob("*.json").scan({ cwd: new URL(".", root).pathname }))).filter(name => !name.endsWith(".invalid.json")).sort();
 		const client = new Set([
 			"hello.json",
 			"command.json",
@@ -232,16 +232,29 @@ describe("app-wire authority", () => {
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
-		expect(APP_WIRE_VERSION).toBe("0.2.0");
+		expect(APP_WIRE_VERSION).toBe("0.3.0");
 	});
 	test("exported wire version matches package metadata", async () => {
 		const metadata = (await Bun.file(new URL("../package.json", import.meta.url)).json()) as { version: string };
 		expect(APP_WIRE_VERSION).toBe(metadata.version);
 	});
+	test("session project wire data is opaque and live state is secret-free", () => {
+		const session = { hostId: "h", sessionId: "s", project: { projectId: "p", name: "Demo" }, revision: "r", title: "Demo", status: "idle", updatedAt: "now", liveState: { phase: "work", phaseLabel: "human" } };
+		const frame = { v: "omp-app/1", type: "sessions", cursor: { epoch: "e", seq: 1 }, sessions: [session] };
+		const decoded = decodeServerFrame(frame);
+		expect(JSON.stringify(decoded)).not.toContain("canonicalCwd");
+		expect(JSON.stringify(decodeCommandResult("session.list", { cursor: { epoch: "e", seq: 1 }, sessions: [session] }))).not.toContain("/workspace");
+		expect(() => decodeServerFrame({ ...frame, sessions: [{ ...session, liveState: { deviceToken: "x" } }] })).toThrow(AppWireError);
+		expect(() => decodeServerFrame({ ...frame, sessions: [{ ...session, liveState: { nested: { session_key: "x" } } }] })).toThrow(AppWireError);
+	});
+	test("malicious secret metadata fixture is rejected", async () => {
+		const malicious = await fixture("session-secret.invalid.json");
+		expect(() => decodeServerFrame(malicious)).toThrow(AppWireError);
+	});
 	test("additive watch, lease, PTY, files, audit, catalog, preview discriminants are bounded", () => {
 		const frames = [
 			{ v: "omp-app/1", type: "host.watch", watchId: "w", hostId: "h", cursor: { epoch: "e", seq: 1 }, state: "ready", revision: "r" },
-			{ v: "omp-app/1", type: "session.delta", hostId: "h", sessionId: "s", cursor: { epoch: "e", seq: 2 }, revision: "r", upsert: { hostId: "h", sessionId: "s", project: { projectId: "p", canonicalCwd: "/workspace" }, revision: "r", title: "Demo", status: "idle", updatedAt: "now" } },
+			{ v: "omp-app/1", type: "session.delta", hostId: "h", sessionId: "s", cursor: { epoch: "e", seq: 2 }, revision: "r", upsert: { hostId: "h", sessionId: "s", project: { projectId: "p" }, revision: "r", title: "Demo", status: "idle", updatedAt: "now" } },
 			{ v: "omp-app/1", type: "prompt.lease", hostId: "h", sessionId: "s", leaseId: "l", cursor: { epoch: "e", seq: 3 }, kind: "prompt", state: "acquired", owner: "desktop", expiresAt: "now" },
 			{ v: "omp-app/1", type: "agent.progress", hostId: "h", sessionId: "s", agentId: "a", cursor: { epoch: "e", seq: 4 }, progress: 0.5, revision: "r" },
 			{ v: "omp-app/1", type: "terminal.output", hostId: "h", sessionId: "s", terminalId: "t", cursor: { epoch: "e", seq: 5 }, stream: "stdout", data: "ok" },
