@@ -4,6 +4,7 @@ import type { Message, TextContent } from "@oh-my-pi/pi-ai";
 import { getAgentDir as getDefaultAgentDir, logger, parseJsonlLenient, toError } from "@oh-my-pi/pi-utils";
 import { computeDefaultSessionDir } from "./session-paths";
 import { FileSessionStorage, type SessionStorage } from "./session-storage";
+import { inspectSessionLock, type SessionLockStatus } from "./session-lock";
 
 /**
  * Coarse lifecycle status of a session, derived from its last persisted message.
@@ -520,7 +521,8 @@ async function scanSessionDir(
 	try {
 		await recoverOrphanedBackups(sessionDir, storage);
 		const files = storage.listFilesSync(sessionDir, "*.jsonl");
-		return await collectSessionsFromFiles(files, storage, withStatus);
+		const sessions = await collectSessionsFromFiles(files, storage, withStatus);
+		return sessions.filter(isWritableResumeCandidate);
 	} catch {
 		return [];
 	}
@@ -561,7 +563,8 @@ export async function listAllSessions(storage: SessionStorage = new FileSessionS
 		const files = await Array.fromAsync(new Bun.Glob("*/*.jsonl").scan(sessionsRoot), name =>
 			path.join(sessionsRoot, name),
 		);
-		return await collectSessionsFromFiles(files, storage, true);
+		const sessions = await collectSessionsFromFiles(files, storage, true);
+		return sessions.filter(isWritableResumeCandidate);
 	} catch {
 		return [];
 	}
@@ -622,6 +625,16 @@ function isSessionStorage(value: SessionStorage | ResolveResumableSessionOptions
 	return "listFilesSync" in value;
 }
 
+function isWritableResumeCandidate(session: SessionInfo): boolean {
+	let status: SessionLockStatus;
+	try {
+		status = inspectSessionLock(session.path).status;
+	} catch {
+		// A lock inspection I/O failure is fail-closed for writable resume.
+		return false;
+	}
+	return status !== "live" && status !== "suspect" && status !== "malformed";
+}
 export async function resolveResumableSession(
 	sessionArg: string,
 	cwd: string,
@@ -633,7 +646,9 @@ export async function resolveResumableSession(
 	const resolvedOptions = isSessionStorage(storageOrOptions) ? options : storageOrOptions;
 	const localSessionDir = sessionDir ?? computeDefaultSessionDir(cwd, storage);
 	const localSessions = await listSessions(localSessionDir, storage);
-	const localMatch = localSessions.find(session => sessionMatchesResumeArg(session, sessionArg));
+	const localMatch = localSessions.find(
+		session => sessionMatchesResumeArg(session, sessionArg) && isWritableResumeCandidate(session),
+	);
 	if (localMatch) {
 		return { session: localMatch, scope: "local" };
 	}
@@ -643,7 +658,9 @@ export async function resolveResumableSession(
 	}
 
 	const globalSessions = await listAllSessions(storage);
-	const globalMatch = globalSessions.find(session => sessionMatchesResumeArg(session, sessionArg));
+	const globalMatch = globalSessions.find(
+		session => sessionMatchesResumeArg(session, sessionArg) && isWritableResumeCandidate(session),
+	);
 	if (!globalMatch) {
 		return undefined;
 	}

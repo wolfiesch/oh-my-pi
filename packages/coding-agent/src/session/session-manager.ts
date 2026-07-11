@@ -58,6 +58,11 @@ import {
 } from "./session-entries";
 import { findMostRecentSession, listAllSessions, listSessions, type SessionInfo } from "./session-listing";
 import { loadEntriesFromFile, readTitleSlotFromFile, resolveBlobRefsInEntries } from "./session-loader";
+import {
+	acquireSessionLock,
+	type SessionLockHandle,
+	type SessionLockOptions,
+} from "./session-lock";
 import { generateId, migrateToCurrentVersion } from "./session-migrations";
 import {
 	computeDefaultSessionDir,
@@ -384,6 +389,9 @@ export class SessionManager {
 	readonly #persist: boolean;
 	readonly #storage: SessionStorage;
 	readonly #blobs: BlobStore;
+	readonly #lockOptions: SessionLockOptions;
+	readonly #lockEnabled: boolean;
+	#sessionLock: SessionLockHandle | undefined;
 
 	#sessionId = "";
 	#sessionName: string | undefined;
@@ -452,12 +460,26 @@ export class SessionManager {
 	#suppressBreadcrumb = false;
 	#sessionNameChangedCallbacks = new Set<() => void>();
 
-	private constructor(cwd: string, sessionDir: string, persist: boolean, storage: SessionStorage) {
+	private constructor(
+		cwd: string,
+		sessionDir: string,
+		persist: boolean,
+		storage: SessionStorage,
+		lockOptions: SessionLockOptions = {},
+	) {
 		this.#cwd = cwd;
 		this.#sessionDir = sessionDir;
 		this.#persist = persist;
 		this.#storage = storage;
 		this.#blobs = new BlobStore(getBlobsDir());
+		this.#lockEnabled = storage instanceof FileSessionStorage || lockOptions.enabled === true;
+		this.#lockOptions = {
+			...lockOptions,
+			onHeartbeatError: error => {
+				this.#noteDiskFailure(error);
+				lockOptions.onHeartbeatError?.(error);
+			},
+		};
 
 		if (persist && sessionDir) this.#storage.ensureDirSync(sessionDir);
 	}
@@ -522,6 +544,17 @@ export class SessionManager {
 		const writer = this.#writer;
 		this.#writer = undefined;
 		if (writer) void writer.close().catch(() => undefined);
+	}
+
+	#acquireSessionLock(): void {
+		if (!this.#lockEnabled || !this.#persist || !this.#sessionFile || this.#sessionLock) return;
+		this.#sessionLock = acquireSessionLock(this.#sessionFile, this.#lockOptions);
+	}
+
+	#releaseSessionLock(): void {
+		const lock = this.#sessionLock;
+		this.#sessionLock = undefined;
+		lock?.release();
 	}
 
 	async #closeWriterHandle(): Promise<void> {
@@ -597,6 +630,7 @@ export class SessionManager {
 	 */
 	#rewriteSynchronously(): void {
 		if (!this.#persist || !this.#sessionFile || !this.#shouldHaveSessionFile()) return;
+		this.#acquireSessionLock();
 
 		try {
 			const body = this.#fileBody();
@@ -604,11 +638,14 @@ export class SessionManager {
 			this.#diskTail = Promise.resolve();
 			this.#closeWriterEventually();
 			this.#storage.writeTextSync(this.#sessionFile, body);
+			this.#sessionLock?.heartbeat();
 			this.#fileIsCurrent = true;
 			this.#rewriteRequired = false;
 			this.#hasTitleSlot = true;
 		} catch (err) {
-			this.#noteDiskFailure(err);
+			const failure = this.#noteDiskFailure(err);
+			this.#releaseSessionLock();
+			throw failure;
 		}
 	}
 
@@ -624,6 +661,8 @@ export class SessionManager {
 	 */
 	async #rewriteAtomically(): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
+		if (!this.#shouldHaveSessionFile()) return;
+		this.#acquireSessionLock();
 
 		const startEpoch = this.#diskEpoch;
 		await this.#scheduleDiskWork(
@@ -684,6 +723,7 @@ export class SessionManager {
 			this.#fileIsCurrent = false;
 			return;
 		}
+		this.#acquireSessionLock();
 
 		// Atomic replacement window: the old path may be moved aside underneath
 		// any newly-opened append handle (Windows EPERM fallback). Do not open a
@@ -708,11 +748,10 @@ export class SessionManager {
 		// Hot path: append synchronously so the entry is durable the instant this
 		// returns (file/memory writers perform the write in-body). Never routed
 		// through the async disk chain — durability must hold without a flush().
-		// A mid-close writer leaves `#writer` undefined, so `#appendWriter` simply
-		// opens a fresh append handle and the entry still lands.
 		try {
 			void this.#appendWriter()
 				.append(this.#lineFor(entry))
+				.then(() => this.#sessionLock?.heartbeat())
 				.catch(err => this.#noteDiskFailure(err));
 		} catch (err) {
 			this.#noteDiskFailure(err);
@@ -846,6 +885,10 @@ export class SessionManager {
 	}
 
 	#recordEntry(entry: SessionEntry): void {
+		if (this.#diskFailure) throw this.#diskFailure;
+		if (this.#persist && this.#sessionFile && (this.#shouldHaveSessionFile() || isAssistantEntry(entry))) {
+			this.#acquireSessionLock();
+		}
 		this.#entries.push(entry);
 		this.#index.insert(entry);
 		this.#appendToSessionFile(entry);
@@ -948,10 +991,21 @@ export class SessionManager {
 	}
 
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
+		const activeFile = this.#sessionFile;
+		let nextLock = this.#sessionLock;
+		if (snapshot.onDisk && snapshot.sessionFile && (!this.#sessionLock || path.resolve(snapshot.sessionFile) !== path.resolve(activeFile ?? ""))) {
+			nextLock = acquireSessionLock(snapshot.sessionFile, this.#lockOptions);
+		} else if (!snapshot.onDisk) {
+			this.#releaseSessionLock();
+			nextLock = undefined;
+		}
 		this.#closeWriterEventually();
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
-
+		if (nextLock !== this.#sessionLock) {
+			this.#releaseSessionLock();
+			this.#sessionLock = nextLock;
+		}
 		this.#cwd = snapshot.cwd;
 		this.#sessionDir = snapshot.sessionDir;
 		this.#sessionFile = snapshot.sessionFile;
@@ -978,7 +1032,9 @@ export class SessionManager {
 		this.#draftOnlySessionCleanupArmed = false;
 
 		const resolvedSessionFile = path.resolve(sessionFile);
+		if (this.#sessionFile !== resolvedSessionFile) this.#releaseSessionLock();
 		this.#sessionFile = resolvedSessionFile;
+		this.#acquireSessionLock();
 		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
 
 		const titleSlot = await readTitleSlotFromFile(resolvedSessionFile, this.#storage);
@@ -990,7 +1046,15 @@ export class SessionManager {
 			this.#forceFileCreation = true;
 			await this.#rewriteAtomically();
 			this.#fileIsCurrent = true;
-			return;
+			this.#rewriteRequired = migrated;
+			this.#forceFileCreation = true;
+			this.#artifactManager = null;
+			this.#artifactManagerSessionFile = null;
+
+			if (this.sanitizeLoadedOpenAIResponsesReplayMetadata()) this.#rewriteRequired = true;
+		} catch (error) {
+			this.#releaseSessionLock();
+			throw error;
 		}
 
 		const migrated = migrateToCurrentVersion(fileEntries);
@@ -1026,12 +1090,14 @@ export class SessionManager {
 	/** Start a new session. Drains and closes any existing writer first. */
 	async newSession(options?: NewSessionOptions): Promise<string | undefined> {
 		await this.#drainAndCloseWriter();
+		this.#releaseSessionLock();
 		return this.#resetToNewSession(options);
 	}
 
 	/** Delete a session file and its artifact directory. ENOENT is treated as success. */
 	async dropSession(sessionPath: string): Promise<void> {
 		await this.#drainAndCloseWriter();
+		this.#releaseSessionLock();
 		try {
 			await this.#storage.deleteSessionWithArtifacts(sessionPath);
 		} catch (err) {
@@ -1049,6 +1115,7 @@ export class SessionManager {
 		const oldSessionFile = this.#sessionFile;
 		const parentSessionId = this.#sessionId;
 		await this.#drainAndCloseWriter();
+		this.#releaseSessionLock();
 		this.#clearDiskError();
 
 		const timestamp = nowIso();
@@ -1117,6 +1184,8 @@ export class SessionManager {
 			const artifactPathChanged = path.resolve(oldArtifactsDir) !== path.resolve(newArtifactsDir);
 			sessionFileExisted = this.#storage.existsSync(oldSessionFile);
 
+			let targetLock: SessionLockHandle | undefined;
+			if (sessionPathChanged) targetLock = acquireSessionLock(newSessionFile, this.#lockOptions);
 			let sessionMoved = false;
 			let artifactsMoved = false;
 
@@ -1158,9 +1227,19 @@ export class SessionManager {
 					}
 				}
 
+				if (targetLock) {
+					targetLock.release();
+					targetLock = undefined;
+				}
 				throw err;
 			}
 
+			if (targetLock) {
+				const sourceLock = this.#sessionLock;
+				this.#sessionLock = targetLock;
+				targetLock = undefined;
+				sourceLock?.release();
+			}
 			this.#sessionFile = newSessionFile;
 			this.#artifactManager = null;
 			this.#artifactManagerSessionFile = null;
@@ -1268,6 +1347,7 @@ export class SessionManager {
 		// tail) to become durable so a graceful shutdown does not exit while
 		// a fire-and-forget publish is still on the wire.
 		await this.#storage.drain();
+		this.#releaseSessionLock();
 		if (this.#diskFailure) throw this.#diskFailure;
 	}
 
@@ -1847,6 +1927,7 @@ export class SessionManager {
 			return undefined;
 		}
 
+		this.#releaseSessionLock();
 		this.#sessionFile = newSessionFile;
 		this.#rewriteSynchronously();
 		this.#rememberBreadcrumb(this.#cwd, newSessionFile);
@@ -1867,9 +1948,14 @@ export class SessionManager {
 	 * @param cwd Working directory (stored in the session header)
 	 * @param sessionDir Optional session directory; defaults to the cwd-derived dir.
 	 */
-	static create(cwd: string, sessionDir?: string, storage: SessionStorage = new FileSessionStorage()): SessionManager {
+	static create(
+		cwd: string,
+		sessionDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+		lockOptions: SessionLockOptions = {},
+	): SessionManager {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
-		const manager = new SessionManager(cwd, dir, true, storage);
+		const manager = new SessionManager(cwd, dir, true, storage, lockOptions);
 		manager.#resetToNewSession();
 		return manager;
 	}
@@ -1910,15 +1996,16 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
-		options?: { suppressBreadcrumb?: boolean; sessionFile?: string },
+		options?: { suppressBreadcrumb?: boolean; sessionFile?: string; lockOptions?: SessionLockOptions },
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
-		const manager = new SessionManager(cwd, dir, true, storage);
+		const manager = new SessionManager(cwd, dir, true, storage, options?.lockOptions);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 
-		const sourceEntries = structuredClone(await loadEntriesFromFile(sourcePath, storage)) as FileEntry[];
-		migrateToCurrentVersion(sourceEntries);
-		await resolveBlobRefsInEntries(sourceEntries, manager.#blobs);
+		try {
+			const sourceEntries = structuredClone(await loadEntriesFromFile(sourcePath, storage)) as FileEntry[];
+			migrateToCurrentVersion(sourceEntries);
+			await resolveBlobRefsInEntries(sourceEntries, manager.#blobs);
 
 		const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const history = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
@@ -1941,18 +2028,17 @@ export class SessionManager {
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();
 		return manager;
+	} catch (error) {
+		manager.#releaseSessionLock();
+		throw error;
+	}
 	}
 
-	/**
-	 * Open a specific session file.
-	 * @param sessionDir Optional dir for /new or /branch; defaults to the file's parent.
-	 * @param options.initialCwd Cwd to use when the file is empty or missing.
-	 */
 	static async open(
 		filePath: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
-		options?: { initialCwd?: string; suppressBreadcrumb?: boolean },
+		options?: { initialCwd?: string; suppressBreadcrumb?: boolean; lockOptions?: SessionLockOptions },
 	): Promise<SessionManager> {
 		const loaded = await loadEntriesFromFile(filePath, storage);
 		const header = loaded.find(entry => entry.type === "session") as SessionHeader | undefined;
@@ -1969,7 +2055,7 @@ export class SessionManager {
 			(recordedCwd && !recordedCwdUsable
 				? SessionManager.getDefaultSessionDir(cwd, undefined, storage)
 				: path.dirname(path.resolve(filePath)));
-		const manager = new SessionManager(cwd, dir, true, storage);
+		const manager = new SessionManager(cwd, dir, true, storage, options?.lockOptions);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		await manager.setSessionFile(filePath);
 		return manager;
