@@ -52,7 +52,6 @@ export interface AppserverHandle {
   readonly hostId: HostId; readonly epoch: string; readonly socketPath: string;
   start(): Promise<void>; stop(): Promise<void>; snapshot(sessionId: SessionId): Projection | undefined;
   replay(sessionId: SessionId, cursor: Cursor): ServerFrame[];
-  command(command: CommandFrame): Promise<CommandOutcome>;
   childFor(sessionId: SessionId): ChildHandle | undefined;
 }
 export type { ChildProcess, CommandFrame, DurableEntry, HostId, ProjectId, Revision, SessionEvent, SessionId, SessionRef, Cursor, ServerFrame };
