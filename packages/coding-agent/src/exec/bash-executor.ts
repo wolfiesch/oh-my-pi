@@ -69,31 +69,86 @@ const shellSessionsInUse = new Set<string>();
  * kill-on-drop, so they still die when the harness tears the Shell down on exit.
  */
 const retainedShells = new Set<Shell>();
-const RETAIN_REAP_INTERVAL_MS = 5_000;
 
-async function retainShellWithLiveBackgroundJobs(shell: Shell): Promise<void> {
-	let live: number;
-	try {
-		live = await shell.liveBackgroundJobCount();
-	} catch {
+/**
+ * One serialized background-job poll chain per Shell. A completed command
+ * advances the generation so an older poll cannot retire a newly active
+ * monitor, and self-rescheduling avoids queueing polls behind a long run.
+ */
+interface ShellBackgroundJobMonitor {
+	generation: number;
+	pollPromise?: Promise<void>;
+	timer?: Timer;
+}
+
+const shellBackgroundJobMonitors = new Map<Shell, ShellBackgroundJobMonitor>();
+const BACKGROUND_REAP_INTERVAL_MS = 5_000;
+
+function stopShellBackgroundJobMonitor(shell: Shell, monitor: ShellBackgroundJobMonitor): void {
+	if (shellBackgroundJobMonitors.get(shell) !== monitor) return;
+	if (monitor.timer) clearTimeout(monitor.timer);
+	shellBackgroundJobMonitors.delete(shell);
+	retainedShells.delete(shell);
+}
+
+function scheduleShellBackgroundJobPoll(shell: Shell, monitor: ShellBackgroundJobMonitor): void {
+	if (shellBackgroundJobMonitors.get(shell) !== monitor) return;
+	const timer = setTimeout(() => {
+		if (shellBackgroundJobMonitors.get(shell) !== monitor || monitor.timer !== timer) return;
+		monitor.timer = undefined;
+		void ensureShellBackgroundJobPoll(shell, monitor);
+	}, BACKGROUND_REAP_INTERVAL_MS);
+	monitor.timer = timer;
+	timer.unref?.();
+}
+
+async function pollShellBackgroundJobs(shell: Shell, monitor: ShellBackgroundJobMonitor): Promise<void> {
+	while (shellBackgroundJobMonitors.get(shell) === monitor) {
+		const generation = monitor.generation;
+		let live: number;
+		try {
+			live = await shell.liveBackgroundJobCount();
+		} catch {
+			if (monitor.generation !== generation) continue;
+			stopShellBackgroundJobMonitor(shell, monitor);
+			return;
+		}
+		if (shellBackgroundJobMonitors.get(shell) !== monitor) return;
+		if (monitor.generation !== generation) continue;
+		if (live <= 0) {
+			stopShellBackgroundJobMonitor(shell, monitor);
+			return;
+		}
+		scheduleShellBackgroundJobPoll(shell, monitor);
 		return;
 	}
-	if (live <= 0) return;
-	retainedShells.add(shell);
-	const interval = setInterval(() => {
-		void shell
-			.liveBackgroundJobCount()
-			.then(remaining => {
-				if (remaining > 0) return;
-				clearInterval(interval);
-				retainedShells.delete(shell);
-			})
-			.catch(() => {
-				clearInterval(interval);
-				retainedShells.delete(shell);
-			});
-	}, RETAIN_REAP_INTERVAL_MS);
-	interval.unref?.();
+}
+
+function ensureShellBackgroundJobPoll(shell: Shell, monitor: ShellBackgroundJobMonitor): Promise<void> {
+	if (monitor.pollPromise) return monitor.pollPromise;
+	const pollPromise = pollShellBackgroundJobs(shell, monitor);
+	monitor.pollPromise = pollPromise;
+	void pollPromise
+		.finally(() => {
+			if (monitor.pollPromise === pollPromise) monitor.pollPromise = undefined;
+		})
+		.catch(() => undefined);
+	return pollPromise;
+}
+
+async function monitorShellBackgroundJobs(shell: Shell, retainShell: boolean): Promise<void> {
+	let monitor = shellBackgroundJobMonitors.get(shell);
+	if (!monitor) {
+		monitor = { generation: 0 };
+		shellBackgroundJobMonitors.set(shell, monitor);
+	}
+	monitor.generation += 1;
+	if (retainShell) retainedShells.add(shell);
+	if (monitor.timer) {
+		clearTimeout(monitor.timer);
+		monitor.timer = undefined;
+	}
+	await ensureShellBackgroundJobPoll(shell, monitor);
 }
 
 function quarantineShellSession(
@@ -450,6 +505,10 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		}
 		if (ownsPersistentSession) {
 			shellSessionsInUse.delete(sessionKey);
+			if (resetSession && shellSession) {
+				const monitor = shellBackgroundJobMonitors.get(shellSession);
+				if (monitor) stopShellBackgroundJobMonitor(shellSession, monitor);
+			}
 			if (resetSession || options?.sessionKey?.includes(":async:")) {
 				// `:async:` keys are per-job (jobId is unique), so the Shell would
 				// otherwise stay in the process-global map forever after completion.
@@ -460,8 +519,12 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				// turns; it is reaped once its last job exits and still dies with the
 				// harness. Skip on resetSession (cancel/error) — those tear down.
 				if (!resetSession && shellSession) {
-					await retainShellWithLiveBackgroundJobs(shellSession);
+					await monitorShellBackgroundJobs(shellSession, true);
 				}
+			} else if (shellSession) {
+				// Persistent shells stay in the reuse map, but their completed
+				// background children still need periodic polling to be reaped.
+				await monitorShellBackgroundJobs(shellSession, false);
 			}
 		}
 	}

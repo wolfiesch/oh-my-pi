@@ -22,6 +22,7 @@ const BACKGROUND_COMPLETION_RACE_MS = 750;
 const KILL_POLL_SECONDS = "0.01"; // a survivor re-checks `release` every ~10ms
 const KILL_SETTLE_MS = 25; // let the kill signal land before we touch `release`
 const KILL_REACT_MS = 50; // > one poll interval: a survivor would write its marker
+const SETSID_BIN = ["/usr/bin/setsid", "/bin/setsid"].find(candidate => fs.existsSync(candidate));
 
 function makeTempDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "omp-bash-exec-"));
@@ -1089,5 +1090,69 @@ describe("executeBash :async: background retention", () => {
 				}
 			}
 		},
+	);
+});
+
+describe("executeBash persistent background reaping", () => {
+	let tmp: string;
+
+	beforeEach(async () => {
+		tmp = makeTempDir();
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true, cwd: tmp });
+	});
+
+	afterEach(() => {
+		resetSettingsForTest();
+		vi.restoreAllMocks();
+		if (fs.existsSync(tmp)) removeSyncWithRetries(tmp);
+	});
+
+	it.skipIf(process.platform !== "linux" || SETSID_BIN === undefined)(
+		"reaps completed external background wrappers",
+		async () => {
+			if (!SETSID_BIN) throw new Error("setsid is unavailable");
+			const pidFile = path.join(tmp, "setsid-pid");
+
+			const result = await executeBash(`${SETSID_BIN} /bin/true & echo $! > ${shellQuote(pidFile)}; sleep 0.05`, {
+				sessionKey: "persistent-reap-probe",
+				cwd: tmp,
+			});
+
+			expect(result.cancelled).toBe(false);
+			const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+			expect(Number.isInteger(pid)).toBe(true);
+			const procPath = `/proc/${pid}`;
+			await pollUntil(() => !fs.existsSync(procPath), Date.now() + 8_000);
+			expect(fs.existsSync(procPath)).toBe(false);
+		},
+		10_000,
+	);
+
+	it.skipIf(process.platform !== "linux")(
+		"reaps a background child after it exits between persistent-shell turns",
+		async () => {
+			const pidFile = path.join(tmp, "sleep-pid");
+			const release = path.join(tmp, "release");
+			const child = `while [ ! -f ${shellQuote(release)} ]; do sleep ${KILL_POLL_SECONDS}; done`;
+			const result = await executeBash(
+				`/bin/sh -c ${shellQuote(child)} >/dev/null 2>&1 & echo $! > ${shellQuote(pidFile)}`,
+				{
+					sessionKey: "persistent-periodic-reap-probe",
+					cwd: tmp,
+				},
+			);
+
+			expect(result.cancelled).toBe(false);
+			const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+			expect(Number.isInteger(pid)).toBe(true);
+			const procPath = `/proc/${pid}`;
+			expect(fs.existsSync(procPath)).toBe(true);
+
+			fs.writeFileSync(release, "");
+			await pollUntil(() => !fs.existsSync(procPath), Date.now() + 8_000);
+			expect(fs.existsSync(procPath)).toBe(false);
+		},
+		10_000,
 	);
 });
