@@ -10,3 +10,13 @@ const frame = decodeServerFrame(line); // AppWireError on malformed input
 ```
 
 The exact device capability set and command mapping are exported. Destructive confirmation is separate from one-time `pair.start`/`pair.ok` pairing. File and review paths, plus known file-command arguments, must be safe relative POSIX paths. Remote-only transport supervision and terminal scraping remain outside this wire package.
+
+## Revision ownership
+
+Every command descriptor declares both its revision policy and its owner:
+
+- `session`: session lifecycle/prompt/cancel/close, agent, bash, terminal, lease, and preview commands. The appserver compares these revisions with the session projection.
+- `authority`: `files.*`, `review.*`, `config.write`, and `settings.write`. The resource authority receives the opaque `expectedRevision` unchanged and performs the resource comparison.
+- `none`: host/session listing and attachment, audit, settings reads, catalog, and watch commands. These commands reject `expectedRevision`.
+
+`revision: "none"` always has `revisionOwner: "none"`; optional and required revisions always name either `session` or `authority`.

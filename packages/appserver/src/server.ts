@@ -112,9 +112,10 @@ export class LocalAppserver implements AppserverHandle {
     const invalidArgs = argumentError(command);
     if (invalidArgs) return this.finish(command, { frame: response(this.hostId, command, false, undefined, { code: "invalid_frame", message: invalidArgs }) });
     if (descriptor.revision === "required" && command.expectedRevision === undefined) return this.finish(command, { frame: response(this.hostId, command, false, undefined, { code: "stale_revision", message: "expectedRevision is required" }) });
+    if (descriptor.revision === "none" && command.expectedRevision !== undefined) return this.finish(command, { frame: response(this.hostId, command, false, undefined, { code: "stale_revision", message: "expectedRevision is forbidden" }) });
     const projection = command.sessionId ? this.#projections.get(command.sessionId) : undefined;
     if (descriptor.scope === "session" && !projection) return this.finish(command, { frame: response(this.hostId, command, false, undefined, { code: "unknown_session", message: "session is not indexed" }) });
-    if (command.expectedRevision && projection && command.expectedRevision !== projection.value.revision) return this.finish(command, { frame: response(this.hostId, command, false, undefined, { code: "stale_revision", message: "session revision is stale", details: { expectedRevision: command.expectedRevision, actualRevision: projection.value.revision } }) });
+    if (descriptor.revisionOwner === "session" && command.expectedRevision !== undefined && projection && command.expectedRevision !== projection.value.revision) return this.finish(command, { frame: response(this.hostId, command, false, undefined, { code: "stale_revision", message: "session revision is stale", details: { expectedRevision: command.expectedRevision, actualRevision: projection.value.revision } }) });
     let outcome: CommandOutcome;
     try {
       const registered = await this.#handlers.dispatch(command);

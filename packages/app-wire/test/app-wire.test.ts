@@ -7,6 +7,7 @@ import {
 	COMMAND_DESCRIPTORS,
 	COMMAND_ARGUMENT_DECODERS,
 	COMMAND_RESULT_DECODERS,
+	validateCommandDescriptor,
 	decodeClientFrame,
 	decodeCommandArguments,
 	decodeCommandResult,
@@ -210,6 +211,7 @@ describe("app-wire authority", () => {
 				args: {},
 			}),
 		).toThrow(AppWireError);
+		expect(() => decodeClientFrame({ v: "omp-app/1", type: "command", requestId: "r", commandId: "c", hostId: "h", sessionId: "s", command: "files.write", args: { path: "a", content: "x" } })).toThrow(AppWireError);
 		const base = { v: "omp-app/1", type: "command", requestId: "r", commandId: "c", hostId: "h", args: {} } as const;
 		expect(() => decodeClientFrame({ ...base, command: "session.create" })).not.toThrow();
 		expect(() => decodeClientFrame({ ...base, command: "session.attach" })).toThrow(AppWireError);
@@ -221,19 +223,21 @@ describe("app-wire authority", () => {
 			capability: "sessions.manage",
 			scope: "host",
 			revision: "none",
+			revisionOwner: "none",
 			confirmation: "none",
 		});
 		expect(COMMAND_DESCRIPTORS["session.attach"]).toEqual({
 			capability: "sessions.read",
 			scope: "session",
 			revision: "none",
+			revisionOwner: "none",
 			confirmation: "none",
 		});
 		expect(Object.values(COMMAND_DESCRIPTORS).every(descriptor => typeof descriptor.capability === "string")).toBe(
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
-		expect(APP_WIRE_VERSION).toBe("0.4.0");
+		expect(APP_WIRE_VERSION).toBe("0.4.1");
 	});
 	test("exported wire version matches package metadata", async () => {
 		const metadata = (await Bun.file(new URL("../package.json", import.meta.url)).json()) as { version: string };
@@ -287,6 +291,24 @@ describe("app-wire authority", () => {
 			const descriptor = COMMAND_DESCRIPTORS[command];
 			expect(descriptor).toBeDefined();
 		}
+	});
+	test("every descriptor declares an exhaustive revision owner", () => {
+		const expected: Record<string, string> = {
+			"session.prompt": "session", "session.cancel": "session", "session.close": "session", "agent.cancel": "session", "bash.run": "session", "term.open": "session",
+			"controller.lease.acquire": "session", "controller.lease.renew": "session", "controller.lease.release": "session", "prompt.lease.acquire": "session", "prompt.lease.renew": "session", "prompt.lease.release": "session",
+			"preview.launch": "session", "preview.state": "session", "preview.navigate": "session", "preview.capture": "session",
+			"files.read": "authority", "files.write": "authority", "files.patch": "authority", "files.list": "authority", "files.diff": "authority", "review.read": "authority", "review.apply": "authority", "config.write": "authority", "settings.write": "authority",
+			"host.list": "none", "session.list": "none", "session.create": "none", "session.attach": "none", "audit.read": "none", "audit.tail": "none", "settings.read": "none", "catalog.get": "none", "host.watch": "none", "session.watch": "none",
+		};
+		expect(Object.keys(COMMAND_DESCRIPTORS).sort()).toEqual(Object.keys(expected).sort());
+		for (const [command, descriptor] of Object.entries(COMMAND_DESCRIPTORS)) {
+			expect(descriptor.revisionOwner).toBe(expected[command]);
+			expect(descriptor.revision === "none").toBe(descriptor.revisionOwner === "none");
+		}
+	});
+	test("descriptor validator rejects mismatched revision policy and owner", () => {
+		expect(() => validateCommandDescriptor("invalid", { capability: "files.read", scope: "host", revision: "none", revisionOwner: "authority", confirmation: "none" })).toThrow(AppWireError);
+		expect(() => validateCommandDescriptor("invalid", { capability: "files.read", scope: "host", revision: "required", revisionOwner: "none", confirmation: "none" })).toThrow(AppWireError);
 	});
 	test("terminal direction and command payload/result contracts are explicit", () => {
 		const base = { v: "omp-app/1", hostId: "h", sessionId: "s", terminalId: "t" };

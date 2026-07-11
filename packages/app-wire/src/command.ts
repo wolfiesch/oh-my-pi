@@ -5,16 +5,82 @@ import { MAX_FILE_BYTES, PROTOCOL_VERSION } from "./limits.ts";
 import { decodeCursor, type Cursor } from "./cursor.ts";
 import { decodeSessionRef, type SessionRef } from "./session-index.ts";
 import type { DeviceCapability } from "./capabilities.ts";
-export interface CommandDescriptor { capability: DeviceCapability; scope: "host"|"session"; revision: "none"|"optional"|"required"; confirmation: "none"|"challenge"; }
-export const COMMAND_DESCRIPTORS: Readonly<Record<string,CommandDescriptor>> = {
-  "host.list":{capability:"sessions.read",scope:"host",revision:"none",confirmation:"none"},"session.list":{capability:"sessions.read",scope:"host",revision:"none",confirmation:"none"},"session.create":{capability:"sessions.manage",scope:"host",revision:"none",confirmation:"none"},"session.attach":{capability:"sessions.read",scope:"session",revision:"none",confirmation:"none"},"session.prompt":{capability:"sessions.prompt",scope:"session",revision:"optional",confirmation:"none"},"session.cancel":{capability:"sessions.control",scope:"session",revision:"optional",confirmation:"challenge"},"session.close":{capability:"sessions.manage",scope:"session",revision:"required",confirmation:"challenge"},
-  "files.read":{capability:"files.read",scope:"session",revision:"optional",confirmation:"none"},"files.write":{capability:"files.write",scope:"session",revision:"required",confirmation:"challenge"},"files.patch":{capability:"files.write",scope:"session",revision:"required",confirmation:"challenge"},"files.list":{capability:"files.list",scope:"session",revision:"optional",confirmation:"none"},"files.diff":{capability:"files.diff",scope:"session",revision:"optional",confirmation:"none"},"review.read":{capability:"files.read",scope:"session",revision:"optional",confirmation:"none"},"review.apply":{capability:"files.write",scope:"session",revision:"required",confirmation:"challenge"},"agent.cancel":{capability:"agents.control",scope:"session",revision:"optional",confirmation:"challenge"},"bash.run":{capability:"bash.run",scope:"session",revision:"optional",confirmation:"challenge"},"term.open":{capability:"term.open",scope:"session",revision:"optional",confirmation:"challenge"},
-  "audit.read":{capability:"audit.read",scope:"host",revision:"none",confirmation:"none"},"audit.tail":{capability:"audit.read",scope:"host",revision:"none",confirmation:"none"},"config.write":{capability:"config.write",scope:"host",revision:"required",confirmation:"challenge"},"settings.read":{capability:"config.read",scope:"host",revision:"none",confirmation:"none"},"settings.write":{capability:"config.write",scope:"host",revision:"required",confirmation:"challenge"},"catalog.get":{capability:"catalog.read",scope:"host",revision:"none",confirmation:"none"},"host.watch":{capability:"sessions.read",scope:"host",revision:"none",confirmation:"none"},"session.watch":{capability:"sessions.read",scope:"session",revision:"none",confirmation:"none"},
-  "controller.lease.acquire":{capability:"sessions.control",scope:"session",revision:"required",confirmation:"none"},"controller.lease.renew":{capability:"sessions.control",scope:"session",revision:"required",confirmation:"none"},"controller.lease.release":{capability:"sessions.control",scope:"session",revision:"required",confirmation:"none"},"prompt.lease.acquire":{capability:"sessions.prompt",scope:"session",revision:"required",confirmation:"none"},"prompt.lease.renew":{capability:"sessions.prompt",scope:"session",revision:"required",confirmation:"none"},"prompt.lease.release":{capability:"sessions.prompt",scope:"session",revision:"required",confirmation:"none"},"preview.launch":{capability:"preview.control",scope:"session",revision:"optional",confirmation:"challenge"},"preview.state":{capability:"preview.read",scope:"session",revision:"optional",confirmation:"none"},"preview.navigate":{capability:"preview.control",scope:"session",revision:"optional",confirmation:"none"},"preview.capture":{capability:"preview.read",scope:"session",revision:"optional",confirmation:"none"},
+export type RevisionOwner = "none" | "session" | "authority";
+export interface CommandDescriptor {
+  capability: DeviceCapability;
+  scope: "host" | "session";
+  revision: "none" | "optional" | "required";
+  revisionOwner: RevisionOwner;
+  confirmation: "none" | "challenge";
+}
+export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = {
+  "host.list": { capability: "sessions.read", scope: "host", revision: "none", revisionOwner: "none", confirmation: "none" },
+  "session.list": { capability: "sessions.read", scope: "host", revision: "none", revisionOwner: "none", confirmation: "none" },
+  "session.create": { capability: "sessions.manage", scope: "host", revision: "none", revisionOwner: "none", confirmation: "none" },
+  "session.attach": { capability: "sessions.read", scope: "session", revision: "none", revisionOwner: "none", confirmation: "none" },
+  "session.prompt": { capability: "sessions.prompt", scope: "session", revision: "optional", revisionOwner: "session", confirmation: "none" },
+  "session.cancel": { capability: "sessions.control", scope: "session", revision: "optional", revisionOwner: "session", confirmation: "challenge" },
+  "session.close": { capability: "sessions.manage", scope: "session", revision: "required", revisionOwner: "session", confirmation: "challenge" },
+  "files.read": { capability: "files.read", scope: "session", revision: "optional", revisionOwner: "authority", confirmation: "none" },
+  "files.write": { capability: "files.write", scope: "session", revision: "required", revisionOwner: "authority", confirmation: "challenge" },
+  "files.patch": { capability: "files.write", scope: "session", revision: "required", revisionOwner: "authority", confirmation: "challenge" },
+  "files.list": { capability: "files.list", scope: "session", revision: "optional", revisionOwner: "authority", confirmation: "none" },
+  "files.diff": { capability: "files.diff", scope: "session", revision: "optional", revisionOwner: "authority", confirmation: "none" },
+  "review.read": { capability: "files.read", scope: "session", revision: "optional", revisionOwner: "authority", confirmation: "none" },
+  "review.apply": { capability: "files.write", scope: "session", revision: "required", revisionOwner: "authority", confirmation: "challenge" },
+  "agent.cancel": { capability: "agents.control", scope: "session", revision: "optional", revisionOwner: "session", confirmation: "challenge" },
+  "bash.run": { capability: "bash.run", scope: "session", revision: "optional", revisionOwner: "session", confirmation: "challenge" },
+  "term.open": { capability: "term.open", scope: "session", revision: "optional", revisionOwner: "session", confirmation: "challenge" },
+  "audit.read": { capability: "audit.read", scope: "host", revision: "none", revisionOwner: "none", confirmation: "none" },
+  "audit.tail": { capability: "audit.read", scope: "host", revision: "none", revisionOwner: "none", confirmation: "none" },
+  "config.write": { capability: "config.write", scope: "host", revision: "required", revisionOwner: "authority", confirmation: "challenge" },
+  "settings.read": { capability: "config.read", scope: "host", revision: "none", revisionOwner: "none", confirmation: "none" },
+  "settings.write": { capability: "config.write", scope: "host", revision: "required", revisionOwner: "authority", confirmation: "challenge" },
+  "catalog.get": { capability: "catalog.read", scope: "host", revision: "none", revisionOwner: "none", confirmation: "none" },
+  "host.watch": { capability: "sessions.read", scope: "host", revision: "none", revisionOwner: "none", confirmation: "none" },
+  "session.watch": { capability: "sessions.read", scope: "session", revision: "none", revisionOwner: "none", confirmation: "none" },
+  "controller.lease.acquire": { capability: "sessions.control", scope: "session", revision: "required", revisionOwner: "session", confirmation: "none" },
+  "controller.lease.renew": { capability: "sessions.control", scope: "session", revision: "required", revisionOwner: "session", confirmation: "none" },
+  "controller.lease.release": { capability: "sessions.control", scope: "session", revision: "required", revisionOwner: "session", confirmation: "none" },
+  "prompt.lease.acquire": { capability: "sessions.prompt", scope: "session", revision: "required", revisionOwner: "session", confirmation: "none" },
+  "prompt.lease.renew": { capability: "sessions.prompt", scope: "session", revision: "required", revisionOwner: "session", confirmation: "none" },
+  "prompt.lease.release": { capability: "sessions.prompt", scope: "session", revision: "required", revisionOwner: "session", confirmation: "none" },
+  "preview.launch": { capability: "preview.control", scope: "session", revision: "optional", revisionOwner: "session", confirmation: "challenge" },
+  "preview.state": { capability: "preview.read", scope: "session", revision: "optional", revisionOwner: "session", confirmation: "none" },
+  "preview.navigate": { capability: "preview.control", scope: "session", revision: "optional", revisionOwner: "session", confirmation: "none" },
+  "preview.capture": { capability: "preview.read", scope: "session", revision: "optional", revisionOwner: "session", confirmation: "none" },
 };
 export const COMMAND_CAPABILITIES: Readonly<Record<string,DeviceCapability>>=Object.fromEntries(Object.entries(COMMAND_DESCRIPTORS).map(([name,descriptor])=>[name,descriptor.capability]));
 export interface CommandFrame { v:typeof PROTOCOL_VERSION; type:"command"; requestId:RequestId; commandId:CommandId; hostId:HostId; sessionId?:SessionId; command:string; expectedRevision?:Revision; confirmationId?:ConfirmationId; args:Record<string,unknown>; }
-export function decodeCommand(input:unknown):CommandFrame { const frame=inputObject(input); if(frame.v!==PROTOCOL_VERSION) fail("MISSING_VERSION",`expected ${PROTOCOL_VERSION}`,"v"); if(frame.type!=="command") fail("INVALID_FRAME","expected command frame","type"); requestId(frame.requestId); commandId(frame.commandId); const host=hostId(frame.hostId); const command=controlFree(frame.command,"command",128); const descriptor=COMMAND_DESCRIPTORS[command]; if(descriptor===undefined) fail("INVALID_FRAME","unknown command","command"); const session=frame.sessionId===undefined?undefined:sessionId(frame.sessionId); if(descriptor.scope==="session"&&session===undefined) fail("INVALID_FRAME","sessionId is required for session command","sessionId"); if(descriptor.scope==="host"&&session!==undefined) fail("INVALID_FRAME","sessionId is forbidden for host command","sessionId"); if(descriptor.revision==="none"&&frame.expectedRevision!==undefined) fail("STALE_REVISION","expectedRevision is forbidden","expectedRevision"); if(descriptor.revision==="required"&&frame.expectedRevision===undefined) fail("STALE_REVISION","expectedRevision is required","expectedRevision"); if(frame.expectedRevision!==undefined) revision(frame.expectedRevision); if(descriptor.confirmation==="none"&&frame.confirmationId!==undefined) fail("CONFIRMATION_INVALID","confirmationId is not valid","confirmationId"); if(frame.confirmationId!==undefined) confirmationId(frame.confirmationId); const args=decodeCommandArguments(command,frame.args===undefined?{}:frame.args); return {...frame,hostId:host,sessionId:session,command,args} as unknown as CommandFrame; }
+export function validateCommandDescriptor(command: string, descriptor: CommandDescriptor): void {
+  const validRevision = descriptor.revision === "none" || descriptor.revision === "optional" || descriptor.revision === "required";
+  const validOwner = descriptor.revisionOwner === "none" || descriptor.revisionOwner === "session" || descriptor.revisionOwner === "authority";
+  const ownerMatchesRevision = descriptor.revision === "none" ? descriptor.revisionOwner === "none" : descriptor.revisionOwner !== "none";
+  if (!validRevision || !validOwner || !ownerMatchesRevision) fail("INVALID_FRAME", "invalid command revision descriptor", `command.${command}`);
+}
+for (const [command, descriptor] of Object.entries(COMMAND_DESCRIPTORS)) validateCommandDescriptor(command, descriptor);
+export function decodeCommand(input: unknown): CommandFrame {
+  const frame = inputObject(input);
+  if (frame.v !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v");
+  if (frame.type !== "command") fail("INVALID_FRAME", "expected command frame", "type");
+  requestId(frame.requestId);
+  commandId(frame.commandId);
+  const host = hostId(frame.hostId);
+  const command = controlFree(frame.command, "command", 128);
+  const descriptor = COMMAND_DESCRIPTORS[command];
+  if (descriptor === undefined) fail("INVALID_FRAME", "unknown command", "command");
+  validateCommandDescriptor(command, descriptor);
+  const session = frame.sessionId === undefined ? undefined : sessionId(frame.sessionId);
+  if (descriptor.scope === "session" && session === undefined) fail("INVALID_FRAME", "sessionId is required for session command", "sessionId");
+  if (descriptor.scope === "host" && session !== undefined) fail("INVALID_FRAME", "sessionId is forbidden for host command", "sessionId");
+  if (descriptor.revision === "none" && frame.expectedRevision !== undefined) fail("STALE_REVISION", "expectedRevision is forbidden", "expectedRevision");
+  if (descriptor.revision === "required" && frame.expectedRevision === undefined) fail("STALE_REVISION", "expectedRevision is required", "expectedRevision");
+  if (frame.expectedRevision !== undefined) revision(frame.expectedRevision);
+  if (descriptor.confirmation === "none" && frame.confirmationId !== undefined) fail("CONFIRMATION_INVALID", "confirmationId is not valid", "confirmationId");
+  if (frame.confirmationId !== undefined) confirmationId(frame.confirmationId);
+  const args = decodeCommandArguments(command, frame.args === undefined ? {} : frame.args);
+  return { ...frame, hostId: host, sessionId: session, command, args } as unknown as CommandFrame;
+}
 export function requiredCapability(command:string):DeviceCapability|undefined { return COMMAND_DESCRIPTORS[command]?.capability; }
 export type CommandArguments=Record<string,unknown>; export type CommandResult=Record<string,unknown>;
 function args(value:unknown,path="args"):Record<string,unknown>{return boundedMap(value,path);} function result(value:unknown):Record<string,unknown>{return boundedMap(value,"result");}

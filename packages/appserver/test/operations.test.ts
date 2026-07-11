@@ -18,7 +18,7 @@ describe("desktop operation dispatcher", () => {
   test("rejects wrong host/scope, stale revision, abort, missing capability, and redacts authority errors", async () => {
     const dispatcher = new DesktopOperationDispatcher(new Proxy({}, { get: () => async () => { throw { code: "secret-provider", message: "token=bad" }; } }) as unknown as DesktopOperationsAuthority);
     await expect(dispatcher.dispatch(command("files.read", { path: "a" }), { ...context, sessionId: sessionId("other") })).rejects.toMatchObject({ code: "FORBIDDEN" });
-    await expect(dispatcher.dispatch(command("files.read", { path: "a" }, true, "r-2"), context)).rejects.toMatchObject({ code: "STALE_REVISION" });
+    await expect(dispatcher.dispatch(command("term.open", {}, true, "r-2"), context)).rejects.toMatchObject({ code: "STALE_REVISION" });
     await expect(dispatcher.dispatch(command("files.read", { path: "a" }), { ...context, abortSignal: AbortSignal.abort() })).rejects.toMatchObject({ code: "ABORTED" });
     await expect(dispatcher.dispatch(command("files.read", { path: "a" }), { ...context, capabilities: new Set() })).rejects.toMatchObject({ code: "FORBIDDEN" });
     await expect(dispatcher.dispatch(command("files.read", { path: "a" }), context)).rejects.toMatchObject({ code: "OPERATION_FAILED" });
@@ -31,7 +31,20 @@ describe("desktop operation dispatcher", () => {
     const dispatcher = new DesktopOperationDispatcher(terminalAuthority); const first = await dispatcher.dispatch(command("term.open"), context); await dispatcher.dispatch({ ...command("term.open"), commandId: commandId("command-term-open-2"), requestId: requestId("request-term-open-2") }, context); const owner = { connectionId: context.connectionId, deviceId: context.deviceId, hostId: context.hostId, sessionId: context.sessionId!, terminalId: terminalId(String(first.terminalId)) };
     expect(() => dispatcher.publishTerminalOutput({ v: "omp-app/1", type: "terminal.output", hostId: context.hostId, sessionId: context.sessionId, terminalId: owner.terminalId, cursor: { epoch: "e", seq: 1 }, stream: "stdout", data: "x" }, owner)).not.toThrow(); expect(outputs).toBe(1); expect(() => dispatcher.publishTerminalOutput({ v: "omp-app/1", type: "terminal.output", hostId: context.hostId, sessionId: context.sessionId, terminalId: terminalId("spoof"), cursor: { epoch: "e", seq: 1 }, stream: "stdout", data: "x" }, owner)).toThrow(); await expect(dispatcher.disconnect(context.connectionId, { ...context, sessionId: context.sessionId! })).rejects.toMatchObject({ code: "OPERATION_FAILED" }); expect(closes).toBe(2); expect(() => dispatcher.publishTerminalOutput({ v: "omp-app/1", type: "terminal.output", hostId: context.hostId, sessionId: context.sessionId, terminalId: owner.terminalId, cursor: { epoch: "e", seq: 2 }, stream: "stdout", data: "x" }, owner)).toThrow();
   });
+  test("authority receives an unchanged expected revision without session comparison", async () => {
+    const seen: { expected?: string; frozen: boolean } = { frozen: false };
+    const resourceAuthority = new Proxy({}, { get: () => async (args: Record<string, unknown>, operationContext: OperationContext) => { seen.expected = operationContext.expectedRevision; seen.frozen = Object.isFrozen(args); return {}; } }) as unknown as DesktopOperationsAuthority;
+    const dispatcher = new DesktopOperationDispatcher(resourceAuthority);
+    await dispatcher.dispatch(command("files.write", { path: "a", content: "x" }, true, "file-hash"), context);
+    expect(seen).toEqual({ expected: "file-hash", frozen: true });
+    await dispatcher.dispatch(command("settings.write", {}, false, "settings-hash"), { ...context, sessionId: undefined, currentRevision: "different" as never });
+    expect(seen.expected).toBe("settings-hash");
+  });
   test("abort signal is passed unchanged to authority", async () => {
-    let seen: AbortSignal | undefined; const abortAuthority = new Proxy({}, { get: () => async (_args: unknown, ctx: OperationContext) => { seen = ctx.abortSignal; return { content: "ok" }; } }) as unknown as DesktopOperationsAuthority; const signal = new AbortController().signal; await new DesktopOperationDispatcher(abortAuthority).dispatch(command("files.read", { path: "a" }), { ...context, abortSignal: signal }); expect(seen).toBe(signal);
+    let seen: AbortSignal | undefined;
+    const abortAuthority = new Proxy({}, { get: () => async (_args: unknown, operationContext: OperationContext) => { seen = operationContext.abortSignal; return { content: "ok" }; } }) as unknown as DesktopOperationsAuthority;
+    const signal = new AbortController().signal;
+    await new DesktopOperationDispatcher(abortAuthority).dispatch(command("files.read", { path: "a" }), { ...context, abortSignal: signal });
+    expect(seen).toBe(signal);
   });
 });
