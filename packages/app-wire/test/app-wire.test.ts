@@ -208,7 +208,11 @@ describe("app-wire authority", () => {
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
-		expect(APP_WIRE_VERSION).toBe("0.1.0");
+		expect(APP_WIRE_VERSION).toBe("0.1.2");
+	});
+	test("exported wire version matches package metadata", async () => {
+		const metadata = (await Bun.file(new URL("../package.json", import.meta.url)).json()) as { version: string };
+		expect(APP_WIRE_VERSION).toBe(metadata.version);
 	});
 	test("session identity remains host scoped", () => {
 		expect(sameSession({ hostId: "h", sessionId: "s" }, { hostId: "other", sessionId: "s" })).toBe(false);

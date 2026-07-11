@@ -25,6 +25,8 @@ export interface CommandDescriptor {
 export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = {
 	"host.list": { capability: "sessions.read", scope: "host", revision: "none", confirmation: "none" },
 	"session.list": { capability: "sessions.read", scope: "host", revision: "none", confirmation: "none" },
+	"session.create": { capability: "sessions.manage", scope: "host", revision: "none", confirmation: "challenge" },
+	"session.attach": { capability: "sessions.manage", scope: "host", revision: "none", confirmation: "none" },
 	"session.prompt": { capability: "sessions.prompt", scope: "session", revision: "optional", confirmation: "none" },
 	"session.cancel": {
 		capability: "sessions.control",

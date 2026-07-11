@@ -15,13 +15,13 @@ export type AppWireErrorCode =
 	| "PAIRING_INVALID";
 
 export class AppWireError extends Error {
-	readonly name = "AppWireError";
-	constructor(
-		readonly code: AppWireErrorCode,
-		message: string,
-		readonly path?: string,
-	) {
+	override readonly name = "AppWireError";
+	readonly code: AppWireErrorCode;
+	readonly path?: string;
+	constructor(code: AppWireErrorCode, message: string, path?: string) {
 		super(message);
+		this.code = code;
+		this.path = path;
 	}
 }
 export function fail(code: AppWireErrorCode, message: string, path?: string): never {

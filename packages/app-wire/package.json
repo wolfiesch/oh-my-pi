@@ -1,6 +1,6 @@
 {
   "name": "@oh-my-pi/app-wire",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "description": "Dependency-free omp app protocol frames and bounded decoders",
@@ -20,7 +20,8 @@
   "files": ["src", "fixtures/v1", "README.md", "LICENSE"],
   "scripts": {
     "build": "bunx tsc -p tsconfig.json --noEmit",
-    "test": "bun test test/*.test.ts"
+    "test": "bun test test/*.test.ts",
+    "typecheck:strict": "bunx tsc -p tsconfig.strict.json --noEmit"
   },
   "engines": { "bun": ">=1.3.14" }
 }

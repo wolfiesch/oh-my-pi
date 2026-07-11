@@ -81,7 +81,11 @@ export function capabilitiesArray(value: unknown, path: string): string[] {
 }
 
 function skip(text: string, i: number): number {
-	while (i < text.length && /\s/u.test(text[i])) i++;
+	while (i < text.length) {
+		const char = text[i];
+		if (char === undefined || !/\s/u.test(char)) break;
+		i++;
+	}
 	return i;
 }
 function jsonString(text: string, start: number): number {
@@ -176,8 +180,7 @@ function validateJson(root: unknown): void {
 		if (!plain(value)) fail("INVALID_JSON", "non-plain object", current.path);
 		const keys = Object.keys(value);
 		if (keys.length > MAX_MAP_KEYS) fail("BOUNDS", "too many object keys", current.path);
-		for (let i = keys.length - 1; i >= 0; i--) {
-			const key = keys[i];
+		for (const key of keys) {
 			approx = addApprox(approx, utf8ByteLength(key), current.path);
 			stack.push({ value: (value as JsonObject)[key], depth: current.depth + 1, path: `${current.path}.${key}` });
 		}
