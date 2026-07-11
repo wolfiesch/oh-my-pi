@@ -187,11 +187,20 @@ function validateValue(def: SettingDefinition, value: unknown, path: string): vo
 		case "record": {
 			const maxEntries = typeof def.maxEntries === "number" ? Math.min(def.maxEntries, 256) : 256;
 			if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length > maxEntries) throw new Error(`invalid map value for ${path}`);
-			let sample: unknown = "unknown";
-			if (path === "modelRoles" || path === "task.agentModelOverrides") sample = "string";
-			else if (path === "retry.fallbackChains") sample = { array: "string" };
-			else if (path === "modelTags") sample = shapeOf({ name: "", color: "", hidden: false });
-			for (const [key, child] of Object.entries(value as Record<string, unknown>)) validateShape(child, sample, `${path}.${key}`);
+			if (path === "modelTags") {
+				for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+					if (!child || typeof child !== "object" || Array.isArray(child)) throw new Error(`invalid record value for ${path}.${key}`);
+					const tag = child as Record<string, unknown>;
+					if (typeof tag.name !== "string") throw new Error(`invalid typed value for ${path}.${key}.name`);
+					if (tag.color !== undefined && typeof tag.color !== "string") throw new Error(`invalid typed value for ${path}.${key}.color`);
+					if (tag.hidden !== undefined && typeof tag.hidden !== "boolean") throw new Error(`invalid typed value for ${path}.${key}.hidden`);
+				}
+			} else {
+				let sample: unknown = "unknown";
+				if (path === "modelRoles" || path === "task.agentModelOverrides") sample = "string";
+				else if (path === "retry.fallbackChains") sample = { array: "string" };
+				for (const [key, child] of Object.entries(value as Record<string, unknown>)) validateShape(child, sample, `${path}.${key}`);
+			}
 			break;
 		}
 	}

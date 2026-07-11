@@ -119,6 +119,12 @@ describe("DesktopConfigAuthority", () => {
 		await expect(config.settingsWrite({ path: "retry.fallbackChains", value: { fast: [42] } })).rejects.toThrow("typed");
 	});
 
+	test("accepts minimal model tags and validates optional fields", async () => {
+		const config = authority();
+		await expect(config.settingsWrite({ path: "modelTags", value: { review: { name: "Review" } } })).resolves.toMatchObject({ accepted: true });
+		await expect(config.settingsWrite({ path: "modelTags", value: { review: { name: "Review", hidden: "yes" } } })).rejects.toThrow("typed");
+	});
+
 	test("catalog projects explicit agent, skill, plugin, and MCP adapters", async () => {
 		const config = new DesktopConfigAuthority({
 			settings: fakeSettings(),
