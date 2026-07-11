@@ -968,10 +968,8 @@ export class LocalAppserver implements AppserverHandle {
 					const connection = this.#remoteConnections.get(ws);
 					if (!connection || !this.#remotePolicy) throw new Error("remote connection is unavailable");
 					decision = await this.#remotePolicy.authenticate(connection, frame);
-if (!decision.authenticated && decision.authentication !== "pairing-required") {
+					if (!decision.authenticated && decision.authentication !== "pairing-required") {
 						ws.close(1008, "remote authentication denied");
-						return;
-					}
 						return;
 					}
 					this.#remoteDecisions.set(ws, decision);
@@ -1003,6 +1001,14 @@ if (!decision.authenticated && decision.authentication !== "pairing-required") {
 				});
 				if (!allowed) {
 					ws.close(1008, "remote policy denied");
+					return;
+				}
+			}
+			if (ws.remote && frame.type === "command") {
+				const connection = this.#remoteConnections.get(ws);
+				const handled = connection && this.#remotePolicy?.handleCommand ? await this.#remotePolicy.handleCommand(connection, frame) : undefined;
+				if (handled) {
+					await this.#sendFrame(ws, handled);
 					return;
 				}
 			}

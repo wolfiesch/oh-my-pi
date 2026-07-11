@@ -40,6 +40,7 @@ export interface RemoteAuthorizationContext {
 export interface RemoteConnectionPolicy {
 	authenticate(connection: RemoteConnection, hello: HelloFrame): RemoteHelloDecision | Promise<RemoteHelloDecision>;
 	pairStart?(connection: RemoteConnection, frame: PairStartFrame): ServerFrame | undefined | Promise<ServerFrame | undefined>;
+	handleCommand?(connection: RemoteConnection, frame: CommandFrame): ServerFrame | undefined | Promise<ServerFrame | undefined>;
 	authorize(
 		connection: RemoteConnection,
 		frame: ClientFrame,

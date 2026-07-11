@@ -40,7 +40,7 @@ interface ConnectionState {
   paired: boolean;
   justPaired: boolean;
   ready: boolean;
-  readonly commandContexts: Map<string, { capability: Capability; sessionId?: string; leaseId?: string }>;
+  readonly commandContexts: Map<string, { capability: Capability; sessionId?: string; leaseId?: string; lease?: Lease; released?: boolean }>;
 }
 export interface TailscaleRemotePolicyOptions {
   readonly registry: DeviceRegistry;
@@ -183,23 +183,35 @@ export class TailscaleRemotePolicy implements RemoteConnectionPolicy {
       const descriptor = COMMAND_DESCRIPTORS[frame.command];
       if (!descriptor) return false;
       const lease = leaseId(frame.args);
+      let leaseResult: Lease | undefined;
+      let released = false;
       if (frame.command === "controller.lease.acquire") {
         if (!frame.sessionId) return false;
-        try { this.#leases.acquire(state.principal!.deviceId, connection.connectionId, frame.sessionId, "controller", 30_000, state.principal!.epoch, frame.expectedRevision); } catch { return false; }
+        try { leaseResult = this.#leases.acquire(state.principal!.deviceId, connection.connectionId, frame.sessionId, "controller", 30_000, state.principal!.epoch, frame.expectedRevision); } catch { return false; }
       } else if (frame.command === "controller.lease.renew" || frame.command === "controller.lease.release") {
         if (!lease) return false;
-        if (frame.command.endsWith("renew")) { try { this.#leases.renew(lease, state.principal!.deviceId, connection.connectionId, 30_000, state.principal!.epoch, frame.expectedRevision, frame.command); } catch { return false; } }
-        else this.#leases.release(lease, state.principal!.deviceId, connection.connectionId, state.principal!.epoch, frame.expectedRevision, frame.command);
+        if (frame.command.endsWith("renew")) { try { leaseResult = this.#leases.renew(lease, state.principal!.deviceId, connection.connectionId, 30_000, state.principal!.epoch, frame.expectedRevision, frame.command); } catch { return false; } }
+        else { this.#leases.release(lease, state.principal!.deviceId, connection.connectionId, state.principal!.epoch, frame.expectedRevision, frame.command); released = true; }
       } else if (mutation(frame.command)) {
         if (!frame.sessionId || !lease || !this.#leases.verify(lease, state.principal!.deviceId, connection.connectionId, frame.sessionId, frame.command, state.principal!.epoch, frame.expectedRevision)) return false;
       }
-      state.commandContexts.set(String(frame.commandId), { capability, ...(frame.sessionId ? { sessionId: frame.sessionId } : {}), ...(lease ? { leaseId: lease } : {}) });
+      state.commandContexts.set(String(frame.commandId), { capability, ...(frame.sessionId ? { sessionId: frame.sessionId } : {}), ...(lease ? { leaseId: lease } : {}), ...(leaseResult ? { lease: leaseResult } : {}), ...(released ? { released } : {}) });
       if (this.#guard && state.principal) {
         try { this.#guard.authorize({ principal: state.principal, command: frame.command, capabilities: state.capabilities, connectionId: connection.connectionId, sessionId: frame.sessionId, revision: frame.expectedRevision, leaseId: lease, confirmationId: frame.confirmationId, args: frame.args }); } catch { return false; }
       }
       return true;
     }
     return true;
+  }
+  handleCommand(connection: RemoteConnection, frame: CommandFrame): ServerFrame | undefined {
+    if (!frame.command.startsWith("controller.lease.")) return undefined;
+    const state = this.#states.get(connection.connectionId);
+    const context = state?.commandContexts.get(String(frame.commandId));
+    if (!state || !context) return undefined;
+    const result = context.lease
+      ? { leaseId: context.lease.leaseId, owner: context.lease.owner, deviceId: context.lease.deviceId, connectionId: context.lease.connectionId, sessionId: context.lease.sessionId, kind: context.lease.kind, expiresAt: context.lease.expiresAt }
+      : { leaseId: context.leaseId, released: context.released === true };
+    return { v: "omp-app/1", type: "response", requestId: frame.requestId, commandId: frame.commandId, command: frame.command, hostId: frame.hostId, sessionId: frame.sessionId, ok: true, result } as ServerFrame;
   }
   private authorizeConfirm(state: ConnectionState, frame: ConfirmFrame): boolean {
     const context = state.commandContexts.get(String(frame.commandId));
