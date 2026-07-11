@@ -271,7 +271,16 @@ function parseRecord(text: string, expectedSessionFile?: string): SessionLockRec
 	) {
 		return null;
 	}
-	return { protocolVersion, ownerId, pid, processStartMarker, hostname, createdAt, heartbeatAt, sessionFile };
+	return {
+		protocolVersion: protocolVersion as number,
+		ownerId: ownerId as string,
+		pid: pid as number,
+		processStartMarker: processStartMarker as string,
+		hostname: hostname as string,
+		createdAt: createdAt as number,
+		heartbeatAt: heartbeatAt as number,
+		sessionFile: sessionFile as string,
+	};
 }
 
 function parseClaim(text: string, expectedSessionFile: string): SessionLockClaim | null {
