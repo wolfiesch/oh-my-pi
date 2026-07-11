@@ -7,6 +7,8 @@
 //! exists there.
 //! Atomic replacements intentionally use mode `0600`; existing modes are not
 //! preserved because the temporary is a newly-created private inode.
+//! The process-wide writer mutex linearizes cooperating addon calls; external
+//! processes are outside that boundary and must honor revision conflicts.
 
 use napi::bindgen_prelude::{Buffer, Error, Result};
 use napi_derive::napi;
@@ -417,7 +419,7 @@ mod unix {
 		}
 	}
 
-	fn read_file_fd(fd: RawFd, cap: usize) -> Result<(Vec<u8>, Signature)> {
+	fn read_file_fd(fd: RawFd, cap: usize) -> Result<(Vec<u8>, Signature, String)> {
 		let before = fstat(fd)?;
 		if !regular(&before) {
 			return Err(native_error(ErrorCode::NotFile));
@@ -432,7 +434,7 @@ mod unix {
 		if signature(&before) != signature(&after) {
 			return Err(native_error(ErrorCode::Conflict));
 		}
-		Ok((bytes, signature(&after)))
+		Ok((bytes, signature(&after), hash.finish()))
 	}
 
 	fn hash_file_fd(fd: RawFd, cap: usize) -> Result<(String, Signature)> {
@@ -604,15 +606,11 @@ mod unix {
 		}
 		#[cfg(target_os = "macos")]
 		{
-			return retry_rc(|| unsafe {
+			return retry_rc(|| {
 				// SAFETY: all fds are open directories and names are NUL-terminated.
-				libc::linkat(parent, temp.as_ptr(), parent, leaf.as_ptr(), 0)
+				unsafe { libc::renameatx_np(parent, temp.as_ptr(), parent, leaf.as_ptr(), libc::RENAME_EXCL) }
 			})
-			.map_err(|error| errno_error(error, true))
-			.and_then(|()| {
-				retry_rc(|| unsafe { libc::unlinkat(parent, temp.as_ptr(), 0) })
-					.map_err(|error| errno_error(error, false))
-			});
+			.map_err(|error| errno_error(error, true));
 		}
 		#[allow(unreachable_code, reason = "Unix targets are Linux or macOS here")]
 		Err(native_error(ErrorCode::Unsupported))
@@ -649,13 +647,11 @@ mod unix {
 		let parent = traverse_parent(&root, &components[..components.len() - 1])?;
 		let leaf = components.last().expect("non-empty path");
 		let fd = open_target(parent.0, leaf.as_c_str())?;
-		let (bytes, _signature) = read_file_fd(fd.0, cap)?;
-		let mut hash = Sha256::new();
-		hash.update(&bytes);
+		let (bytes, _signature, revision_sha256) = read_file_fd(fd.0, cap)?;
 		Ok(SecureReadFileResult {
 			size: u32::try_from(bytes.len()).map_err(|_| native_error(ErrorCode::Bounds))?,
 			data: Buffer::from(bytes),
-			revision_sha256: hash.finish(),
+			revision_sha256,
 		})
 	}
 
