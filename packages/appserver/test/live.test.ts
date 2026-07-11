@@ -13,7 +13,7 @@ const stamp = "2026-01-01T00:00:00.000Z";
 const sid = (value: string) => sessionId(value);
 const rid = (value: string) => value as never;
 function record(id: string): SessionRecord { return { sessionId: sid(id), path: `/tmp/${id}.jsonl`, cwd: "/tmp", projectId: projectId("project-test"), title: id, updatedAt: stamp, status: "idle", entries: [] }; }
-function hello(capabilities?: string[]): Record<string, unknown> { return { v: "omp-app/1", type: "hello", protocol: { min: "omp-app/1", max: "omp-app/1" }, client: { name: "raw-test", version: "1", build: "test", platform: "linux" }, requestedFeatures: ["resume"], savedCursors: [], ...(capabilities ? { capabilities: { client: capabilities } } : {}) }; }
+function hello(capabilities?: string[], authentication = false): Record<string, unknown> { return { v: "omp-app/1", type: "hello", protocol: { min: "omp-app/1", max: "omp-app/1" }, client: { name: "raw-test", version: "1", build: "test", platform: "linux" }, requestedFeatures: ["resume"], savedCursors: [], ...(capabilities ? { capabilities: { client: capabilities } } : {}), ...(authentication ? { authentication: { deviceId: "device", deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" } } : {}) }; }
 function command(requestId: string, commandId: string, name: string, session: string, args: Record<string, unknown>): Record<string, unknown> { return { v: "omp-app/1", type: "command", requestId: rid(requestId), commandId: rid(commandId), hostId: host, sessionId: sid(session), command: name, args }; }
 function hostCommand(requestId: string, commandId: string, name: string, args: Record<string, unknown>): Record<string, unknown> { return { v: "omp-app/1", type: "command", requestId: rid(requestId), commandId: rid(commandId), hostId: host, command: name, args }; }
 function confirmFrame(requestId: string, confirmationId: string, commandId: string, decision: "approve" | "deny", session?: string): Record<string, unknown> { return { v: "omp-app/1", type: "confirm", requestId: rid(requestId), confirmationId: rid(confirmationId), commandId: rid(commandId), hostId: host, ...(session ? { sessionId: sid(session) } : {}), decision }; }
@@ -105,6 +105,16 @@ async function liveServer(factory: LiveFactory, records = [record("s1"), record(
 }
 
 describe("live Unix websocket protocol", () => {
+  test("local transport rejects device authentication without echoing the token", async () => {
+    const { appserver, path } = await liveServer(new LiveFactory(), []);
+    const client = await RawUdsWebSocket.connect(path);
+    client.sendJson(hello(undefined, true));
+    const frame = await client.nextServer();
+    expect(frame.type).toBe("error");
+    expect(JSON.stringify(frame)).not.toContain("AAAAAAAA");
+    await client.closed();
+    await appserver.stop();
+  });
   test("two clients negotiate capabilities, attach with one snapshot, and reject duplicate hello", async () => {
     const factory = new LiveFactory(); const { appserver, path } = await liveServer(factory);
     const readOnly = await readyClient(path, ["sessions.read"]); const promptClient = await readyClient(path, ["sessions.read", "sessions.prompt"]);
