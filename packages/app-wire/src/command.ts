@@ -22,9 +22,6 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
   "agent.cancel": { capability: "agents.control", scope: "session", revision: "optional", confirmation: "challenge" },
   "bash.run": { capability: "bash.run", scope: "session", revision: "optional", confirmation: "challenge" },
   "term.open": { capability: "term.open", scope: "session", revision: "optional", confirmation: "challenge" },
-  "term.input": { capability: "term.input", scope: "session", revision: "optional", confirmation: "none" },
-  "term.resize": { capability: "term.resize", scope: "session", revision: "optional", confirmation: "none" },
-  "term.close": { capability: "term.open", scope: "session", revision: "optional", confirmation: "challenge" },
   "audit.read": { capability: "audit.read", scope: "host", revision: "none", confirmation: "none" },
   "audit.tail": { capability: "audit.read", scope: "host", revision: "none", confirmation: "none" },
   "config.write": { capability: "config.write", scope: "host", revision: "required", confirmation: "challenge" },
@@ -33,8 +30,6 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
   "catalog.get": { capability: "catalog.read", scope: "host", revision: "none", confirmation: "none" },
   "host.watch": { capability: "sessions.read", scope: "host", revision: "none", confirmation: "none" },
   "session.watch": { capability: "sessions.read", scope: "session", revision: "none", confirmation: "none" },
-  "session.state": { capability: "sessions.read", scope: "session", revision: "optional", confirmation: "none" },
-  "session.delta": { capability: "sessions.read", scope: "session", revision: "optional", confirmation: "none" },
   "controller.lease.acquire": { capability: "sessions.control", scope: "session", revision: "required", confirmation: "none" },
   "controller.lease.renew": { capability: "sessions.control", scope: "session", revision: "required", confirmation: "none" },
   "controller.lease.release": { capability: "sessions.control", scope: "session", revision: "required", confirmation: "none" },
@@ -62,6 +57,7 @@ export function decodeCommand(input: unknown): CommandFrame {
   if (descriptor.revision === "none" && frame.expectedRevision !== undefined) fail("STALE_REVISION", "expectedRevision is forbidden for this command", "expectedRevision");
   if (descriptor.revision === "required" && frame.expectedRevision === undefined) fail("STALE_REVISION", "expectedRevision is required", "expectedRevision");
   if (frame.expectedRevision !== undefined) revision(frame.expectedRevision);
+  // A missing confirmationId is the intentional first attempt; the server must issue a challenge. Present tokens are bounded and validated below.
   if (descriptor.confirmation === "none" && frame.confirmationId !== undefined) fail("CONFIRMATION_INVALID", "confirmationId is not valid for this command", "confirmationId");
   if (frame.confirmationId !== undefined) confirmationId(frame.confirmationId);
   const args = frame.args === undefined ? {} : boundedMap(frame.args, "args");
@@ -74,37 +70,35 @@ export type CommandArguments = Record<string, unknown>;
 export type CommandResult = Record<string, unknown>;
 function requireArgs(value: unknown, path = "args"): Record<string, unknown> { return boundedMap(value, path); }
 function requiredPath(args: Record<string, unknown>): string { return safeRelativePath(args.path); }
+function emptyArgs(value: unknown): CommandArguments { return requireArgs(value); }
+function emptyResult(value: unknown): CommandResult { return requireArgs(value, "result"); }
+function listResult(value: unknown): CommandResult { const result = requireArgs(value, "result"); boundedArray(result.items ?? result.entries, "result.items"); return result; }
 export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown) => CommandArguments>> = {
-  "files.read": value => { const args = requireArgs(value); requiredPath(args); return args; },
-  "files.write": value => { const args = requireArgs(value); requiredPath(args); boundedText(args.content, "args.content", MAX_FILE_BYTES); return args; },
-  "files.patch": value => { const args = requireArgs(value); requiredPath(args); boundedText(args.patch, "args.patch", MAX_FILE_BYTES); return args; },
-  "files.list": value => { const args = requireArgs(value); if (args.path !== undefined) safeRelativePath(args.path); return args; },
-  "files.diff": value => { const args = requireArgs(value); requiredPath(args); return args; },
-  "term.input": value => { const args = requireArgs(value); controlFree(args.terminalId, "args.terminalId", 256); boundedText(args.data, "args.data", MAX_TERMINAL_INPUT_BYTES); return args; },
-  "term.resize": value => { const args = requireArgs(value); controlFree(args.terminalId, "args.terminalId", 256); const cols = safeSeq(args.cols, "args.cols"); const rows = safeSeq(args.rows, "args.rows"); if (cols === 0 || rows === 0 || cols > 1_000_000 || rows > 1_000_000) fail("BOUNDS", "invalid terminal dimensions", "args"); return args; },
-  "term.close": value => { const args = requireArgs(value); controlFree(args.terminalId, "args.terminalId", 256); return args; },
-  "audit.tail": value => requireArgs(value),
-  "catalog.get": value => requireArgs(value),
-  "settings.read": value => requireArgs(value),
-  "settings.write": value => requireArgs(value),
-  "preview.launch": value => requireArgs(value),
-  "preview.state": value => requireArgs(value),
-  "preview.navigate": value => { const args = requireArgs(value); controlFree(args.url, "args.url", 4096); return args; },
-  "preview.capture": value => requireArgs(value),
+  "host.list": emptyArgs, "session.list": emptyArgs, "session.create": emptyArgs, "session.attach": emptyArgs,
+  "session.prompt": value => { const args=requireArgs(value); boundedText(args.prompt,"args.prompt",MAX_FILE_BYTES); return args; },
+  "session.cancel": emptyArgs, "session.close": emptyArgs, "files.read": value => { const args=requireArgs(value); requiredPath(args); return args; },
+  "files.write": value => { const args=requireArgs(value); requiredPath(args); boundedText(args.content,"args.content",MAX_FILE_BYTES); return args; },
+  "files.patch": value => { const args=requireArgs(value); requiredPath(args); boundedText(args.patch,"args.patch",MAX_FILE_BYTES); return args; },
+  "files.list": value => { const args=requireArgs(value); if(args.path!==undefined) safeRelativePath(args.path); return args; },
+  "files.diff": value => { const args=requireArgs(value); requiredPath(args); return args; },
+  "review.read": emptyArgs, "review.apply": emptyArgs, "agent.cancel": emptyArgs, "bash.run": value => { const args=requireArgs(value); boundedText(args.command,"args.command",MAX_FILE_BYTES); return args; },
+  "term.open": emptyArgs, "audit.read": emptyArgs, "audit.tail": emptyArgs, "config.write": value => requireArgs(value),
+  "settings.read": emptyArgs, "settings.write": value => requireArgs(value), "catalog.get": emptyArgs,
+  "host.watch": emptyArgs, "session.watch": emptyArgs,
+  "controller.lease.acquire": emptyArgs, "controller.lease.renew": emptyArgs, "controller.lease.release": emptyArgs,
+  "prompt.lease.acquire": emptyArgs, "prompt.lease.renew": emptyArgs, "prompt.lease.release": emptyArgs,
+  "preview.launch": emptyArgs, "preview.state": emptyArgs, "preview.navigate": value => { const args=requireArgs(value); controlFree(args.url,"args.url",4096); return args; }, "preview.capture": emptyArgs,
 };
-const MAX_TERMINAL_INPUT_BYTES = 256_000;
 export const COMMAND_RESULT_DECODERS: Readonly<Record<string, (value: unknown) => CommandResult>> = {
-  "files.read": value => { const result = requireArgs(value, "result"); boundedText(result.content, "result.content", MAX_FILE_BYTES); return result; },
-  "files.list": value => { const result = requireArgs(value, "result"); boundedArray(result.entries, "result.entries"); return result; },
-  "files.diff": value => { const result = requireArgs(value, "result"); boundedText(result.diff, "result.diff", MAX_FILE_BYTES); return result; },
-  "audit.tail": value => { const result = requireArgs(value, "result"); boundedArray(result.events, "result.events"); return result; },
-  "catalog.get": value => { const result = requireArgs(value, "result"); boundedArray(result.items, "result.items"); return result; },
-  "settings.read": value => requireArgs(value, "result"),
-  "preview.capture": value => { const result = requireArgs(value, "result"); boundedText(result.content, "result.content", MAX_FILE_BYTES); return result; },
+  "host.list": listResult, "session.list": listResult, "session.create": emptyResult, "session.attach": emptyResult,
+  "session.prompt": emptyResult, "session.cancel": emptyResult, "session.close": emptyResult, "files.read": value => { const result=requireArgs(value,"result"); boundedText(result.content,"result.content",MAX_FILE_BYTES); return result; },
+  "files.write": emptyResult, "files.patch": emptyResult, "files.list": listResult, "files.diff": value => { const result=requireArgs(value,"result"); boundedText(result.diff,"result.diff",MAX_FILE_BYTES); return result; },
+  "review.read": emptyResult, "review.apply": emptyResult, "agent.cancel": emptyResult, "bash.run": emptyResult, "term.open": emptyResult,
+  "audit.read": emptyResult, "audit.tail": value => { const result=requireArgs(value,"result"); boundedArray(result.events,"result.events").forEach((entry,i)=>boundedMap(entry,`result.events[${i}]`)); return result; },
+  "config.write": emptyResult, "settings.read": emptyResult, "settings.write": emptyResult, "catalog.get": value => { const result=requireArgs(value,"result"); boundedArray(result.items,"result.items").forEach((item,i)=>boundedMap(item,`result.items[${i}]`)); return result; },
+  "host.watch": emptyResult, "session.watch": emptyResult, "controller.lease.acquire": emptyResult, "controller.lease.renew": emptyResult, "controller.lease.release": emptyResult,
+  "prompt.lease.acquire": emptyResult, "prompt.lease.renew": emptyResult, "prompt.lease.release": emptyResult,
+  "preview.launch": emptyResult, "preview.state": emptyResult, "preview.navigate": emptyResult, "preview.capture": value => { const result=requireArgs(value,"result"); boundedText(result.content,"result.content",MAX_FILE_BYTES); return result; },
 };
-for (const name of Object.keys(COMMAND_DESCRIPTORS)) {
-  if (!(name in COMMAND_ARGUMENT_DECODERS)) (COMMAND_ARGUMENT_DECODERS as Record<string, (value: unknown) => CommandArguments>)[name] = value => requireArgs(value);
-  if (!(name in COMMAND_RESULT_DECODERS)) (COMMAND_RESULT_DECODERS as Record<string, (value: unknown) => CommandResult>)[name] = value => requireArgs(value, "result");
-}
-export function decodeCommandArguments(command: string, value: unknown): CommandArguments { const decoder = COMMAND_ARGUMENT_DECODERS[command]; if (decoder === undefined) fail("INVALID_FRAME", "command has no typed argument decoder", "command"); return decoder(value); }
-export function decodeCommandResult(command: string, value: unknown): CommandResult { const decoder = COMMAND_RESULT_DECODERS[command]; if (decoder === undefined) fail("INVALID_FRAME", "command has no typed result decoder", "command"); return decoder(value); }
+export function decodeCommandArguments(command: string, value: unknown): CommandArguments { const decoder=COMMAND_ARGUMENT_DECODERS[command]; if(decoder===undefined) fail("INVALID_FRAME","command has no typed argument decoder","command"); return decoder(value); }
+export function decodeCommandResult(command: string, value: unknown): CommandResult { const decoder=COMMAND_RESULT_DECODERS[command]; if(decoder===undefined) fail("INVALID_FRAME","command has no typed result decoder","command"); return decoder(value); }

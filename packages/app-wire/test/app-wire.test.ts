@@ -239,10 +239,10 @@ describe("app-wire authority", () => {
 	test("additive watch, lease, PTY, files, audit, catalog, preview discriminants are bounded", () => {
 		const frames = [
 			{ v: "omp-app/1", type: "host.watch", watchId: "w", hostId: "h", cursor: { epoch: "e", seq: 1 }, state: "ready", revision: "r" },
-			{ v: "omp-app/1", type: "session.delta", hostId: "h", sessionId: "s", cursor: { epoch: "e", seq: 2 }, revision: "r", changes: { status: "idle" } },
-			{ v: "omp-app/1", type: "prompt.lease", hostId: "h", sessionId: "s", leaseId: "l", kind: "prompt", state: "acquired", owner: "desktop", expiresAt: "now" },
-			{ v: "omp-app/1", type: "agent.progress", hostId: "h", sessionId: "s", agentId: "a", progress: 0.5, revision: "r" },
-			{ v: "omp-app/1", type: "terminal.output", hostId: "h", sessionId: "s", terminalId: "t", stream: "stdout", data: "ok" },
+			{ v: "omp-app/1", type: "session.delta", hostId: "h", sessionId: "s", cursor: { epoch: "e", seq: 2 }, revision: "r", upsert: { hostId: "h", sessionId: "s", project: { projectId: "p", canonicalCwd: "/workspace" }, revision: "r", title: "Demo", status: "idle", updatedAt: "now" } },
+			{ v: "omp-app/1", type: "prompt.lease", hostId: "h", sessionId: "s", leaseId: "l", cursor: { epoch: "e", seq: 3 }, kind: "prompt", state: "acquired", owner: "desktop", expiresAt: "now" },
+			{ v: "omp-app/1", type: "agent.progress", hostId: "h", sessionId: "s", agentId: "a", cursor: { epoch: "e", seq: 4 }, progress: 0.5, revision: "r" },
+			{ v: "omp-app/1", type: "terminal.output", hostId: "h", sessionId: "s", terminalId: "t", cursor: { epoch: "e", seq: 5 }, stream: "stdout", data: "ok" },
 			{ v: "omp-app/1", type: "files.diff", hostId: "h", sessionId: "s", path: "src/a.ts", diff: "@@\\n" },
 			{ v: "omp-app/1", type: "audit.event", hostId: "h", cursor: { epoch: "e", seq: 1 }, event: { eventId: "op", hostId: "h", action: "read", actor: "desktop", timestamp: "now" } },
 			{ v: "omp-app/1", type: "catalog", hostId: "h", revision: "r", items: [{ id: "tool", kind: "tool", name: "shell" }] },
