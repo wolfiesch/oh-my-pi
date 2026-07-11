@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as http from "node:http";
-import { requestId, type HelloFrame, type PairStartFrame } from "@oh-my-pi/app-wire";
+import { decodeServerFrame, requestId, type HelloFrame, type PairStartFrame, type ServerFrame } from "@oh-my-pi/app-wire";
 import { runAppserverPair } from "../../coding-agent/src/cli/appserver-cli.ts";
 import { createAppserver } from "../src/server.ts";
 import { LocalPairingTicketIssuer, SqliteDeviceRegistry } from "../src/security/index.ts";
@@ -49,6 +50,43 @@ async function udsAdmin(socketPath: string, path: string, method: "GET" | "POST"
 	request.end();
 	return gate.promise;
 }
+
+test("remote welcome preserves protocol authentication state while redacting nested secrets", () => {
+	const root = mkdtempSync(join(tmpdir(), "omp-remote-policy-"));
+	const registry = new SqliteDeviceRegistry(join(root, "devices.sqlite"));
+	const policy = new TailscaleRemotePolicy({ registry });
+	const connection = {
+		connectionId: "welcome-connection",
+		peer: { address: "100.64.0.2", source: "direct" as const, identity: { nodeId: "node-1", addresses: ["100.64.0.2"], source: "direct" as const } },
+		socket: { connectionId: "welcome-connection", peer: undefined as never, send: () => true, close: () => undefined },
+	};
+	try {
+		const hello: HelloFrame = { v: "omp-app/1", type: "hello", protocol: { min: "1", max: "1" }, client: { name: "test", version: "1", build: "test", platform: "linux" }, requestedFeatures: [], savedCursors: [] };
+		expect(policy.authenticate(connection, hello).authentication).toBe("pairing-required");
+		const frame = {
+			v: "omp-app/1", type: "welcome", selectedProtocol: "omp-app/1", hostId: "host", ompVersion: "1", ompBuild: "test",
+			appserverVersion: "1", appserverBuild: "test", epoch: "epoch", grantedCapabilities: [], grantedFeatures: [],
+			negotiatedLimits: { authentication: "nested-auth", token: "nested-token", deviceToken: "nested-device-token" },
+			authentication: "pairing-required", resumed: false,
+		} as unknown as ServerFrame;
+		const outbound = policy.transformOutbound(connection, frame);
+		expect(outbound?.type).toBe("welcome");
+		expect((outbound as Record<string, unknown>).authentication).toBe("pairing-required");
+		expect((outbound as Extract<ServerFrame, { type: "welcome" }>).negotiatedLimits).toEqual({ authentication: "[redacted]", token: "[redacted]", deviceToken: "[redacted]" });
+		expect(decodeServerFrame(outbound)).toMatchObject({ type: "welcome", authentication: "pairing-required" });
+		const response = {
+			v: "omp-app/1", type: "response", requestId: "request-1", commandId: "command-1",
+			command: "controller.lease.acquire", hostId: "host", ok: true,
+			result: { leaseId: "lease-1", owner: "owner", deviceId: "device-1", connectionId: "welcome-connection", expiresAt: 1 },
+		} as unknown as ServerFrame;
+		const responseOutbound = policy.transformOutbound(connection, response)!;
+		expect((responseOutbound as Record<string, unknown>).command).toBe("controller.lease.acquire");
+		expect(decodeServerFrame(responseOutbound)).toMatchObject({ type: "response", command: "controller.lease.acquire" });
+	} finally {
+		policy.close();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 
 test("pair CLI admin ticket reaches the in-process issuer and is one-use across reconnect", async () => {
 	const root = await mkdtemp(join(tmpdir(), "omp-admin-e2e-"));

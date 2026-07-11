@@ -387,7 +387,12 @@ function sanitizeRemoteFrame(frame: ServerFrame): ServerFrame | undefined {
     const entries = Object.entries(value);
     if (entries.length > 128) throw new Error("outbound object exceeded");
     for (const [childKey, child] of entries) {
-      if (childKey === "deviceToken" || isSecretLikeKey(childKey)) {
+      if (
+        (frame.type === "welcome" && depth === 0 && childKey === "authentication") ||
+        (frame.type === "response" && depth === 0 && childKey === "command")
+      ) {
+        result[childKey] = child;
+      } else if (childKey === "deviceToken" || isSecretLikeKey(childKey)) {
         result[childKey] = "[redacted]";
       } else result[childKey] = walk(child, childKey, depth + 1);
     }
