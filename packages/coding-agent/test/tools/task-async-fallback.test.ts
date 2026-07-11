@@ -51,9 +51,8 @@ describe("task.async-fallback", () => {
 		const tool = await TaskTool.create(createSession({ "async.enabled": true }));
 
 		const result = await tool.execute("tool-1", {
-			agent: "task",
-			name: "One",
-			task: "Do the thing.",
+			context: "Shared test context.",
+			tasks: [{ agent: "task", name: "One", task: "Do the thing." }],
 		} as TaskParams);
 
 		const text = getFirstText(result);
