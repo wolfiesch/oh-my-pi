@@ -1,0 +1,1 @@
+{"v":"omp-app/1","type":"sessions","cursor":{"epoch":8,"seq":3},"sessions":[{"hostId":"host-a","sessionId":"same-raw-id","title":"Local task","status":"active","updatedAt":"2026-07-11T10:00:00Z"},{"hostId":"host-b","sessionId":"same-raw-id","title":"Remote task","status":"idle","updatedAt":"2026-07-11T10:01:00Z"}]}

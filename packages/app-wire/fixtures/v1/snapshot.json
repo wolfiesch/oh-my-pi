@@ -1,0 +1,1 @@
+{"v":"omp-app/1","type":"snapshot","cursor":{"epoch":8,"seq":9},"hostId":"host-a","sessionId":"same-raw-id","entries":[{"id":"entry-1","hostId":"host-a","sessionId":"same-raw-id","kind":"message","timestamp":"2026-07-11T10:00:00Z","data":{"role":"user","text":"hello"}}],"continuity":{"epoch":8}}

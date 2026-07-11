@@ -1,0 +1,1 @@
+{"v":"omp-app/1","type":"welcome","server":"omp-appserver","epoch":9,"capabilities":{"client":["sessions.read"],"server":["sessions"]},"resumed":false,"restart":{"previousEpoch":8,"reason":"appserver continuity loss"}}

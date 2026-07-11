@@ -1,0 +1,1 @@
+{"v":"omp-app/1","type":"welcome","server":"omp-appserver","epoch":8,"capabilities":{"client":["sessions.read","session.command"],"server":["sessions","snapshot","events","agents","terminals","files","review","audit","pairing"]},"resumed":false,"restart":{"previousEpoch":7}}

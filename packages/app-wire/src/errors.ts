@@ -1,0 +1,19 @@
+export type AppWireErrorCode =
+  | "INVALID_JSON"
+  | "INVALID_FRAME"
+  | "OVERSIZED_INPUT"
+  | "UNSAFE_SEQUENCE"
+  | "MISSING_VERSION"
+  | "UNKNOWN_FRAME"
+  | "BOUNDS";
+
+export class AppWireError extends Error {
+  readonly name = "AppWireError";
+  constructor(readonly code: AppWireErrorCode, message: string, readonly path?: string) {
+    super(message);
+  }
+}
+
+export function fail(code: AppWireErrorCode, message: string, path?: string): never {
+  throw new AppWireError(code, message, path);
+}
