@@ -17,7 +17,7 @@ export type AppWireErrorCode =
 export class AppWireError extends Error {
 	override readonly name = "AppWireError";
 	readonly code: AppWireErrorCode;
-	readonly path?: string;
+	readonly path: string | undefined;
 	constructor(code: AppWireErrorCode, message: string, path?: string) {
 		super(message);
 		this.code = code;
