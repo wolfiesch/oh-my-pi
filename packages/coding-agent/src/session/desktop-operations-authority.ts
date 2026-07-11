@@ -290,13 +290,23 @@ async function runArgv(
 	let cancelled = false,
 		timedOut = false,
 		truncated = false,
-		killed = false;
+		killed = false,
+		hardKillTimer: NodeJS.Timeout | undefined;
 	const kill = () => {
 		if (killed) return;
 		killed = true;
+		const pid = proc.pid;
 		try {
-			proc.kill("SIGTERM");
+			if (process.platform !== "win32" && typeof pid === "number") process.kill(-pid, "SIGTERM");
+			else proc.kill("SIGTERM");
 		} catch {}
+		hardKillTimer = setTimeout(() => {
+			try {
+				if (process.platform !== "win32" && typeof pid === "number") process.kill(-pid, "SIGKILL");
+				else proc.kill("SIGKILL");
+			} catch {}
+		}, 100);
+		hardKillTimer.unref?.();
 	};
 	const onAbort = () => {
 		cancelled = true;
@@ -332,6 +342,7 @@ async function runArgv(
 		};
 	} finally {
 		clearTimeout(timer);
+		clearTimeout(hardKillTimer);
 		signal?.removeEventListener("abort", onAbort);
 	}
 }
@@ -477,11 +488,19 @@ export class CodingAgentDesktopAuthority {
 	}
 	async filesDiff(request: DesktopDiffRequest, context?: OperationContextLike): Promise<Record<string, unknown>> {
 		const signal = this.#signal(request, context),
-			path = safeRelativePath(request.path);
-		if (request.content === undefined) throw protocolError("UNSUPPORTED");
+			path = safeRelativePath(request.path),
+			basis = request.fromRevision ?? context?.expectedRevision;
+		if (
+			request.fromRevision !== undefined &&
+			context?.expectedRevision !== undefined &&
+			request.fromRevision !== context.expectedRevision
+		)
+			throw protocolError("OPERATION_FAILED");
+		if (request.content === undefined || basis === undefined) throw protocolError("UNSUPPORTED");
 		try {
 			const current = await this.filesRead({ path, encoding: "utf8", signal }, context),
 				requested = decodeUtf8(decodeContent(request.content, request.encoding));
+			if (current.revision !== basis) throw protocolError("STALE_REVISION");
 			if (signal?.aborted) throw protocolError("ABORTED");
 			return freeze({ path, diff: diffText(path, current.content, requested), fromRevision: current.revision });
 		} catch (error) {

@@ -106,7 +106,8 @@ describe("CodingAgentDesktopAuthority jailed files", () => {
 		const { root, value } = await authority();
 		await writeFile(join(root, "diff.txt"), "old\n");
 		await expect(value.filesDiff({ path: "diff.txt" })).rejects.toMatchObject({ code: "UNSUPPORTED" });
-		const diff = await value.filesDiff({ path: "diff.txt", content: "new\n" });
+		const current = await value.filesRead({ path: "diff.txt" });
+		const diff = await value.filesDiff({ path: "diff.txt", content: "new\n", fromRevision: current.revision });
 		expect(diff.diff).toContain("-old");
 		expect(diff.diff).toContain("+new");
 		const controller = new AbortController();
