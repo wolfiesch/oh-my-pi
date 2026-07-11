@@ -366,10 +366,10 @@ mod unix {
 				dev: stat.st_dev as u64,
 				ino: stat.st_ino as u64,
 				size: stat.st_size.max(0) as u64,
-				mtime_sec: stat.st_mtimespec.tv_sec,
-				mtime_nsec: stat.st_mtimespec.tv_nsec,
-				ctime_sec: stat.st_ctimespec.tv_sec,
-				ctime_nsec: stat.st_ctimespec.tv_nsec,
+				mtime_sec: stat.st_mtime as i64,
+				mtime_nsec: stat.st_mtime_nsec as i64,
+				ctime_sec: stat.st_ctime as i64,
+				ctime_nsec: stat.st_ctime_nsec as i64,
 			}
 		}
 	}
