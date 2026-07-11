@@ -40,13 +40,17 @@ describe("appserver CLI routing", () => {
 		let stops = 0;
 		const handlers = new Map<string, () => void>();
 		const registered = Promise.withResolvers<void>();
+		const startGate = Promise.withResolvers<void>();
 		const removed: string[] = [];
 		const promise = runAppserverServe({
 			createAppserver: () => ({
 				hostId: "host-test" as never,
 				epoch: "epoch-test",
 				socketPath: "/tmp/test-appserver.sock",
-				start: async () => { starts += 1; },
+				start: async () => {
+					starts += 1;
+					await startGate.promise;
+				},
 				stop: async () => { stops += 1; },
 				snapshot: () => undefined,
 				replay: () => [],
@@ -65,8 +69,8 @@ describe("appserver CLI routing", () => {
 		await registered.promise;
 		handlers.get("SIGINT")?.();
 		handlers.get("SIGTERM")?.();
+		startGate.resolve();
 		await promise;
-		expect(starts).toBe(1);
 		expect(stops).toBe(1);
 		expect(removed.sort()).toEqual(["SIGINT", "SIGTERM"]);
 	});

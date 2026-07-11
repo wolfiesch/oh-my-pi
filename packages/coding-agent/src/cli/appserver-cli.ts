@@ -126,17 +126,38 @@ export async function runAppserverServe(deps: AppserverRunnerDeps = {}): Promise
 	const onSignal = deps.onSignal ?? defaultOnSignal;
 	const removeSignal = deps.removeSignal ?? defaultRemoveSignal;
 	const appserver = await create();
-	await appserver.start();
 	const stopped = Promise.withResolvers<void>();
-	let stopping = false;
-	const shutdown = (): void => {
-		if (stopping) return;
-		stopping = true;
+	let started = false;
+	let stopRequested = false;
+	let stopStarted = false;
+	const stopOnce = (): void => {
+		if (stopStarted) return;
+		stopStarted = true;
 		void appserver.stop().then(stopped.resolve, stopped.reject);
+	};
+	const shutdown = (): void => {
+		stopRequested = true;
+		if (started) stopOnce();
 	};
 	onSignal("SIGINT", shutdown);
 	onSignal("SIGTERM", shutdown);
 	try {
+		let startError: unknown;
+		try {
+			await appserver.start();
+			started = true;
+		} catch (error) {
+			startError = error;
+		}
+		if (startError !== undefined) {
+			if (stopRequested) {
+				try {
+					await appserver.stop();
+				} catch {}
+			}
+			throw startError;
+		}
+		if (stopRequested) stopOnce();
 		await stopped.promise;
 	} finally {
 		removeSignal("SIGINT", shutdown);
