@@ -76,6 +76,8 @@ export interface SessionRecord {
 	title: string;
 	updatedAt: string;
 	status: SessionRef["status"];
+	model?: string;
+	thinking?: string;
 	entries: DurableEntry[];
 }
 export interface SessionAuthoritySession {

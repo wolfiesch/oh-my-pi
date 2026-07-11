@@ -19,7 +19,7 @@ export class SessionProjection {
     const entries = [...this.#byId.values()];
     for (const entry of entries) this.#revisionHash.update(`${JSON.stringify(entry)}\n`);
     const currentRevision = revision(`r-${this.#revisionHash.copy().digest("hex").slice(0, 24)}`);
-    this.value = { hostId: host, sessionId: record.sessionId, revision: currentRevision, cursor: { epoch, seq: 0 }, entries, ref: { hostId: host, sessionId: record.sessionId, project: { projectId: record.projectId, name: record.projectName }, revision: currentRevision, title: record.title, status: record.status, updatedAt: record.updatedAt }, ring: [] };
+    this.value = { hostId: host, sessionId: record.sessionId, revision: currentRevision, cursor: { epoch, seq: 0 }, entries, ref: { hostId: host, sessionId: record.sessionId, project: { projectId: record.projectId, name: record.projectName }, revision: currentRevision, title: record.title, status: record.status, updatedAt: record.updatedAt, ...(record.model ? { model: record.model } : {}), ...(record.thinking ? { thinking: record.thinking } : {}) }, ring: [] };
   }
   setStatus(status: SessionRef["status"]): void {
     this.value.ref = { ...this.value.ref, status };
