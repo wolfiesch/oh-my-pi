@@ -100,11 +100,10 @@ fn validate_revision(revision: Option<&str>) -> Result<()> {
 #[cfg(unix)]
 mod unix {
 	use super::*;
-	use std::collections::HashMap;
 	use std::ffi::{CStr, CString};
 	use std::fmt::Write as _;
 	use std::os::fd::RawFd;
-	use std::sync::{Arc, LazyLock, Mutex};
+	use std::sync::{LazyLock, Mutex};
 
 	struct Fd(RawFd);
 
@@ -192,31 +191,11 @@ mod unix {
 		ctime_nsec: i64,
 	}
 
-	#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-	struct WriteKey {
-		root_dev: u64,
-		root_ino: u64,
-		parent_dev: u64,
-		parent_ino: u64,
-		leaf: Vec<u8>,
-	}
+	// One process-wide lock keeps cooperating addon writers linearizable without
+	// attacker-controlled lock-map growth. External writers remain outside this
+	// serialization boundary and must use the revision protocol themselves.
+	static SECURE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-	static WRITE_LOCKS: LazyLock<Mutex<HashMap<WriteKey, Arc<Mutex<()>>>>> =
-		LazyLock::new(|| Mutex::new(HashMap::new()));
-
-	fn write_lock(root: RawFd, parent: RawFd, leaf: &CStr) -> Result<Arc<Mutex<()>>> {
-		let root_stat = fstat(root)?;
-		let parent_stat = fstat(parent)?;
-		let key = WriteKey {
-			root_dev: root_stat.st_dev as u64,
-			root_ino: root_stat.st_ino as u64,
-			parent_dev: parent_stat.st_dev as u64,
-			parent_ino: parent_stat.st_ino as u64,
-			leaf: leaf.to_bytes().to_vec(),
-		};
-		let mut locks = WRITE_LOCKS.lock().map_err(|_| native_error(ErrorCode::Io))?;
-		Ok(locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone())
-	}
 
 	fn errno() -> i32 {
 		std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
@@ -754,8 +733,7 @@ mod unix {
 		let root = Fd::open_root(root)?;
 		let parent = traverse_parent(&root, &components[..components.len() - 1])?;
 		let leaf = components.last().expect("non-empty path");
-		let lock = write_lock(root.0, parent.0, leaf.as_c_str())?;
-		let _guard = lock.lock().map_err(|_| native_error(ErrorCode::Io))?;
+		let _guard = SECURE_WRITE_LOCK.lock().map_err(|_| native_error(ErrorCode::Io))?;
 
 		if let Some(expected) = expected_revision {
 			let initial = revision_at(parent.0, leaf.as_c_str(), cap)?;
@@ -1054,7 +1032,7 @@ mod tests {
 
 	#[cfg(unix)]
 	#[test]
-	fn in_process_create_race_has_one_winner() {
+	fn in_process_revision_race_has_one_winner() {
 		use std::fs;
 		use std::sync::{Arc, Barrier};
 		use std::thread;
@@ -1062,25 +1040,30 @@ mod tests {
 		let suffix = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
 		let root = std::env::temp_dir().join(format!("omp-secure-race-{suffix}"));
 		fs::create_dir(&root).expect("root");
-		let root = Arc::new(root.to_str().expect("utf8 root").to_owned());
-		let barrier = Arc::new(Barrier::new(8));
-		#[allow(clippy::needless_collect, reason = "collect keeps all racers alive until the barrier releases")]
-		let handles = (0..8)
+		let root_string = root.to_str().expect("utf8 root").to_owned();
+		let initial = super::unix::write(&root_string, "race", &[7], None, 1024).expect("initial");
+		let expected = initial.revision_sha256;
+		let root = Arc::new(root_string);
+		let barrier = Arc::new(Barrier::new(2));
+		#[allow(clippy::needless_collect, reason = "collect keeps both racers alive before joining")]
+		let handles = (0..2)
 			.map(|index| {
 				let root = Arc::clone(&root);
 				let barrier = Arc::clone(&barrier);
+				let expected = expected.clone();
 				thread::spawn(move || {
 					barrier.wait();
-					super::unix::write(&root, "race", &[index], None, 1024).is_ok()
+					super::unix::write(&root, "race", &[index], Some(&expected), 1024)
 				})
 			})
 			.collect::<Vec<_>>();
-		let winners = handles
-			.into_iter()
-			.map(|handle| handle.join().expect("join"))
-			.filter(|won| *won)
-			.count();
-		assert_eq!(winners, 1);
+		#[allow(clippy::needless_collect, reason = "collect stores both outcomes for deterministic assertions")]
+		let outcomes = handles.into_iter().map(|handle| handle.join().expect("join")).collect::<Vec<_>>();
+		assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+		assert_eq!(outcomes.iter().filter(|result| result.is_err()).count(), 1);
+		let winner = outcomes.iter().find_map(|result| result.as_ref().ok()).expect("winner");
+		let read = super::unix::read(&root, "race", 1024).expect("read winner");
+		assert_eq!(read.revision_sha256, winner.revision_sha256);
 		fs::remove_dir_all(root.as_str()).expect("cleanup");
 	}
 }
