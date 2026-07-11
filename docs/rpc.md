@@ -49,12 +49,35 @@ There is no envelope beyond the object shape itself.
 10. Subagent frames (`subagent_lifecycle`, `subagent_progress`, `subagent_event`), gated by `set_subagent_subscription`
 11. Builtin slash-command side channels (`command_output`, `session_info_update`, `config_update`)
 
+12. Durable session-entry notifications (`session_entry`)
+
 ### Inbound frame categories (stdin)
 
 1. `RpcCommand`
 2. `RpcExtensionUIResponse` (`{ type: "extension_ui_response", ... }`)
 3. Host tool updates/results (`host_tool_update`, `host_tool_result`)
 4. Host URI results (`host_uri_result`)
+
+### Durable session-entry notifications
+
+Each exact durable append is emitted once on stdout as an additive frame:
+
+```json
+{
+  "type": "session_entry",
+  "entry": {
+    "type": "message",
+    "id": "entry-id",
+    "parentId": "parent-entry-id",
+    "timestamp": "2026-07-11T12:00:00.000Z",
+    "message": { "role": "user", "content": "..." }
+  }
+}
+```
+
+`entry` is the typed `SessionEntry` object, including its exact `id`, `parentId`, and `timestamp`; all entry-specific fields are preserved. The JSONL session transcript remains the durable authority for replay and recovery. `session_entry` is a live notification only, not a replacement for reading JSONL.
+
+This frame is additive: older RPC consumers may ignore unknown outbound `type` values and continue handling existing responses/events unchanged.
 
 ## Request/Response Correlation
 

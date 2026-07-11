@@ -47,6 +47,7 @@ import type {
 	RpcHostUriRequest,
 	RpcHostUriResult,
 	RpcResponse,
+	RpcSessionEntryFrame,
 	RpcSessionState,
 	RpcSubagentSubscriptionLevel,
 } from "./rpc-types";
@@ -69,6 +70,74 @@ type RpcOutput = (
 		| RpcHostUriCancelRequest
 		| object,
 ) => void;
+type RpcSessionEntryManager = Pick<AgentSession["sessionManager"], "subscribeEntryAppended">;
+
+export interface RpcSessionEntrySubscription {
+	bind(sessionManager: RpcSessionEntryManager): void;
+	unbind(): void;
+	switchTo(sessionManager: RpcSessionEntryManager): void;
+	dispose(): void;
+}
+
+/**
+ * Route durable session appends through the RPC output writer.
+ *
+ * Binding a new manager first detaches the old manager, so switching sessions
+ * cannot leave a stale transcript listener behind. A writer failure also
+ * detaches the listener before rethrowing; SessionManager isolates that error
+ * from persistence and other subscribers.
+ */
+export function createRpcSessionEntrySubscription(output: (frame: RpcSessionEntryFrame) => void): RpcSessionEntrySubscription {
+	let boundManager: RpcSessionEntryManager | undefined;
+	let unsubscribe: (() => void) | undefined;
+	let disposed = false;
+
+	const detach = () => {
+		const cleanup = unsubscribe;
+		unsubscribe = undefined;
+		boundManager = undefined;
+		cleanup?.();
+	};
+
+	const bind = (sessionManager: RpcSessionEntryManager) => {
+		if (disposed) return;
+		if (boundManager === sessionManager && unsubscribe) return;
+		detach();
+		try {
+			unsubscribe = sessionManager.subscribeEntryAppended(entry => {
+				if (disposed) return;
+				try {
+					output({ type: "session_entry", entry });
+				} catch (error) {
+					disposed = true;
+					detach();
+					throw error;
+				}
+			});
+			boundManager = sessionManager;
+		} catch (error) {
+			detach();
+			throw error;
+		}
+	};
+
+	return {
+		bind,
+		unbind() {
+			if (!disposed) detach();
+		},
+		switchTo(sessionManager) {
+			if (disposed) return;
+			detach();
+			bind(sessionManager);
+		},
+		dispose() {
+			disposed = true;
+			detach();
+		},
+	};
+}
+
 
 export type RpcSessionChangeCommand = Extract<
 	RpcCommand,
@@ -532,6 +601,8 @@ export async function runRpcMode(
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
 		process.stdout.write(`${JSON.stringify(obj)}\n`);
 	};
+	const sessionEntrySubscription = createRpcSessionEntrySubscription(output);
+	sessionEntrySubscription.bind(session.sessionManager);
 	const emitRpcTitles = shouldEmitRpcTitles();
 
 	const success = <T extends RpcCommand["type"]>(
@@ -800,22 +871,27 @@ export async function runRpcMode(
 	const rpcUiContext = new RpcExtensionUIContext(pendingExtensionRequests, output);
 	setToolUIContext?.(rpcUiContext, true);
 
-	// Set up extensions with RPC-based UI context
-	await initializeExtensions(session, {
-		reportSendError: (action, err) => {
-			output(error(undefined, action, err.message));
-		},
-		reportRuntimeError: err => {
-			output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
-		},
-		onShutdown: () => {
-			shutdownState.requested = true;
-		},
-		trackAgentInvokingMessage: task => {
-			extensionUserMessageTracker.trackAgentMessageTask(task);
-		},
-		uiContext: rpcUiContext,
-	});
+	// Set up extensions with RPC-based UI context.
+	try {
+		await initializeExtensions(session, {
+			reportSendError: (action, err) => {
+				output(error(undefined, action, err.message));
+			},
+			reportRuntimeError: err => {
+				output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
+			},
+			onShutdown: () => {
+				shutdownState.requested = true;
+			},
+			trackAgentInvokingMessage: task => {
+				extensionUserMessageTracker.trackAgentMessageTask(task);
+			},
+			uiContext: rpcUiContext,
+		});
+	} catch (error) {
+		sessionEntrySubscription.dispose();
+		throw error;
+	}
 
 	// Output all agent events as JSON
 	session.subscribe(event => {
@@ -926,14 +1002,21 @@ export async function runRpcMode(
 			case "new_session":
 			case "switch_session":
 			case "branch": {
-				const result = await handleRpcSessionChange(session, command, subagentRegistry);
-				if (!result.data.cancelled) await emitAvailableCommandsUpdate();
-				return success(id, result.type, result.data);
+				sessionEntrySubscription.unbind();
+				try {
+					const result = await handleRpcSessionChange(session, command, subagentRegistry);
+					sessionEntrySubscription.bind(session.sessionManager);
+					if (!result.data.cancelled) await emitAvailableCommandsUpdate();
+					return success(id, result.type, result.data);
+				} catch (error) {
+					try {
+						sessionEntrySubscription.bind(session.sessionManager);
+					} catch {
+						sessionEntrySubscription.dispose();
+					}
+					throw error;
+				}
 			}
-
-			// =================================================================
-			// State
-			// =================================================================
 
 			case "get_state": {
 				const state: RpcSessionState = {
@@ -1304,7 +1387,7 @@ export async function runRpcMode(
 	// Background bash tasks may still owe response frames; drain them before
 	// tearing down (stdin EOF ends the frame stream, not in-flight work).
 	await shutdownCoordinator.drain();
-
+	sessionEntrySubscription.dispose();
 	// stdin closed — RPC client is gone, exit cleanly
 	hostToolBridge.rejectAllPending("RPC client disconnected before host tool execution completed");
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");

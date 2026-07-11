@@ -10,7 +10,7 @@ import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
-import type { FileEntry } from "../../session/session-entries";
+import type { FileEntry, SessionEntry } from "../../session/session-entries";
 import type { AvailableSlashCommandSource } from "../../slash-commands/available-commands";
 import type {
 	AgentProgress,
@@ -302,6 +302,11 @@ export type RpcResponse =
 // Subagent Events (stdout)
 // ============================================================================
 
+export interface RpcSessionEntryFrame {
+	type: "session_entry";
+	entry: SessionEntry;
+}
+
 export interface RpcSubagentLifecycleFrame {
 	type: "subagent_lifecycle";
 	payload: SubagentLifecyclePayload;
@@ -319,7 +324,7 @@ export interface RpcSubagentEventFrame {
 
 export type RpcSubagentFrame = RpcSubagentLifecycleFrame | RpcSubagentProgressFrame | RpcSubagentEventFrame;
 
-export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame;
+export type RpcSessionEventFrame = AgentSessionEvent | RpcSessionEntryFrame | RpcSubagentFrame;
 
 // ============================================================================
 // Extension UI Events (stdout)
