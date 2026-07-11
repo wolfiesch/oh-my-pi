@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as http from "node:http";
-import { decodeServerFrame, requestId, type HelloFrame, type PairStartFrame, type ServerFrame } from "@oh-my-pi/app-wire";
+import { decodeServerFrame, decodeSessions, MAX_ARRAY_ITEMS, requestId, type HelloFrame, type PairStartFrame, type ServerFrame } from "@oh-my-pi/app-wire";
 import { runAppserverPair } from "../../coding-agent/src/cli/appserver-cli.ts";
 import { createAppserver } from "../src/server.ts";
 import { LocalPairingTicketIssuer, SqliteDeviceRegistry } from "../src/security/index.ts";
@@ -88,6 +88,30 @@ test("remote welcome preserves protocol authentication state while redacting nes
 	}
 });
 
+test("remote sessions inventory preserves protocol-sized arrays and rejects oversized arrays", () => {
+	const root = mkdtempSync(join(tmpdir(), "omp-remote-sessions-"));
+	const registry = new SqliteDeviceRegistry(join(root, "devices.sqlite"));
+	const policy = new TailscaleRemotePolicy({ registry });
+	const connection = {
+		connectionId: "sessions-connection",
+		peer: { address: "100.64.0.2", source: "direct" as const, identity: { nodeId: "node-1", addresses: ["100.64.0.2"], source: "direct" as const } },
+		socket: { connectionId: "sessions-connection", peer: undefined as never, send: () => true, close: () => undefined },
+	};
+	try {
+		const hello: HelloFrame = { v: "omp-app/1", type: "hello", protocol: { min: "1", max: "1" }, client: { name: "test", version: "1", build: "test", platform: "linux" }, requestedFeatures: [], savedCursors: [] };
+		expect(policy.authenticate(connection, hello).authentication).toBe("pairing-required");
+		const sessions = Array.from({ length: 318 }, (_, index) => ({ hostId: "host", sessionId: `session-${index}`, project: { projectId: "project" }, revision: "1", title: `Session ${index}`, status: "idle", updatedAt: new Date(0).toISOString() }));
+		const frame = { v: "omp-app/1", type: "sessions", cursor: { epoch: "epoch", seq: 0 }, sessions } as unknown as ServerFrame;
+		const outbound = policy.transformOutbound(connection, frame);
+		expect(outbound).toBeDefined();
+		expect(decodeSessions(outbound).sessions).toHaveLength(318);
+		const oversized = { ...frame, sessions: Array.from({ length: MAX_ARRAY_ITEMS + 1 }, () => sessions[0]) } as unknown as ServerFrame;
+		expect(policy.transformOutbound(connection, oversized)).toBeUndefined();
+	} finally {
+		policy.close();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 test("pair CLI admin ticket reaches the in-process issuer and is one-use across reconnect", async () => {
 	const root = await mkdtemp(join(tmpdir(), "omp-admin-e2e-"));
 	const registry = new SqliteDeviceRegistry(join(root, "devices.sqlite"));

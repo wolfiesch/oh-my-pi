@@ -3,6 +3,7 @@ import {
   COMMAND_DESCRIPTORS,
   DEVICE_CAPABILITIES,
   isSecretLikeKey,
+  MAX_ARRAY_ITEMS,
   pairingId,
   REMOTE_DEFAULT_CAPABILITIES,
   type ClientFrame,
@@ -378,7 +379,7 @@ function sanitizeRemoteFrame(frame: ServerFrame): ServerFrame | undefined {
     if (seen.has(value)) throw new Error("outbound cycle");
     seen.add(value);
     if (Array.isArray(value)) {
-      if (value.length > 128) throw new Error("outbound array exceeded");
+      if (value.length > MAX_ARRAY_ITEMS) throw new Error("outbound array exceeded");
       const result = value.map(item => walk(item, key, depth + 1));
       seen.delete(value);
       return result;
