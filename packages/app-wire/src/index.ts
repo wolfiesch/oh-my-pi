@@ -1,3 +1,4 @@
+export * from "./additive.ts";
 export * from "./agents.ts";
 export * from "./audit.ts";
 export * from "./capabilities.ts";

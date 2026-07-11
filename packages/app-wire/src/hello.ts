@@ -1,4 +1,4 @@
-import { decodeFeatureList, decodeCapabilities, type Capabilities } from "./capabilities.ts";
+import { decodeFeatureList, decodeNegotiatedFeatureList, decodeCapabilities, type Capabilities } from "./capabilities.ts";
 import { decodeCursor, type Cursor } from "./cursor.ts";
 import { fail } from "./errors.ts";
 import { hostId, sessionId, type HostId, type SessionId } from "./ids.ts";
@@ -79,7 +79,7 @@ export function decodeHello(input: unknown): HelloFrame {
 	const maxMajor = protocolMajor(protocol.max, "protocol.max").major;
 	if (minMajor > 1 || maxMajor < 1) fail("UNSUPPORTED_PROTOCOL", "no supported protocol in range", "protocol");
 	const client = identity(frame.client, "client");
-	const requestedFeatures = decodeFeatureList(frame.requestedFeatures, "requestedFeatures");
+	const requestedFeatures = decodeNegotiatedFeatureList(frame.requestedFeatures, "requestedFeatures");
 	const raw = boundedArray(frame.savedCursors, "savedCursors", MAX_SAVED_CURSORS);
 	const savedCursors: SavedCursor[] = [];
 	for (let i = 0; i < raw.length; i++) {
@@ -107,7 +107,7 @@ export function decodeWelcome(input: unknown): WelcomeFrame {
 	controlFree(frame.appserverBuild, "appserverBuild", 128);
 	controlFree(frame.epoch, "epoch", 128);
 	const grantedCapabilities = decodeFeatureList(frame.grantedCapabilities, "grantedCapabilities");
-	const grantedFeatures = decodeFeatureList(frame.grantedFeatures, "grantedFeatures");
+	const grantedFeatures = decodeNegotiatedFeatureList(frame.grantedFeatures, "grantedFeatures");
 	const negotiatedLimits = boundedMap(frame.negotiatedLimits, "negotiatedLimits");
 	if (typeof frame.resumed !== "boolean") fail("INVALID_FRAME", "resumed must be boolean", "resumed");
 	return {

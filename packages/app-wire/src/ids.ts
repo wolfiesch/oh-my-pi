@@ -13,6 +13,11 @@ export type CommandId = string & { readonly __commandId: unique symbol };
 export type PairingId = string & { readonly __pairingId: unique symbol };
 export type ConfirmationId = string & { readonly __confirmationId: unique symbol };
 export type Revision = string & { readonly __revision: unique symbol };
+export type WatchId = string & { readonly __watchId: unique symbol };
+export type LeaseId = string & { readonly __leaseId: unique symbol };
+export type OperationId = string & { readonly __operationId: unique symbol };
+export type PreviewId = string & { readonly __previewId: unique symbol };
+export type CatalogId = string & { readonly __catalogId: unique symbol };
 
 export function id<T extends string>(value: unknown, path: string): T {
 	return controlFree(value, path, MAX_ID_BYTES) as T;
@@ -27,6 +32,11 @@ export const requestId = (v: unknown, p = "requestId"): RequestId => id<RequestI
 export const commandId = (v: unknown, p = "commandId"): CommandId => id<CommandId>(v, p);
 export const pairingId = (v: unknown, p = "pairingId"): PairingId => id<PairingId>(v, p);
 export const confirmationId = (v: unknown, p = "confirmationId"): ConfirmationId => id<ConfirmationId>(v, p);
+export const watchId = (v: unknown, p = "watchId"): WatchId => id<WatchId>(v, p);
+export const leaseId = (v: unknown, p = "leaseId"): LeaseId => id<LeaseId>(v, p);
+export const operationId = (v: unknown, p = "operationId"): OperationId => id<OperationId>(v, p);
+export const previewId = (v: unknown, p = "previewId"): PreviewId => id<PreviewId>(v, p);
+export const catalogId = (v: unknown, p = "catalogId"): CatalogId => id<CatalogId>(v, p);
 export const revision = (v: unknown, p = "revision"): Revision => id<Revision>(v, p);
 export interface SessionKey {
 	readonly hostId: HostId;

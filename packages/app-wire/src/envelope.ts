@@ -25,6 +25,7 @@ import { decodeEntry, type DurableEntry } from "./entry.ts";
 import { decodeCursor, type Cursor } from "./cursor.ts";
 import { hostId, revision, sessionId, type HostId, type Revision, type SessionId } from "./ids.ts";
 import { decodeBye, decodePing, decodePong, type ByeFrame, type PingFrame, type PongFrame } from "./heartbeat.ts";
+import { decodeAdditiveServerFrame, type AdditiveServerFrame } from "./additive.ts";
 export interface ErrorFrame {
 	v: typeof PROTOCOL_VERSION;
 	type: "error";
@@ -59,7 +60,8 @@ export type ServerFrame =
 	| GapFrame
 	| ErrorFrame
 	| PongFrame
-	| ByeFrame;
+	| ByeFrame
+	| AdditiveServerFrame;
 export type AppFrame = ClientFrame | ServerFrame;
 function decodeError(input: unknown): ErrorFrame {
 	const frame = inputObject(input);
@@ -139,7 +141,7 @@ export function decodeServerFrame(input: unknown): ServerFrame {
 		case "bye":
 			return decodeBye(frame);
 		default:
-			fail("UNKNOWN_FRAME", "unknown server frame family", "type");
+			return decodeAdditiveServerFrame(frame);
 	}
 }
 export function isClientFrame(value: unknown): value is ClientFrame {

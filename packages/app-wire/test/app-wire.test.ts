@@ -5,10 +5,13 @@ import {
 	MAX_FILE_BYTES,
 	MAX_INPUT_BYTES,
 	COMMAND_DESCRIPTORS,
+	COMMAND_ARGUMENT_DECODERS,
+	COMMAND_RESULT_DECODERS,
 	decodeClientFrame,
 	decodeDurableEntryFrame,
 	decodeEntry,
 	decodeServerFrame,
+	decodeAdditiveServerFrame,
 	inputObject,
 	safeRelativePath,
 	sameSession,
@@ -227,11 +230,41 @@ describe("app-wire authority", () => {
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
-		expect(APP_WIRE_VERSION).toBe("0.1.2");
+		expect(APP_WIRE_VERSION).toBe("0.2.0");
 	});
 	test("exported wire version matches package metadata", async () => {
 		const metadata = (await Bun.file(new URL("../package.json", import.meta.url)).json()) as { version: string };
 		expect(APP_WIRE_VERSION).toBe(metadata.version);
+	});
+	test("additive watch, lease, PTY, files, audit, catalog, preview discriminants are bounded", () => {
+		const frames = [
+			{ v: "omp-app/1", type: "host.watch", watchId: "w", hostId: "h", cursor: { epoch: "e", seq: 1 }, state: "ready", revision: "r" },
+			{ v: "omp-app/1", type: "session.delta", hostId: "h", sessionId: "s", cursor: { epoch: "e", seq: 2 }, revision: "r", changes: { status: "idle" } },
+			{ v: "omp-app/1", type: "prompt.lease", hostId: "h", sessionId: "s", leaseId: "l", kind: "prompt", state: "acquired", owner: "desktop", expiresAt: "now" },
+			{ v: "omp-app/1", type: "agent.progress", hostId: "h", sessionId: "s", agentId: "a", progress: 0.5, revision: "r" },
+			{ v: "omp-app/1", type: "terminal.output", hostId: "h", sessionId: "s", terminalId: "t", stream: "stdout", data: "ok" },
+			{ v: "omp-app/1", type: "files.diff", hostId: "h", sessionId: "s", path: "src/a.ts", diff: "@@\\n" },
+			{ v: "omp-app/1", type: "audit.event", hostId: "h", cursor: { epoch: "e", seq: 1 }, event: { eventId: "op", hostId: "h", action: "read", actor: "desktop", timestamp: "now" } },
+			{ v: "omp-app/1", type: "catalog", hostId: "h", revision: "r", items: [{ id: "tool", kind: "tool", name: "shell" }] },
+			{ v: "omp-app/1", type: "preview.capture", hostId: "h", sessionId: "s", previewId: "p", content: "YQ==", encoding: "base64", mimeType: "image/png" },
+		] as const;
+		for (const value of frames) expect(decodeServerFrame(value).type).toBe(value.type);
+		expect(() => decodeAdditiveServerFrame({ ...frames[0], state: "future" })).toThrow(AppWireError);
+		expect(() => decodeAdditiveServerFrame({ ...frames[2], kind: "controller" })).toThrow(AppWireError);
+		expect(() => decodeAdditiveServerFrame({ ...frames[4], data: "x", stream: "future" })).toThrow(AppWireError);
+		expect(() => decodeAdditiveServerFrame({ ...frames[5], path: "../secret" })).toThrow(AppWireError);
+		expect(() => decodeAdditiveServerFrame({ ...frames[6], event: { ...frames[6].event, hostId: "other" } })).toThrow(AppWireError);
+	});
+	test("every command has typed bounded argument and result decoders", () => {
+		for (const command of Object.keys(COMMAND_DESCRIPTORS)) {
+			expect(COMMAND_ARGUMENT_DECODERS[command]).toBeFunction();
+			expect(COMMAND_RESULT_DECODERS[command]).toBeFunction();
+			const descriptor = COMMAND_DESCRIPTORS[command];
+			const frame: Record<string, unknown> = { v: "omp-app/1", type: "command", requestId: "r", commandId: "c", hostId: "h", command, args: {} };
+			if (descriptor?.scope === "session") frame.sessionId = "s";
+			if (descriptor?.revision === "required") frame.expectedRevision = "rev";
+			expect(() => decodeClientFrame(frame)).not.toThrow();
+		}
 	});
 	test("session identity remains host scoped", () => {
 		expect(sameSession({ hostId: "h", sessionId: "s" }, { hostId: "other", sessionId: "s" })).toBe(false);
