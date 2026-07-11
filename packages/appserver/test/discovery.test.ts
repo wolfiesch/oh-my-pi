@@ -82,12 +82,19 @@ function transcript(entries: Record<string, unknown>[], title?: string): string 
   });
 
   test("uses the first substantive Change line for a bounded fallback title", async () => {
-    const wrapped = "Complete the assignment below\n\n# Target\nIgnore this heading\n\n# Change\n1. Build a durable projector with a deliberately long description " + "x".repeat(200);
+    const wrapped = "Complete the assignment below, thoroughly:\n\n# Target\nIgnore this heading\n\n# Change\n1. Build a durable projector with a deliberately long description " + "x".repeat(200);
     const entries = [{ type: "message", id: "u1", parentId: null, timestamp: stamp, message: { role: "user", content: wrapped } }];
     const discovery = new FileSessionDiscovery("/root", fakeFs({ "/root/session.jsonl": transcript(entries) }, ["/root"]), host);
     const [session] = await discovery.list();
     expect(session?.title?.startsWith("Build a durable projector")).toBe(true);
     expect(new TextEncoder().encode(session?.title ?? "").byteLength).toBeLessThanOrEqual(120);
+  });
+
+  test("keeps direct-message fallback on its first substantive line", async () => {
+    const entries = [{ type: "message", id: "u1", parentId: null, timestamp: stamp, message: { role: "user", content: "Please inspect this project\n# Change\n1. Do not use this as a title" } }];
+    const discovery = new FileSessionDiscovery("/root", fakeFs({ "/root/session.jsonl": transcript(entries) }, ["/root"]), host);
+    const [session] = await discovery.list();
+    expect(session?.title).toBe("Please inspect this project");
   });
 
   test("limits snapshots to 1000 entries with an omission notice", async () => {

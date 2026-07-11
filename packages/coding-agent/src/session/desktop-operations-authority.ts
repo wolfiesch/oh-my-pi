@@ -451,7 +451,7 @@ export class CodingAgentDesktopAuthority {
 			if (signal?.aborted) throw protocolError("ABORTED");
 			const entries = result.entries
 				.slice()
-				.sort((left, right) => left.name.localeCompare(right.name))
+				.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
 				.map(protocolSafeDirectoryEntry)
 				.filter((entry): entry is ProtocolSafeDirectoryEntry => entry !== undefined)
 				.map(entry => freeze(entry));
