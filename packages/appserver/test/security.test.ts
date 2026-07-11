@@ -30,7 +30,7 @@ class FakeRegistry {
   close() {}
 }
 
-beforeAll(() => { dbPath = `/tmp/omp-security-${process.pid}.sqlite`; });
+beforeAll(() => { dbPath = `/tmp/omp-security-${process.pid}/device.sqlite`; });
 afterAll(async () => { await unlink(dbPath).catch(() => undefined); });
 
 describe("security core", () => {
@@ -145,7 +145,7 @@ it("pair completion stays bound to the issuing connection", () => {
 
 it("expired credentials are rejected and revoked", () => {
   const localClock = { value: 100, now() { return this.value; } };
-  const path = `/tmp/omp-expired-${process.pid}.sqlite`;
+  const path = `/tmp/omp-expired-${process.pid}/device.sqlite`;
   const registry = new SqliteDeviceRegistry(path, localClock, { bytes: (n) => new Uint8Array(n).fill(6) });
   registry.create({ deviceId: "expired", identityKey: JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]), capabilities: ["sessions.read"], metadata: { label: "x" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: 110, revokedAt: null, epoch: 0 }, "A".repeat(43));
   localClock.value = 111;
