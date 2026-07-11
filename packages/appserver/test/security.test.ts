@@ -19,11 +19,13 @@ const identity = { nodeId: "node-a", login: "alice@example.com", hostId: "host-a
 const clock = { value: 1_000, now() { return this.value; } };
 class FakeRegistry {
   readonly records = new Map<string, DeviceRecord>();
+  readonly active = new Map<string, DeviceRecord & { authenticatedAt: number; connectionId: string }>();
   get(id: string): DeviceRecord | null { return this.records.get(id) ?? null; }
   create(record: DeviceRecord, token: string) { this.records.set(record.deviceId, record); }
   updateMetadata(id: string, metadata: DeviceMetadata, capabilities: readonly DeviceRecord["capabilities"][number][]) { const old = this.records.get(id); if (old) this.records.set(id, { ...old, metadata, capabilities }); }
-  authenticate(id: string, token: string, identity: RemotePeerIdentity, connectionId: string) { const record = this.records.get(id); if (!record || token !== "token") throw new Error("denied"); return { ...record, authenticatedAt: clock.now(), connectionId }; }
-  revoke(id: string) { const record = this.records.get(id); if (record) this.records.set(id, { ...record, revokedAt: clock.now(), epoch: record.epoch + 1 }); }
+  authenticate(id: string, token: string, identity: RemotePeerIdentity, connectionId: string) { const record = this.records.get(id); if (!record || token !== "token") throw new Error("denied"); const principal = { ...record, authenticatedAt: clock.now(), connectionId }; this.active.set(`${connectionId}:${id}`, principal); return principal; }
+  getAuthenticatedPrincipal(connectionId: string, deviceId: string) { return this.active.get(`${connectionId}:${deviceId}`) ?? null; }
+  revoke(id: string) { const record = this.records.get(id); if (record) { this.records.set(id, { ...record, revokedAt: clock.now(), epoch: record.epoch + 1 }); for (const key of this.active.keys()) if (key.endsWith(`:${id}`)) this.active.delete(key); } }
   list(): readonly DeviceRecord[] { return [...this.records.values()]; }
   close() {}
 }
@@ -35,8 +37,11 @@ describe("security core", () => {
   it("pairs once and authenticates a returned token without storing plaintext", () => {
     const registry = new SqliteDeviceRegistry(dbPath, clock);
     const pairing = new SqlitePairingService(registry, clock, { bytes: (n) => new Uint8Array(n).fill(7) });
-    const grant = pairing.start("connection-a", ["sessions.read"]);
-    const result = pairing.complete("connection-a", grant.code, identity, { label: "device" }, ["sessions.read"]);
+    const issuerRecord = { deviceId: "issuer", identityKey: JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]), capabilities: ["sessions.manage"] as const, metadata: { label: "issuer" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: clock.now() + 86_400_000, revokedAt: null, epoch: 0 };
+    registry.create(issuerRecord, "token");
+    const issuer = registry.authenticate("issuer", "token", identity, "connection-a");
+    const grant = pairing.start("connection-a", ["sessions.read"], undefined, { deviceId: issuer.deviceId, epoch: issuer.epoch, identityKey: issuer.identityKey });
+    const result = pairing.complete("connection-a", grant.code, identity, { label: "device" }, ["sessions.read"], { deviceId: issuer.deviceId, epoch: issuer.epoch, identityKey: issuer.identityKey });
     expect(registry.authenticate(result.deviceId, result.token, identity, "connection-a").deviceId).toBe(result.deviceId);
     expect(() => registry.authenticate(result.deviceId, "wrong", identity, "connection-a")).toThrow();
     registry.close();
@@ -47,6 +52,7 @@ describe("security core", () => {
     const registry = new FakeRegistry();
     registry.create(principal, "token");
     const guard = new DefaultAuthorizationGuard(registry);
+    registry.authenticate("d", "token", identity, "c");
     const base = { principal, connectionId: "c", capabilities: ["sessions.read"] as const, args: {} };
     expect(() => guard.authorize({ ...base, command: "session.attach", sessionId: "s" })).not.toThrow();
     expect(() => guard.authorize({ ...base, command: "session.prompt", sessionId: "s" })).toThrow();
@@ -79,7 +85,7 @@ describe("security core", () => {
   });
 
   it("writes redacted JSONL audit values", async () => {
-    const path = `/tmp/omp-security-audit-${process.pid}.jsonl`;
+    const path = `/tmp/omp-security-audit-${process.pid}/audit.jsonl`;
     const sink = new JsonlAuditSink(path);
     await sink.write({ command: "x", token: "secret-canary" });
     const text = await Bun.file(path).text();
@@ -90,10 +96,14 @@ describe("security core", () => {
 it("rejects expired or replayed pairing and mismatched identity", () => {
   const localClock = { value: 100, now() { return this.value; } };
   const registry = new FakeRegistry();
+  const issuerRecord = { deviceId: "issuer-exp", identityKey: JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]), capabilities: ["sessions.manage"] as const, metadata: { label: "issuer" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: 100_000, revokedAt: null, epoch: 0 };
+  registry.create(issuerRecord, "token");
+  const issuer = registry.authenticate("issuer-exp", "token", identity, "c");
   const pairing = new SqlitePairingService(registry, localClock, { bytes: (n) => new Uint8Array(n).fill(9) });
-  const grant = pairing.start("c", ["sessions.read"], 10);
+  const context = { deviceId: issuer.deviceId, epoch: issuer.epoch, identityKey: issuer.identityKey };
+  const grant = pairing.start("c", ["sessions.read"], 10, context);
   localClock.value = 111;
-  expect(() => pairing.complete("c", grant.code, identity, { label: "x" }, ["sessions.read"])).toThrow();
+  expect(() => pairing.complete("c", grant.code, identity, { label: "x" }, ["sessions.read"], context)).toThrow();
 });
 
 it("invalidates an authenticated principal after revoke epoch change", () => {
@@ -124,9 +134,13 @@ it("redacts cycles, JWT, bearer, basic and private-key strings", () => {
 });
 it("pair completion stays bound to the issuing connection", () => {
   const registry = new FakeRegistry();
+  const issuerRecord = { deviceId: "issuer-bind", identityKey: JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]), capabilities: ["sessions.manage"] as const, metadata: { label: "issuer" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: Date.now() + 86_400_000, revokedAt: null, epoch: 0 };
+  registry.create(issuerRecord, "token");
+  const issuer = registry.authenticate("issuer-bind", "token", identity, "issuer");
   const pairing = new SqlitePairingService(registry, clock, { bytes: (n) => new Uint8Array(n).fill(8) });
-  const grant = pairing.start("issuer", ["sessions.read"]);
-  expect(() => pairing.complete("other", grant.code, identity, { label: "x" }, ["sessions.read"])).toThrow();
+  const context = { deviceId: issuer.deviceId, epoch: issuer.epoch, identityKey: issuer.identityKey };
+  const grant = pairing.start("issuer", ["sessions.read"], undefined, context);
+  expect(() => pairing.complete("other", grant.code, identity, { label: "x" }, ["sessions.read"], context)).toThrow();
 });
 
 it("expired credentials are rejected and revoked", () => {
