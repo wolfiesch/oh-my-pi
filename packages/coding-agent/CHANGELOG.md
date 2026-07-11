@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Changed `omp --version` and `omp -v` to return before loading the full command registry.
+
 ## [16.4.2] - 2026-07-10
 
 ### Fixed

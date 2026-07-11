@@ -99,7 +99,7 @@ describe("global --profile flag", () => {
 		await runCli(["--profile=work", "--version"]);
 
 		expect(process.exitCode).toBe(0);
-		expect(writeSpy).toHaveBeenCalled();
+		expect(writeSpy).toHaveBeenCalledWith(`${APP_NAME}/${VERSION}\n`);
 		expect(getActiveProfile()).toBe("work");
 		expect(getAgentDir()).toBe(path.join(os.homedir(), configDir, "profiles", "work", "agent"));
 	});
@@ -113,18 +113,69 @@ describe("global --profile flag", () => {
 		await runCli(["--version"]);
 
 		expect(process.exitCode).toBe(0);
-		expect(writeSpy).toHaveBeenCalled();
+		expect(writeSpy).toHaveBeenCalledWith(`${APP_NAME}/${VERSION}\n`);
 		expect(getActiveProfile()).toBe("work");
 		expect(getAgentDir()).toBe(path.join(os.homedir(), configDir, "profiles", "work", "agent"));
 		expect(getAgentDbPath()).toBe(path.join(os.homedir(), configDir, "profiles", "work", "agent", "agent.db"));
 	});
 
+	it("prints --version and -v without loading the command registry", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-version-fast-path-"));
+		try {
+			const preloadPath = path.join(root, "block-cli-commands.ts");
+			await Bun.write(
+				preloadPath,
+				[
+					"Bun.plugin({",
+					'  name: "block-cli-commands",',
+					"  setup(build) {",
+					"    build.onResolve({ filter: /^\\.\\/cli-commands$/ }, () => ({",
+					'      path: "cli-commands-blocked",',
+					'      namespace: "cli-commands-blocked",',
+					"    }));",
+					'    build.onLoad({ filter: /.*/, namespace: "cli-commands-blocked" }, () => ({',
+					'      contents: "throw new Error(\\"cli-commands import blocked\\"); export {}; ",',
+					'      loader: "ts",',
+					"    }));",
+					"  },",
+					"});",
+				].join("\n"),
+			);
+
+			for (const flag of ["--version", "-v"]) {
+				const proc = Bun.spawn([process.execPath, "--preload", preloadPath, cliEntry, flag], {
+					cwd: repoRoot,
+					stdout: "pipe",
+					stderr: "pipe",
+					env: {
+						...process.env,
+						PI_CONFIG_DIR: `.omp-version-fast-path-${flag.replaceAll("-", "")}`,
+						PI_NO_TITLE: "1",
+						NO_COLOR: "1",
+					},
+				});
+				const [stdout, stderr, exitCode] = await Promise.all([
+					readStream(proc.stdout as ReadableStream<Uint8Array>),
+					readStream(proc.stderr as ReadableStream<Uint8Array>),
+					proc.exited,
+				]);
+
+				expect(exitCode, stderr).toBe(0);
+				expect(stdout).toBe(`${APP_NAME}/${VERSION}\n`);
+				expect(stderr).not.toContain("cli-commands import blocked");
+			}
+		} finally {
+			await removeWithRetries(root);
+		}
+	});
+
 	it("accepts the profile flag after other root flags", async () => {
-		vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
 		await runCli(["--version", "--profile", "office"]);
 
 		expect(process.exitCode).toBe(0);
+		expect(writeSpy).toHaveBeenCalledWith(`${APP_NAME}/${VERSION}\n`);
 		expect(getActiveProfile()).toBe("office");
 		expect(getAgentDir()).toBe(path.join(os.homedir(), configDir, "profiles", "office", "agent"));
 	});

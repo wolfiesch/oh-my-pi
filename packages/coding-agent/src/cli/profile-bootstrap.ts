@@ -33,7 +33,6 @@
  * them also activates (`omp --print --profile work`).
  */
 
-import { isSubcommand } from "../cli-commands";
 import {
 	EXTENSION_SHADOWABLE_STRING_FLAGS,
 	isUnknownLongValueCandidate,
@@ -42,6 +41,7 @@ import {
 	PROFILE_BOOTSTRAP_BOUNDARY_ARG,
 	STRING_VALUE_FLAGS,
 } from "./flag-tables";
+import { isSubcommand } from "./subcommands";
 
 function isProfileBootstrapSubcommand(arg: string): boolean {
 	return arg === "launch" || arg === "acp";

@@ -317,6 +317,10 @@ export async function runCli(argv: string[]): Promise<void> {
 		await runSmokeTest();
 		return;
 	}
+	if (resolvedArgv[0] === "--version" || resolvedArgv[0] === "-v") {
+		process.stdout.write(`${APP_NAME}/${VERSION}\n`);
+		return;
+	}
 	const [{ run }, { commands, resolveCliArgv }] = await Promise.all([
 		import("@oh-my-pi/pi-utils/cli"),
 		import("./cli-commands"),
