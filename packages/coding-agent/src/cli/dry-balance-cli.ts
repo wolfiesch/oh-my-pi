@@ -187,6 +187,8 @@ type DryBalanceBenchTarget =
 			ok: true;
 			account: string;
 			accessToken: string;
+			projectId?: string;
+			email?: string;
 			credentialId?: number;
 	  }
 	| {
@@ -234,6 +236,22 @@ function getBenchTargetKey(access: {
 		(access.credentialId === undefined ? access.accessToken : `credential:${access.credentialId}`) ??
 		"(unknown oauth account)"
 	);
+}
+
+function usesCloudCodeAssistCredentialEnvelope(provider: string): boolean {
+	return provider === "google-antigravity" || provider === "google-gemini-cli";
+}
+
+function formatBenchApiKey(
+	provider: string,
+	credential: { accessToken: string; projectId?: string; email?: string },
+): string {
+	if (!usesCloudCodeAssistCredentialEnvelope(provider)) return credential.accessToken;
+	return JSON.stringify({
+		token: credential.accessToken,
+		projectId: credential.projectId,
+		email: credential.email,
+	});
 }
 
 function sanitizeBenchText(text: string, width: number): string {
@@ -391,17 +409,22 @@ async function runBenchRequest(
 	streamFn: DryBalanceStreamSimple,
 	now: () => number,
 ): Promise<DryBalanceBenchResult> {
-	const { account, accessToken, credentialId } = target;
+	const { account, accessToken, credentialId, projectId, email } = target;
 	const startedAt = now();
 	let firstTokenAt: number | undefined;
 	// Re-mint the cached token on a 401: a peer/broker may have rotated it out
 	// from under our snapshot (Anthropic rotates refresh tokens on every use).
 	// The bench measures one account, so the switch step intentionally declines.
 	const apiKey: ApiKeyResolver = async ({ lastChance, error }) => {
-		if (error === undefined) return accessToken;
+		if (error === undefined) return formatBenchApiKey(model.provider, { accessToken, projectId, email });
 		if (lastChance || credentialId === undefined || !authStorage.forceRefreshCredentialById) return undefined;
 		const refreshed = await authStorage.forceRefreshCredentialById(credentialId);
-		return refreshed.credential.type === "oauth" ? refreshed.credential.access : undefined;
+		if (refreshed.credential.type !== "oauth") return undefined;
+		return formatBenchApiKey(model.provider, {
+			accessToken: refreshed.credential.access,
+			projectId: refreshed.credential.projectId,
+			email: refreshed.credential.email,
+		});
 	};
 	try {
 		const context: Context = {
@@ -480,7 +503,14 @@ async function resolveBenchTargets(
 		seen.add(key);
 		const account = extractAccount(entry);
 		if (entry.ok) {
-			targets.push({ ok: true, account, accessToken: entry.accessToken, credentialId: entry.credentialId });
+			targets.push({
+				ok: true,
+				account,
+				accessToken: entry.accessToken,
+				projectId: entry.projectId,
+				email: entry.email,
+				credentialId: entry.credentialId,
+			});
 		} else {
 			targets.push({ ok: false, account, error: entry.error });
 		}

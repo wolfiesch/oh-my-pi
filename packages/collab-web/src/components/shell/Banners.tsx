@@ -4,11 +4,12 @@ import type { ConnectionPhase } from "../../lib/client";
 export interface BannersProps {
 	phase: ConnectionPhase;
 	endedReason: string | null;
+	autoReconnecting?: boolean;
 	onRejoin(): void;
 	onNewLink(): void;
 }
 
-export function Banners({ phase, endedReason, onRejoin, onNewLink }: BannersProps): ReactNode {
+export function Banners({ phase, endedReason, autoReconnecting = false, onRejoin, onNewLink }: BannersProps): ReactNode {
 	if (phase === "connecting" || phase === "waiting") {
 		return (
 			<div className="sh-banner" role="status">
@@ -31,6 +32,7 @@ export function Banners({ phase, endedReason, onRejoin, onNewLink }: BannersProp
 				<div className="sh-ended-card">
 					<div className="sh-ended-title">session ended</div>
 					{endedReason && <div className="sh-ended-reason">{endedReason}</div>}
+					{autoReconnecting && <div className="sh-ended-reason">Reconnecting…</div>}
 					<div className="sh-ended-actions">
 						<button type="button" className="sh-btn sh-btn-primary" onClick={onRejoin}>
 							Rejoin

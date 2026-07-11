@@ -1,5 +1,6 @@
 import * as os from "node:os";
 import { scheduler } from "node:timers/promises";
+import { resolveCodexClientVersion } from "@oh-my-pi/pi-catalog/discovery/codex";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import {
 	CODEX_BASE_URL,
@@ -1202,7 +1203,7 @@ async function buildCodexRequestContext(
 	const url = resolveCodexResponsesUrl(baseUrl);
 	const promptCacheKey = normalizeOpenAIPromptCacheKey(options?.promptCacheKey ?? options?.sessionId);
 	const transportSessionId = normalizeOpenAIPromptCacheKey(options?.sessionId);
-	const codexClientVersion = CODEX_CLIENT_VERSION;
+	const codexClientVersion = await resolveCodexClientVersion(undefined, options?.fetch ?? fetch, options?.signal);
 	const transformedBody = await buildTransformedCodexRequestBody(model, context, options, promptCacheKey);
 
 	const requestHeaders = { ...(model.headers ?? {}), ...(options?.headers ?? {}) };
@@ -2566,7 +2567,7 @@ export async function prewarmOpenAICodexResponses(
 		transportSessionId ?? crypto.randomUUID(),
 		providerSessionState,
 	);
-	const codexClientVersion = CODEX_CLIENT_VERSION;
+	const codexClientVersion = await resolveCodexClientVersion(undefined, fetch, options?.signal);
 	const requestIdentity = createCodexCompatibilityIdentity(metadataSession);
 	const headers = logger.time(
 		"prewarmCodex:createHeaders",

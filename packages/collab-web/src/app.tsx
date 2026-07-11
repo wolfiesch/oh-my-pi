@@ -8,13 +8,15 @@ import { ConnectScreen } from "./components/shell/ConnectScreen";
 import { HeaderBar } from "./components/shell/HeaderBar";
 import { Toasts } from "./components/shell/Toasts";
 import { Transcript } from "./components/transcript/Transcript";
-import { GuestClient } from "./lib/client";
+import { GuestClient, type ConnectionPhase } from "./lib/client";
 import { useGuestSnapshot } from "./lib/use-guest";
 import type { ToolRenderHost } from "./tool-render";
 import "./components/shell/shell.css";
 
 const NAME_KEY = "omp.collab.name";
 const LAST_LINK_KEY = "omp.collab.lastLink";
+const CURRENT_ROOM_PATH = "/current-room.json";
+const AUTO_RECOVERY_DELAYS_MS = [2_000, 4_000, 8_000, 15_000] as const;
 
 interface BeforeInstallPromptChoice {
 	outcome: "accepted" | "dismissed";
@@ -38,6 +40,10 @@ interface Creds {
 	name: string;
 }
 
+interface CurrentRoomFile {
+	link?: unknown;
+}
+
 function storedName(): string {
 	try {
 		return localStorage.getItem(NAME_KEY) ?? "guest";
@@ -53,6 +59,47 @@ function storedLastLink(): string | null {
 	} catch {
 		return null;
 	}
+}
+
+function currentRoomLinkOf(value: unknown): string | null {
+	if (!value || typeof value !== "object") return null;
+	const link = (value as CurrentRoomFile).link;
+	return typeof link === "string" && link.trim() ? link.trim() : null;
+}
+
+async function fetchCurrentRoomLink(signal: AbortSignal): Promise<string | null> {
+	try {
+		const response = await fetch(CURRENT_ROOM_PATH, { cache: "no-store", signal });
+		if (!response.ok) return null;
+		return currentRoomLinkOf(await response.json());
+	} catch {
+		return null;
+	}
+}
+
+function onClientEndsBeforeLive(client: GuestClient, listener: () => void): () => void {
+	let done = false;
+	let unsubscribe = (): void => {};
+	const check = (): void => {
+		if (done) return;
+		const phase = client.getSnapshot().phase;
+		if (phase === "live") {
+			done = true;
+			unsubscribe();
+			return;
+		}
+		if (phase === "ended") {
+			done = true;
+			unsubscribe();
+			listener();
+		}
+	};
+	unsubscribe = client.subscribe(check);
+	check();
+	return () => {
+		done = true;
+		unsubscribe();
+	};
 }
 
 function isStandaloneDisplay(): boolean {
@@ -109,17 +156,33 @@ function usePwaInstall(): PwaInstallState {
 
 export function App(): ReactNode {
 	const [client, setClient] = useState<GuestClient | null>(null);
+	const [clientPhase, setClientPhase] = useState<ConnectionPhase | null>(null);
 	const [connectError, setConnectError] = useState<string | null>(null);
+	const [autoReconnecting, setAutoReconnecting] = useState(false);
+	const clientRef = useRef<GuestClient | null>(null);
+	const connectAttemptRef = useRef(0);
 	const credsRef = useRef<Creds | null>(null);
+	const explicitLeaveRef = useRef(false);
+	const rejoinAbortRef = useRef<AbortController | null>(null);
 	const install = usePwaInstall();
+	useEffect(() => {
+		if ("serviceWorker" in navigator) {
+			void navigator.serviceWorker.register("/sw.js").catch(() => {});
+		}
+	}, []);
 
-	const connect = useCallback((link: string, name: string): void => {
+	const connect = useCallback((link: string, name: string): GuestClient | null => {
+		rejoinAbortRef.current?.abort();
+		rejoinAbortRef.current = null;
+		explicitLeaveRef.current = false;
+		setAutoReconnecting(false);
+		connectAttemptRef.current += 1;
 		let next: GuestClient;
 		try {
 			next = new GuestClient(link, name);
 		} catch (err) {
 			setConnectError(err instanceof Error ? err.message : String(err));
-			return;
+			return null;
 		}
 		next.connect();
 		try {
@@ -129,15 +192,24 @@ export function App(): ReactNode {
 			// storage unavailable (private mode) — non-fatal
 		}
 		credsRef.current = { link, name };
+		clientRef.current = next;
 		window.location.hash = link;
 		setConnectError(null);
 		setClient(prev => {
 			prev?.close();
 			return next;
 		});
+		return next;
 	}, []);
 
 	const leave = useCallback((): void => {
+		explicitLeaveRef.current = true;
+		rejoinAbortRef.current?.abort();
+		rejoinAbortRef.current = null;
+		connectAttemptRef.current += 1;
+		setAutoReconnecting(false);
+		setClientPhase(null);
+		clientRef.current = null;
 		setClient(prev => {
 			prev?.close();
 			return null;
@@ -145,10 +217,94 @@ export function App(): ReactNode {
 		history.replaceState(null, "", window.location.pathname + window.location.search);
 	}, []);
 
-	const rejoin = useCallback((): void => {
-		const creds = credsRef.current;
-		if (creds) connect(creds.link, creds.name);
+	const rejoin = useCallback(async (): Promise<void> => {
+		rejoinAbortRef.current?.abort();
+		const abort = new AbortController();
+		rejoinAbortRef.current = abort;
+		const expectedClient = clientRef.current;
+		const expectedAttempt = connectAttemptRef.current;
+		const name = credsRef.current?.name ?? storedName();
+
+		const liveLink = await fetchCurrentRoomLink(abort.signal);
+		if (rejoinAbortRef.current === abort) rejoinAbortRef.current = null;
+		if (abort.signal.aborted || clientRef.current !== expectedClient || connectAttemptRef.current !== expectedAttempt) return;
+
+		const link = liveLink ?? credsRef.current?.link ?? storedLastLink();
+		if (link) connect(link, name);
 	}, [connect]);
+
+	useEffect(() => {
+		return () => {
+			rejoinAbortRef.current?.abort();
+		};
+	}, []);
+
+	useEffect(() => {
+		if (!client) {
+			setClientPhase(null);
+			return;
+		}
+		const updatePhase = (): void => {
+			setClientPhase(client.getSnapshot().phase);
+		};
+		updatePhase();
+		return client.subscribe(updatePhase);
+	}, [client]);
+
+	useEffect(() => {
+		if (!client || clientPhase !== "ended" || client.getSnapshot().phase !== "ended" || explicitLeaveRef.current) {
+			setAutoReconnecting(false);
+			return;
+		}
+
+		const expectedClient = client;
+		const expectedAttempt = connectAttemptRef.current;
+		const deadLink = (credsRef.current?.link ?? storedLastLink())?.trim() ?? null;
+		const name = credsRef.current?.name ?? storedName();
+		let cancelled = false;
+		let timer: ReturnType<typeof setTimeout> | null = null;
+		let abort: AbortController | null = null;
+		let delayIndex = 0;
+
+		const stale = (): boolean =>
+			cancelled ||
+			explicitLeaveRef.current ||
+			clientRef.current !== expectedClient ||
+			connectAttemptRef.current !== expectedAttempt;
+
+		async function poll(): Promise<void> {
+			if (stale()) return;
+			abort = new AbortController();
+			const link = await fetchCurrentRoomLink(abort.signal);
+			abort = null;
+			if (stale()) return;
+			if (link && link !== deadLink) {
+				connect(link, name);
+				return;
+			}
+			scheduleNext();
+		}
+
+		function scheduleNext(): void {
+			if (stale()) return;
+			const delay = AUTO_RECOVERY_DELAYS_MS[Math.min(delayIndex, AUTO_RECOVERY_DELAYS_MS.length - 1)];
+			delayIndex += 1;
+			timer = setTimeout(() => {
+				timer = null;
+				void poll();
+			}, delay);
+		}
+
+		setAutoReconnecting(true);
+		scheduleNext();
+
+		return () => {
+			cancelled = true;
+			if (timer !== null) clearTimeout(timer);
+			abort?.abort();
+			setAutoReconnecting(false);
+		};
+	}, [client, clientPhase, connect]);
 
 	// Visual Viewport: adjust app height to fit screen space when mobile keyboard opens.
 	useEffect(() => {
@@ -171,10 +327,67 @@ export function App(): ReactNode {
 	}, []);
 
 	// Deep link: a page load with a hash auto-connects. Installed/standalone launches
-	// start at `/`, so fall back to the last successful collab link for app-like use.
+	// start at `/`, so use the last successful collab link first. If that cached
+	// room is gone, ask the same-origin Sentry bridge for the current room.
 	useEffect(() => {
-		const link = hashLink() ?? storedLastLink();
-		if (link) connect(link, storedName());
+		const name = storedName();
+		const initialHashLink = hashLink();
+		const initialAttempt = connectAttemptRef.current;
+		if (initialHashLink) {
+			connect(initialHashLink, name);
+			return;
+		}
+
+		const abort = new AbortController();
+		let cancelled = false;
+		let stopWatchingStored: (() => void) | undefined;
+
+		const connectCurrentRoom = async (expectedClient: GuestClient | null, expectedAttempt: number): Promise<void> => {
+			const link = await fetchCurrentRoomLink(abort.signal);
+			if (cancelled || clientRef.current !== expectedClient || connectAttemptRef.current !== expectedAttempt) return;
+			if (link) {
+				connect(link, name);
+				return;
+			}
+			if (expectedClient) {
+				clientRef.current = null;
+				setClient(prev => {
+					if (prev !== expectedClient) return prev;
+					prev.close();
+					return null;
+				});
+				history.replaceState(null, "", window.location.pathname + window.location.search);
+			}
+		};
+
+		const stored = storedLastLink();
+		if (!stored) {
+			void connectCurrentRoom(null, initialAttempt);
+			return () => {
+				cancelled = true;
+				abort.abort();
+			};
+		}
+
+		const storedClient = connect(stored, name);
+		if (!storedClient) {
+			void connectCurrentRoom(null, connectAttemptRef.current);
+			return () => {
+				cancelled = true;
+				abort.abort();
+			};
+		}
+
+		const storedAttempt = connectAttemptRef.current;
+
+		stopWatchingStored = onClientEndsBeforeLive(storedClient, () => {
+			void connectCurrentRoom(storedClient, storedAttempt);
+		});
+		return () => {
+			cancelled = true;
+			abort.abort();
+			stopWatchingStored?.();
+		};
 	}, [connect]);
 
 	useEffect(() => {
@@ -196,6 +409,7 @@ export function App(): ReactNode {
 	return (
 		<Session
 			client={client}
+			autoReconnecting={autoReconnecting}
 			installAvailable={install.available}
 			onInstall={install.prompt}
 			onLeave={leave}
@@ -206,13 +420,14 @@ export function App(): ReactNode {
 
 interface SessionProps {
 	client: GuestClient;
+	autoReconnecting: boolean;
 	installAvailable: boolean;
 	onInstall(): void;
 	onLeave(): void;
 	onRejoin(): void;
 }
 
-function Session({ client, installAvailable, onInstall, onLeave, onRejoin }: SessionProps): ReactNode {
+function Session({ client, autoReconnecting, installAvailable, onInstall, onLeave, onRejoin }: SessionProps): ReactNode {
 	const snap = useGuestSnapshot(client);
 	const [railOpen, setRailOpen] = useState(false);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -300,7 +515,13 @@ function Session({ client, installAvailable, onInstall, onLeave, onRejoin }: Ses
 					/>
 				</>
 			)}
-			<Banners phase={snap.phase} endedReason={snap.endedReason} onRejoin={onRejoin} onNewLink={onLeave} />
+			<Banners
+				phase={snap.phase}
+				endedReason={snap.endedReason}
+				autoReconnecting={autoReconnecting}
+				onRejoin={onRejoin}
+				onNewLink={onLeave}
+			/>
 			<Toasts notices={snap.notices} />
 		</div>
 	);

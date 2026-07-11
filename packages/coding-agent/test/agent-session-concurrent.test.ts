@@ -12,6 +12,7 @@ import type { AssistantMessage, Message, ToolCall } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import * as piNatives from "@oh-my-pi/pi-natives";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -1104,6 +1105,26 @@ describe("AgentSession TTSR resume gate", () => {
 		};
 	}
 
+	function makeToolCallMessage(toolCalls: ToolCall[]): AssistantMessage {
+		return {
+			role: "assistant",
+			content: toolCalls,
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "mock",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		};
+	}
+
 	function pushContinuationStream(stream: AssistantMessageEventStream, onComplete: () => void): void {
 		queueMicrotask(() => {
 			const partial = makeMsg("");
@@ -2108,5 +2129,322 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(session.model?.id).toBe(codexModel.id);
 		expect(session.isStreaming).toBe(false);
 		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
+	});
+	it("defers native AST matching for interleaved edit/write deltas until each distinct completed call", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const partialDeltasHandled = Promise.withResolvers<void>();
+		const releaseCompletions = Promise.withResolvers<void>();
+		let digestCallsBeforeCompletion = 0;
+		let streamCallCount = 0;
+		const executedToolNames: string[] = [];
+		const sourceDigest = (args: unknown): string | undefined => {
+			if (!args || typeof args !== "object") return undefined;
+			const candidate = "input" in args ? args.input : "content" in args ? args.content : undefined;
+			return typeof candidate === "string" ? candidate : undefined;
+		};
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "never",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		const astEditRule: Rule = {
+			name: "ast-edit-console-log",
+			path: "/tmp/ast-edit-console-log.md",
+			content: "Do not leave console logging in edits.",
+			astCondition: ["($X as { $$$BODY }).$PROP"],
+			scope: ["tool:edit(*.ts)"],
+			_source: { provider: "test", providerName: "test", path: "/tmp/ast-edit-console-log.md", level: "project" },
+		};
+		const astWriteRule: Rule = {
+			name: "ast-write-console-log",
+			path: "/tmp/ast-write-console-log.md",
+			content: "Do not leave console logging in writes.",
+			astCondition: ["($X as { $$$BODY }).$PROP"],
+			scope: ["tool:write(*.ts)"],
+			_source: { provider: "test", providerName: "test", path: "/tmp/ast-write-console-log.md", level: "project" },
+		};
+		ttsrManager.addRule(astEditRule);
+		ttsrManager.addRule(astWriteRule);
+		const astMatchSpy = vi.spyOn(piNatives, "astMatch");
+
+		const editCall: ToolCall = {
+			type: "toolCall",
+			id: "call_ast_edit",
+			name: "edit",
+			arguments: { path: "src/edit-target.ts", input: "const edit = (value as { content: unknown }).content;" },
+		};
+		const writeCall: ToolCall = {
+			type: "toolCall",
+			id: "call_ast_write",
+			name: "write",
+			arguments: { path: "src/write-target.ts", content: "const written = (value as { content: unknown }).content;" },
+		};
+		const partial = makeToolCallMessage([
+			{ ...editCall, arguments: { path: "src/edit-target.ts", input: "const edit = (value" } },
+			{ ...writeCall, arguments: { path: "src/write-target.ts", content: "const written = (value" } },
+		]);
+		const tools: AgentTool[] = [
+			{
+				name: "edit",
+				label: "Edit",
+				description: "Test edit tool",
+				parameters: type({ path: "string", input: "string" }),
+				matcherDigest: args => {
+					if (++digestCallsBeforeCompletion === 4) partialDeltasHandled.resolve();
+					return sourceDigest(args);
+				},
+				execute: async () => {
+					executedToolNames.push("edit");
+					return { content: [{ type: "text" as const, text: "edit applied" }] };
+				},
+			},
+			{
+				name: "write",
+				label: "Write",
+				description: "Test write tool",
+				parameters: type({ path: "string", content: "string" }),
+				matcherDigest: args => {
+					if (++digestCallsBeforeCompletion === 4) partialDeltasHandled.resolve();
+					return sourceDigest(args);
+				},
+				execute: async () => {
+					executedToolNames.push("write");
+					return { content: [{ type: "text" as const, text: "write applied" }] };
+				},
+			},
+		];
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools },
+			streamFn: () => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(async () => {
+					if (streamCallCount === 1) {
+						stream.push({ type: "start", partial });
+						stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+						stream.push({ type: "toolcall_start", contentIndex: 1, partial });
+						stream.push({ type: "toolcall_delta", contentIndex: 0, delta: "const edit", partial });
+						stream.push({ type: "toolcall_delta", contentIndex: 1, delta: "const written", partial });
+						stream.push({ type: "toolcall_delta", contentIndex: 0, delta: " = (value", partial });
+						stream.push({ type: "toolcall_delta", contentIndex: 1, delta: " = (value", partial });
+						await releaseCompletions.promise;
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: editCall, partial });
+						stream.push({ type: "toolcall_end", contentIndex: 1, toolCall: writeCall, partial });
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: editCall, partial });
+						stream.push({ type: "done", reason: "toolUse", message: makeToolCallMessage([editCall, writeCall]) });
+					} else {
+						const done = makeMsg("complete");
+						stream.push({ type: "start", partial: done });
+						stream.push({ type: "done", reason: "stop", message: done });
+					}
+				});
+				return stream;
+			},
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-ast-stream.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir, "models.yml")),
+			ttsrManager,
+		});
+
+		const prompt = session.prompt("Apply the edits");
+		await partialDeltasHandled.promise;
+		expect(astMatchSpy).not.toHaveBeenCalled();
+		releaseCompletions.resolve();
+		await prompt;
+
+		expect(astMatchSpy).toHaveBeenCalledTimes(2);
+		expect(astMatchSpy.mock.calls.map(([request]) => request.source)).toEqual([
+			"const edit = (value as { content: unknown }).content;",
+			"const written = (value as { content: unknown }).content;",
+		]);
+		expect((await Promise.all(astMatchSpy.mock.results.map(result => result.value as Promise<{ totalMatches: number }>))).map(result => result.totalMatches)).toEqual([
+			1,
+			1,
+		]);
+		expect(executedToolNames).toEqual(["edit", "write"]);
+		expect(ttsrManager.getInjectedRuleNames().sort()).toEqual(["ast-edit-console-log", "ast-write-console-log"]);
+	});
+
+	it("runs malformed completed AST payloads once without a per-delta matcher flood", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const partialDeltasHandled = Promise.withResolvers<void>();
+		const releaseCompletion = Promise.withResolvers<void>();
+		let digestCalls = 0;
+		let streamCallCount = 0;
+		const ttsrManager = new TtsrManager({ enabled: true, contextMode: "discard", interruptMode: "never", repeatMode: "once", repeatGap: 10 });
+		ttsrManager.addRule({
+			name: "malformed-ast-payload",
+			path: "/tmp/malformed-ast-payload.md",
+			content: "Malformed source should be diagnosed once.",
+			astCondition: ["($X as { $$$BODY }).$PROP"],
+			scope: ["tool:edit(*.ts)"],
+			_source: { provider: "test", providerName: "test", path: "/tmp/malformed-ast-payload.md", level: "project" },
+		});
+		const astMatchSpy = vi.spyOn(piNatives, "astMatch");
+		const malformedCall: ToolCall = {
+			type: "toolCall",
+			id: "call_malformed_ast",
+			name: "edit",
+			arguments: { path: "src/broken.ts", input: "export function broken( { return 1; }" },
+		};
+		const partial = makeToolCallMessage([
+			{ ...malformedCall, arguments: { path: "src/broken.ts", input: "export function" } },
+		]);
+		const tool: AgentTool = {
+			name: "edit",
+			label: "Edit",
+			description: "Test edit tool",
+			parameters: type({ path: "string", input: "string" }),
+			matcherDigest: args => {
+				if (!args || typeof args !== "object" || !("input" in args) || typeof args.input !== "string") return undefined;
+				if (++digestCalls === 3) partialDeltasHandled.resolve();
+				return args.input;
+			},
+			execute: async () => ({ content: [{ type: "text" as const, text: "edit applied" }] }),
+		};
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [tool] },
+			streamFn: () => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(async () => {
+					if (streamCallCount === 1) {
+						stream.push({ type: "start", partial });
+						stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+						stream.push({ type: "toolcall_delta", contentIndex: 0, delta: "export function", partial });
+						stream.push({ type: "toolcall_delta", contentIndex: 0, delta: " broken(", partial });
+						stream.push({ type: "toolcall_delta", contentIndex: 0, delta: " { return 1; }", partial });
+						await releaseCompletion.promise;
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: malformedCall, partial });
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: malformedCall, partial });
+						stream.push({ type: "done", reason: "toolUse", message: makeToolCallMessage([malformedCall]) });
+					} else {
+						const done = makeMsg("complete");
+						stream.push({ type: "start", partial: done });
+						stream.push({ type: "done", reason: "stop", message: done });
+					}
+				});
+				return stream;
+			},
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-malformed-ast.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir, "models.yml")),
+			ttsrManager,
+		});
+
+		const prompt = session.prompt("Attempt the malformed edit");
+		await partialDeltasHandled.promise;
+		expect(astMatchSpy).not.toHaveBeenCalled();
+		releaseCompletion.resolve();
+		await prompt;
+
+		expect(astMatchSpy).toHaveBeenCalledTimes(1);
+		expect(astMatchSpy.mock.calls[0]?.[0].source).toBe("export function broken( { return 1; }");
+	});
+
+	it("continues matching regex TTSR conditions on edit argument deltas", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const deltaMatched = Promise.withResolvers<void>();
+		const releaseCompletion = Promise.withResolvers<void>();
+		let streamCallCount = 0;
+		const ttsrManager = new TtsrManager({ enabled: true, contextMode: "discard", interruptMode: "never", repeatMode: "once", repeatGap: 10 });
+		ttsrManager.addRule({
+			name: "streaming-regex",
+			path: "/tmp/streaming-regex.md",
+			content: "The regex rule must match while arguments are still streaming.",
+			condition: ["STREAMING_REGEX_SENTINEL"],
+			scope: ["tool:edit(*.ts)"],
+			_source: { provider: "test", providerName: "test", path: "/tmp/streaming-regex.md", level: "project" },
+		});
+		const originalCheckDelta = ttsrManager.checkDelta.bind(ttsrManager);
+		vi.spyOn(ttsrManager, "checkDelta").mockImplementation((delta, context) => {
+			const matches = originalCheckDelta(delta, context);
+			if (matches.some(rule => rule.name === "streaming-regex")) deltaMatched.resolve();
+			return matches;
+		});
+		const editCall: ToolCall = {
+			type: "toolCall",
+			id: "call_streaming_regex",
+			name: "edit",
+			arguments: { path: "src/regex-target.ts", input: "complete source" },
+		};
+		const partial = makeToolCallMessage([editCall]);
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [
+					{
+						name: "edit",
+						label: "Edit",
+						description: "Test edit tool",
+						parameters: type({ path: "string", input: "string" }),
+						execute: async () => ({ content: [{ type: "text" as const, text: "edit applied" }] }),
+					},
+				],
+			},
+			streamFn: () => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(async () => {
+					if (streamCallCount === 1) {
+						stream.push({ type: "start", partial });
+						stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+						stream.push({ type: "toolcall_delta", contentIndex: 0, delta: "STREAMING_REGEX_SENTINEL", partial });
+						await releaseCompletion.promise;
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: editCall, partial });
+						stream.push({ type: "done", reason: "toolUse", message: makeToolCallMessage([editCall]) });
+					} else {
+						const done = makeMsg("complete");
+						stream.push({ type: "start", partial: done });
+						stream.push({ type: "done", reason: "stop", message: done });
+					}
+				});
+				return stream;
+			},
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-streaming-regex.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir, "models.yml")),
+			ttsrManager,
+		});
+
+		const prompt = session.prompt("Stream an edit");
+		await deltaMatched.promise;
+		expect(ttsrManager.getInjectedRuleNames()).toContain("streaming-regex");
+		releaseCompletion.resolve();
+		await prompt;
+		const reminder = agent.state.messages.find(
+			(message): message is Extract<typeof message, { role: "toolResult" }> => message.role === "toolResult",
+		);
+		const reminderText = Array.isArray(reminder?.content)
+			? reminder.content
+					.filter((content): content is { type: "text"; text: string } => content.type === "text")
+					.map(content => content.text)
+					.join("\n")
+			: "";
+		expect(reminderText).toContain('rule="streaming-regex"');
 	});
 });

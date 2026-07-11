@@ -1821,6 +1821,8 @@ export class AgentSession {
 	// TTSR manager for time-traveling stream rules
 	#ttsrManager: TtsrManager | undefined = undefined;
 	#pendingTtsrInjections: Rule[] = [];
+	/** Completed tool-call stream keys already submitted for AST matching this turn. */
+	#completedTtsrAstToolCalls = new Set<string>();
 	/** Per-tool TTSR rules whose `interruptMode` opted out of aborting the stream.
 	 *  These are folded into the matched tool call's `toolResult` content as an
 	 *  in-band system reminder, instead of spawning a separate follow-up turn. */
@@ -3715,6 +3717,7 @@ export class AgentSession {
 			this.#resetStreamingEditState();
 			// TTSR: Reset buffer on turn start
 			this.#ttsrManager?.resetBuffer();
+			this.#completedTtsrAstToolCalls.clear();
 		}
 
 		// TTSR: Increment message count on turn end (for repeat-after-gap tracking)
@@ -3773,17 +3776,27 @@ export class AgentSession {
 				if (matches.length > 0 && this.#handleTtsrMatches(matches, matchContext, targetMessageTimestamp)) {
 					return;
 				}
-				// ast-grep `astCondition` rules match against the reconstructed edit/write
-				// snapshot, which only exists for tool argument streams. The native worker
-				// call is async, so this path is awaited and self-throttled by the manager.
-				if (matchContext.source === "tool" && this.#ttsrManager?.hasAstRules()) {
-					const astMatches = await this.#checkTtsrAstStream(matchContext, streamingToolCall);
-					if (astMatches.length > 0 && this.#handleTtsrMatches(astMatches, matchContext, targetMessageTimestamp)) {
-						return;
-					}
-				}
 			}
 		}
+
+		// Regex conditions remain incremental, but AST matching must only see the
+		// completed edit/write payload. `toolcall_end.toolCall` is the provider's
+		// finalized call; using it here avoids parsing or caching partial digests
+		// from preceding `toolcall_delta` snapshots.
+		if (
+			event.type === "message_update" &&
+			event.assistantMessageEvent.type === "toolcall_end" &&
+			this.#ttsrManager?.hasAstRules()
+		) {
+			const assistantEvent = event.assistantMessageEvent;
+			const matchContext = this.#getTtsrToolMatchContext(assistantEvent.toolCall, assistantEvent.contentIndex);
+			const targetMessageTimestamp = event.message.role === "assistant" ? event.message.timestamp : undefined;
+			const astMatches = await this.#checkTtsrAstToolCall(matchContext, assistantEvent.toolCall);
+			if (astMatches.length > 0 && this.#handleTtsrMatches(astMatches, matchContext, targetMessageTimestamp)) {
+				return;
+			}
+		}
+
 
 		if (
 			event.type === "message_update" &&
@@ -4660,7 +4673,7 @@ export class AgentSession {
 		return block as ToolCall;
 	}
 
-	/** Build TTSR match context for tool call argument deltas. */
+	/** Build TTSR match context for a streaming or completed tool call. */
 	#getTtsrToolMatchContext(toolCall: ToolCall | undefined, contentIndex: number): TtsrMatchContext {
 		const context: TtsrMatchContext = { source: "tool" };
 		if (!toolCall) {
@@ -4768,19 +4781,24 @@ export class AgentSession {
 	}
 
 	/**
-	 * Match ast-grep `astCondition` rules against the reconstructed tool snapshot.
+	 * Match ast-grep `astCondition` rules against a completed tool call.
 	 *
-	 * Only edit/write tool streams expose a `matcherDigest`, which is the real source
-	 * the call introduces; AST matching needs that (and a language inferred from the
-	 * path argument), so non-digest streams never produce AST matches.
+	 * Only edit/write tools expose a `matcherDigest`, which reconstructs the source
+	 * introduced by the finalized arguments. AST matching never receives partial
+	 * argument snapshots; the language is inferred from the completed path argument.
 	 */
-	async #checkTtsrAstStream(matchContext: TtsrMatchContext, toolCall: ToolCall | undefined): Promise<Rule[]> {
+	async #checkTtsrAstToolCall(matchContext: TtsrMatchContext, toolCall: ToolCall): Promise<Rule[]> {
 		const manager = this.#ttsrManager;
 		if (!manager) {
 			return [];
 		}
+		const completionKey = matchContext.streamKey;
+		if (completionKey && this.#completedTtsrAstToolCalls.has(completionKey)) {
+			return [];
+		}
 		const entries = this.#resolveTtsrMatcherEntries(toolCall);
 		if (entries) {
+			if (completionKey) this.#completedTtsrAstToolCalls.add(completionKey);
 			const matches: Rule[] = [];
 			for (const entry of entries) {
 				matches.push(
@@ -4792,6 +4810,11 @@ export class AgentSession {
 		const digest = this.#resolveTtsrMatcherDigest(toolCall);
 		if (digest === undefined) {
 			return [];
+		}
+		// Claim before the async native call so duplicated/racing completion events
+		// cannot submit the same tool call twice. Distinct tool-call IDs remain isolated.
+		if (completionKey) {
+			this.#completedTtsrAstToolCalls.add(completionKey);
 		}
 		return manager.checkAstSnapshot(digest, matchContext);
 	}

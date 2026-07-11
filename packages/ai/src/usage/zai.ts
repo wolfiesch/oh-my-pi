@@ -19,6 +19,8 @@ const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 const WEEK_MS = 7 * DAY_MS;
 const MONTH_MS = 30 * DAY_MS;
+const FIVE_HOURS_MS = 5 * HOUR_MS;
+const THIRTY_DAYS_MS = 30 * DAY_MS;
 
 interface ZaiUsageDetail {
 	modelCode?: string;
@@ -36,12 +38,12 @@ function normalizeZaiBaseUrl(baseUrl?: string): string {
 
 interface ZaiUsageLimitItem {
 	type?: string;
+	unit?: number;
 	usage?: number;
 	currentValue?: number;
 	percentage?: number;
 	remaining?: number;
 	nextResetTime?: number;
-	unit?: number;
 	number?: number;
 	usageDetails?: ZaiUsageDetail[];
 }
@@ -86,8 +88,8 @@ function parseLimitItem(value: unknown): ZaiUsageLimitItem | null {
 		currentValue: toNumber(value.currentValue),
 		percentage: toNumber(value.percentage),
 		remaining: toNumber(value.remaining),
-		nextResetTime: parseMillis(value.nextResetTime),
 		unit: toNumber(value.unit),
+		nextResetTime: parseMillis(value.nextResetTime),
 		number: toNumber(value.number),
 		usageDetails: parseUsageDetails(value.usageDetails),
 	};
@@ -191,6 +193,19 @@ function buildModelUsageUrl(baseUrl: string, now: Date): string {
 	return `${baseUrl}${MODEL_USAGE_PATH}?startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}`;
 }
 
+function tokenWindowForUnit(unit: number | undefined): UsageWindow & { scopeId: string } {
+	if (unit === 3) {
+		return { id: "5h", scopeId: "5h", label: "5h", durationMs: FIVE_HOURS_MS };
+	}
+	if (unit === 6) {
+		return { id: "weekly", scopeId: "weekly", label: "Weekly", durationMs: SEVEN_DAYS_MS };
+	}
+	if (unit === 5) {
+		return { id: "monthly", scopeId: "monthly", label: "Monthly", durationMs: THIRTY_DAYS_MS };
+	}
+	return { id: `tokens-u${unit ?? "unknown"}`, scopeId: `tokens-u${unit ?? "unknown"}`, label: "Tokens", durationMs: SEVEN_DAYS_MS };
+}
+
 async function fetchZaiUsage(params: UsageFetchParams, ctx: UsageFetchContext): Promise<UsageReport | null> {
 	if (params.provider !== "zai") return null;
 	const credential = params.credential;
@@ -247,6 +262,7 @@ async function fetchZaiUsage(params: UsageFetchParams, ctx: UsageFetchContext): 
 				scope: {
 					provider: params.provider,
 					windowId: window.id,
+					tier: "tokens",
 					shared: true,
 				},
 				window,
@@ -269,6 +285,7 @@ async function fetchZaiUsage(params: UsageFetchParams, ctx: UsageFetchContext): 
 				scope: {
 					provider: params.provider,
 					windowId: window.id,
+					tier: "tools",
 					shared: true,
 				},
 				window,
