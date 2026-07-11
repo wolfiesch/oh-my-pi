@@ -48,6 +48,7 @@ export class SqliteDeviceRegistry implements DeviceRegistry {
     if (versionRow && Object.values(versionRow).some((value) => typeof value === "number" && value !== 0 && value !== 1)) throw new Error("unsupported device schema");
     this.database.run("CREATE TABLE IF NOT EXISTS devices(device_id TEXT PRIMARY KEY, identity_key TEXT NOT NULL, node_id TEXT NOT NULL, login TEXT NOT NULL, host_id TEXT NOT NULL, tailnet_ip TEXT NOT NULL, metadata TEXT NOT NULL, capabilities TEXT NOT NULL, created_at INTEGER NOT NULL, last_seen_at INTEGER, token_expires_at INTEGER NOT NULL DEFAULT 0, revoked_at INTEGER, epoch INTEGER NOT NULL, salt BLOB NOT NULL, token_digest BLOB NOT NULL)");
     try { this.database.run("ALTER TABLE devices ADD COLUMN token_expires_at INTEGER NOT NULL DEFAULT 0"); } catch {}
+    this.database.run("UPDATE devices SET token_expires_at=created_at+7776000000 WHERE token_expires_at=0");
     this.database.run("PRAGMA user_version=1");
   }
   get(deviceId: string): DeviceRecord | null { return this.read(this.database.query("SELECT * FROM devices WHERE device_id=?").get(deviceId)); }
