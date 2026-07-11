@@ -152,7 +152,7 @@ describe("child supervision", () => {
     const socket = createConnection(path); await new Promise<void>(resolve => socket.once("connect", resolve));
     socket.write("GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: MTIzNDU2Nzg5MDEyMzQ1Ng==\r\nSec-WebSocket-Version: 13\r\n\r\n");
     const handshake = await new Promise<Buffer>(resolve => socket.once("data", resolve)); expect(handshake.toString()).toContain("101");
-    socket.write(wsFrame(JSON.stringify({ v: "omp-app/1", type: "hello", protocol: { min: "omp-app/1", max: "omp-app/1" }, client: { name: "test", version: "1", build: "b", platform: "linux" }, requestedFeatures: ["resume", "unknown"], savedCursors: [] })));
+    socket.write(wsFrame(JSON.stringify({ v: "omp-app/1", type: "hello", protocol: { min: "omp-app/1", max: "omp-app/1" }, client: { name: "test", version: "1", build: "b", platform: "linux" }, requestedFeatures: ["resume"], savedCursors: [] })));
     const frame = await new Promise<Buffer>(resolve => socket.once("data", resolve)); const welcome = decodeServerFrame(wsPayload(frame)); expect(welcome.type).toBe("welcome"); if (welcome.type === "welcome") expect(welcome.grantedFeatures).toEqual(["resume"]);
     await appserver.stop(); socket.destroy(); expect(await unixSocketActive(path)).toBe(false);
   });

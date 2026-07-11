@@ -2,6 +2,12 @@ import { createHash } from "node:crypto";
 import { hostId, revision, type DurableEntry, type HostId, type SessionEvent, type SessionId, type SessionRef, type ServerFrame } from "@oh-my-pi/app-wire";
 import type { Projection, SessionRecord } from "./types.ts";
 
+function frameCursor(frame: ServerFrame): { epoch: string; seq: number } | undefined {
+  if (!("cursor" in frame) || !frame.cursor || typeof frame.cursor !== "object") return undefined;
+  const cursor = frame.cursor;
+  if (!("epoch" in cursor) || typeof cursor.epoch !== "string" || !("seq" in cursor) || typeof cursor.seq !== "number") return undefined;
+  return { epoch: cursor.epoch, seq: cursor.seq };
+}
 export class SessionProjection {
   readonly value: Projection;
   #byId = new Map<string, DurableEntry>();
@@ -39,8 +45,8 @@ export class SessionProjection {
   replay(cursor: { epoch: string; seq: number }): ServerFrame[] {
     if (cursor.epoch !== this.value.cursor.epoch) return [{ v: "omp-app/1", type: "gap", hostId: this.value.hostId, sessionId: this.value.sessionId, from: { epoch: this.value.cursor.epoch, seq: 0 }, to: this.value.cursor, reason: "epoch_mismatch" }, this.snapshot()];
     const oldest = this.value.ring[0];
-    const oldestSeq = oldest && "cursor" in oldest ? oldest.cursor.seq : this.value.cursor.seq + 1;
+    const oldestSeq = oldest ? (frameCursor(oldest)?.seq ?? this.value.cursor.seq + 1) : this.value.cursor.seq + 1;
     if (cursor.seq < oldestSeq - 1) return [{ v: "omp-app/1", type: "gap", hostId: this.value.hostId, sessionId: this.value.sessionId, from: { epoch: cursor.epoch, seq: cursor.seq + 1 }, to: this.value.cursor, reason: "ring_evicted" }, this.snapshot()];
-    return this.value.ring.filter(frame => "cursor" in frame && frame.cursor.seq > cursor.seq);
+    return this.value.ring.filter(frame => (frameCursor(frame)?.seq ?? 0) > cursor.seq);
   }
 }
