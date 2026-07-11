@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
 import { chmod, lstat, mkdir, rename, open, unlink, link, readFile } from "node:fs/promises";
 import { chmodSync, lstatSync, mkdirSync } from "node:fs";
@@ -107,6 +107,79 @@ export class SqlitePairingService implements PairingService {
   start(connectionId: string, allowedCapabilities: readonly Capability[], ttlMs = 120_000, issuer: PairingIssuer): PairStart { this.prune(); if (!safe(connectionId) || this.pending.size >= 5) throw new Error("pairing capacity reached"); const verified = this.registry.getAuthenticatedPrincipal(connectionId, issuer.deviceId); if (!verified || verified.epoch !== issuer.epoch || verified.identityKey !== issuer.identityKey) throw new Error("pairing issuer denied"); const code = digits(this.random, 6); const expiresAt = this.now() + Math.min(Math.max(ttlMs, 1), 120_000); this.pending.set(code, { issuerId: connectionId, issuer, code, expiresAt, allowed: caps(allowedCapabilities), attempts: 0 }); return { code, expiresAt }; }
   complete(connectionId: string, code: string, identity: RemotePeerIdentity, metadata: DeviceMetadata, requestedCapabilities: readonly Capability[], issuer: PairingIssuer) { this.prune(); const key = `${connectionId}:${issuer.deviceId}`; const now = this.now(); const bucket = this.failedAttempts.get(key); const attempts = bucket && bucket.expiresAt > now ? bucket.count + 1 : 1; this.failedAttempts.set(key, { count: attempts, expiresAt: now + 120_000 }); const verified = this.registry.getAuthenticatedPrincipal(connectionId, issuer.deviceId); const canonical = canonicalIdentity(identity); const match = [...this.pending.values()].find((entry) => { const left = Buffer.from(entry.code); const right = Buffer.from(code); return left.length === right.length && timingSafeEqual(left, right); }); if (!verified || verified.epoch !== issuer.epoch || verified.identityKey !== issuer.identityKey || canonical !== issuer.identityKey || !match || match.issuerId !== connectionId || match.expiresAt <= now || match.attempts >= 5 || attempts > 5 || match.issuer.deviceId !== issuer.deviceId || match.issuer.epoch !== issuer.epoch || match.issuer.identityKey !== issuer.identityKey) throw new Error("pairing denied"); match.attempts += 1; this.failedAttempts.delete(key); this.pending.delete(match.code); const granted = requestedCapabilities.filter((value) => match.allowed.includes(value) && isCapability(value)); const token = b64(this.random.bytes(32)); const deviceId = b64(this.random.bytes(12)); const tokenExpiresAt = now + 90 * 24 * 60 * 60 * 1000; this.registry.create({ deviceId, identityKey: canonical, capabilities: caps(granted), metadata, createdAt: now, lastSeenAt: now, tokenExpiresAt, revokedAt: null, epoch: 0 }, token); return { deviceId, token, tokenExpiresAt }; }
   private prune() { const now = this.now(); for (const [code, entry] of this.pending) if (entry.expiresAt <= now || entry.attempts >= 5) this.pending.delete(code); for (const [key, bucket] of this.failedAttempts) if (bucket.expiresAt <= now) this.failedAttempts.delete(key); while (this.failedAttempts.size > 2048) this.failedAttempts.delete(this.failedAttempts.keys().next().value ?? ""); }
+}
+export interface LocalPairingTicket {
+  readonly code: string;
+  readonly expiresAt: number;
+}
+export interface LocalPairingResult {
+  readonly deviceId: string;
+  readonly token: string;
+  readonly tokenExpiresAt: number;
+  readonly capabilities: readonly Capability[];
+}
+export class LocalPairingTicketIssuer {
+  private readonly key: Uint8Array;
+  private readonly pending = new Map<string, { digest: Buffer; expiresAt: number; nodeId?: string; allowed: readonly Capability[]; attempts: number }>();
+  private readonly failures = new Map<string, { count: number; blockedUntil: number }>();
+  private lastNow = Number.NEGATIVE_INFINITY;
+  constructor(
+    private readonly registry: DeviceRegistry,
+    key: Uint8Array,
+    private readonly clock: Clock = realClock,
+    private readonly random: Random = realRandom,
+  ) {
+    if (key.byteLength < 32) throw new Error("local pairing key is too short");
+    this.key = new Uint8Array(key);
+  }
+  private now(): number {
+    const value = this.clock.now();
+    if (!Number.isFinite(value)) throw new Error("clock invalid");
+    this.lastNow = Math.max(this.lastNow, value);
+    return this.lastNow;
+  }
+  issue(allowedCapabilities: readonly Capability[], ttlMs = 120_000, nodeId?: string): LocalPairingTicket {
+    const allowed = caps(allowedCapabilities);
+    if (allowed.length === 0 || !Number.isSafeInteger(ttlMs) || ttlMs <= 0 || ttlMs > 600_000 || (nodeId !== undefined && !safe(nodeId)))
+      throw new Error("local pairing ticket invalid");
+    const now = this.now();
+    const code = digits(this.random, 6);
+    const digest = createHmac("sha256", this.key).update("local-pair-code\0").update(code).digest();
+    this.pending.set(digest.toString("hex"), { digest, expiresAt: now + ttlMs, ...(nodeId ? { nodeId } : {}), allowed, attempts: 0 });
+    return { code, expiresAt: now + ttlMs };
+  }
+  consume(
+    code: string,
+    identity: RemotePeerIdentity,
+    deviceId: string,
+    metadata: DeviceMetadata,
+    requestedCapabilities: readonly Capability[],
+  ): LocalPairingResult {
+    if (!/^\d{6}$/u.test(code) || !safe(deviceId) || !safe(metadata.label)) throw new Error("pairing denied");
+    const now = this.now();
+    const failure = this.failures.get(identity.nodeId);
+    if (failure && failure.blockedUntil > now) throw new Error("pairing denied");
+    const expected = createHmac("sha256", this.key).update("local-pair-code\0").update(code).digest();
+    const match = [...this.pending.values()].find(entry => entry.digest.length === expected.length && timingSafeEqual(entry.digest, expected));
+    const denied = (): never => {
+      const count = (failure?.count ?? 0) + 1;
+      this.failures.set(identity.nodeId, { count, blockedUntil: count >= 5 ? now + 30_000 : now });
+      throw new Error("pairing denied");
+    };
+    if (!match || match.expiresAt <= now || (match.nodeId !== undefined && match.nodeId !== identity.nodeId) || match.attempts >= 5) return denied();
+    match.attempts += 1;
+    const requested = caps(requestedCapabilities);
+    const granted = requested.filter(capability => match.allowed.includes(capability));
+    if (granted.length === 0) return denied();
+    if (this.registry.get(deviceId)) return denied();
+    const token = b64(this.random.bytes(32));
+    const tokenExpiresAt = now + 90 * 24 * 60 * 60 * 1000;
+    const identityKey = JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]);
+    this.registry.create({ deviceId, identityKey, capabilities: granted, metadata, createdAt: now, lastSeenAt: now, tokenExpiresAt, revokedAt: null, epoch: 0 }, token);
+    this.pending.delete(match.digest.toString("hex"));
+    this.failures.delete(identity.nodeId);
+    return { deviceId, token, tokenExpiresAt, capabilities: granted };
+  }
 }
 
 export interface AuthorizationRequest { readonly principal: AuthenticatedPrincipal; readonly command: string; readonly capabilities: readonly Capability[]; readonly connectionId: string; readonly sessionId?: string; readonly revision?: string; readonly leaseId?: string; readonly confirmationId?: string; readonly args: Record<string, unknown>; }

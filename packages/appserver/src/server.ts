@@ -968,14 +968,28 @@ export class LocalAppserver implements AppserverHandle {
 					const connection = this.#remoteConnections.get(ws);
 					if (!connection || !this.#remotePolicy) throw new Error("remote connection is unavailable");
 					decision = await this.#remotePolicy.authenticate(connection, frame);
-					if (!decision.authenticated) {
+if (!decision.authenticated && decision.authentication !== "pairing-required") {
 						ws.close(1008, "remote authentication denied");
+						return;
+					}
 						return;
 					}
 					this.#remoteDecisions.set(ws, decision);
 				}
 				this.#hello.add(ws);
 				await this.hello(ws, frame, decision);
+				return;
+			}
+			if (frame.type === "pair.start") {
+				if (!this.#hello.has(ws) || !ws.remote) throw new Error("pairing requires remote hello");
+				const connection = this.#remoteConnections.get(ws);
+				if (!connection || !this.#remotePolicy?.pairStart) throw new Error("pairing unavailable");
+				const result = await this.#remotePolicy.pairStart(connection, frame);
+				if (!result) {
+					await this.#sendFrame(ws, { v: "omp-app/1", type: "pair.error", code: "pairing_denied", message: "pairing denied", requestId: frame.requestId });
+					return;
+				}
+				await this.#sendFrame(ws, result);
 				return;
 			}
 			if (!this.#hello.has(ws)) throw new Error("hello required before commands");
@@ -1187,6 +1201,7 @@ export class LocalAppserver implements AppserverHandle {
 			resumed: frame.savedCursors.some(cursor => cursor.hostId === this.hostId && cursor.cursor.epoch === this.epoch),
 		};
 		await this.#sendFrame(ws, welcome as ServerFrame);
+		if (decision?.authentication === "pairing-required") return;
 		await this.#sendFrame(ws, this.sessionsFrame());
 	}
 	#createLocalTransport(ws: LocalWs): AppWs {
