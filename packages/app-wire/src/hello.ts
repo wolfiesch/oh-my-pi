@@ -106,7 +106,7 @@ export function decodeWelcome(input: unknown): WelcomeFrame {
 	controlFree(frame.appserverVersion, "appserverVersion", 64);
 	controlFree(frame.appserverBuild, "appserverBuild", 128);
 	controlFree(frame.epoch, "epoch", 128);
-	const grantedCapabilities = decodeFeatureList(frame.grantedCapabilities, "grantedCapabilities");
+	const grantedCapabilities = decodeCapabilities({ client: frame.grantedCapabilities }, "grantedCapabilities").client;
 	const grantedFeatures = decodeNegotiatedFeatureList(frame.grantedFeatures, "grantedFeatures");
 	const negotiatedLimits = boundedMap(frame.negotiatedLimits, "negotiatedLimits");
 	if (typeof frame.resumed !== "boolean") fail("INVALID_FRAME", "resumed must be boolean", "resumed");

@@ -43,7 +43,7 @@ export interface SessionsFrame {
 	cursor: Cursor;
 	sessions: SessionRef[];
 }
-function decodeSession(value: unknown, path: string): SessionRef {
+export function decodeSessionRef(value: unknown, path: string): SessionRef {
 	const session = boundedMap(value, path);
 	hostId(session.hostId, `${path}.hostId`);
 	sessionId(session.sessionId, `${path}.sessionId`);
@@ -84,6 +84,6 @@ export function decodeSessions(input: unknown): SessionsFrame {
 	if (frame.type !== "sessions") fail("INVALID_FRAME", "expected sessions frame", "type");
 	const cursor = decodeCursor(frame.cursor);
 	const values = boundedArray(frame.sessions, "sessions");
-	for (let i = 0; i < values.length; i++) decodeSession(values[i], `sessions[${i}]`);
+	for (let i = 0; i < values.length; i++) decodeSessionRef(values[i], `sessions[${i}]`);
 	return { ...frame, cursor } as unknown as SessionsFrame;
 }

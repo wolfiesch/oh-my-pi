@@ -25,7 +25,7 @@ import { decodeEntry, type DurableEntry } from "./entry.ts";
 import { decodeCursor, type Cursor } from "./cursor.ts";
 import { hostId, revision, sessionId, type HostId, type Revision, type SessionId } from "./ids.ts";
 import { decodeBye, decodePing, decodePong, type ByeFrame, type PingFrame, type PongFrame } from "./heartbeat.ts";
-import { decodeAdditiveServerFrame, type AdditiveServerFrame } from "./additive.ts";
+import { decodeAdditiveServerFrame, decodeTerminalClient, type AdditiveServerFrame, type TerminalClientFrame } from "./additive.ts";
 export interface ErrorFrame {
 	v: typeof PROTOCOL_VERSION;
 	type: "error";
@@ -42,7 +42,7 @@ export interface DurableEntryFrame {
 	sessionId: SessionId;
 	entry: DurableEntry;
 }
-export type ClientFrame = HelloFrame | CommandFrame | ConfirmFrame | PairStartFrame | PingFrame;
+export type ClientFrame = HelloFrame | CommandFrame | ConfirmFrame | PairStartFrame | PingFrame | TerminalClientFrame;
 export type ServerFrame =
 	| WelcomeFrame
 	| SessionsFrame
@@ -98,6 +98,10 @@ export function decodeClientFrame(input: unknown): ClientFrame {
 			return decodePairing(frame) as PairStartFrame;
 		case "ping":
 			return decodePing(frame);
+		case "terminal.input":
+		case "terminal.resize":
+		case "terminal.close":
+			return decodeTerminalClient(frame);
 		default:
 			fail("UNKNOWN_FRAME", "unknown client frame family", "type");
 	}
