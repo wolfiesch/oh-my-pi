@@ -16,7 +16,7 @@ import {
 	type Revision,
 	type SessionId,
 } from "./ids.ts";
-import { boundedMap, controlFree, inputObject, string } from "./guards.ts";
+import { boundedMap, controlFree, deviceToken, inputObject, string } from "./guards.ts";
 import { PROTOCOL_VERSION } from "./limits.ts";
 export interface ConfirmationChallenge {
 	v: typeof PROTOCOL_VERSION;
@@ -131,7 +131,7 @@ export function decodePairing(input: unknown): PairingFrame {
 		const granted = decodeFeatureList(frame.grantedCapabilities, "grantedCapabilities");
 		decodeCapabilities({ client: granted });
 		controlFree(frame.deviceToken, "deviceToken", 512);
-		controlFree(frame.expiresAt, "expiresAt", 128);
+		deviceToken(frame.deviceToken, "deviceToken");
 		return frame as unknown as PairOkFrame;
 	}
 	if (frame.type === "pair.error") {

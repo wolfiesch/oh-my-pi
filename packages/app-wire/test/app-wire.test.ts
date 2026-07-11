@@ -37,6 +37,7 @@ describe("app-wire authority", () => {
 		const files = (await Array.fromAsync(new Bun.Glob("*.json").scan({ cwd: new URL(".", root).pathname }))).filter(name => !name.endsWith(".invalid.json")).sort();
 		const client = new Set([
 			"hello.json",
+			"hello-auth.json",
 			"command.json",
 			"confirmation.json",
 			"pair-start.json",
@@ -232,7 +233,7 @@ describe("app-wire authority", () => {
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
-		expect(APP_WIRE_VERSION).toBe("0.3.0");
+		expect(APP_WIRE_VERSION).toBe("0.4.0");
 	});
 	test("exported wire version matches package metadata", async () => {
 		const metadata = (await Bun.file(new URL("../package.json", import.meta.url)).json()) as { version: string };
@@ -250,6 +251,15 @@ describe("app-wire authority", () => {
 	test("malicious secret metadata fixture is rejected", async () => {
 		const malicious = await fixture("session-secret.invalid.json");
 		expect(() => decodeServerFrame(malicious)).toThrow(AppWireError);
+	});
+	test("authenticated hello fixtures reject partial/bad auth without echoing token", async () => {
+		const partial = await fixture("hello-auth-partial.invalid.json");
+		const bad = await fixture("hello-auth-bad.invalid.json");
+		expect(() => decodeClientFrame(partial)).toThrow(AppWireError);
+		let caught: unknown;
+		try { decodeClientFrame(bad); } catch (error) { caught = error; }
+		expect(caught).toBeInstanceOf(AppWireError);
+		expect(String(caught)).not.toContain("not-a-token");
 	});
 	test("additive watch, lease, PTY, files, audit, catalog, preview discriminants are bounded", () => {
 		const frames = [
