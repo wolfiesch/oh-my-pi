@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { decodeServerFrame, entryId, hostId, projectId, sessionId, type DurableEntry } from "@oh-my-pi/app-wire";
-import { FileSessionDiscovery } from "../src/discovery.ts";
+import { FileSessionDiscovery, stableProjectId } from "../src/discovery.ts";
 import { createEpoch, createHostId, loadPersistentHostId, unixSocketActive } from "../src/identity.ts";
 import { IdempotencyStore } from "../src/idempotency.ts";
 import { SessionProjection } from "../src/projection.ts";
@@ -38,13 +38,15 @@ class IdleFactory implements RpcChildFactory {
 function fakeFs(files: Record<string, string | Uint8Array>, directories: string[]): FileSystem {
   return {
     mkdir: async () => {}, chmod: async () => {}, unlink: async () => {},
-    readdir: async path => path === "/root" ? ["/root/-tmp-project"] : ["/root/-tmp-project/ok.jsonl", "/root/-tmp-project/bad.jsonl", "/root/-tmp-project/huge.jsonl", "/root/-tmp-project/duplicate.jsonl", "/root/-tmp-project/invalid-utf8.jsonl"],
+    readdir: async path => path === "/root" ? ["/root/-tmp-project", "/root/current.jsonl", "/root/arbitrary.jsonl", "/root/title-only.jsonl"] : ["/root/-tmp-project/ok.jsonl", "/root/-tmp-project/bad.jsonl", "/root/-tmp-project/huge.jsonl", "/root/-tmp-project/duplicate.jsonl", "/root/-tmp-project/invalid-utf8.jsonl"],
     stat: async path => ({ isFile: () => !directories.includes(path), isDirectory: () => directories.includes(path), mode: 0o644, mtimeMs: path.endsWith("ok.jsonl") ? 20 : 10, size: path.endsWith("huge.jsonl") ? 70 * 1024 * 1024 : (typeof files[path] === "string" ? new TextEncoder().encode(files[path]).byteLength : files[path]?.byteLength ?? 0) }),
     readFile: async path => files[path] ?? "",
   };
 }
 
-const validTranscript = `${JSON.stringify({ type: "session", id: "ok", cwd: "/tmp/project", title: "Good" })}\n${JSON.stringify({ type: "message", id: "entry", parentId: null, timestamp: stamp, message: "hello" })}\n`;
+const validTranscript = `${JSON.stringify({ type: "session", id: "ok", cwd: "/tmp/project", title: "Good", timestamp: stamp })}\n${JSON.stringify({ type: "message", id: "entry", parentId: null, timestamp: stamp, message: "hello" })}\n`;
+
+const currentTranscript = `${JSON.stringify({ type: "title", v: 1, title: "Mutable title" })}\n${JSON.stringify({ type: "session", version: 3, id: "current", timestamp: stamp, cwd: "/tmp/current", title: "Stale title" })}\n${JSON.stringify({ type: "message", id: "entry", parentId: null, timestamp: stamp, message: "hello" })}\n`;
 
 describe("discovery hardening", () => {
   test("recurses encoded cwd directories and sorts newest first", async () => {
@@ -52,6 +54,24 @@ describe("discovery hardening", () => {
     const sessions = await discovery.list();
     expect(sessions.map(session => String(session.sessionId))).toEqual(["ok"]);
     expect(sessions[0]?.cwd).toBe("/tmp/project");
+  });
+  test("discovers current title-prelude format without pseudo-entries", async () => {
+    const discovery = new FileSessionDiscovery("/root", fakeFs({ "/root/current.jsonl": currentTranscript }, ["/root"]), host);
+    const [session] = await discovery.list();
+    expect(String(session?.sessionId)).toBe("current");
+    expect(session?.cwd).toBe("/tmp/current");
+    expect(session?.projectId).toBe(stableProjectId("/tmp/current"));
+    expect(session?.title).toBe("Mutable title");
+    expect(session?.entries).toHaveLength(1);
+    expect(session?.entries[0]?.kind).toBe("message");
+  });
+  test("rejects arbitrary or missing preludes", async () => {
+    const files = {
+      "/root/arbitrary.jsonl": `${JSON.stringify({ type: "other", title: "x" })}\n${JSON.stringify({ type: "session", id: "x", cwd: "/tmp", timestamp: stamp })}\n`,
+      "/root/title-only.jsonl": `${JSON.stringify({ type: "title", v: 1, title: "x" })}\n`,
+    };
+    const discovery = new FileSessionDiscovery("/root", fakeFs(files, ["/root"]), host);
+    expect(await discovery.list()).toEqual([]);
   });
   test("rejects malformed and primitive transcripts as whole files", async () => {
     const files = { "/root/-tmp-project/ok.jsonl": `${JSON.stringify({ type: "session", id: "primitive", cwd: "/tmp" })}\n1\n`, "/root/-tmp-project/bad.jsonl": "not-json\n" };

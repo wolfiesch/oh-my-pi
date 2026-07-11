@@ -49,13 +49,21 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid transcript entry");
     return value as Record<string, unknown>;
   });
-  const header = values[0];
-  if (header.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string") throw new Error("invalid transcript header");
+  let headerIndex = 0;
+  const first = values[0];
+  if (first.type === "title") {
+    if (first.v !== 1 || typeof first.title !== "string") throw new Error("invalid transcript prelude");
+    headerIndex = 1;
+  }
+  const header = values[headerIndex];
+  if (!header || header.type !== "session" || typeof header.id !== "string" || !header.id || typeof header.cwd !== "string" || !header.cwd || typeof header.timestamp !== "string" || !Number.isFinite(Date.parse(header.timestamp))) throw new Error("invalid transcript header");
   const sid = sessionId(header.id);
-  const entries = values.slice(1).map(value => asEntry(value, host, sid));
+  const entries = values.slice(headerIndex + 1).map(value => asEntry(value, host, sid));
   const cwd = resolve(header.cwd);
-  const first = entries.find(entry => entry.kind === "message");
-  const title = typeof header.title === "string" && header.title ? header.title : first ? String(first.data.message ?? "Untitled") : "Untitled";
+  const firstMessage = entries.find(entry => entry.kind === "message");
+  const preludeTitle = headerIndex === 1 && typeof first.title === "string" && first.title.trim() ? first.title : undefined;
+  const sessionTitle = typeof header.title === "string" && header.title.trim() ? header.title : undefined;
+  const title = preludeTitle ?? sessionTitle ?? (firstMessage ? String(firstMessage.data.message ?? "Untitled") : "Untitled");
   return { sessionId: sid, path, cwd, projectId: stableProjectId(cwd), title, updatedAt: "", status: "idle", entries };
 }
 
