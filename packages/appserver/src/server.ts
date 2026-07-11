@@ -133,7 +133,8 @@ export class LocalAppserver implements AppserverHandle {
         outcome = { frame: response(this.hostId, command, result.success, result, result.success ? undefined : { code: "child_error", message: result.error }) };
       } else outcome = { frame: response(this.hostId, command, false, undefined, { code: "unsupported", message: "command is deferred to a later wave" }) };
     } catch (error) {
-      if (command.command === "session.prompt") this.#projections.get(command.sessionId!)?.setStatus("idle");
+      const failedProjection = command.command === "session.prompt" ? this.#projections.get(command.sessionId!) : undefined;
+      if (failedProjection && failedProjection.value.ref.status === "active" && !this.#closedSessions.has(command.sessionId!)) failedProjection.setStatus("idle");
       outcome = { frame: response(this.hostId, command, false, undefined, { code: "outcome_unknown", message: error instanceof Error ? error.message : "command failed", details: { recovery: "reconnect and replay from snapshot" } }), unknown: true };
     }
     return this.finish(command, outcome);
