@@ -969,8 +969,7 @@ export class LocalAppserver implements AppserverHandle {
 					if (!connection || !this.#remotePolicy) throw new Error("remote connection is unavailable");
 					decision = await this.#remotePolicy.authenticate(connection, frame);
 					if (!decision.authenticated) {
-						await this.#sendFrame(ws, { v: "omp-app/1", type: "error", code: "unauthenticated", message: "remote authentication denied" });
-						ws.close(1008, "authentication denied");
+						ws.close(1008, "remote authentication denied");
 						return;
 					}
 					this.#remoteDecisions.set(ws, decision);
@@ -989,7 +988,7 @@ export class LocalAppserver implements AppserverHandle {
 					...(frame.type === "command" ? { command: frame } : {}),
 				});
 				if (!allowed) {
-					await this.#sendFrame(ws, { v: "omp-app/1", type: "error", code: "policy_denied", message: "frame denied by remote policy" });
+					ws.close(1008, "remote policy denied");
 					return;
 				}
 			}
@@ -1066,6 +1065,10 @@ export class LocalAppserver implements AppserverHandle {
 				for (const output of outputs) await this.#sendFrame(ws, output);
 			}
 		} catch {
+			if (ws.remote) {
+				ws.close(1008, "invalid frame");
+				return;
+			}
 			await this.#sendFrame(ws, { v: "omp-app/1", type: "error", code: "invalid_frame", message: "invalid frame" });
 			ws.close(1008, "invalid frame");
 		}
@@ -1236,13 +1239,19 @@ async #remoteDisconnected(connection: RemoteConnection): Promise<void> {
 		if (transport) await this.disconnectClient(transport);
 		if (this.#remotePolicy?.disconnected) await this.#remotePolicy.disconnected(connection);
 	}
-async #sendFrame(transport: AppWs, frame: ServerFrame): Promise<boolean> {
+	async #sendFrame(transport: AppWs, frame: ServerFrame): Promise<boolean> {
 		if (transport.remote) {
 			const connection = this.#remoteConnections.get(transport);
 			if (!connection || !this.#remotePolicy) return false;
-			const transformed = this.#remotePolicy.transformOutbound
-				? await this.#remotePolicy.transformOutbound(connection, frame)
-				: frame;
+			let transformed: ServerFrame | string | undefined;
+			try {
+				transformed = this.#remotePolicy.transformOutbound
+					? await this.#remotePolicy.transformOutbound(connection, frame)
+					: frame;
+			} catch {
+				connection.socket.close(1011, "remote policy failed");
+				return false;
+			}
 			if (transformed === undefined) return false;
 			return transport.send(typeof transformed === "string" ? transformed : JSON.stringify(transformed));
 		}
