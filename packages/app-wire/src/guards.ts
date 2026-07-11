@@ -227,3 +227,26 @@ export function safeRelativePath(value: unknown, path = "path", max = 4096): str
 		fail("UNSAFE_PATH", "path contains an unsafe segment", path);
 	return result;
 }
+export function boundedMetadata(value: unknown, path: string, secretKey: (key: string) => boolean): JsonObject {
+	const root = inputObject(value);
+	const stack: Array<{ value: unknown; path: string }> = [{ value: root, path }];
+	while (stack.length > 0) {
+		const current = stack.pop()!;
+		if (typeof current.value === "string") {
+			if (utf8ByteLength(current.value) > MAX_STRING_BYTES) fail("BOUNDS", "metadata string exceeds protocol limit", current.path);
+			continue;
+		}
+		if (current.value === null || typeof current.value !== "object") continue;
+		if (Array.isArray(current.value)) {
+			for (let i = current.value.length - 1; i >= 0; i--) {
+				stack.push({ value: current.value[i], path: `${current.path}[${i}]` });
+			}
+			continue;
+		}
+		for (const [key, child] of Object.entries(current.value)) {
+			if (secretKey(key)) fail("INVALID_FRAME", "secret-like metadata key is forbidden", `${current.path}.${key}`);
+			stack.push({ value: child, path: `${current.path}.${key}` });
+		}
+	}
+	return root;
+}

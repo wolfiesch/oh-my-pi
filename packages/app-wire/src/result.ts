@@ -1,3 +1,4 @@
+import { decodeCommandResult } from "./command.ts";
 import { fail } from "./errors.ts";
 import {
 	commandId,
@@ -25,6 +26,7 @@ export interface ResultFrame {
 	sessionId?: SessionId;
 	ok: boolean;
 	result?: unknown;
+	command?: string;
 	error?: ResultError;
 }
 export function decodeResult(input: unknown): ResultFrame {
@@ -52,6 +54,10 @@ export function decodeResult(input: unknown): ResultFrame {
 				controlFree(details.actualRevision, "error.details.actualRevision", 256);
 			} else if (error.code === "outcome_unknown") controlFree(details.recovery, "error.details.recovery", 1024);
 		}
+	}
+	if (frame.command !== undefined) {
+		const command = controlFree(frame.command, "command", 128);
+		if (frame.ok) return { ...frame, command, result: decodeCommandResult(command, frame.result) } as unknown as ResultFrame;
 	}
 	return frame as unknown as ResultFrame;
 }

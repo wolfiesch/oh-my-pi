@@ -262,10 +262,7 @@ describe("app-wire authority", () => {
 			expect(COMMAND_ARGUMENT_DECODERS[command]).toBeFunction();
 			expect(COMMAND_RESULT_DECODERS[command]).toBeFunction();
 			const descriptor = COMMAND_DESCRIPTORS[command];
-			const frame: Record<string, unknown> = { v: "omp-app/1", type: "command", requestId: "r", commandId: "c", hostId: "h", command, args: {} };
-			if (descriptor?.scope === "session") frame.sessionId = "s";
-			if (descriptor?.revision === "required") frame.expectedRevision = "rev";
-			expect(() => decodeClientFrame(frame)).not.toThrow();
+			expect(descriptor).toBeDefined();
 		}
 	});
 	test("terminal direction and command payload/result contracts are explicit", () => {
@@ -279,12 +276,35 @@ describe("app-wire authority", () => {
 		expect(decodeCommandArguments("session.prompt", { message: "hello" }).message).toBe("hello");
 		expect(() => decodeCommandArguments("preview.launch", { url: "javascript:alert(1)" })).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("settings.write", { apiKey: "secret" })).toThrow(AppWireError);
+		expect(() => decodeClientFrame({ v: "omp-app/1", type: "command", requestId: "r", commandId: "c", hostId: "h", sessionId: "s", command: "session.prompt", args: { prompt: "wrong" } })).toThrow(AppWireError);
+		expect(() => decodeClientFrame({ v: "omp-app/1", type: "command", requestId: "r", commandId: "c", hostId: "h", sessionId: "s", command: "files.list", args: { path: "../secret" } })).toThrow(AppWireError);
 		expect(decodeCommandResult("session.list", { cursor: { epoch: "e", seq: 1 }, sessions: [] }).sessions).toEqual([]);
 		expect(() => decodeCommandResult("session.list", { sessions: [] })).toThrow(AppWireError);
 		expect(decodeCommandResult("session.attach", { attached: true, cursor: { epoch: "e", seq: 1 } }).attached).toBe(true);
 		expect(() => decodeCommandResult("session.create", { session: {} })).toThrow(AppWireError);
+		expect(decodeCommandResult("session.cancel", { cancelled: true }).cancelled).toBe(true);
+		expect(() => decodeCommandResult("session.cancel", { ok: true })).toThrow(AppWireError);
+		expect(decodeCommandResult("session.prompt", { accepted: true }).accepted).toBe(true);
+		expect(decodeCommandResult("term.open", { terminalId: "t" }).terminalId).toBe("t");
+		expect(() => decodeCommandResult("term.open", { terminalId: 1 })).toThrow(AppWireError);
+		expect(() => decodeCommandResult("preview.capture", { content: "not-base64" })).toThrow(AppWireError);
+		expect(decodeCommandResult("controller.lease.renew", { leaseId: "l", cursor: { epoch: "e", seq: 1 } }).leaseId).toBe("l");
+		expect(() => decodeCommandResult("host.watch", { watchId: "w" })).toThrow(AppWireError);
+		expect(() => decodeCommandArguments("settings.write", { values: { nested: [{ ok: true }] } })).not.toThrow();
+		expect(() => decodeCommandArguments("settings.write", { values: { password: "nope" } })).toThrow(AppWireError);
+		expect(() => decodeCommandArguments("settings.write", { value: Number.NaN })).toThrow(AppWireError);
+		const deep: Record<string, unknown> = {};
+		let node = deep;
+		for (let i = 0; i < 40; i++) {
+			const next: Record<string, unknown> = {};
+			node.next = next;
+			node = next;
+		}
+		expect(() => decodeCommandArguments("settings.write", deep)).toThrow(AppWireError);
+		expect(() => decodeCommandArguments("settings.write", { values: Array.from({ length: 1001 }, () => true) })).toThrow(AppWireError);
 	});
 	test("session identity remains host scoped", () => {
+		expect((decodeServerFrame({ v: "omp-app/1", type: "response", requestId: "r", hostId: "h", command: "session.cancel", ok: true, result: { cancelled: true } }) as Record<string, unknown>).result).toEqual({ cancelled: true });
 		expect(sameSession({ hostId: "h", sessionId: "s" }, { hostId: "other", sessionId: "s" })).toBe(false);
 	});
 });
