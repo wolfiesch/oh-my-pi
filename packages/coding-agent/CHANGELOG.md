@@ -125,6 +125,8 @@
 
 - Added separate delegation guidance and per-session concurrency controls for descendant task agents ([#5133](https://github.com/can1357/oh-my-pi/pull/5133) by [@lyc-aon](https://github.com/lyc-aon)).
 - Prevented shared batch context from expanding a subagent's executable assignment with parent-only orchestration work ([#5134](https://github.com/can1357/oh-my-pi/pull/5134) by [@lyc-aon](https://github.com/lyc-aon)).
+- Fixed empty background-job lists returning blank tool output instead of an explicit no-jobs status ([#5143](https://github.com/can1357/oh-my-pi/pull/5143) by [@lyc-aon](https://github.com/lyc-aon)).
+- Reaped completed background jobs from persistent shell sessions to prevent zombie processes accumulating during long runs ([#5144](https://github.com/can1357/oh-my-pi/pull/5144) by [@lyc-aon](https://github.com/lyc-aon)).
 
 ## [16.4.2] - 2026-07-10
 
