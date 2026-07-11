@@ -100,9 +100,11 @@ fn validate_revision(revision: Option<&str>) -> Result<()> {
 #[cfg(unix)]
 mod unix {
 	use super::*;
+	use std::collections::HashMap;
 	use std::ffi::{CStr, CString};
 	use std::fmt::Write as _;
 	use std::os::fd::RawFd;
+	use std::sync::{Arc, LazyLock, Mutex};
 
 	struct Fd(RawFd);
 
@@ -127,17 +129,11 @@ mod unix {
 			Ok(Self(fd))
 		}
 	}
-
 	impl Drop for Fd {
 		fn drop(&mut self) {
 			if self.0 >= 0 {
-				loop {
-					// SAFETY: self.0 is owned by this guard and is closed at most once.
-					let result = unsafe { libc::close(self.0) };
-					if result == 0 || errno() != libc::EINTR {
-						break;
-					}
-				}
+				// SAFETY: self.0 is owned by this guard and is closed at most once.
+				let _ = unsafe { libc::close(self.0) };
 			}
 		}
 	}
@@ -196,8 +192,46 @@ mod unix {
 		ctime_nsec: i64,
 	}
 
+	#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+	struct WriteKey {
+		root_dev: u64,
+		root_ino: u64,
+		parent_dev: u64,
+		parent_ino: u64,
+		leaf: Vec<u8>,
+	}
+
+	static WRITE_LOCKS: LazyLock<Mutex<HashMap<WriteKey, Arc<Mutex<()>>>>> =
+		LazyLock::new(|| Mutex::new(HashMap::new()));
+
+	fn write_lock(root: RawFd, parent: RawFd, leaf: &CStr) -> Result<Arc<Mutex<()>>> {
+		let root_stat = fstat(root)?;
+		let parent_stat = fstat(parent)?;
+		let key = WriteKey {
+			root_dev: root_stat.st_dev as u64,
+			root_ino: root_stat.st_ino as u64,
+			parent_dev: parent_stat.st_dev as u64,
+			parent_ino: parent_stat.st_ino as u64,
+			leaf: leaf.to_bytes().to_vec(),
+		};
+		let mut locks = WRITE_LOCKS.lock().map_err(|_| native_error(ErrorCode::Io))?;
+		Ok(locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone())
+	}
+
 	fn errno() -> i32 {
 		std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+	}
+
+	fn clear_errno() {
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		// SAFETY: libc exposes the thread-local errno slot for this process.
+		unsafe {
+			*libc::__errno_location() = 0;
+		}
+		#[cfg(target_os = "macos")]
+		unsafe {
+			*libc::__error() = 0;
+		}
 	}
 
 	fn retry_fd<F>(mut operation: F) -> std::result::Result<RawFd, i32>
@@ -258,6 +292,7 @@ mod unix {
 		if path.as_bytes().contains(&0)
 			|| path.starts_with('/')
 			|| path.contains('\\')
+			|| path.contains(':')
 			|| path.len() > MAX_COMPONENT_BYTES.saturating_mul(MAX_PATH_COMPONENTS)
 		{
 			return Err(native_error(ErrorCode::UnsafePath));
@@ -281,6 +316,13 @@ mod unix {
 	fn traverse_parent(root: &Fd, components: &[CString]) -> Result<Fd> {
 		let mut current = root.duplicate()?;
 		for component in components {
+			let stat = fstatat(current.0, component).map_err(|error| errno_error(error, false))?;
+			if (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+				return Err(native_error(ErrorCode::UnsafePath));
+			}
+			if !directory_mode(&stat) {
+				return Err(native_error(ErrorCode::NotFile));
+			}
 			// SAFETY: component is NUL-terminated and current.0 is an open directory fd.
 			let next = retry_fd(|| unsafe {
 				libc::openat(
@@ -350,6 +392,9 @@ mod unix {
 			}
 		}
 	}
+	const fn directory_mode(stat: &libc::stat) -> bool {
+		(stat.st_mode & libc::S_IFMT) == libc::S_IFDIR
+	}
 
 	const fn regular(stat: &libc::stat) -> bool {
 		(stat.st_mode & libc::S_IFMT) == libc::S_IFREG
@@ -411,14 +456,17 @@ mod unix {
 		Ok((bytes, signature(&after)))
 	}
 
-	fn hash_file_fd(fd: RawFd) -> Result<(String, Signature)> {
+	fn hash_file_fd(fd: RawFd, cap: usize) -> Result<(String, Signature)> {
 		let before = fstat(fd)?;
 		if !regular(&before) {
 			return Err(native_error(ErrorCode::NotFile));
 		}
+		if signature(&before).size > cap as u64 {
+			return Err(native_error(ErrorCode::Bounds));
+		}
 		let mut ignored = Vec::new();
 		let mut hash = Sha256::new();
-		read_loop(fd, &mut ignored, None, &mut hash)?;
+		read_loop(fd, &mut ignored, Some(cap), &mut hash)?;
 		let after = fstat(fd)?;
 		if signature(&before) != signature(&after) {
 			return Err(native_error(ErrorCode::Conflict));
@@ -484,30 +532,33 @@ mod unix {
 			}
 			let name = c_string(&name, ErrorCode::Io)?;
 			// SAFETY: name is NUL-terminated and parent is an open directory fd.
-			let fd = unsafe {
-				libc::openat(
-					parent,
-					name.as_ptr(),
-					libc::O_WRONLY
-						| libc::O_CREAT
-						| libc::O_EXCL
-						| libc::O_CLOEXEC
-						| libc::O_NOFOLLOW,
-					0o600,
-				)
+			let fd = retry_fd(|| {
+				// SAFETY: name is NUL-terminated and parent is an open directory fd.
+				unsafe {
+					libc::openat(
+						parent,
+						name.as_ptr(),
+						libc::O_WRONLY
+							| libc::O_CREAT
+							| libc::O_EXCL
+							| libc::O_CLOEXEC
+							| libc::O_NOFOLLOW,
+						0o600,
+					)
+				}
+			});
+			let fd = match fd {
+				Ok(fd) => fd,
+				Err(error) if error == libc::EEXIST => continue,
+				Err(error) => return Err(errno_error(error, false)),
 			};
-			if fd >= 0 {
-				return Ok(TempFile {
-					parent,
-					name,
-					fd: Some(Fd(fd)),
-					renamed: false,
-					_marker: std::marker::PhantomData,
-				});
-			}
-			if errno() != libc::EEXIST {
-				return Err(errno_error(errno(), false));
-			}
+			return Ok(TempFile {
+				parent,
+				name,
+				fd: Some(Fd(fd)),
+				renamed: false,
+				_marker: std::marker::PhantomData,
+			});
 		}
 		Err(native_error(ErrorCode::Io))
 	}
@@ -541,12 +592,63 @@ mod unix {
 		.map_err(|_| native_error(ErrorCode::Io))
 	}
 
-	fn revision_at(parent: RawFd, name: &CStr) -> Result<Option<(String, Signature)>> {
-		let stat = match fstatat(parent, name) {
-			Ok(stat) => stat,
-			Err(libc::ENOENT) => return Ok(None),
-			Err(error) => return Err(errno_error(error, true)),
-		};
+	fn install_temp(parent: RawFd, temp: &CStr, leaf: &CStr, replace: bool) -> Result<()> {
+		if replace {
+			return retry_rc(|| unsafe {
+				// SAFETY: all fds are open directories and names are NUL-terminated.
+				libc::renameat(parent, temp.as_ptr(), parent, leaf.as_ptr())
+			})
+			.map_err(|error| errno_error(error, true));
+		}
+		#[cfg(target_os = "linux")]
+		{
+			loop {
+				// SAFETY: all fds are open directories and names are NUL-terminated.
+				let rc = unsafe {
+					libc::syscall(
+						libc::SYS_renameat2,
+						parent,
+						temp.as_ptr(),
+						parent,
+						leaf.as_ptr(),
+						1u32,
+					)
+				};
+				if rc == 0 {
+					return Ok(());
+				}
+				let error = errno();
+				if error != libc::EINTR {
+					return Err(errno_error(error, true));
+				}
+			}
+		}
+		#[cfg(target_os = "macos")]
+		{
+			return retry_rc(|| unsafe {
+				// SAFETY: all fds are open directories and names are NUL-terminated.
+				libc::linkat(parent, temp.as_ptr(), parent, leaf.as_ptr(), 0)
+			})
+			.map_err(|error| errno_error(error, true))
+			.and_then(|()| {
+				retry_rc(|| unsafe { libc::unlinkat(parent, temp.as_ptr(), 0) })
+					.map_err(|error| errno_error(error, false))
+			});
+		}
+		#[allow(unreachable_code, reason = "Unix targets are Linux or macOS here")]
+		Err(native_error(ErrorCode::Unsupported))
+	}
+
+	fn target_stat(parent: RawFd, name: &CStr) -> Result<Option<libc::stat>> {
+		match fstatat(parent, name) {
+			Ok(stat) => Ok(Some(stat)),
+			Err(libc::ENOENT) => Ok(None),
+			Err(error) => Err(errno_error(error, true)),
+		}
+	}
+
+	fn revision_at(parent: RawFd, name: &CStr, cap: usize) -> Result<Option<(String, Signature)>> {
+		let stat = target_stat(parent, name)?.ok_or_else(|| native_error(ErrorCode::NotFound))?;
 		if !regular(&stat) {
 			if (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK {
 				return Err(native_error(ErrorCode::UnsafePath));
@@ -554,7 +656,7 @@ mod unix {
 			return Err(native_error(ErrorCode::NotFile));
 		}
 		let fd = open_target(parent, name)?;
-		let (revision, fd_signature) = hash_file_fd(fd.0)?;
+		let (revision, fd_signature) = hash_file_fd(fd.0, cap)?;
 		if signature(&stat) != fd_signature {
 			return Err(native_error(ErrorCode::Conflict));
 		}
@@ -598,6 +700,8 @@ mod unix {
 		let mut entries = Vec::with_capacity(cap.min(256));
 		loop {
 			// SAFETY: directory is a valid DIR pointer owned by the guard.
+			clear_errno();
+			// SAFETY: directory is a valid DIR pointer owned by the guard.
 			let entry = unsafe { libc::readdir(directory.0) };
 			if entry.is_null() {
 				let error = errno();
@@ -630,6 +734,7 @@ mod unix {
 			});
 		}
 		entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+		entries.dedup_by(|left, right| left.name == right.name);
 		Ok(SecureListDirectoryResult { entries })
 	}
 
@@ -649,14 +754,25 @@ mod unix {
 		let root = Fd::open_root(root)?;
 		let parent = traverse_parent(&root, &components[..components.len() - 1])?;
 		let leaf = components.last().expect("non-empty path");
-		let initial = revision_at(parent.0, leaf.as_c_str())?;
-		match (expected_revision, initial.as_ref()) {
-			(None, Some(_)) => return Err(native_error(ErrorCode::Conflict)),
-			(Some(_), None) => return Err(native_error(ErrorCode::NotFound)),
-			(Some(expected), Some((actual, _))) if expected != actual => {
-				return Err(native_error(ErrorCode::Conflict));
-			},
-			_ => {},
+		let lock = write_lock(root.0, parent.0, leaf.as_c_str())?;
+		let _guard = lock.lock().map_err(|_| native_error(ErrorCode::Io))?;
+
+		if let Some(expected) = expected_revision {
+			let initial = revision_at(parent.0, leaf.as_c_str(), cap)?;
+			match initial {
+				Some((actual, _)) if actual == expected => {},
+				Some(_) => return Err(native_error(ErrorCode::Conflict)),
+				None => return Err(native_error(ErrorCode::NotFound)),
+			}
+		} else if let Some(stat) = target_stat(parent.0, leaf.as_c_str())? {
+			if (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+				return Err(native_error(ErrorCode::UnsafePath));
+			}
+			return Err(if regular(&stat) {
+				native_error(ErrorCode::Conflict)
+			} else {
+				native_error(ErrorCode::NotFile)
+			});
 		}
 
 		let mut temp = create_temp(parent.0)?;
@@ -664,22 +780,15 @@ mod unix {
 		write_all(temp_fd, data).and_then(|()| fsync(temp_fd))?;
 		drop(temp.fd.take());
 
-		let current = revision_at(parent.0, leaf.as_c_str())?;
-		match (expected_revision, current.as_ref()) {
-			(None, Some(_)) => return Err(native_error(ErrorCode::Conflict)),
-			(Some(_), None) => return Err(native_error(ErrorCode::Conflict)),
-			(Some(expected), Some((actual, _))) if expected != actual => {
-				return Err(native_error(ErrorCode::Conflict));
-			},
-			_ => {},
+		if let Some(expected) = expected_revision {
+			let current = revision_at(parent.0, leaf.as_c_str(), cap)?;
+			match current {
+				Some((actual, _)) if actual == expected => {},
+				Some(_) => return Err(native_error(ErrorCode::Conflict)),
+				None => return Err(native_error(ErrorCode::Conflict)),
+			}
 		}
-		// SAFETY: both names are NUL-terminated and parent is a stable directory fd.
-		let rename = retry_rc(|| unsafe {
-			libc::renameat(parent.0, temp.name.as_ptr(), parent.0, leaf.as_ptr())
-		});
-		if let Err(error) = rename {
-			return Err(errno_error(error, true));
-		}
+		install_temp(parent.0, temp.name.as_c_str(), leaf.as_c_str(), expected_revision.is_some())?;
 		temp.disarm();
 		fsync(parent.0)?;
 		let mut hash = Sha256::new();
@@ -927,5 +1036,51 @@ mod tests {
 		assert!(super::unix::read(root_string, "link", 1024).is_err());
 
 		fs::remove_dir_all(root).expect("cleanup");
+	}
+	#[cfg(unix)]
+	#[test]
+	fn stale_errno_does_not_poison_list_eof() {
+		use std::fs;
+		use std::time::{SystemTime, UNIX_EPOCH};
+		let suffix = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+		let root = std::env::temp_dir().join(format!("omp-secure-errno-{suffix}"));
+		fs::create_dir(&root).expect("root");
+		fs::write(root.join("notdir"), b"x").expect("file");
+		let root_string = root.to_str().expect("utf8 root");
+		assert!(super::unix::read(root_string, "notdir/x", 1024).is_err());
+		assert!(super::unix::list(root_string, None, 10).is_ok());
+		fs::remove_dir_all(root).expect("cleanup");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn in_process_create_race_has_one_winner() {
+		use std::fs;
+		use std::sync::{Arc, Barrier};
+		use std::thread;
+		use std::time::{SystemTime, UNIX_EPOCH};
+		let suffix = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+		let root = std::env::temp_dir().join(format!("omp-secure-race-{suffix}"));
+		fs::create_dir(&root).expect("root");
+		let root = Arc::new(root.to_str().expect("utf8 root").to_owned());
+		let barrier = Arc::new(Barrier::new(8));
+		#[allow(clippy::needless_collect, reason = "collect keeps all racers alive until the barrier releases")]
+		let handles = (0..8)
+			.map(|index| {
+				let root = Arc::clone(&root);
+				let barrier = Arc::clone(&barrier);
+				thread::spawn(move || {
+					barrier.wait();
+					super::unix::write(&root, "race", &[index], None, 1024).is_ok()
+				})
+			})
+			.collect::<Vec<_>>();
+		let winners = handles
+			.into_iter()
+			.map(|handle| handle.join().expect("join"))
+			.filter(|won| *won)
+			.count();
+		assert_eq!(winners, 1);
+		fs::remove_dir_all(root.as_str()).expect("cleanup");
 	}
 }

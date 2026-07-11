@@ -172,44 +172,6 @@ export declare function __ompInstallTokioRuntime(): void
  */
 export declare function __piNativesV16_4_6(): void
 
-/** Result of a race-resistant secure file read. */
-export interface SecureReadFileResult {
-  data: Buffer
-  size: number
-  revisionSha256: string
-}
-
-/** A directory entry observed without following symlinks. */
-export interface SecureDirectoryEntry {
-  name: string
-  path: string
-  kind: string
-  size?: number
-}
-
-/** Result of a secure directory listing. */
-export interface SecureListDirectoryResult {
-  entries: Array<SecureDirectoryEntry>
-}
-
-/** Result of an atomic secure file write. New and replacement files are mode 0600. */
-export interface SecureWriteFileResult {
-  size: number
-  revisionSha256: string
-}
-
-/**
- * Read a regular file beneath a session root using stable directory fds.
- * Relative paths reject traversal, absolute paths, backslashes, and symlink components.
- */
-export declare function secureReadFile(root: string, relativePath: string, maxBytes: number): SecureReadFileResult
-
-/** List entries beneath a session root, sorted by name and capped during iteration. */
-export declare function secureListDirectory(root: string, relativePath: string | null, maxEntries: number): SecureListDirectoryResult
-
-/** Create or atomically replace a file beneath a session root with an optional revision guard. */
-export declare function secureWriteFileAtomic(root: string, relativePath: string, data: Buffer, expectedRevision: string | null, maxBytes: number): SecureWriteFileResult
-
 /**
  * Apply ast-grep rewrite rules to matching files; honors `dryRun` and returns
  * a promise.
@@ -1403,6 +1365,37 @@ export interface SearchResult {
 }
 
 export declare function setHangulCompatJamoWidthOverride(value: number): void
+
+export interface SecureDirectoryEntry {
+  name: string
+  path: string
+  kind: string
+  size?: number
+}
+
+/** List a directory beneath `root`, sorted by entry name. */
+export declare function secureListDirectory(root: string, relativePath: string | undefined | null, maxEntries: number): SecureListDirectoryResult
+
+export interface SecureListDirectoryResult {
+  entries: Array<SecureDirectoryEntry>
+}
+
+/** Read one regular file beneath `root` without following symlinks. */
+export declare function secureReadFile(root: string, relativePath: string, maxBytes: number): SecureReadFileResult
+
+export interface SecureReadFileResult {
+  data: Buffer
+  size: number
+  revisionSha256: string
+}
+
+/** Atomically create or replace one regular file beneath `root`. */
+export declare function secureWriteFileAtomic(root: string, relativePath: string, data: Buffer, expectedRevision: string | undefined | null, maxBytes: number): SecureWriteFileResult
+
+export interface SecureWriteFileResult {
+  size: number
+  revisionSha256: string
+}
 
 /** Options for executing a shell command via brush-core. */
 export interface ShellExecuteOptions {
