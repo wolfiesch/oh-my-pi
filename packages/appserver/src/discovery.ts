@@ -380,7 +380,7 @@ function fallbackTitle(firstUserText: string | undefined): string | undefined {
   const lines = firstUserText.split(/\r?\n/u);
   const wrapper = /^Complete the assignment below,\s*thoroughly:\s*$/iu.test(lines[0]?.trim() ?? "");
   const changeIndex = wrapper ? lines.findIndex(line => /^#{1,6}\s*change\s*$/iu.test(line.trim())) : -1;
-  const candidates = changeIndex >= 0 ? lines.slice(changeIndex + 1) : lines;
+  const candidates = wrapper ? lines.slice(changeIndex >= 0 ? changeIndex + 1 : 1) : lines;
   for (const line of candidates) {
     const trimmed = line.trim();
     if (!trimmed || /^#{1,6}(?:\s|$)/u.test(trimmed)) continue;

@@ -90,6 +90,13 @@ function transcript(entries: Record<string, unknown>[], title?: string): string 
     expect(new TextEncoder().encode(session?.title ?? "").byteLength).toBeLessThanOrEqual(120);
   });
 
+  test("skips a wrapper line when Change is absent", async () => {
+    const entries = [{ type: "message", id: "u1", parentId: null, timestamp: stamp, message: { role: "user", content: "Complete the assignment below, thoroughly:\n\n# Target\nFallback title" } }];
+    const discovery = new FileSessionDiscovery("/root", fakeFs({ "/root/session.jsonl": transcript(entries) }, ["/root"]), host);
+    const [session] = await discovery.list();
+    expect(session?.title).toBe("Fallback title");
+  });
+
   test("keeps direct-message fallback on its first substantive line", async () => {
     const entries = [{ type: "message", id: "u1", parentId: null, timestamp: stamp, message: { role: "user", content: "Please inspect this project\n# Change\n1. Do not use this as a title" } }];
     const discovery = new FileSessionDiscovery("/root", fakeFs({ "/root/session.jsonl": transcript(entries) }, ["/root"]), host);
