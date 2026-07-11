@@ -1,12 +1,9 @@
-import { randomUUID } from "node:crypto";
-import { chmod, link, mkdir, open, readFile, realpath, rename, rm, stat as fsStat, unlink, writeFile } from "node:fs/promises";
-import { realpathSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
-import { COMMAND_DESCRIPTORS, DEVICE_CAPABILITIES, requiredCapability } from "@oh-my-pi/app-wire";
-import { decodeClientFrame, decodeCursor, parseBounded, utf8ByteLength, type CommandFrame, type DurableEntry, type HelloFrame, type HostId, type ResultFrame, type ServerFrame, type SessionId } from "@oh-my-pi/app-wire";
-import { inspectSessionLock, SessionLockError } from "../../coding-agent/src/session/session-lock.ts";
-import type { AppserverHandle, AppserverOptions, ChildHandle, CommandOutcome, Clock, SessionRecord } from "./types.ts";
+import { createHash, randomUUID } from "node:crypto";
+import { chmod, link, mkdir, open, readFile, rename, rm, stat as fsStat, unlink } from "node:fs/promises";
+import { dirname } from "node:path";
+import { COMMAND_DESCRIPTORS, requiredCapability, type ConfirmFrame, type ConfirmationChallenge } from "@oh-my-pi/app-wire";
+import { decodeClientFrame, decodeConfirm, decodeCursor, parseBounded, utf8ByteLength, type CommandFrame, type DurableEntry, type HelloFrame, type HostId, type ResultFrame, type ServerFrame, type SessionId } from "@oh-my-pi/app-wire";
+import type { AppserverHandle, AppserverOptions, ChildHandle, CommandOutcome, Clock, SessionAuthority, SessionRecord } from "./types.ts";
 import { createEpoch, createHostId, defaultSocketPath, loadPersistentHostId, unixSocketActive } from "./identity.ts";
 import { FileSessionDiscovery, stableProjectId } from "./discovery.ts";
 import { SessionProjection } from "./projection.ts";
@@ -43,34 +40,6 @@ function argumentError(command: CommandFrame): string | undefined {
   if (keys.length !== 0) return "command does not accept args";
   return undefined;
 }
-async function canonicalCwd(raw: unknown): Promise<string> {
-  const requested = typeof raw === "string" ? raw : process.cwd();
-  try {
-    const canonical = await realpath(resolve(requested));
-    const info = await fsStat(canonical);
-    if (!info.isDirectory()) throw new Error("not a directory");
-    return canonical;
-  } catch {
-    throw new Error("create cwd must resolve to an existing directory");
-  }
-}
-function sessionDirName(cwd: string): string {
-  const canonical = resolve(cwd);
-  const home = resolve(process.env.HOME || homedir());
-  const temp = resolve(tmpdir());
-  const homeRelative = relative(home, canonical);
-  const tempRelative = relative(temp, canonical);
-  const encode = (value: string) => value.replace(/[\/\\:]/g, "-");
-  if (homeRelative === "" || (!homeRelative.startsWith("..") && !homeRelative.startsWith("/"))) return `-${encode(homeRelative) || ""}`;
-  if (tempRelative === "" || (!tempRelative.startsWith("..") && !tempRelative.startsWith("/"))) return `-tmp${tempRelative ? `-${encode(tempRelative)}` : ""}`;
-  return `--${encode(canonical).replace(/^-/, "")}--`;
-}
-function defaultSessionRoot(): string {
-  return join(process.env.PI_CODING_AGENT_DIR || join(process.env.HOME || homedir(), ".omp", "agent"), "sessions");
-}
-function newSessionId(): string {
-  return typeof Bun !== "undefined" && typeof Bun.randomUUIDv7 === "function" ? Bun.randomUUIDv7() : randomUUID();
-}
 async function publishOwner(path: string, ownerId: string): Promise<void> {
   const temp = `${path}.tmp-${ownerId}`;
   const handle = await open(temp, "w", 0o600);
@@ -80,10 +49,10 @@ async function publishOwner(path: string, ownerId: string): Promise<void> {
 type AppWs = Bun.ServerWebSocket<ServerWebSocketData>;
 export class LocalAppserver implements AppserverHandle {
   hostId: HostId; readonly epoch: string; readonly socketPath: string;
-  #clock: Clock; #discovery; #factory; #lockCheck; #ringSize; #handlers = new AppserverCommandHandlers(); #records = new Map<SessionId, SessionRecord>(); #projections = new Map<SessionId, SessionProjection>(); #supervisors = new Map<SessionId, RpcChildSupervisor>(); #startPromises = new Map<SessionId, Promise<RpcChildSupervisor>>(); #closedSessions = new Set<SessionId>(); #idempotency = new IdempotencyStore(); #server?: Bun.Server<ServerWebSocketData>; #clients = new Set<AppWs>(); #hello = new Set<AppWs>(); #clientCapabilities = new Map<AppWs, Set<string>>(); #attached = new Map<AppWs, Set<SessionId>>(); #started = false; #stopping = false; #hostProvided: boolean; #ownerLock = false; #ownerId?: string; #ompVersion; #ompBuild; #appserverVersion; #appserverBuild; #supportedFeatures; #supportedCapabilities;
+  #clock: Clock; #discovery; #authority?: SessionAuthority; #factory; #lockCheck; #ringSize; #handlers = new AppserverCommandHandlers(); #challenges = new Map<string, { command: CommandFrame; ws: AppWs; expiresAt: number; hash: string }>(); #records = new Map<SessionId, SessionRecord>(); #projections = new Map<SessionId, SessionProjection>(); #supervisors = new Map<SessionId, RpcChildSupervisor>(); #startPromises = new Map<SessionId, Promise<RpcChildSupervisor>>(); #closedSessions = new Set<SessionId>(); #idempotency = new IdempotencyStore(); #server?: Bun.Server<ServerWebSocketData>; #clients = new Set<AppWs>(); #hello = new Set<AppWs>(); #clientCapabilities = new Map<AppWs, Set<string>>(); #attached = new Map<AppWs, Set<SessionId>>(); #started = false; #stopping = false; #hostProvided: boolean; #ownerLock = false; #ownerId?: string; #ompVersion; #ompBuild; #appserverVersion; #appserverBuild; #supportedFeatures; #supportedCapabilities;
   constructor(options: AppserverOptions = {}) {
     this.#hostProvided = Boolean(options.hostId); this.hostId = options.hostId ?? createHostId(); this.epoch = createEpoch(options.epoch); this.socketPath = options.socketPath ?? defaultSocketPath();
-    this.#clock = options.clock ?? clock; this.#discovery = options.discovery ?? new FileSessionDiscovery(defaultSessionRoot(), undefined, this.hostId); this.#factory = options.childFactory ?? new BunRpcChildFactory(); this.#lockCheck = options.lockCheck ?? ((session: SessionRecord) => { const inspection = inspectSessionLock(session.path); if (inspection.status === "live" || inspection.status === "suspect" || inspection.status === "malformed") throw new SessionLockError(inspection.status === "malformed" ? "malformed" : "locked", `session lock is ${inspection.status}`, session.path, inspection.lockPath, inspection); }); this.#ringSize = options.ringSize ?? 256;
+    this.#clock = options.clock ?? clock; this.#authority = options.sessionAuthority; this.#discovery = options.discovery ?? options.sessionAuthority ?? { list: async () => [] }; this.#factory = options.childFactory ?? new BunRpcChildFactory(); this.#lockCheck = options.lockCheck ?? (() => undefined); this.#ringSize = options.ringSize ?? 256;
     this.#ompVersion = options.ompVersion ?? "local"; this.#ompBuild = options.ompBuild ?? "local"; this.#appserverVersion = options.appserverVersion ?? "0.1.0"; this.#appserverBuild = options.appserverBuild ?? "local"; this.#supportedFeatures = new Set(options.supportedFeatures ?? ["resume", "live", "replay"]);
     const implemented = new Set(["sessions.read", "sessions.manage", "sessions.prompt", "sessions.control"]); const requested = options.supportedCapabilities ?? [...implemented]; if (requested.some(capability => !implemented.has(capability))) throw new Error("unsupported capability has no Wave1 handler"); this.#supportedCapabilities = new Set(requested);
     this.#handlers.register("session.create", command => this.handleCreate(command));
@@ -131,7 +100,7 @@ export class LocalAppserver implements AppserverHandle {
   snapshot(sessionId: SessionId) { return this.#projections.get(sessionId)?.value; }
   replay(sessionId: SessionId, cursor: { epoch: string; seq: number }): ServerFrame[] { return this.#projections.get(sessionId)?.replay(cursor) ?? []; }
   childFor(sessionId: SessionId): ChildHandle | undefined { return this.#supervisors.get(sessionId)?.child(); }
-  async command(command: CommandFrame, capabilities?: Set<string>): Promise<CommandOutcome> {
+  async command(command: CommandFrame, capabilities?: Set<string>, approved = false): Promise<CommandOutcome> {
     if (command.hostId !== this.hostId) return { frame: response(this.hostId, command, false, undefined, { code: "host_mismatch", message: "command targets another host" }) };
     const descriptor = COMMAND_DESCRIPTORS[command.command]; if (!descriptor) return { frame: response(this.hostId, command, false, undefined, { code: "unsupported", message: "unknown command" }) };
     const required = requiredCapability(command.command); if (capabilities && required && !capabilities.has(required)) return { frame: response(this.hostId, command, false, undefined, { code: "capability_denied", message: "client capability was not granted" }) };
@@ -164,41 +133,37 @@ export class LocalAppserver implements AppserverHandle {
         outcome = { frame: response(this.hostId, command, result.success, result, result.success ? undefined : { code: "child_error", message: result.error }) };
       } else outcome = { frame: response(this.hostId, command, false, undefined, { code: "unsupported", message: "command is deferred to a later wave" }) };
     } catch (error) {
-      const lockError = error instanceof SessionLockError;
-      outcome = { frame: response(this.hostId, command, false, undefined, { code: lockError ? `session_lock_${error.code}` : "outcome_unknown", message: error instanceof Error ? error.message : String(error), details: lockError ? { status: error.inspection?.status } : { recovery: "reconnect and replay from snapshot" } }), unknown: !lockError };
+      if (command.command === "session.prompt") this.#projections.get(command.sessionId!)?.setStatus("idle");
+      outcome = { frame: response(this.hostId, command, false, undefined, { code: "outcome_unknown", message: error instanceof Error ? error.message : "command failed", details: { recovery: "reconnect and replay from snapshot" } }), unknown: true };
     }
     return this.finish(command, outcome);
   }
   private async createSession(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const cwd = await canonicalCwd(args.cwd);
-    const title = typeof args.title === "string" ? args.title : "Untitled";
-    const session = newSessionId() as SessionId;
+    if (!this.#authority) throw new Error("session creation is unavailable");
+    const requestedCwd = typeof args.cwd === "string" ? args.cwd : process.cwd();
+    const title = typeof args.title === "string" ? args.title : undefined;
+    const created = await this.#authority.create(requestedCwd, title);
     const timestamp = this.#clock.now().toISOString();
-    const directory = join(defaultSessionRoot(), sessionDirName(cwd));
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    try { await chmod(directory, 0o700); } catch {}
-    const path = join(directory, `${timestamp.replace(/[:.]/g, "-")}_${session}.jsonl`);
-    const header = { type: "session", version: 3, id: session, timestamp, cwd, title };
-    await writeFile(path, `${JSON.stringify(header)}\n`, { flag: "wx", mode: 0o600 });
-    const record: SessionRecord = { sessionId: session, path, cwd, projectId: stableProjectId(cwd), title, updatedAt: timestamp, status: "idle", entries: [] };
-    this.#records.set(session, record);
-    this.#projections.set(session, new SessionProjection(this.hostId, record, this.epoch, this.#ringSize));
-    return { sessionId: session, path, cwd, project: { projectId: record.projectId, canonicalCwd: cwd }, revision: this.#projections.get(session)!.value.revision };
+    const record: SessionRecord = { sessionId: created.sessionId, path: created.path, cwd: created.cwd, projectId: stableProjectId(created.cwd), title: created.title ?? "", updatedAt: timestamp, status: "idle", entries: created.entries };
+    this.#records.set(record.sessionId, record);
+    this.#projections.set(record.sessionId, new SessionProjection(this.hostId, record, this.epoch, this.#ringSize));
+    return { sessionId: record.sessionId, cwd: record.cwd, project: { projectId: record.projectId, canonicalCwd: record.cwd }, revision: this.#projections.get(record.sessionId)!.value.revision };
   }
   private async handleCreate(command: CommandFrame): Promise<CommandOutcome> {
     return { frame: response(this.hostId, command, true, await this.createSession(command.args)) };
   }
-  private handleClose(command: CommandFrame): CommandOutcome {
+  private async handleClose(command: CommandFrame): Promise<CommandOutcome> {
     const sessionId = command.sessionId!;
     const projection = this.#projections.get(sessionId)!;
     this.#closedSessions.add(sessionId);
+    const pending = this.#startPromises.get(sessionId);
+    if (pending) await pending.catch(() => undefined);
     this.#supervisors.get(sessionId)?.stop();
     this.#supervisors.delete(sessionId);
     projection.setStatus("closed");
     this.broadcast(sessionId, projection.appendEvent({ type: "session_closed" }));
     return { frame: response(this.hostId, command, true, { closed: true, sessionId }) };
   }
-  private record(sessionId: SessionId): SessionRecord { const record = this.#records.get(sessionId); if (!record) throw new Error("unknown session"); return record; }
   private finish(command: CommandFrame, outcome: CommandOutcome): CommandOutcome { this.#idempotency.complete(command.commandId, command, outcome); return outcome; }
   private async ensureSupervisor(sessionId: SessionId): Promise<RpcChildSupervisor> {
     if (this.#stopping) throw new Error("appserver is stopping");
@@ -212,11 +177,46 @@ export class LocalAppserver implements AppserverHandle {
     const existing = this.#supervisors.get(sessionId); if (existing) return existing;
     if (this.#stopping || this.#closedSessions.has(sessionId)) throw new Error("session is closed");
     const record = this.#records.get(sessionId); if (!record) throw new Error("unknown session"); await this.#lockCheck(record);
+    if (this.#stopping || this.#closedSessions.has(sessionId)) throw new Error("session is closed");
     const projection = this.#projections.get(sessionId)!;
     const supervisor = new RpcChildSupervisor(this.#factory, record, { entry: frame => { const entry = fromRpcEntry(frame.entry as unknown as Record<string, unknown>, this.hostId, sessionId); const output = entry ? projection.appendEntry(entry) : undefined; if (output) this.broadcast(sessionId, output); }, event: frame => this.broadcast(sessionId, projection.appendEvent({ type: typeof frame.type === "string" ? frame.type : "rpc", ...frame })), crashed: () => { projection.setStatus("closed"); this.#supervisors.delete(sessionId); } }, this.#factory.argv(record.path));
     this.#supervisors.set(sessionId, supervisor); try { await supervisor.start(); return supervisor; } catch (error) { this.#supervisors.delete(sessionId); supervisor.stop(); throw error; }
   }
-  private async message(ws: AppWs, raw: string | Buffer): Promise<void> { try { if (typeof raw !== "string") throw new Error("binary websocket frames are not supported"); const frame = decodeClientFrame(parseBounded(raw)); if (frame.type === "hello") { if (this.#hello.has(ws)) throw new Error("hello already received"); this.#hello.add(ws); this.hello(ws, frame); } else { if (!this.#hello.has(ws)) throw new Error("hello required before commands"); if (frame.type === "ping") ws.send(JSON.stringify({ v: "omp-app/1", type: "pong", nonce: frame.nonce, timestamp: this.#clock.now().toISOString() })); else if (frame.type === "command") { const outcome = await this.command(frame, this.#clientCapabilities.get(ws)); ws.send(JSON.stringify(outcome.frame)); if (frame.command === "session.attach" && frame.sessionId && outcome.frame.type === "response" && outcome.frame.ok) { this.#attached.get(ws)?.add(frame.sessionId); const cursor = frame.args.cursor; const outputs = cursor ? this.replay(frame.sessionId, cursor as { epoch: string; seq: number }) : [this.#projections.get(frame.sessionId)!.snapshot()]; for (const output of outputs) ws.send(JSON.stringify(output)); } } else ws.send(JSON.stringify({ v: "omp-app/1", type: "error", code: "unsupported", message: "frame is not supported" })); } } catch (error) { ws.send(JSON.stringify({ v: "omp-app/1", type: "error", code: "invalid_frame", message: error instanceof Error ? error.message : String(error) })); ws.close(1008, "invalid frame"); } }
+  private async message(ws: AppWs, raw: string | Buffer): Promise<void> {
+    try {
+      if (typeof raw !== "string") throw new Error("binary websocket frames are not supported");
+      const frame = decodeClientFrame(parseBounded(raw));
+      if (frame.type === "hello") { if (this.#hello.has(ws)) throw new Error("hello already received"); this.#hello.add(ws); this.hello(ws, frame); return; }
+      if (!this.#hello.has(ws)) throw new Error("hello required before commands");
+      if (frame.type === "ping") { ws.send(JSON.stringify({ v: "omp-app/1", type: "pong", nonce: frame.nonce, timestamp: this.#clock.now().toISOString() })); return; }
+      if (frame.type === "confirm") { ws.send(JSON.stringify((await this.confirm(ws, frame)).frame)); return; }
+      if (frame.type !== "command") { ws.send(JSON.stringify({ v: "omp-app/1", type: "error", code: "unsupported", message: "frame is not supported" })); return; }
+      const descriptor = COMMAND_DESCRIPTORS[frame.command];
+      if (descriptor?.confirmation === "challenge" && frame.confirmationId === undefined) { ws.send(JSON.stringify(this.challenge(ws, frame))); return; }
+      const outcome = await this.command(frame, this.#clientCapabilities.get(ws));
+      ws.send(JSON.stringify(outcome.frame));
+      if (frame.command === "session.attach" && frame.sessionId && outcome.frame.type === "response" && outcome.frame.ok) {
+        this.#attached.get(ws)?.add(frame.sessionId);
+        const cursor = frame.args.cursor;
+        const outputs = cursor ? this.replay(frame.sessionId, cursor as { epoch: string; seq: number }) : [this.#projections.get(frame.sessionId)!.snapshot()];
+        for (const output of outputs) ws.send(JSON.stringify(output));
+      }
+    } catch (error) { ws.send(JSON.stringify({ v: "omp-app/1", type: "error", code: "invalid_frame", message: error instanceof Error ? error.message : "invalid frame" })); ws.close(1008, "invalid frame"); }
+  }
+  private challenge(ws: AppWs, command: CommandFrame): ConfirmationChallenge {
+    const hash = createHash("sha256").update(JSON.stringify({ ...command, confirmationId: undefined })).digest("hex");
+    const confirmationId = randomUUID() as never;
+    const expiresAt = Date.now() + 60_000;
+    this.#challenges.set(String(confirmationId), { command, ws, expiresAt, hash });
+    return { v: "omp-app/1", type: "confirmation", confirmationId, commandId: command.commandId, hostId: this.hostId, sessionId: command.sessionId, commandHash: hash, revision: (command.expectedRevision ?? this.#projections.get(command.sessionId!)?.value.revision ?? "host") as never, expiresAt: new Date(expiresAt).toISOString(), summary: command.command };
+  }
+  private async confirm(ws: AppWs, frame: ConfirmFrame): Promise<CommandOutcome> {
+    const pending = this.#challenges.get(String(frame.confirmationId));
+    if (!pending || pending.ws !== ws || pending.expiresAt < Date.now() || pending.command.commandId !== frame.commandId || pending.command.hostId !== frame.hostId || pending.command.sessionId !== frame.sessionId) return { frame: response(this.hostId, { ...pending?.command ?? frame, requestId: frame.requestId, commandId: frame.commandId, hostId: this.hostId } as CommandFrame, false, undefined, { code: "confirmation_invalid", message: "confirmation is invalid or expired" }) };
+    this.#challenges.delete(String(frame.confirmationId));
+    if (frame.decision === "deny") return { frame: response(this.hostId, pending.command, false, undefined, { code: "confirmation_denied", message: "command was denied" }) };
+    return this.command({ ...pending.command, confirmationId: frame.confirmationId }, this.#clientCapabilities.get(ws), true);
+  }
   private hello(ws: AppWs, frame: HelloFrame): void { const requestedCapabilities = new Set(frame.capabilities?.client ?? this.#supportedCapabilities); const grantedCapabilities = [...this.#supportedCapabilities].filter(capability => requestedCapabilities.has(capability)); this.#clientCapabilities.set(ws, new Set(grantedCapabilities)); const welcome = { v: "omp-app/1", type: "welcome", selectedProtocol: "omp-app/1", hostId: this.hostId, ompVersion: this.#ompVersion, ompBuild: this.#ompBuild, appserverVersion: this.#appserverVersion, appserverBuild: this.#appserverBuild, epoch: this.epoch, grantedCapabilities, grantedFeatures: frame.requestedFeatures.filter(feature => this.#supportedFeatures.has(feature)), negotiatedLimits: { maxPayloadLength: 1024 * 1024, ringSize: this.#ringSize }, resumed: frame.savedCursors.some(cursor => cursor.hostId === this.hostId && cursor.cursor.epoch === this.epoch) }; ws.send(JSON.stringify(welcome)); ws.send(JSON.stringify(this.sessionsFrame())); }
   private async loadSessions(): Promise<void> { const records = await this.#discovery.list(); records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.sessionId.localeCompare(b.sessionId)); for (const record of records) { if (this.#records.has(record.sessionId)) throw new Error(`duplicate session id: ${record.sessionId}`); this.#records.set(record.sessionId, record); this.#projections.set(record.sessionId, new SessionProjection(this.hostId, record, this.epoch, this.#ringSize)); } }
   private sessionsFrame(): ServerFrame { return { v: "omp-app/1", type: "sessions", cursor: { epoch: this.epoch, seq: 0 }, sessions: [...this.#projections.values()].map(value => value.value.ref) }; }

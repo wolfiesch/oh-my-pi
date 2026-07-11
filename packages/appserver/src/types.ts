@@ -14,6 +14,17 @@ export interface SessionRecord {
   sessionId: SessionId; path: string; cwd: string; projectId: ProjectId; projectName?: string;
   title: string; updatedAt: string; status: SessionRef["status"]; entries: DurableEntry[];
 }
+export interface SessionAuthoritySession {
+  sessionId: SessionId;
+  path: string;
+  cwd: string;
+  title?: string;
+  entries: DurableEntry[];
+}
+export interface SessionAuthority {
+  create(cwd: string, title?: string): Promise<SessionAuthoritySession>;
+  list(): Promise<SessionRecord[]>;
+}
 export interface SessionDiscovery { list(): Promise<SessionRecord[]>; }
 export interface ChildHandle {
   stdin: { write(data: string): Promise<void> | void };
@@ -22,10 +33,10 @@ export interface ChildHandle {
   exited: Promise<number>;
   kill(signal?: string): void;
 }
-export interface RpcChildFactory { spawn(spec: { session: SessionRecord; argv: string[]; cwd: string }): ChildHandle; argv(sessionPath: string): string[]; }
 export type LockCheckHook = (session: SessionRecord) => Promise<void> | void;
+export interface RpcChildFactory { spawn(spec: { session: SessionRecord; argv: string[]; cwd: string }): ChildHandle; argv(sessionPath: string): string[]; }
 export interface AppserverOptions {
-  hostId?: HostId; epoch?: string; clock?: Clock; discovery?: SessionDiscovery;
+  hostId?: HostId; epoch?: string; clock?: Clock; discovery?: SessionDiscovery; sessionAuthority?: SessionAuthority;
   childFactory?: RpcChildFactory; lockCheck?: LockCheckHook; socketPath?: string;
   ompVersion?: string; ompBuild?: string; appserverVersion?: string; appserverBuild?: string;
   supportedFeatures?: readonly string[];

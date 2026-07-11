@@ -109,8 +109,10 @@ async function readUnixHealth(socketPath: string, timeoutMs: number): Promise<un
 
 // Keep the private appserver graph out of unrelated CLI commands; the command
 // loader is intentionally the runtime-selected boundary for this package.
-function defaultCreateAppserver(): Promise<AppserverHandle> {
-	return import("@oh-my-pi/appserver").then(module => module.createAppserver());
+async function defaultCreateAppserver(): Promise<AppserverHandle> {
+  const [{ createAppserver }, { createAppserverAuthority, appserverLockCheck }] = await Promise.all([import("@oh-my-pi/appserver"), import("../session/appserver-authority")]);
+  const authority = createAppserverAuthority();
+  return createAppserver({ sessionAuthority: authority, discovery: authority, lockCheck: appserverLockCheck });
 }
 
 function defaultOnSignal(signal: NodeJS.Signals, handler: () => void): void {
