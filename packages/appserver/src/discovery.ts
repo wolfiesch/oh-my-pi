@@ -12,6 +12,7 @@ const MAX_SNAPSHOT_ENTRIES = 1000;
 const MAX_SNAPSHOT_BYTES = 512 * 1024;
 const MAX_TEXT_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 64 * 1024;
+const MAX_ARGUMENT_BYTES = 128 * 1024;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const realFs: FileSystem = {
@@ -143,7 +144,9 @@ function normalizeEntries(values: Record<string, unknown>[], host: HostId, sid: 
           const block = asObject(item);
           if (block?.type === "thinking" && typeof block.thinking === "string") reasoningParts.push(block.thinking);
           if (block?.type === "toolCall" && typeof block.id === "string" && typeof block.name === "string") {
-            toolCalls.push({ id: block.id, name: cleanText(block.name, 256, true), title: typeof block.title === "string" ? cleanText(block.title, 256, true) : cleanText(block.name, 256, true), args: safeValue(block.arguments ?? {}) });
+            const args = safeValue(block.arguments ?? {});
+            const argsBytes = encoder.encode(JSON.stringify(args) ?? "").byteLength;
+            toolCalls.push({ id: block.id, name: cleanText(block.name, 256, true), title: typeof block.title === "string" ? cleanText(block.title, 256, true) : cleanText(block.name, 256, true), args: argsBytes <= MAX_ARGUMENT_BYTES ? args : { omitted: "Tool arguments exceeded the app-wire display budget." } });
           }
         }
       }
@@ -199,12 +202,20 @@ function normalizeEntries(values: Record<string, unknown>[], host: HostId, sid: 
     aliases.set(raw.id, parentId);
   }
 
-  let omitted = Math.max(0, entries.length - (MAX_SNAPSHOT_ENTRIES - 1));
-  const retained = omitted > 0 ? entries.slice(- (MAX_SNAPSHOT_ENTRIES - 1)) : [...entries];
-  while (retained.length > 1 && encoder.encode(JSON.stringify(retained)).byteLength > MAX_SNAPSHOT_BYTES) {
-    retained.shift();
-    omitted++;
+  const retainedReverse: DurableEntry[] = [];
+  let payloadBytes = 2;
+  for (let i = entries.length - 1; i >= 0 && retainedReverse.length < MAX_SNAPSHOT_ENTRIES - 1; i--) {
+    const entryBytes = encoder.encode(JSON.stringify(entries[i])).byteLength;
+    const separatorBytes = retainedReverse.length === 0 ? 0 : 1;
+    if (payloadBytes + separatorBytes + entryBytes > MAX_SNAPSHOT_BYTES) {
+      if (retainedReverse.length === 0) continue;
+      break;
+    }
+    retainedReverse.push(entries[i]);
+    payloadBytes += separatorBytes + entryBytes;
   }
+  const retained = retainedReverse.reverse();
+  const omitted = entries.length - retained.length;
   if (omitted === 0) return { entries: retained, firstUserText, titleChange, model, thinking };
   const retainedIds = new Set(retained.map(entry => entry.id));
   for (let i = 0; i < retained.length; i++) {

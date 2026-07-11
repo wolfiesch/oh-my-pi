@@ -26,12 +26,13 @@ function transcript(entries: Record<string, unknown>[], title?: string): string 
 
  describe("current OMP JSONL projection", () => {
   test("normalizes nested messages, tools, hidden entries, and runtime settings", async () => {
+    const hugeArgs = Array.from({ length: 1000 }, () => "x".repeat(900));
     const entries: Record<string, unknown>[] = [
       { type: "session_init", id: "init", parentId: null, timestamp: stamp, systemPrompt: "do not leak /home/lycaon/secret", task: "task", tools: ["read"] },
       { type: "model_change", id: "model", parentId: "init", timestamp: stamp, model: "openai/gpt-5.6" },
       { type: "thinking_level_change", id: "thinking", parentId: "model", timestamp: stamp, thinkingLevel: "high" },
       { type: "message", id: "u1", parentId: "thinking", timestamp: stamp, message: { role: "user", content: "Please inspect the project" } },
-      { type: "message", id: "a1", parentId: "u1", timestamp: stamp, message: { role: "assistant", content: [{ type: "thinking", thinking: "I should inspect safely." }, { type: "toolCall", id: "call-1", name: "read", arguments: { path: "/home/lycaon/project/src/app.ts" } }] } },
+      { type: "message", id: "a1", parentId: "u1", timestamp: stamp, message: { role: "assistant", content: [{ type: "thinking", thinking: "I should inspect safely." }, { type: "toolCall", id: "call-1", name: "read", arguments: { path: "/home/lycaon/project/src/app.ts", values: hugeArgs } }] } },
       { type: "message", id: "r1", parentId: "a1", timestamp: stamp, message: { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "file contents" }], isError: false } },
       { type: "custom_message", id: "hidden", parentId: "r1", timestamp: stamp, customType: "secret", content: "hidden", display: false },
       { type: "custom_message", id: "shown", parentId: "hidden", timestamp: stamp, customType: "notice", content: "Visible note", display: true, attribution: "agent" },
@@ -48,6 +49,8 @@ function transcript(entries: Record<string, unknown>[], title?: string): string 
     expect(message?.data).toEqual({ role: "user", text: "Please inspect the project" });
     const tool = session?.entries[2];
     expect(tool?.data).toMatchObject({ tool: "read", title: "read", ok: true, result: { output: "file contents" } });
+    const toolArgs = (tool?.data.args && typeof tool.data.args === "object" ? JSON.stringify(tool.data.args) : "");
+    expect(new TextEncoder().encode(toolArgs).byteLength).toBeLessThan(128 * 1024);
     expect(JSON.stringify(session?.entries)).not.toContain("systemPrompt");
     expect(JSON.stringify(session?.entries)).not.toContain("/home/lycaon");
     expect(session?.entries[1]?.data).toEqual({ role: "assistant", text: "", reasoning: "I should inspect safely." });
