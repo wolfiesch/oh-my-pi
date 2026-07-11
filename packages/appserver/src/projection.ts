@@ -15,7 +15,10 @@ export class SessionProjection {
   #revisionHash = createHash("sha256");
   constructor(host: HostId, record: SessionRecord, epoch: string, ringSize = 256) {
     this.#ringSize = ringSize;
-    for (const entry of record.entries) this.#byId.set(entry.id, entry);
+    for (const entry of record.entries) {
+      const rebound = { ...entry, hostId: host, sessionId: record.sessionId };
+      this.#byId.set(rebound.id, rebound);
+    }
     const entries = [...this.#byId.values()];
     for (const entry of entries) this.#revisionHash.update(`${JSON.stringify(entry)}\n`);
     const currentRevision = revision(`r-${this.#revisionHash.copy().digest("hex").slice(0, 24)}`);

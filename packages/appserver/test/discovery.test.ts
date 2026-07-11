@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { hostId, parseBounded } from "@oh-my-pi/app-wire";
+import { decodeServerFrame, hostId, parseBounded } from "@oh-my-pi/app-wire";
 import type { FileSystem } from "../src/types.ts";
 import { FileSessionDiscovery } from "../src/discovery.ts";
 import { SessionProjection } from "../src/projection.ts";
@@ -54,6 +54,19 @@ function transcript(entries: Record<string, unknown>[], title?: string): string 
     expect(JSON.stringify(session?.entries)).not.toContain("systemPrompt");
     expect(JSON.stringify(session?.entries)).not.toContain("/home/lycaon");
     expect(session?.entries[1]?.data).toEqual({ role: "assistant", text: "", reasoning: "I should inspect safely." });
+  });
+
+  test("rebinds discovered entry identities to the snapshot envelope", async () => {
+    const entries = [{ type: "message", id: "mismatch", parentId: null, timestamp: stamp, message: { role: "user", content: "hello" } }];
+    const sessionDiscovery = new FileSessionDiscovery("/root", fakeFs({ "/root/session.jsonl": transcript(entries) }, ["/root"]), hostId("discovery-other"));
+    const [session] = await sessionDiscovery.list();
+    if (!session) throw new Error("session not discovered");
+    const frame = new SessionProjection(host, session, "epoch-test").snapshot();
+    const decoded = decodeServerFrame(frame);
+    expect(decoded.type).toBe("snapshot");
+    if (decoded.type === "snapshot") {
+      expect(decoded.entries.every(entry => entry.hostId === decoded.hostId && entry.sessionId === decoded.sessionId)).toBe(true);
+    }
   });
 
   test("bounds non-ASCII titles and falls back to the first visible user text", async () => {

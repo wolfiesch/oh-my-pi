@@ -13,6 +13,7 @@ const MAX_SNAPSHOT_BYTES = 512 * 1024;
 const MAX_TEXT_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 64 * 1024;
 const MAX_ARGUMENT_BYTES = 128 * 1024;
+const MAX_SNAPSHOT_NODES = 16_000;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const realFs: FileSystem = {
@@ -61,6 +62,11 @@ function safeValue(value: unknown, key = "", depth = 0): unknown {
     return output;
   }
   return undefined;
+}
+function jsonNodeCount(value: unknown): number {
+  if (value === null || typeof value !== "object") return 1;
+  if (Array.isArray(value)) return 1 + value.reduce((count, item) => count + jsonNodeCount(item), 0);
+  return 1 + Object.values(value).reduce((count, item) => count + jsonNodeCount(item), 0);
 }
 
 function asObject(value: unknown): Record<string, unknown> | undefined {
@@ -204,15 +210,18 @@ function normalizeEntries(values: Record<string, unknown>[], host: HostId, sid: 
 
   const retainedReverse: DurableEntry[] = [];
   let payloadBytes = 2;
+  let payloadNodes = 1;
   for (let i = entries.length - 1; i >= 0 && retainedReverse.length < MAX_SNAPSHOT_ENTRIES - 1; i--) {
     const entryBytes = encoder.encode(JSON.stringify(entries[i])).byteLength;
+    const entryNodes = jsonNodeCount(entries[i]);
     const separatorBytes = retainedReverse.length === 0 ? 0 : 1;
-    if (payloadBytes + separatorBytes + entryBytes > MAX_SNAPSHOT_BYTES) {
+    if (payloadBytes + separatorBytes + entryBytes > MAX_SNAPSHOT_BYTES || payloadNodes + entryNodes > MAX_SNAPSHOT_NODES) {
       if (retainedReverse.length === 0) continue;
       break;
     }
     retainedReverse.push(entries[i]);
     payloadBytes += separatorBytes + entryBytes;
+    payloadNodes += entryNodes;
   }
   const retained = retainedReverse.reverse();
   const omitted = entries.length - retained.length;
