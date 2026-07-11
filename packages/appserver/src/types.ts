@@ -1,0 +1,44 @@
+import type { ChildProcess } from "node:child_process";
+import type { CommandFrame, DurableEntry, HostId, ProjectId, Revision, SessionEvent, SessionId, SessionRef, Cursor, ServerFrame } from "@oh-my-pi/app-wire";
+
+export interface Clock { now(): Date; }
+export interface FileSystem {
+  mkdir(path: string, options?: { recursive?: boolean; mode?: number }): Promise<void>;
+  chmod(path: string, mode: number): Promise<void>;
+  unlink(path: string): Promise<void>;
+  stat(path: string): Promise<{ isFile(): boolean; isDirectory(): boolean; mode: number; mtimeMs: number; size: number }>;
+  readdir(path: string): Promise<string[]>;
+  readFile(path: string): Promise<string>;
+}
+export interface SessionRecord {
+  sessionId: SessionId; path: string; cwd: string; projectId: ProjectId; projectName?: string;
+  title: string; updatedAt: string; status: SessionRef["status"]; entries: DurableEntry[];
+}
+export interface SessionDiscovery { list(): Promise<SessionRecord[]>; }
+export interface ChildHandle {
+  stdin: { write(data: string | Uint8Array): void | Promise<void>; end?(): void };
+  stdout: AsyncIterable<string | Uint8Array>;
+  exited: Promise<number>;
+  kill(signal?: string): void;
+}
+export interface RpcChildFactory { spawn(spec: { session: SessionRecord; argv: string[]; cwd: string }): ChildHandle; }
+export interface LockCheckHook { check(session: SessionRecord): Promise<void> | void; }
+export interface AppserverOptions {
+  hostId?: HostId; epoch?: string; clock?: Clock; discovery?: SessionDiscovery;
+  childFactory?: RpcChildFactory; lockCheck?: LockCheckHook; socketPath?: string;
+  ompVersion?: string; ompBuild?: string; appserverVersion?: string; appserverBuild?: string;
+  ringSize?: number; now?: () => Date;
+}
+export interface Projection {
+  hostId: HostId; sessionId: SessionId; revision: Revision; cursor: Cursor; entries: DurableEntry[];
+  ref: SessionRef; ring: ServerFrame[];
+}
+export interface CommandOutcome { frame: ServerFrame; unknown?: boolean; }
+export interface AppserverHandle {
+  readonly hostId: HostId; readonly epoch: string; readonly socketPath: string;
+  start(): Promise<void>; stop(): Promise<void>; snapshot(sessionId: SessionId): Projection | undefined;
+  replay(sessionId: SessionId, cursor: Cursor): ServerFrame[];
+  command(command: CommandFrame): Promise<CommandOutcome>;
+  childFor(sessionId: SessionId): ChildHandle | undefined;
+}
+export type { ChildProcess, CommandFrame, DurableEntry, HostId, ProjectId, Revision, SessionEvent, SessionId, SessionRef, Cursor, ServerFrame };
