@@ -38,8 +38,8 @@ describe("security core", () => {
     const registry = new SqliteDeviceRegistry(dbPath, clock);
     const pairing = new SqlitePairingService(registry, clock, { bytes: (n) => new Uint8Array(n).fill(7) });
     const issuerRecord = { deviceId: "issuer", identityKey: JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]), capabilities: ["sessions.manage"] as const, metadata: { label: "issuer" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: clock.now() + 86_400_000, revokedAt: null, epoch: 0 };
-    registry.create(issuerRecord, "token");
-    const issuer = registry.authenticate("issuer", "token", identity, "connection-a");
+    registry.create(issuerRecord, "A".repeat(43));
+    const issuer = registry.authenticate("issuer", "A".repeat(43), identity, "connection-a");
     const grant = pairing.start("connection-a", ["sessions.read"], undefined, { deviceId: issuer.deviceId, epoch: issuer.epoch, identityKey: issuer.identityKey });
     const result = pairing.complete("connection-a", grant.code, identity, { label: "device" }, ["sessions.read"], { deviceId: issuer.deviceId, epoch: issuer.epoch, identityKey: issuer.identityKey });
     expect(registry.authenticate(result.deviceId, result.token, identity, "connection-a").deviceId).toBe(result.deviceId);
@@ -147,9 +147,9 @@ it("expired credentials are rejected and revoked", () => {
   const localClock = { value: 100, now() { return this.value; } };
   const path = `/tmp/omp-expired-${process.pid}.sqlite`;
   const registry = new SqliteDeviceRegistry(path, localClock, { bytes: (n) => new Uint8Array(n).fill(6) });
-  registry.create({ deviceId: "expired", identityKey: JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]), capabilities: ["sessions.read"], metadata: { label: "x" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: 110, revokedAt: null, epoch: 0 }, "token");
+  registry.create({ deviceId: "expired", identityKey: JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]), capabilities: ["sessions.read"], metadata: { label: "x" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: 110, revokedAt: null, epoch: 0 }, "A".repeat(43));
   localClock.value = 111;
-  expect(() => registry.authenticate("expired", "token", identity, "connection")).toThrow();
+  expect(() => registry.authenticate("expired", "A".repeat(43), identity, "connection")).toThrow();
   expect(registry.get("expired")?.revokedAt).toBe(111);
   registry.close();
   unlink(path).catch(() => undefined);
