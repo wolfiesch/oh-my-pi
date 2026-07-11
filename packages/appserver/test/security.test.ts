@@ -181,3 +181,33 @@ it("lease owner is device plus connection and command allowlist is enforced", ()
   expect(leases.verify(lease.leaseId, "device", "other", "session", "session.prompt")).toBe(false);
   expect(leases.verify(lease.leaseId, "device", "connection", "session", "session.cancel")).toBe(false);
 });
+it("audit dispose releases single-writer ownership", async () => {
+  const path = `/tmp/omp-audit-dispose-${process.pid}/audit.jsonl`;
+  const first = new JsonlAuditSink(path);
+  await first.write({ ok: true });
+  first.dispose();
+  first.close();
+  const second = new JsonlAuditSink(path);
+  second.dispose();
+  await unlink(path).catch(() => undefined);
+});
+
+it("pairing rejects a caller identity different from verified issuer", () => {
+  const registry = new FakeRegistry();
+  const issuerIdentity = identity;
+  const issuerRecord = { deviceId: "issuer-canonical", identityKey: JSON.stringify([issuerIdentity.nodeId, issuerIdentity.login, issuerIdentity.hostId, issuerIdentity.tailnetIp]), capabilities: ["sessions.manage"] as const, metadata: { label: "issuer" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: Date.now() + 86_400_000, revokedAt: null, epoch: 0 };
+  registry.create(issuerRecord, "token");
+  const principal = registry.authenticate("issuer-canonical", "token", issuerIdentity, "issuer-canonical-connection");
+  const pairing = new SqlitePairingService(registry, clock, { bytes: (n) => new Uint8Array(n).fill(2) });
+  const context = { deviceId: principal.deviceId, epoch: principal.epoch, identityKey: principal.identityKey };
+  const grant = pairing.start("issuer-canonical-connection", ["sessions.read"], undefined, context);
+  expect(() => pairing.complete("issuer-canonical-connection", grant.code, { ...issuerIdentity, tailnetIp: "100.64.0.3" }, { label: "x" }, ["sessions.read"], context)).toThrow();
+});
+
+it("lease renew and release reject command-kind bypasses", () => {
+  const leases = new LeaseRegistry(clock, { bytes: (n) => new Uint8Array(n).fill(5) });
+  const lease = leases.acquire("device", "connection", "session", "prompt");
+  expect(() => leases.renew(lease.leaseId, "device", "connection", 30_000, 0, undefined, "session.cancel")).toThrow();
+  leases.release(lease.leaseId, "device", "connection", 0, undefined, "session.cancel");
+  expect(leases.verify(lease.leaseId, "device", "connection", "session", "session.prompt", 0)).toBe(true);
+});
