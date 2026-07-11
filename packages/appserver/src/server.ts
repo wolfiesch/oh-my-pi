@@ -7,7 +7,6 @@ import {
 	type CommandFrame,
 	type ConfirmationChallenge,
 	type ConfirmFrame,
-	type DurableEntry,
 	decodeClientFrame,
 	decodeCursor,
 	type HelloFrame,
@@ -21,8 +20,8 @@ import {
 	utf8ByteLength,
 } from "@oh-my-pi/app-wire";
 import { AppserverCommandHandlers } from "./command-handler.ts";
-import { stableProjectId } from "./discovery.ts";
 import { IdempotencyStore } from "./idempotency.ts";
+import { SessionEntryProjector, stableProjectId } from "./discovery.ts";
 import { createEpoch, createHostId, defaultSocketPath, loadPersistentHostId, unixSocketActive } from "./identity.ts";
 import {
 	DesktopOperationDispatcher,
@@ -81,28 +80,6 @@ function response(
 		ok,
 		...(ok ? { result } : { error }),
 	} as ResultFrame;
-}
-function fromRpcEntry(raw: Record<string, unknown>, host: HostId, session: SessionId): DurableEntry {
-	if (
-		typeof raw.id !== "string" ||
-		typeof raw.type !== "string" ||
-		!raw.type ||
-		(raw.parentId !== null && typeof raw.parentId !== "string") ||
-		typeof raw.timestamp !== "string" ||
-		!Number.isFinite(Date.parse(raw.timestamp))
-	)
-		throw new Error("malformed rpc session entry");
-	return {
-		id: raw.id as DurableEntry["id"],
-		parentId: raw.parentId as DurableEntry["parentId"],
-		hostId: host,
-		sessionId: session,
-		kind: raw.type,
-		timestamp: raw.timestamp,
-		data: Object.fromEntries(
-			Object.entries(raw).filter(([key]) => !["id", "parentId", "type", "timestamp"].includes(key)),
-		),
-	};
 }
 function argumentError(command: CommandFrame): string | undefined {
 	const args = command.args;
@@ -919,14 +896,19 @@ export class LocalAppserver implements AppserverHandle {
 		await this.#lockCheck(record);
 		if (this.#stopping || this.#closedSessions.has(sessionId)) throw new Error("session is closed");
 		const projection = this.#projections.get(sessionId)!;
+		const projector = new SessionEntryProjector(this.hostId, sessionId, "live", projection.value.entries);
 		const supervisor = new RpcChildSupervisor(
 			this.#factory,
 			record,
 			{
 				entry: frame => {
-					const entry = fromRpcEntry(frame.entry as unknown as Record<string, unknown>, this.hostId, sessionId);
-					const output = entry ? projection.appendEntry(entry) : undefined;
-					if (output) this.broadcast(sessionId, output);
+					const value: unknown = frame.entry;
+					const raw = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+					if (!raw) return;
+					for (const entry of projector.project(raw)) {
+						const output = projection.appendEntry(entry);
+						if (output) this.broadcast(sessionId, output);
+					}
 				},
 				event: frame =>
 					this.broadcast(

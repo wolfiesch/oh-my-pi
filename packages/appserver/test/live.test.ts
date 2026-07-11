@@ -199,6 +199,34 @@ describe("live Unix websocket protocol", () => {
     s2.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "s2-after", timestamp: stamp }); expect((await s2.client.nextServer()).type).toBe("pong");
     await closeClients([s2.client, unattached.client]); await appserver.stop();
   });
+
+  test("projects nested OMP records into safe flat durable entries", async () => {
+    const factory = new LiveFactory(); const { appserver, path } = await liveServer(factory, [record("s1")]);
+    const client = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+    client.client.sendJson(command("attach-project", "attach-project", "session.attach", "s1", {})); await responseAndSnapshot(client.client, "attach-project");
+    client.client.sendJson(command("prompt-project", "prompt-project", "session.prompt", "s1", { message: "go" }));
+    const child = await factory.child(); await child.waitForWrites(1);
+    child.push({ type: "session_entry", entry: { id: "init", parentId: null, type: "session_init", timestamp: stamp, systemPrompt: "hidden /home/lycaon/system", token: "secret" } });
+    child.push({ type: "session_entry", entry: { id: "hidden", parentId: "init", type: "custom_message", timestamp: stamp, display: false, content: "hidden custom /home/lycaon/private", authorization: "secret" } });
+    child.push({ type: "session_entry", entry: { id: "user", parentId: "hidden", type: "message", timestamp: stamp, message: { role: "user", content: "Inspect /home/lycaon/project" } } });
+    child.push({ type: "session_entry", entry: { id: "assistant", parentId: "user", type: "message", timestamp: stamp, message: { role: "assistant", content: [{ type: "thinking", thinking: "I will inspect safely." }, { type: "toolCall", id: "call-1", name: "read", title: "Read file", arguments: { path: "/home/lycaon/project/src/app.ts", authorization: "secret" } }] } } });
+    const beforeResult = [await client.client.nextServer(), await client.client.nextServer()];
+    expect(beforeResult.every(frame => frame.type === "entry" && frame.entry.kind !== "tool-use")).toBe(true);
+    child.push({ type: "session_entry", entry: { id: "result", parentId: "assistant", type: "message", timestamp: stamp, message: { role: "toolResult", toolCallId: "call-1", content: [{ type: "text", text: "contents from /home/lycaon/project/src/app.ts" }], isError: false } } });
+    child.push({ type: "session_entry", entry: { id: "shown", parentId: "result", type: "custom_message", timestamp: stamp, display: true, attribution: "agent", content: "Visible note" } });
+    responseFor(child, "prompt");
+    const output = await untilResponse(client.client, "prompt-project");
+    const entries = [...beforeResult, ...output.frames].filter(frame => frame.type === "entry");
+    expect(entries.map(frame => frame.type === "entry" ? frame.entry.kind : "")).toEqual(["message", "message", "tool-use", "message"]);
+    if (entries[0]?.type === "entry") expect(entries[0].entry.data).toEqual({ role: "user", text: "Inspect [path]" });
+    if (entries[1]?.type === "entry") expect(entries[1].entry.data).toEqual({ role: "assistant", text: "", reasoning: "I will inspect safely." });
+    if (entries[2]?.type === "entry") expect(entries[2].entry.data).toMatchObject({ toolCallId: "call-1", tool: "read", title: "Read file", ok: true, result: { output: "contents from [path]" } });
+    if (entries[3]?.type === "entry") expect(entries[3].entry.data).toEqual({ role: "assistant", text: "Visible note" });
+    expect(JSON.stringify(output.frames)).not.toContain("systemPrompt");
+    expect(JSON.stringify(output.frames)).not.toContain("authorization");
+    expect(JSON.stringify(output.frames)).not.toContain("/home/lycaon");
+    await closeClients([client.client]); await appserver.stop();
+  });
 });
 
 describe("raw RFC6455 boundary and lifecycle", () => {

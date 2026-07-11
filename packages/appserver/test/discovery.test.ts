@@ -81,6 +81,15 @@ function transcript(entries: Record<string, unknown>[], title?: string): string 
     expect(new TextEncoder().encode(titled?.title ?? "").byteLength).toBeLessThanOrEqual(512);
   });
 
+  test("uses the first substantive Change line for a bounded fallback title", async () => {
+    const wrapped = "Complete the assignment below\n\n# Target\nIgnore this heading\n\n# Change\n1. Build a durable projector with a deliberately long description " + "x".repeat(200);
+    const entries = [{ type: "message", id: "u1", parentId: null, timestamp: stamp, message: { role: "user", content: wrapped } }];
+    const discovery = new FileSessionDiscovery("/root", fakeFs({ "/root/session.jsonl": transcript(entries) }, ["/root"]), host);
+    const [session] = await discovery.list();
+    expect(session?.title?.startsWith("Build a durable projector")).toBe(true);
+    expect(new TextEncoder().encode(session?.title ?? "").byteLength).toBeLessThanOrEqual(120);
+  });
+
   test("limits snapshots to 1000 entries with an omission notice", async () => {
     const entries: Record<string, unknown>[] = [];
     for (let i = 0; i < 1001; i++) entries.push({ type: "message", id: `m-${i}`, parentId: i === 0 ? null : `m-${i - 1}`, timestamp: stamp, message: { role: "user", content: `${"x".repeat(8192)} ${i}` } });

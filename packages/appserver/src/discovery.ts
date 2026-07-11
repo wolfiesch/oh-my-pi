@@ -35,6 +35,7 @@ function boundUtf8(value: string, maxBytes: number): string {
 
 function redactString(value: string): string {
   return value
+    .replace(/(?<![:/A-Za-z0-9_])\/(?:[^\s"'`/]+\/)+[^\s"'`]+/g, "[path]")
     .replace(/(?:\/(?:home|tmp|var|root|Users|private|workspace)\/[^\s"'`]+|[A-Za-z]:\\[^\s"'`]+)/g, "[path]")
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
     .replace(/\b(?:sk|rk)-[A-Za-z0-9_-]{12,}\b/g, "[redacted]");
@@ -58,7 +59,10 @@ function safeValue(value: unknown, key = "", depth = 0): unknown {
   if (Array.isArray(value)) return value.slice(0, 64).map(item => safeValue(item, "", depth + 1));
   if (typeof value === "object") {
     const output: Record<string, unknown> = {};
-    for (const [name, item] of Object.entries(value).slice(0, 64)) output[name] = safeValue(item, name, depth + 1);
+    for (const [name, item] of Object.entries(value).slice(0, 64)) {
+      if (isSensitiveKey(name)) continue;
+      output[name] = safeValue(item, name, depth + 1);
+    }
     return output;
   }
   return undefined;
@@ -96,7 +100,230 @@ function uniqueEntryId(base: string, used: Set<string>): EntryId {
   return entryId(`snapshot-${suffix}-${used.size}`);
 }
 
-interface ToolResultProjection { ok: boolean; text: string }
+
+type ProjectionMode = "batch" | "live";
+
+interface PendingToolCall {
+  callId: string;
+  tool: string;
+  title: string;
+  args: unknown;
+  parentId: EntryId | null;
+  idBase: string;
+  timestamp: string;
+}
+
+interface ProjectedToolResult {
+  ok: boolean;
+  text: string;
+  timestamp: string;
+}
+
+function validRawEntry(raw: Record<string, unknown>): boolean {
+  return typeof raw.id === "string" && Boolean(raw.id) &&
+    typeof raw.type === "string" && Boolean(raw.type) &&
+    (raw.parentId === undefined || raw.parentId === null || typeof raw.parentId === "string") &&
+    typeof raw.timestamp === "string" && Number.isFinite(Date.parse(raw.timestamp));
+}
+
+export class SessionEntryProjector {
+  readonly entries: DurableEntry[] = [];
+  readonly mode: ProjectionMode;
+  #host: HostId;
+  #session: SessionId;
+  #aliases = new Map<string, EntryId | null>();
+  #pendingCalls = new Map<string, PendingToolCall>();
+  #pendingResults = new Map<string, ProjectedToolResult>();
+  #settledCalls = new Set<string>();
+  #usedIds = new Set<string>();
+  #firstUserText?: string;
+  #titleChange?: string;
+  #model?: string;
+  #thinking?: string;
+  #knownEntryIds = new Set<string>();
+
+  constructor(host: HostId, session: SessionId, mode: ProjectionMode, knownEntries: readonly DurableEntry[] = []) {
+    this.#host = host;
+    this.#session = session;
+    this.mode = mode;
+    for (const entry of knownEntries) this.#knownEntryIds.add(entry.id);
+  }
+
+  get firstUserText(): string | undefined { return this.#firstUserText; }
+  get titleChange(): string | undefined { return this.#titleChange; }
+  get model(): string | undefined { return this.#model; }
+  get thinking(): string | undefined { return this.#thinking; }
+
+  #resolveParent(raw: unknown): EntryId | null {
+    if (typeof raw !== "string") return null;
+    const seen = new Set<string>();
+    let current: string | undefined = raw;
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const alias = this.#aliases.get(current);
+      if (alias === undefined) {
+        try {
+          const known = entryId(current);
+          return this.#knownEntryIds.has(known) ? known : null;
+        } catch {
+          return null;
+        }
+      }
+      if (alias !== null) return alias;
+      current = undefined;
+    }
+    return null;
+  }
+
+
+  #add(raw: Record<string, unknown>, kind: string, data: Record<string, unknown>, parentId: EntryId | null, idBase = String(raw.id)): DurableEntry {
+    const id = uniqueEntryId(idBase, this.#usedIds);
+    this.#usedIds.add(id);
+    const entry: DurableEntry = {
+      id,
+      parentId,
+      hostId: this.#host,
+      sessionId: this.#session,
+      kind,
+      timestamp: String(raw.timestamp),
+      data,
+    };
+    this.entries.push(entry);
+    return entry;
+  }
+
+  #tool(raw: Record<string, unknown>, call: PendingToolCall, result: ProjectedToolResult): DurableEntry {
+    return this.#add(
+      { ...raw, timestamp: result.timestamp },
+      "tool-use",
+      {
+        toolCallId: call.callId,
+        tool: call.tool,
+        title: call.title,
+        args: call.args,
+        ok: result.ok,
+        result: { output: boundUtf8(result.text, MAX_RESULT_BYTES) },
+      },
+      call.parentId,
+      call.idBase,
+    );
+  }
+
+  #rememberUserText(role: string, text: string): void {
+    if (role === "user" && text && this.#firstUserText === undefined) this.#firstUserText = text;
+  }
+
+  project(raw: Record<string, unknown>): DurableEntry[] {
+    if (!validRawEntry(raw)) return [];
+    const before = this.entries.length;
+    const parentId = this.#resolveParent(raw.parentId);
+    const nested = asObject(raw.message);
+    const message = nested ?? raw;
+    const role = typeof message.role === "string"
+      ? message.role
+      : raw.type === "message" && typeof raw.text === "string"
+        ? "assistant"
+        : raw.type === "message" && typeof raw.message === "string"
+          ? "user"
+          : undefined;
+
+    if (raw.type === "message" && (role === "user" || role === "assistant")) {
+      const content = message.content ?? message.text ?? (nested ? message.message : raw.text ?? raw.message);
+      const text = contentText(content);
+      const reasoningParts: string[] = [];
+      const toolCalls: PendingToolCall[] = [];
+      if (role === "assistant" && Array.isArray(message.content)) {
+        for (const item of message.content) {
+          const block = asObject(item);
+          if (block?.type === "thinking" && typeof block.thinking === "string") reasoningParts.push(block.thinking);
+          if (block?.type === "toolCall" && typeof block.id === "string" && typeof block.name === "string") {
+            const args = safeValue(block.arguments ?? block.args ?? {});
+            const argsBytes = encoder.encode(JSON.stringify(args) ?? "").byteLength;
+            toolCalls.push({
+              callId: block.id,
+              tool: cleanText(block.name, 256, true),
+              title: typeof block.title === "string" ? cleanText(block.title, 256, true) : cleanText(block.name, 256, true),
+              args: argsBytes <= MAX_ARGUMENT_BYTES ? args : { omitted: "Tool arguments exceeded the app-wire display budget." },
+              parentId: null,
+              idBase: `${raw.id}:tool:${block.id}`,
+              timestamp: String(raw.timestamp),
+            });
+          }
+        }
+      }
+      const reasoning = cleanText(reasoningParts.join(""), MAX_TEXT_BYTES);
+      const messageEntry = text || reasoning || role === "user"
+        ? this.#add(raw, "message", { role, text, ...(reasoning ? { reasoning } : {}) }, parentId)
+        : undefined;
+      this.#rememberUserText(role, text);
+      const alias = messageEntry?.id ?? parentId;
+      this.#aliases.set(String(raw.id), alias);
+      for (const call of toolCalls) {
+        call.parentId = alias;
+        this.#pendingCalls.set(call.callId, call);
+        const pending = this.#pendingResults.get(call.callId);
+        if (pending) {
+          this.#tool(raw, call, pending);
+          this.#pendingResults.delete(call.callId);
+          this.#pendingCalls.delete(call.callId);
+          this.#settledCalls.add(call.callId);
+        }
+      }
+    } else if (raw.type === "message" && role === "toolResult") {
+      const callId = typeof message.toolCallId === "string" ? message.toolCallId : typeof raw.toolCallId === "string" ? raw.toolCallId : undefined;
+      if (callId && !this.#settledCalls.has(callId)) {
+        const result: ProjectedToolResult = {
+          ok: message.isError !== true,
+          text: contentText(message.content ?? message.text ?? raw.text),
+          timestamp: String(raw.timestamp),
+        };
+        const call = this.#pendingCalls.get(callId);
+        if (call) {
+          this.#tool(raw, call, result);
+          this.#pendingCalls.delete(callId);
+          this.#settledCalls.add(callId);
+        } else {
+          this.#pendingResults.set(callId, result);
+        }
+      }
+      this.#aliases.set(String(raw.id), parentId);
+    } else if (raw.type === "custom_message" && raw.display === true) {
+      const text = contentText(raw.content ?? raw.text);
+      const customRole = raw.attribution === "agent" ? "assistant" : "user";
+      const entry = this.#add(raw, "message", { role: customRole, text }, parentId);
+      this.#aliases.set(String(raw.id), entry.id);
+      this.#rememberUserText(customRole, text);
+    } else if (raw.type === "compaction" && typeof raw.summary === "string") {
+      const entry = this.#add(raw, "compaction", {
+        summary: cleanText(raw.summary, MAX_RESULT_BYTES),
+        ...(typeof raw.shortSummary === "string" ? { shortSummary: cleanText(raw.shortSummary, MAX_TEXT_BYTES) } : {}),
+      }, parentId);
+      this.#aliases.set(String(raw.id), entry.id);
+    } else {
+      if (raw.type === "title_change" && typeof raw.title === "string" && cleanText(raw.title, 512, true)) this.#titleChange = cleanText(raw.title, 512, true);
+      if (raw.type === "model_change" && typeof raw.model === "string" && cleanText(raw.model, 256, true)) this.#model = cleanText(raw.model, 256, true);
+      if (raw.type === "thinking_level_change") {
+        const candidate = typeof raw.configured === "string" ? raw.configured : raw.thinkingLevel;
+        if (typeof candidate === "string" && cleanText(candidate, 256, true)) this.#thinking = cleanText(candidate, 256, true);
+      }
+      this.#aliases.set(String(raw.id), parentId);
+    }
+    return this.entries.slice(before);
+  }
+
+  finish(): DurableEntry[] {
+    const before = this.entries.length;
+    if (this.mode === "batch") {
+      for (const call of this.#pendingCalls.values()) {
+        this.#tool({ id: call.idBase, timestamp: call.timestamp }, call, { ok: false, text: "", timestamp: call.timestamp });
+        this.#settledCalls.add(call.callId);
+      }
+    }
+    this.#pendingCalls.clear();
+    this.#pendingResults.clear();
+    return this.entries.slice(before);
+  }
+}
 
 function normalizeEntries(values: Record<string, unknown>[], host: HostId, sid: SessionId, headerTimestamp: string): {
   entries: DurableEntry[];
@@ -105,109 +332,14 @@ function normalizeEntries(values: Record<string, unknown>[], host: HostId, sid: 
   model?: string;
   thinking?: string;
 } {
-  const entries: DurableEntry[] = [];
-  const aliases = new Map<string, EntryId | null>();
-  const toolRows = new Map<string, { index: number; id: EntryId }>();
-  const pendingResults = new Map<string, ToolResultProjection>();
-  const usedIds = new Set<string>();
-  let firstUserText: string | undefined;
-  let titleChange: string | undefined;
-  let model: string | undefined;
-  let thinking: string | undefined;
-
-  const resolveParent = (raw: unknown): EntryId | null => {
-    if (typeof raw !== "string") return null;
-    const seen = new Set<string>();
-    let current: string | undefined = raw;
-    while (current && !seen.has(current)) {
-      seen.add(current);
-      const alias = aliases.get(current);
-      if (alias === undefined) return null;
-      if (alias !== null) return alias;
-      current = undefined;
-    }
-    return null;
-  };
-  const add = (raw: Record<string, unknown>, kind: string, data: Record<string, unknown>, parentId: EntryId | null, idBase = String(raw.id)): EntryId => {
-    const id = uniqueEntryId(idBase, usedIds);
-    usedIds.add(id);
-    entries.push({ id, parentId, hostId: host, sessionId: sid, kind, timestamp: String(raw.timestamp), data });
-    return id;
-  };
-
+  const projector = new SessionEntryProjector(host, sid, "batch");
   for (const raw of values) {
-    if (typeof raw.id !== "string" || !raw.id || typeof raw.type !== "string" || !raw.type || (raw.parentId !== null && typeof raw.parentId !== "string") || typeof raw.timestamp !== "string" || !Number.isFinite(Date.parse(raw.timestamp))) throw new Error("invalid transcript entry");
-    entryId(raw.id);
-    const parentId = resolveParent(raw.parentId);
-    const message = asObject(raw.message) ?? raw;
-    const role = typeof message.role === "string" ? message.role : raw.type === "message" && typeof raw.message === "string" ? "user" : undefined;
-    if (raw.type === "message" && (role === "user" || role === "assistant")) {
-      const text = contentText(message.content ?? message.message);
-      const reasoningParts: string[] = [];
-      const toolCalls: Array<{ id: string; name: string; title: string; args: unknown }> = [];
-      if (role === "assistant" && Array.isArray(message.content)) {
-        for (const item of message.content) {
-          const block = asObject(item);
-          if (block?.type === "thinking" && typeof block.thinking === "string") reasoningParts.push(block.thinking);
-          if (block?.type === "toolCall" && typeof block.id === "string" && typeof block.name === "string") {
-            const args = safeValue(block.arguments ?? {});
-            const argsBytes = encoder.encode(JSON.stringify(args) ?? "").byteLength;
-            toolCalls.push({ id: block.id, name: cleanText(block.name, 256, true), title: typeof block.title === "string" ? cleanText(block.title, 256, true) : cleanText(block.name, 256, true), args: argsBytes <= MAX_ARGUMENT_BYTES ? args : { omitted: "Tool arguments exceeded the app-wire display budget." } });
-          }
-        }
-      }
-      const reasoning = cleanText(reasoningParts.join(""), MAX_TEXT_BYTES);
-      const primary = text || reasoning || role === "user" ? add(raw, "message", { role, text, ...(reasoning ? { reasoning } : {}) }, parentId) : undefined;
-      if (role === "user" && text && firstUserText === undefined) firstUserText = text;
-      aliases.set(raw.id, primary ?? parentId);
-      for (const call of toolCalls) {
-        const toolId = add(raw, "tool-use", { toolCallId: call.id, tool: call.name, title: call.title, args: call.args ?? {}, ok: false, result: { output: "" } }, primary ?? parentId, `${raw.id}:tool:${call.id}`);
-        toolRows.set(call.id, { index: entries.length - 1, id: toolId });
-        const pending = pendingResults.get(call.id);
-        if (pending) {
-          entries[entries.length - 1] = { ...entries[entries.length - 1], data: { ...entries[entries.length - 1].data, ok: pending.ok, result: { output: pending.text } } };
-          pendingResults.delete(call.id);
-        }
-      }
-      continue;
-    }
-
-    if (raw.type === "message" && role === "toolResult") {
-      const callId = typeof message.toolCallId === "string" ? message.toolCallId : undefined;
-      if (callId) {
-        const result: ToolResultProjection = { ok: message.isError !== true, text: contentText(message.content) };
-        const row = toolRows.get(callId);
-        if (row) entries[row.index] = { ...entries[row.index], data: { ...entries[row.index].data, ok: result.ok, result: { output: boundUtf8(result.text, MAX_RESULT_BYTES) } } };
-        else pendingResults.set(callId, result);
-      }
-      aliases.set(raw.id, parentId);
-      continue;
-    }
-
-    if (raw.type === "custom_message" && raw.display === true) {
-      const text = contentText(raw.content);
-      const customRole = raw.attribution === "agent" ? "assistant" : "user";
-      const id = add(raw, "message", { role: customRole, text }, parentId);
-      aliases.set(raw.id, id);
-      if (customRole === "user" && text && firstUserText === undefined) firstUserText = text;
-      continue;
-    }
-
-    if (raw.type === "compaction" && typeof raw.summary === "string") {
-      const id = add(raw, "compaction", { summary: cleanText(raw.summary, MAX_RESULT_BYTES), ...(typeof raw.shortSummary === "string" ? { shortSummary: cleanText(raw.shortSummary, MAX_TEXT_BYTES) } : {}) }, parentId);
-      aliases.set(raw.id, id);
-      continue;
-    }
-
-    if (raw.type === "title_change" && typeof raw.title === "string" && cleanText(raw.title, 512, true)) titleChange = cleanText(raw.title, 512, true);
-    if (raw.type === "model_change" && typeof raw.model === "string" && cleanText(raw.model, 256, true)) model = cleanText(raw.model, 256, true);
-    if (raw.type === "thinking_level_change") {
-      const candidate = typeof raw.configured === "string" ? raw.configured : raw.thinkingLevel;
-      if (typeof candidate === "string" && cleanText(candidate, 256, true)) thinking = cleanText(candidate, 256, true);
-    }
-    aliases.set(raw.id, parentId);
+    if (!validRawEntry(raw)) throw new Error("invalid transcript entry");
+    entryId(String(raw.id));
+    projector.project(raw);
   }
-
+  projector.finish();
+  const entries = projector.entries;
   const retainedReverse: DurableEntry[] = [];
   let payloadBytes = 2;
   let payloadNodes = 1;
@@ -225,7 +357,7 @@ function normalizeEntries(values: Record<string, unknown>[], host: HostId, sid: 
   }
   const retained = retainedReverse.reverse();
   const omitted = entries.length - retained.length;
-  if (omitted === 0) return { entries: retained, firstUserText, titleChange, model, thinking };
+  if (omitted === 0) return { entries: retained, firstUserText: projector.firstUserText, titleChange: projector.titleChange, model: projector.model, thinking: projector.thinking };
   const retainedIds = new Set(retained.map(entry => entry.id));
   for (let i = 0; i < retained.length; i++) {
     const parentId = retained[i].parentId;
@@ -234,13 +366,26 @@ function normalizeEntries(values: Record<string, unknown>[], host: HostId, sid: 
   const noticeTimestamp = retained[0]?.timestamp ?? headerTimestamp;
   const noticeId = uniqueEntryId(`snapshot-truncation-${sid}`, new Set(retained.map(entry => entry.id)));
   retained.unshift({ id: noticeId, parentId: null, hostId: host, sessionId: sid, kind: "compaction", timestamp: noticeTimestamp, data: { summary: `Older transcript entries were omitted from this snapshot (${omitted} entries).`, omitted } });
-  return { entries: retained, firstUserText, titleChange, model, thinking };
+  return { entries: retained, firstUserText: projector.firstUserText, titleChange: projector.titleChange, model: projector.model, thinking: projector.thinking };
 }
 
 export function stableProjectId(cwd: string): ProjectId {
   let canonical = resolve(cwd);
   try { canonical = realpathSync.native(canonical); } catch {}
   return projectId(`project-${createHash("sha256").update(canonical).digest("hex").slice(0, 24)}`);
+}
+
+function fallbackTitle(firstUserText: string | undefined): string | undefined {
+  if (!firstUserText) return undefined;
+  const lines = firstUserText.split(/\r?\n/u);
+  const changeIndex = lines.findIndex(line => /^#{1,6}\s*change\s*$/iu.test(line.trim()));
+  const candidates = changeIndex >= 0 ? lines.slice(changeIndex + 1) : lines;
+  for (const line of candidates) {
+    const trimmed = line.trim();
+    if (!trimmed || /^#{1,6}\s/u.test(trimmed)) continue;
+    return cleanText(trimmed.replace(/^\d+[.)]\s*/u, ""), 120, true) || undefined;
+  }
+  return undefined;
 }
 
 function parseTranscript(input: string | Uint8Array, path: string, host: HostId): SessionRecord {
@@ -275,7 +420,7 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
   const cwd = resolve(header.cwd);
   const normalized = normalizeEntries(values.slice(headerIndex + 1), host, sid, header.timestamp);
   const sessionTitle = typeof header.title === "string" ? cleanText(header.title, 512, true) : undefined;
-  const title = fixedTitle || normalized.titleChange || sessionTitle || normalized.firstUserText || "Untitled";
+  const title = fixedTitle || normalized.titleChange || sessionTitle || fallbackTitle(normalized.firstUserText) || "Untitled";
   return { sessionId: sid, path, cwd, projectId: stableProjectId(cwd), projectName: basename(cwd), title: cleanText(title, 512, true) || "Untitled", updatedAt: "", status: "idle", ...(normalized.model ? { model: normalized.model } : {}), ...(normalized.thinking ? { thinking: normalized.thinking } : {}), entries: normalized.entries };
 }
 
