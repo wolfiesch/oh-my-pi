@@ -31,6 +31,9 @@ export interface DesktopSettingsPort {
 	clearGlobal(path: SettingPath): void;
 }
 export interface CatalogProvider { list?: () => unknown[] | Promise<unknown[]>; metadata?: () => unknown[] | Promise<unknown[]>; }
+export interface SkillLoader { (): unknown | Promise<unknown>; }
+export interface PluginManagerLike { list(): unknown[] | Promise<unknown[]>; }
+export interface McpManagerLike { getConnectedServers(): string[]; getAllServerNames(): string[]; }
 export interface OperationContextLike { currentRevision?: string; expectedRevision?: string; }
 export interface DesktopConfigAuthorityOptions {
 	settings: DesktopSettingsPort;
@@ -38,11 +41,14 @@ export interface DesktopConfigAuthorityOptions {
 	platform?: string;
 	modelRegistry?: Pick<ModelRegistry, "getAll" | "getAvailable"> | { getAll?: () => unknown[]; getAvailable?: () => unknown[] };
 	agentRegistry?: Pick<AgentRegistry, "list"> | { list: () => unknown[] };
-	skillsProvider?: CatalogProvider | (() => unknown[] | Promise<unknown[]>);
+	skillsLoader?: SkillLoader;
+	pluginManager?: PluginManagerLike;
+	mcpManager?: McpManagerLike;
+	skillsProvider?: CatalogProvider | SkillLoader;
 	pluginProvider?: CatalogProvider | (() => unknown[] | Promise<unknown[]>);
 	mcpProvider?: CatalogProvider | (() => unknown[] | Promise<unknown[]>);
-	/** Backward-compatible local names; callers should prefer *Provider. */
-	skills?: CatalogProvider | (() => unknown[] | Promise<unknown[]>);
+	/** Legacy aliases retained for callers that have not adopted explicit adapters. */
+	skills?: CatalogProvider | SkillLoader;
 	plugins?: CatalogProvider | (() => unknown[] | Promise<unknown[]>);
 	mcp?: CatalogProvider | (() => unknown[] | Promise<unknown[]>);
 }
@@ -59,20 +65,24 @@ function canonical(value: unknown): string {
 	return `{${Object.keys(object).sort().map(key => `${JSON.stringify(key)}:${canonical(object[key])}`).join(",")}}`;
 }
 function revisionFor(value: unknown): string { return createHash("sha256").update(canonical(value)).digest("hex"); }
-function text(value: unknown, max = MAX_STRING): string | undefined { return typeof value === "string" ? value.slice(0, max) : undefined; }
+function text(value: unknown, max = MAX_STRING): string | undefined {
+	if (typeof value !== "string") return undefined;
+	return value.replace(/[\u0000-\u001f\u007f]/gu, "").slice(0, max);
+}
 function pathSafe(value: string): string { return isAbsolute(value) ? "<redacted-path>" : value; }
 function secretKey(key: string): boolean { return SECRET_KEY.test(key); }
 function safeMetadata(value: unknown, depth = 0, state = { nodes: 0 }, key = ""): unknown {
 	if (++state.nodes > MAX_NODES || depth > MAX_DEPTH) return "<redacted-bounds>";
 	if (secretKey(key) || typeof value === "function" || typeof value === "bigint" || value === undefined) return undefined;
-	if (typeof value === "string") return pathSafe(value.slice(0, MAX_STRING));
-	if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+	if (typeof value === "string") return pathSafe(text(value) ?? "");
+	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+	if (typeof value === "boolean" || value === null) return value;
 	if (Array.isArray(value)) return value.slice(0, MAX_ITEMS).map(item => safeMetadata(item, depth + 1, state, key)).filter(item => item !== undefined);
 	if (typeof value !== "object") return undefined;
 	const result: Record<string, unknown> = {};
 	for (const [childKey, child] of Object.entries(value as Record<string, unknown>).slice(0, 256)) {
 		const clean = safeMetadata(child, depth + 1, state, childKey);
-		if (clean !== undefined) result[childKey] = clean;
+		if (clean !== undefined) result[text(childKey, 256) ?? "<redacted-key>"] = clean;
 	}
 	return result;
 }
@@ -103,13 +113,62 @@ function containsSecretKey(value: unknown, depth = 0): boolean {
 	if (Array.isArray(value)) return value.some(item => containsSecretKey(item, depth + 1));
 	return Object.entries(value as Record<string, unknown>).some(([key, child]) => secretKey(key) || containsSecretKey(child, depth + 1));
 }
+const STRING_ARRAY_SETTINGS = new Set([
+	"extensions", "enabledModels", "disabledProviders", "disabledExtensions", "modelProviderOrder", "statusLine.leftSegments",
+	"statusLine.rightSegments", "hindsight.recallTypes", "ttsr.disabledRules", "shellMinimizer.only", "shellMinimizer.except",
+	"tools.essentialOverride", "mcp.discoveryDefaultServers", "goal.continuationModes", "task.disabledAgents", "skills.customDirectories",
+	"skills.ignoredSkills", "skills.includeSkills", "providers.webSearchExclude", "cycleOrder",
+]);
 function validateNested(value: unknown, path: string, depth = 0): void {
 	if (depth > MAX_DEPTH) throw new Error(`value exceeds nesting limit for ${path}`);
 	if (typeof value === "string") { if (value.length > MAX_STRING) throw new Error(`string exceeds limit for ${path}`); return; }
 	if (value === null || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) return;
-	if (Array.isArray(value)) { if (value.length > MAX_ITEMS) throw new Error(`array exceeds limit for ${path}`); value.forEach((item, index) => validateNested(item, `${path}[${index}]`, depth + 1)); return; }
-	if (value && typeof value === "object") { const entries = Object.entries(value as Record<string, unknown>); if (entries.length > 256) throw new Error(`map exceeds limit for ${path}`); for (const [key, child] of entries) { if (secretKey(key)) throw new Error(`secret-like keys cannot be written for ${path}`); validateNested(child, `${path}.${key}`, depth + 1); } return; }
+	if (Array.isArray(value)) {
+		if (value.length > MAX_ITEMS) throw new Error(`array exceeds limit for ${path}`);
+		value.forEach((item, index) => validateNested(item, `${path}[${index}]`, depth + 1));
+		return;
+	}
+	if (value && typeof value === "object") {
+		const entries = Object.entries(value as Record<string, unknown>);
+		if (entries.length > 256) throw new Error(`map exceeds limit for ${path}`);
+		for (const [key, child] of entries) {
+			if (key.length > MAX_STRING || secretKey(key)) throw new Error(`secret-like keys cannot be written for ${path}`);
+			validateNested(child, `${path}.${key}`, depth + 1);
+		}
+		return;
+	}
 	throw new Error(`value for ${path} is not serializable`);
+}
+function shapeOf(value: unknown): unknown {
+	if (typeof value === "string" || typeof value === "boolean" || typeof value === "number") return typeof value;
+	if (Array.isArray(value)) return value.length > 0 ? { array: shapeOf(value[0]) } : { array: "unknown" };
+	if (value && typeof value === "object") {
+		return { object: Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, child]) => [key, shapeOf(child)])) };
+	}
+	return "unknown";
+}
+function validateShape(value: unknown, shape: unknown, path: string): void {
+	if (shape === "unknown") return;
+	if (typeof shape === "string") {
+		if (typeof value !== shape || (shape === "number" && !Number.isFinite(value))) throw new Error(`invalid typed value for ${path}`);
+		return;
+	}
+	if (!shape || typeof shape !== "object") return;
+	const spec = shape as Record<string, unknown>;
+	if ("array" in spec) {
+		if (!Array.isArray(value)) throw new Error(`invalid array value for ${path}`);
+		for (const [index, item] of value.entries()) validateShape(item, spec.array, `${path}[${index}]`);
+		return;
+	}
+	if ("object" in spec) {
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`invalid record value for ${path}`);
+		const expected = spec.object as Record<string, unknown>;
+		for (const [key, expectedShape] of Object.entries(expected)) {
+			if (!(key in (value as Record<string, unknown>))) throw new Error(`missing record key ${path}.${key}`);
+			validateShape((value as Record<string, unknown>)[key], expectedShape, `${path}.${key}`);
+		}
+		return;
+	}
 }
 function validateValue(def: SettingDefinition, value: unknown, path: string): void {
 	validateNested(value, path);
@@ -118,31 +177,62 @@ function validateValue(def: SettingDefinition, value: unknown, path: string): vo
 		case "number": if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`invalid number value for ${path}`); else { if (typeof def.min === "number" && value < def.min) throw new Error(`${path} is below minimum`); if (typeof def.max === "number" && value > def.max) throw new Error(`${path} is above maximum`); } break;
 		case "string": if (typeof value !== "string") throw new Error(`invalid string value for ${path}`); break;
 		case "enum": if (!Array.isArray(def.values) || !def.values.includes(value as string)) throw new Error(`invalid enum value for ${path}`); break;
-		case "array": { const maxItems = typeof def.maxItems === "number" ? def.maxItems : MAX_ITEMS; if (!Array.isArray(value) || value.length > maxItems) throw new Error(`invalid array value for ${path}`); break; }
-		case "record": { const maxEntries = typeof def.maxEntries === "number" ? def.maxEntries : 256; if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length > maxEntries) throw new Error(`invalid map value for ${path}`); break; }
+		case "array": {
+			const maxItems = typeof def.maxItems === "number" ? Math.min(def.maxItems, MAX_ITEMS) : MAX_ITEMS;
+			if (!Array.isArray(value) || value.length > maxItems) throw new Error(`invalid array value for ${path}`);
+			const sample = Array.isArray(def.default) && def.default.length > 0 ? shapeOf(def.default[0]) : STRING_ARRAY_SETTINGS.has(path) ? "string" : "unknown";
+			validateShape(value, { array: sample }, path);
+			break;
+		}
+		case "record": {
+			const maxEntries = typeof def.maxEntries === "number" ? Math.min(def.maxEntries, 256) : 256;
+			if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length > maxEntries) throw new Error(`invalid map value for ${path}`);
+			let sample: unknown = "unknown";
+			if (path === "modelRoles" || path === "task.agentModelOverrides") sample = "string";
+			else if (path === "retry.fallbackChains") sample = { array: "string" };
+			else if (path === "modelTags") sample = shapeOf({ name: "", color: "", hidden: false });
+			for (const [key, child] of Object.entries(value as Record<string, unknown>)) validateShape(child, sample, `${path}.${key}`);
+			break;
+		}
 	}
 	if (containsSecretKey(value)) throw new Error(`secret-like keys cannot be written for ${path}`);
 	if (safeMetadata(value) === undefined) throw new Error(`value for ${path} is not serializable`);
 }
-function normalizeProvider(provider: CatalogProvider | (() => unknown[] | Promise<unknown[]>) | undefined): Promise<unknown[]> {
+function normalizeProvider(provider: CatalogProvider | (() => unknown | Promise<unknown>) | undefined): Promise<unknown[]> {
 	if (!provider) return Promise.resolve([]);
-	try { const output = typeof provider === "function" ? provider() : provider.list?.() ?? provider.metadata?.() ?? []; return Promise.resolve(output).then(value => { if (!Array.isArray(value)) throw new Error("provider unavailable"); return value; }); } catch { return Promise.reject(new Error("provider unavailable")); }
+	try {
+		const output = typeof provider === "function" ? provider() : provider.list?.() ?? provider.metadata?.() ?? [];
+		return Promise.resolve(output).then(value => {
+			if (Array.isArray(value)) return value;
+			if (value && typeof value === "object" && Array.isArray((value as Record<string, unknown>).skills)) return (value as Record<string, unknown>).skills as unknown[];
+			if (value && typeof value === "object" && Array.isArray((value as Record<string, unknown>).items)) return (value as Record<string, unknown>).items as unknown[];
+			throw new Error("provider unavailable");
+		});
+	} catch { return Promise.reject(new Error("provider unavailable")); }
 }
 function itemFromUnknown(value: unknown, fallbackKind: CatalogItem["kind"], fallbackId: string): CatalogItem | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const source = value as Record<string, unknown>;
-	const id = pathSafe(text(source.id) ?? fallbackId);
-	const name = pathSafe(text(source.name) ?? text(source.displayName) ?? id);
+	const id = pathSafe(text(source.id, 256) ?? text(source.name, 256) ?? text(fallbackId, 256) ?? "item");
+	const name = pathSafe(text(source.name, 256) ?? text(source.displayName, 256) ?? id);
 	if (!id || !name) return undefined;
 	const item: CatalogItem = { id: catalogId(id), kind: fallbackKind, name };
-	const description = text(source.description);
+	const description = text(source.description, 4096);
 	if (description) item.description = description;
-	const capabilities = Array.isArray(source.capabilities) ? source.capabilities.filter((value): value is string => typeof value === "string").slice(0, 128) : undefined;
+	const capabilities = Array.isArray(source.capabilities) ? source.capabilities.flatMap(capability => [text(capability, 256)]).filter((capability): capability is string => capability !== undefined).slice(0, 128) : undefined;
 	if (capabilities?.length) item.capabilities = capabilities;
 	const metadata: Record<string, unknown> = {};
-	for (const [key, child] of Object.entries(source)) { if (["id", "kind", "name", "displayName", "description", "capabilities"].includes(key)) continue; const clean = safeMetadata(child, 1, { nodes: 0 }, key); if (clean !== undefined) metadata[key] = clean; }
+	for (const [key, child] of Object.entries(source)) {
+		if (["id", "kind", "name", "displayName", "description", "capabilities"].includes(key)) continue;
+		const clean = safeMetadata(child, 1, { nodes: 0 }, key);
+		if (clean !== undefined) metadata[text(key, 256) ?? "<redacted-key>"] = clean;
+	}
 	if (Object.keys(metadata).length) item.metadata = metadata;
 	return item;
+}
+function unsupportedItem(kind: CatalogItem["kind"], id: string, reason: string): CatalogItem {
+	const safeId = text(id, 256) ?? "unavailable";
+	return { id: catalogId(safeId), kind, name: safeId, supported: false, reason: text(reason, 4096) ?? "provider unavailable" };
 }
 
 export class DesktopConfigAuthority {
@@ -164,39 +254,51 @@ export class DesktopConfigAuthority {
 		for (const path of [...(paths && paths.length > 0 ? paths : Object.keys(SETTINGS_SCHEMA))].sort()) { const def = settingDefinition(path); if (!def) continue; const sensitive = settingSensitive(path); settings[path] = { ...controlMetadata(def), default: sensitive ? undefined : safeMetadata(def.default), effective: sensitive ? undefined : safeMetadata(this.#settings.get(path as SettingPath)), effectiveSource: sourceFor(this.#settings, path as SettingPath), configured: this.#settings.isConfigured?.(path as SettingPath) ?? false, sensitive }; }
 		return { settings };
 	}
-	#revision(paths?: readonly string[]): string { return revisionFor(this.#revisionData(paths)); }
+	#revision(): string { return revisionFor(this.#revisionData()); }
 	settingsRead(args: SettingsReadArgs = {}, _context?: OperationContextLike): SettingsFrame {
-		let paths = args.paths ?? (args.path ? [args.path] : undefined); if (paths && paths.length > MAX_PATHS) throw new Error("too many settings paths");
-		if (args.category) { const category = args.category; paths = Object.keys(SETTINGS_SCHEMA).filter(path => path === category || path.startsWith(`${category}.`) || settingDefinition(path)?.ui?.tab === category || settingDefinition(path)?.ui?.group === category); }
+		let paths = args.paths ?? (args.path ? [args.path] : undefined);
+		if (paths && paths.length > MAX_PATHS) throw new Error("too many settings paths");
+		if (args.category) {
+			const category = args.category;
+			paths = Object.keys(SETTINGS_SCHEMA).filter(path => path === category || path.startsWith(`${category}.`) || settingDefinition(path)?.ui?.tab === category || settingDefinition(path)?.ui?.group === category);
+		}
 		if (paths) for (const path of paths) if (!settingDefinition(path)) throw new Error(`unknown setting path: ${path}`);
-		return { v: "omp-app/1", type: "settings", hostId: this.#hostId as SettingsFrame["hostId"], revision: this.#revision(paths) as SettingsFrame["revision"], settings: this.#revisionData(paths).settings as Record<string, unknown> };
+		return { v: "omp-app/1", type: "settings", hostId: this.#hostId as SettingsFrame["hostId"], revision: this.#revision() as SettingsFrame["revision"], settings: this.#revisionData(paths).settings as Record<string, unknown> };
 	}
-	async #writeOne(edit: SettingsWriteEdit): Promise<Record<string, unknown>> {
+	#validateEdit(edit: SettingsWriteEdit): { path: SettingPath; scope: "global" | "session"; reset: boolean; def: SettingDefinition } {
+		if (!edit || typeof edit.path !== "string") throw new Error("invalid settings edit");
 		const path = edit.path;
 		const def = settingDefinition(path);
 		if (!def) throw new Error(`unknown setting path: ${path}`);
 		const scope = edit.scope ?? "global";
 		if (scope !== "global" && scope !== "session") throw new Error(`unsupported settings scope: ${scope}`);
 		if (settingSensitive(path)) throw new Error("sensitive setting values cannot be written through desktop authority");
-		const snapshot = this.#settings.getDesktopSnapshot(path as SettingPath);
 		const reset = edit.reset === true;
-		if (reset) {
-			if (scope === "session") {
-				if (!this.#settings.clearOverride) throw new Error("session reset unavailable");
-				this.#settings.clearOverride(path as SettingPath);
-			} else this.#settings.clearGlobal(path as SettingPath);
-		} else {
+		if (!reset) {
 			const controlType = edit.controlType ?? edit.type;
 			if (controlType !== undefined && controlType !== def.type) throw new Error(`setting type mismatch for ${path}`);
 			if (edit.value === undefined) throw new Error(`value is required for ${path}`);
 			validateValue(def, edit.value, path);
-			if (scope === "session") {
-				if (!this.#settings.override) throw new Error("session overrides unavailable");
-				this.#settings.override(path as SettingPath, edit.value);
-			} else this.#settings.set(path as SettingPath, edit.value);
 		}
-		try { await this.#settings.flush?.(); } catch { try { this.#settings.restoreDesktopSnapshot(snapshot); await this.#settings.flush?.(); } catch { /* best effort rollback */ } throw new Error("settings save failed"); }
-		return { path, scope, reset, restartRequired: def.restartRequired === true || def.ui?.restartRequired === true };
+		return { path: path as SettingPath, scope, reset, def };
+	}
+	#applyEdit(edit: SettingsWriteEdit, normalized: { path: SettingPath; scope: "global" | "session"; reset: boolean }): void {
+		if (normalized.reset) {
+			if (normalized.scope === "session") {
+				if (!this.#settings.clearOverride) throw new Error("session reset unavailable");
+				this.#settings.clearOverride(normalized.path);
+			} else this.#settings.clearGlobal(normalized.path);
+			return;
+		}
+		if (normalized.scope === "session") {
+			if (!this.#settings.override) throw new Error("session overrides unavailable");
+			this.#settings.override(normalized.path, edit.value);
+		} else this.#settings.set(normalized.path, edit.value);
+	}
+	#restartRequired(def: SettingDefinition): boolean {
+		if (typeof def.restartRequired === "boolean") return def.restartRequired;
+		if (def.ui && typeof def.ui.restartRequired === "boolean") return def.ui.restartRequired;
+		return false;
 	}
 	#mutationQueue: Promise<void> = Promise.resolve();
 	settingsWrite(args: SettingsWriteArgs, context?: string | OperationContextLike): Promise<Record<string, unknown>> {
@@ -205,31 +307,26 @@ export class DesktopConfigAuthority {
 		return task;
 	}
 	async #settingsWriteNow(args: SettingsWriteArgs, context?: string | OperationContextLike): Promise<Record<string, unknown>> {
-		const wanted = (typeof context === "object" ? context.expectedRevision : undefined) ?? args.expectedRevision;
-		const edits: SettingsWriteEdit[] = args.edits ?? [{ path: args.path ?? "", value: args.value, scope: args.scope, reset: args.reset, controlType: args.controlType, type: args.type }];
-		if (edits.length === 0 || edits.length > MAX_PATHS) throw new Error("invalid settings edits");
+		const wanted = (typeof context === "string" ? context : context?.expectedRevision) ?? args.expectedRevision;
+		const edits = args.edits ?? [{ path: args.path ?? "", value: args.value, scope: args.scope, reset: args.reset, controlType: args.controlType, type: args.type }];
+		if (!Array.isArray(edits) || edits.length === 0 || edits.length > MAX_PATHS) throw new Error("invalid settings edits");
 		if (wanted !== undefined && wanted !== this.#revision()) throw new Error("settings revision conflict");
-		for (const edit of edits) {
-			const def = settingDefinition(edit.path);
-			if (!def) throw new Error(`unknown setting path: ${edit.path ?? ""}`);
-			const scope = edit.scope ?? "global";
-			if (scope !== "global" && scope !== "session") throw new Error(`unsupported settings scope: ${scope}`);
-			if (settingSensitive(edit.path)) throw new Error("sensitive setting values cannot be written through desktop authority");
-			if (!edit.reset) {
-				const controlType = edit.controlType ?? edit.type;
-				if (controlType !== undefined && controlType !== def.type) throw new Error(`setting type mismatch for ${edit.path}`);
-				if (edit.value === undefined) throw new Error(`value is required for ${edit.path}`);
-				validateValue(def, edit.value, edit.path);
-			}
-		}
-		const snapshots = new Map<string, SettingsDesktopSnapshot>();
-		for (const edit of edits) snapshots.set(edit.path, this.#settings.getDesktopSnapshot(edit.path as SettingPath));
+		const normalized = edits.map(edit => this.#validateEdit(edit));
+		const snapshots = new Map<SettingPath, SettingsDesktopSnapshot>();
+		for (const edit of normalized) if (!snapshots.has(edit.path)) snapshots.set(edit.path, this.#settings.getDesktopSnapshot(edit.path));
 		const results: Record<string, unknown>[] = [];
 		try {
-			for (const edit of edits) results.push(await this.#writeOne(edit));
+			for (const [index, edit] of edits.entries()) {
+				const item = normalized[index];
+				this.#applyEdit(edit, item);
+				results.push({ path: item.path, scope: item.scope, reset: item.reset, restartRequired: this.#restartRequired(item.def) });
+			}
+			await this.#settings.flush?.();
 		} catch {
-			for (const snapshot of snapshots.values()) try { this.#settings.restoreDesktopSnapshot(snapshot); } catch { /* best effort rollback */ }
-			try { await this.#settings.flush?.(); } catch { /* best effort rollback */ }
+			for (const snapshot of snapshots.values()) {
+				try { this.#settings.restoreDesktopSnapshot(snapshot); } catch { /* continue restoring every target */ }
+			}
+			try { await this.#settings.flush?.(); } catch { /* rollback persistence is best effort */ }
 			throw new Error("settings write failed");
 		}
 		return { accepted: true, edits: results, path: results.length === 1 ? results[0].path : undefined, scope: results.length === 1 ? results[0].scope : undefined, reset: results.length === 1 ? results[0].reset : undefined, revision: this.#revision(), restartRequired: results.some(result => result.restartRequired === true) };
@@ -238,15 +335,65 @@ export class DesktopConfigAuthority {
 		const items = this.#settingItems();
 		for (const name of Object.keys({ ...BUILTIN_TOOLS, ...HIDDEN_TOOLS }).sort()) items.push({ id: catalogId(`tool:${name}`), kind: "tool", name, metadata: { builtin: true } });
 		for (const command of BUILTIN_SLASH_COMMAND_DEFS) items.push({ id: catalogId(`command:/${command.name}`), kind: "command", name: `/${command.name}`, description: text(command.description), metadata: safeMetadata({ aliases: command.aliases, subcommands: command.subcommands, inlineHint: command.inlineHint }) as Record<string, unknown> });
+
 		const modelRegistry = this.#options.modelRegistry;
-		const models = modelRegistry?.getAvailable?.() ?? [];
-		if (!modelRegistry || models.length === 0) items.push({ id: catalogId("availability:models"), kind: "model", name: "models", supported: false, reason: "model registry unavailable or no available models" });
-		const providers = new Set<string>();
-		for (const model of models) { if (!model || typeof model !== "object") continue; const raw = model as Record<string, unknown>; const provider = pathSafe(text(raw.provider) ?? "unknown"); const id = pathSafe(text(raw.id) ?? text(raw.name) ?? "model"); providers.add(provider); items.push({ id: catalogId(`model:${provider}/${id}`), kind: "model", name: pathSafe(text(raw.name) ?? id), description: text(raw.description), metadata: safeMetadata({ provider, modelId: id, contextWindow: raw.contextWindow, capabilities: raw.capabilities }) as Record<string, unknown> }); }
-		for (const provider of [...providers].sort()) items.push({ id: catalogId(`provider:${provider}`), kind: "provider", name: provider });
+		let models: unknown[] = [];
+		try { models = modelRegistry?.getAvailable?.() ?? []; } catch { /* fail soft below */ }
+		if (!modelRegistry || models.length === 0) items.push(unsupportedItem("model", "availability:models", "model registry unavailable or no available models"));
+		const modelProviders = new Set<string>();
+		for (const [index, model] of models.entries()) {
+			if (!model || typeof model !== "object" || Array.isArray(model)) {
+				items.push(unsupportedItem("model", `availability:model:${index}`, "malformed model metadata"));
+				continue;
+			}
+			const raw = model as Record<string, unknown>;
+			const provider = pathSafe(text(raw.provider, 256) ?? "unknown");
+			const id = pathSafe(text(raw.id, 256) ?? text(raw.name, 256) ?? `model-${index}`);
+			const name = pathSafe(text(raw.name, 256) ?? id);
+			modelProviders.add(provider);
+			items.push({ id: catalogId(`model:${provider}/${id}`), kind: "model", name, description: text(raw.description, 4096), metadata: safeMetadata({ provider, modelId: id, contextWindow: raw.contextWindow, capabilities: raw.capabilities }) as Record<string, unknown> });
+		}
+		for (const provider of [...modelProviders].sort()) items.push({ id: catalogId(`provider:${provider}`), kind: "provider", name: provider });
+
+		const agentRegistry = this.#options.agentRegistry;
+		if (agentRegistry) {
+			try {
+				for (const [index, agent] of agentRegistry.list().entries()) {
+					const item = itemFromUnknown(agent, "agent", `agent:${index}`);
+					items.push(item ?? unsupportedItem("agent", `availability:agent:${index}`, "malformed agent metadata"));
+				}
+			} catch { items.push(unsupportedItem("agent", "availability:agents", "agent registry unavailable")); }
+		} else items.push(unsupportedItem("agent", "availability:agents", "agent registry unavailable"));
+
+		const skillsProvider = this.#options.skillsLoader ?? this.#options.skillsProvider ?? this.#options.skills;
+		const pluginProvider = this.#options.pluginManager ?? this.#options.pluginProvider ?? this.#options.plugins;
+		let mcpProvider: CatalogProvider | (() => unknown | Promise<unknown>) | undefined = this.#options.mcpProvider ?? this.#options.mcp;
+		if (this.#options.mcpManager) {
+			mcpProvider = () => {
+				const all = this.#options.mcpManager!.getAllServerNames();
+				const connected = new Set(this.#options.mcpManager!.getConnectedServers());
+				return all.map(name => ({ id: name, name, connected: connected.has(name) }));
+			};
+		}
+		const providers: Array<{ kind: CatalogItem["kind"]; label: string; provider?: CatalogProvider | (() => unknown | Promise<unknown>) }> = [
+			{ kind: "skill", label: "skills", provider: skillsProvider },
+			{ kind: "provider", label: "plugins", provider: pluginProvider },
+			{ kind: "provider", label: "mcp", provider: mcpProvider },
+		];
+		for (const { kind, label, provider } of providers) {
+			if (!provider) {
+				items.push(unsupportedItem(kind, `availability:${label}`, `${label} provider unavailable`));
+				continue;
+			}
+			let values: unknown[];
+			try { values = await normalizeProvider(provider); } catch { items.push(unsupportedItem(kind, `availability:${label}`, `${label} provider unavailable`)); continue; }
+			for (const [index, value] of values.entries()) {
+				const item = itemFromUnknown(value, kind, `${label}:${index}`);
+				items.push(item ?? unsupportedItem(kind, `availability:${label}:${index}`, `malformed ${label} metadata`));
+			}
+		}
 		const roles = this.#settings.get("modelRoles" as SettingPath);
-		if (roles && typeof roles === "object" && !Array.isArray(roles)) for (const [role, model] of Object.entries(roles as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))) if (typeof model === "string") items.push({ id: catalogId(`mode:role:${role}`), kind: "mode", name: role, metadata: { role, modelId: pathSafe(model) } });
-		for (const [kind, provider, label] of [["skill", this.#options.skillsProvider ?? this.#options.skills, "skills"], ["provider", this.#options.pluginProvider ?? this.#options.plugins, "plugins"], ["provider", this.#options.mcpProvider ?? this.#options.mcp, "mcp"]] as const) { let values: unknown[] = []; let failed = false; if (provider) try { values = await normalizeProvider(provider); } catch { failed = true; } if (!provider || failed) items.push({ id: catalogId(`availability:${label}`), kind, name: label, supported: false, reason: `${label} provider unavailable` }); for (const [index, value] of values.entries()) { const item = itemFromUnknown(value, kind, `${label}:${index}`); if (item) items.push(item); } }
+		if (roles && typeof roles === "object" && !Array.isArray(roles)) for (const [role, model] of Object.entries(roles as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))) if (typeof model === "string") items.push({ id: catalogId(`mode:role:${role}`), kind: "mode", name: text(role, 256) ?? "role", metadata: { role: text(role, 256), modelId: pathSafe(model) } });
 		return items;
 	}
 	async catalogGet(args: CatalogGetArgs = {}, _context?: OperationContextLike): Promise<CatalogFrame> {

@@ -411,6 +411,7 @@ export class Settings {
 	/** Restore a previously captured desktop snapshot exactly. */
 	restoreDesktopSnapshot(snapshot: SettingsDesktopSnapshot): void {
 		const segments = SETTING_PATH_SEGMENTS[snapshot.path];
+		const previous = this.get(snapshot.path);
 		const restore = (target: RawSettings, layer: SettingsLayerValue): void => {
 			if (layer.present) setByPath(target, [...segments], structuredClone(layer.value));
 			else deleteByPath(target, segments);
@@ -421,7 +422,11 @@ export class Settings {
 		restore(this.#overrides, snapshot.override);
 		this.#modified.add(snapshot.path);
 		this.#rebuildMerged();
+		const next = this.get(snapshot.path);
 		this.#queueSave();
+		const hook = SETTING_HOOKS[snapshot.path];
+		if (hook) hook(next, previous);
+		this.#fireEffectiveSettingChanged(snapshot.path, next, previous);
 	}
 	/**
 	 * Get a setting value (sync).
