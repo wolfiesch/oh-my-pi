@@ -3,17 +3,15 @@ import { unlink } from "node:fs/promises";
 import {
   DefaultAuthorizationGuard,
   DefaultRedactor,
-  DeviceRecord,
-  DeviceMetadata,
   JsonlAuditSink,
   LeaseRegistry,
-  RemotePeerIdentity,
   OutboundQueue,
   SecureConfirmationStore,
   SqliteDeviceRegistry,
   SqlitePairingService,
   TokenBucketLimiter,
 } from "../src/security/index.ts";
+import type { DeviceRecord, DeviceMetadata, RemotePeerIdentity } from "../src/security/index.ts";
 
 let dbPath = "";
 const identity = { nodeId: "node-a", login: "alice@example.com", hostId: "host-a", tailnetIp: "100.64.0.2" };
@@ -64,9 +62,9 @@ describe("security core", () => {
 
   it("consumes confirmations once and redacts nested secrets", () => {
     const confirmations = new SecureConfirmationStore(clock);
-    const grant = confirmations.issue({ connectionId: "c", deviceId: "d", command: "files.write", sessionId: "s", argsDigest: "a", epoch: 0 });
-    confirmations.consume(grant.id, { connectionId: "c", deviceId: "d", command: "files.write", sessionId: "s", argsDigest: "a", epoch: 0 });
-    expect(() => confirmations.consume(grant.id, { connectionId: "c", deviceId: "d", command: "files.write", sessionId: "s", argsDigest: "a", epoch: 0 })).toThrow();
+    const grant = confirmations.issue({ connectionId: "c", deviceId: "d", command: "files.write", sessionId: "s", argsDigest: "a", revision: "r", epoch: 0 });
+    confirmations.consume(grant.id, { connectionId: "c", deviceId: "d", command: "files.write", sessionId: "s", argsDigest: "a", revision: "r", epoch: 0 });
+    expect(() => confirmations.consume(grant.id, { connectionId: "c", deviceId: "d", command: "files.write", sessionId: "s", argsDigest: "a", revision: "r", epoch: 0 })).toThrow();
     expect(new DefaultRedactor().redact({ auth: { token: "secret" }, nested: [{ password: "x" }] })).toEqual({ auth: "[redacted]", nested: [{ password: "[redacted]" }] });
   });
 
@@ -75,8 +73,8 @@ describe("security core", () => {
     expect(limiter.allow("ip")).toBe(true);
     expect(limiter.allow("ip")).toBe(false);
     const queue = new OutboundQueue(10);
-    queue.push({ kind: "result", bytes: 8, payload: "done" });
-    expect(() => queue.push({ kind: "event", bytes: 8, payload: "drop-me" })).toThrow();
+    queue.push({ kind: "result", payload: "done" });
+    expect(() => queue.push({ kind: "event", payload: "drop-me" })).toThrow();
     expect(queue.shift()?.kind).toBe("result");
   });
 
