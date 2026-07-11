@@ -49,12 +49,18 @@ import type {
 	ChildHandle,
 	Clock,
 	CommandOutcome,
+	ConnectionTransport,
 	LockCheckHook,
+	RemoteAuthorizationContext,
+	RemoteConnectionPolicy,
+	RemoteHelloDecision,
 	RpcChildFactory,
 	SessionAuthority,
 	SessionDiscovery,
 	SessionRecord,
 } from "./types.ts";
+import { BunRemoteListener, createListenerPlan, createServeProxyPlan } from "./remote/listener.ts";
+import type { RemoteConnection, RemoteListenerConfig } from "./remote/types.ts";
 
 const clock: Clock = { now: () => new Date() };
 function response(
@@ -148,7 +154,8 @@ function argumentError(command: CommandFrame): string | undefined {
 	if (keys.length !== 0) return "command does not accept args";
 	return undefined;
 }
-type AppWs = Bun.ServerWebSocket<ServerWebSocketData>;
+type AppWs = ConnectionTransport;
+type LocalWs = Bun.ServerWebSocket<ServerWebSocketData>;
 interface RunIdentity {
 	paths: OwnerPaths;
 	record: OwnerRecord;
@@ -232,9 +239,16 @@ export class LocalAppserver implements AppserverHandle {
 	#hello = new Set<AppWs>();
 	#clientCapabilities = new Map<AppWs, Set<string>>();
 	#attached = new Map<AppWs, Set<SessionId>>();
-	#connectionIds = new Map<AppWs, string>();
 	#deviceIds = new Map<AppWs, string>();
 	#abortControllers = new Map<AppWs, Set<AbortController>>();
+	#localTransports = new Map<LocalWs, AppWs>();
+	#remoteTransports = new Map<string, AppWs>();
+	#remoteConnections = new Map<AppWs, RemoteConnection>();
+	#remoteDecisions = new Map<AppWs, RemoteHelloDecision>();
+	#remoteListener?: BunRemoteListener;
+	#remotePolicy?: RemoteConnectionPolicy;
+	#remoteEndpoint?: RemoteListenerConfig;
+	#remoteResolver?: AppserverOptions["remoteResolver"];
 	#started = false;
 	#stopping = false;
 	#hostProvided: boolean;
@@ -257,13 +271,16 @@ export class LocalAppserver implements AppserverHandle {
 		this.hostId = options.hostId ?? createHostId();
 		this.epoch = createEpoch(options.epoch);
 		this.socketPath = options.socketPath ?? defaultSocketPath();
+		this.#remotePolicy = options.remotePolicy;
+		this.#remoteEndpoint = options.remoteEndpoint;
+		this.#remoteResolver = options.remoteResolver;
+		this.#remoteListener = options.remoteListener;
 		this.#clock = options.clock ?? clock;
 		this.#authority = options.sessionAuthority;
 		this.#operations = options.operationsAuthority
 			? new DesktopOperationDispatcher(options.operationsAuthority, undefined, (frame, owner) => {
 					for (const ws of this.#clients)
-						if (this.#connectionIds.get(ws) === owner.connectionId && this.#deviceIds.get(ws) === owner.deviceId)
-							ws.send(JSON.stringify(frame));
+						if (ws.connectionId === owner.connectionId && ws.deviceId === owner.deviceId) void this.#sendFrame(ws, frame as ServerFrame);
 				})
 			: undefined;
 		this.#projectRootForProject = options.projectRootForProject;
@@ -275,14 +292,31 @@ export class LocalAppserver implements AppserverHandle {
 		this.#ompBuild = options.ompBuild ?? "local";
 		this.#appserverVersion = options.appserverVersion ?? "0.1.0";
 		this.#appserverBuild = options.appserverBuild ?? "local";
-		const unsupportedAdditiveFeatures = new Set([
-			"host.watch",
-			"session.watch",
-			"controller.lease",
-			"prompt.lease",
-		]);
+		const unsupportedAdditiveFeatures = new Set(["host.watch", "session.watch", "controller.lease", "prompt.lease"]);
+		const implementedFeatures = new Set<string>(["resume"]);
+		const operationAuthority = options.operationsAuthority;
+		if (operationAuthority?.catalogGet) implementedFeatures.add("catalog.metadata");
+		if (operationAuthority?.settingsRead) implementedFeatures.add("settings.metadata");
+		if (
+			operationAuthority?.termOpen &&
+			operationAuthority.terminalInput &&
+			operationAuthority.terminalResize &&
+			operationAuthority.terminalClose
+		)
+			implementedFeatures.add("terminal.io");
+		if (operationAuthority?.filesList) implementedFeatures.add("files.list");
+		if (operationAuthority?.filesDiff) implementedFeatures.add("files.diff");
+		if (
+			operationAuthority?.previewLaunch &&
+			operationAuthority.previewState &&
+			operationAuthority.previewNavigate &&
+			operationAuthority.previewCapture
+		)
+			implementedFeatures.add("preview.control");
 		this.#supportedFeatures = new Set(
-			(options.supportedFeatures ?? ["resume"]).filter(feature => !unsupportedAdditiveFeatures.has(feature)),
+			(options.supportedFeatures ?? [...implementedFeatures]).filter(
+				feature => implementedFeatures.has(feature) && !unsupportedAdditiveFeatures.has(feature),
+			),
 		);
 		const builtIn = new Set(["sessions.read", "sessions.manage", "sessions.prompt", "sessions.control"]);
 		const implemented = new Set([...builtIn, ...operationCapabilities(options.operationsAuthority)]);
@@ -341,18 +375,21 @@ export class LocalAppserver implements AppserverHandle {
 					backpressureLimit: 1024 * 1024,
 					closeOnBackpressureLimit: true,
 					open: ws => {
-						this.#clients.add(ws);
-						this.#clientCapabilities.set(ws, new Set());
-						this.#attached.set(ws, new Set());
-						this.#connectionIds.set(ws, randomUUID());
-						this.#deviceIds.set(ws, randomUUID());
-						this.#abortControllers.set(ws, new Set());
+						const transport = this.#createLocalTransport(ws);
+						this.#localTransports.set(ws, transport);
+						this.#clients.add(transport);
+						this.#clientCapabilities.set(transport, new Set());
+						this.#attached.set(transport, new Set());
+						this.#deviceIds.set(transport, transport.deviceId);
+						this.#abortControllers.set(transport, new Set());
 					},
 					message: (ws, message) => {
-						void this.message(ws, message);
+						const transport = this.#localTransports.get(ws);
+						if (transport) void this.message(transport, message);
 					},
 					close: ws => {
-						void this.disconnectClient(ws);
+						const transport = this.#localTransports.get(ws);
+						if (transport) void this.disconnectClient(transport);
 					},
 				},
 			});
@@ -381,6 +418,29 @@ export class LocalAppserver implements AppserverHandle {
 			if (this.#stopping) throw new Error("appserver is stopping");
 			this.#runIdentity = { paths, record, marker: finalMarker };
 			this.#started = true;
+			if (this.#remotePolicy && this.#remoteEndpoint) {
+				const listener =
+					this.#remoteListener ??
+					new BunRemoteListener(
+						this.#remoteEndpoint.serveProxy === true
+							? createServeProxyPlan(this.#remoteEndpoint)
+							: createListenerPlan(this.#remoteEndpoint),
+						{
+							connected: connection => this.#remoteConnected(connection),
+							message: (connection, message) => this.#remoteMessage(connection, message),
+							disconnected: connection => this.#remoteDisconnected(connection),
+						},
+						this.#remoteEndpoint,
+						this.#remoteResolver,
+					);
+				this.#remoteListener = listener;
+				try {
+					listener.start();
+				} catch (error) {
+					this.#remoteListener = undefined;
+					throw error;
+				}
+			}
 		} catch (error) {
 			await this.cleanupPartial();
 			throw error;
@@ -389,6 +449,8 @@ export class LocalAppserver implements AppserverHandle {
 	async stop(): Promise<void> {
 		if (!this.#started && !this.#server && !this.#ownerLock && this.#startPromises.size === 0) return;
 		this.#stopping = true;
+		await this.#remoteListener?.stop();
+		this.#remoteListener = undefined;
 		await Promise.all(
 			[...this.#clients].map(async ws => {
 				for (const controller of this.#abortControllers.get(ws) ?? []) controller.abort();
@@ -737,8 +799,8 @@ export class LocalAppserver implements AppserverHandle {
 				const context: OperationContext = {
 					hostId: this.hostId,
 					sessionId: command.sessionId,
-					deviceId: this.#deviceIds.get(ws) ?? "local",
-					connectionId: this.#connectionIds.get(ws) ?? "local",
+					deviceId: ws.deviceId,
+					connectionId: ws.connectionId,
 					capabilities: (capabilities ?? new Set()) as OperationContext["capabilities"],
 					currentRevision: projection?.value.revision,
 					expectedRevision: command.expectedRevision,
@@ -895,42 +957,58 @@ export class LocalAppserver implements AppserverHandle {
 			throw error;
 		}
 	}
-	private async message(ws: AppWs, raw: string | Buffer): Promise<void> {
+	private async message(ws: AppWs, raw: string | Uint8Array): Promise<void> {
 		try {
 			if (typeof raw !== "string") throw new Error("binary websocket frames are not supported");
 			const frame = decodeClientFrame(parseBounded(raw));
 			if (frame.type === "hello") {
 				if (this.#hello.has(ws)) throw new Error("hello already received");
+				let decision: RemoteHelloDecision | undefined;
+				if (ws.remote) {
+					const connection = this.#remoteConnections.get(ws);
+					if (!connection || !this.#remotePolicy) throw new Error("remote connection is unavailable");
+					decision = await this.#remotePolicy.authenticate(connection, frame);
+					if (!decision.authenticated) {
+						await this.#sendFrame(ws, { v: "omp-app/1", type: "error", code: "unauthenticated", message: "remote authentication denied" });
+						ws.close(1008, "authentication denied");
+						return;
+					}
+					this.#remoteDecisions.set(ws, decision);
+				}
 				this.#hello.add(ws);
-				this.hello(ws, frame);
+				await this.hello(ws, frame, decision);
 				return;
 			}
 			if (!this.#hello.has(ws)) throw new Error("hello required before commands");
+			if (ws.remote) {
+				const connection = this.#remoteConnections.get(ws);
+				if (!connection || !this.#remotePolicy) throw new Error("remote connection is unavailable");
+				const allowed = await this.#remotePolicy.authorize(connection, frame, {
+					connectionId: ws.connectionId,
+					peer: connection.peer,
+					...(frame.type === "command" ? { command: frame } : {}),
+				});
+				if (!allowed) {
+					await this.#sendFrame(ws, { v: "omp-app/1", type: "error", code: "policy_denied", message: "frame denied by remote policy" });
+					return;
+				}
+			}
 			if (frame.type === "ping") {
-				ws.send(
-					JSON.stringify({
-						v: "omp-app/1",
-						type: "pong",
-						nonce: frame.nonce,
-						timestamp: this.#clock.now().toISOString(),
-					}),
-				);
+				await this.#sendFrame(ws, {
+					v: "omp-app/1",
+					type: "pong",
+					nonce: frame.nonce,
+					timestamp: this.#clock.now().toISOString(),
+				});
 				return;
 			}
 			if (frame.type === "confirm") {
-				ws.send(JSON.stringify((await this.confirm(ws, frame)).frame));
+				await this.#sendFrame(ws, (await this.confirm(ws, frame)).frame);
 				return;
 			}
 			if (frame.type === "terminal.input" || frame.type === "terminal.resize" || frame.type === "terminal.close") {
 				if (!this.#operations) {
-					ws.send(
-						JSON.stringify({
-							v: "omp-app/1",
-							type: "error",
-							code: "unsupported",
-							message: "terminal operations are unsupported",
-						}),
-					);
+					await this.#sendFrame(ws, { v: "omp-app/1", type: "error", code: "unsupported", message: "terminal operations are unsupported" });
 					return;
 				}
 				const session = this.#projections.get(frame.sessionId);
@@ -940,8 +1018,8 @@ export class LocalAppserver implements AppserverHandle {
 					await this.#operations.routeTerminal(frame, {
 						hostId: this.hostId,
 						sessionId: frame.sessionId,
-						deviceId: this.#deviceIds.get(ws) ?? "local",
-						connectionId: this.#connectionIds.get(ws) ?? "local",
+						deviceId: ws.deviceId,
+						connectionId: ws.connectionId,
 						capabilities: (this.#clientCapabilities.get(ws) ?? new Set()) as OperationContext["capabilities"],
 						currentRevision: session?.value.revision,
 						abortSignal: controller.signal,
@@ -951,67 +1029,44 @@ export class LocalAppserver implements AppserverHandle {
 						error && typeof error === "object" && "code" in error && typeof error.code === "string"
 							? error.code.toUpperCase()
 							: "OPERATION_FAILED";
-					const code = new Set([
-						"FORBIDDEN",
-						"NOT_FOUND",
-						"STALE_REVISION",
-						"UNSUPPORTED",
-						"ABORTED",
-						"CONFLICT",
-						"OPERATION_FAILED",
-					]).has(rawCode)
+					const code = new Set(["FORBIDDEN", "NOT_FOUND", "STALE_REVISION", "UNSUPPORTED", "ABORTED", "CONFLICT", "OPERATION_FAILED"]).has(rawCode)
 						? rawCode
 						: "OPERATION_FAILED";
-					ws.send(JSON.stringify({ v: "omp-app/1", type: "error", code, message: "terminal operation failed" }));
+					await this.#sendFrame(ws, { v: "omp-app/1", type: "error", code, message: "terminal operation failed" });
 				} finally {
 					this.#abortControllers.get(ws)?.delete(controller);
 				}
 				return;
 			}
 			if (frame.type !== "command") {
-				ws.send(
-					JSON.stringify({
-						v: "omp-app/1",
-						type: "error",
-						code: "unsupported",
-						message: "frame is not supported",
-					}),
-				);
+				await this.#sendFrame(ws, { v: "omp-app/1", type: "error", code: "unsupported", message: "frame is not supported" });
 				return;
 			}
 			const descriptor = COMMAND_DESCRIPTORS[frame.command];
 			if (descriptor?.confirmation === "challenge") {
 				if (frame.confirmationId !== undefined) {
-					ws.send(
-						JSON.stringify(
-							response(this.hostId, frame, false, undefined, {
-								code: "confirmation_invalid",
-								message: "command confirmation must be approved through a confirm frame",
-							}),
-						),
+					await this.#sendFrame(
+						ws,
+						response(this.hostId, frame, false, undefined, {
+							code: "confirmation_invalid",
+							message: "command confirmation must be approved through a confirm frame",
+						}),
 					);
 					return;
 				}
-				ws.send(JSON.stringify(this.challenge(ws, frame)));
+				await this.#sendFrame(ws, this.challenge(ws, frame));
 				return;
 			}
 			const outcome = await this.#command(frame, ws);
-			ws.send(JSON.stringify(outcome.frame));
-			if (
-				frame.command === "session.attach" &&
-				frame.sessionId &&
-				outcome.frame.type === "response" &&
-				outcome.frame.ok
-			) {
+			await this.#sendFrame(ws, outcome.frame);
+			if (frame.command === "session.attach" && frame.sessionId && outcome.frame.type === "response" && outcome.frame.ok) {
 				this.#attached.get(ws)?.add(frame.sessionId);
 				const cursor = frame.args.cursor;
-				const outputs = cursor
-					? this.replay(frame.sessionId, cursor as { epoch: string; seq: number })
-					: [this.#projections.get(frame.sessionId)!.snapshot()];
-				for (const output of outputs) ws.send(JSON.stringify(output));
+				const outputs = cursor ? this.replay(frame.sessionId, cursor as { epoch: string; seq: number }) : [this.#projections.get(frame.sessionId)!.snapshot()];
+				for (const output of outputs) await this.#sendFrame(ws, output);
 			}
 		} catch {
-			ws.send(JSON.stringify({ v: "omp-app/1", type: "error", code: "invalid_frame", message: "invalid frame" }));
+			await this.#sendFrame(ws, { v: "omp-app/1", type: "error", code: "invalid_frame", message: "invalid frame" });
 			ws.close(1008, "invalid frame");
 		}
 	}
@@ -1072,18 +1127,19 @@ export class LocalAppserver implements AppserverHandle {
 		return this.#command({ ...pending.command, confirmationId: frame.confirmationId }, ws, true);
 	}
 	private async disconnectClient(ws: AppWs): Promise<void> {
+		if (!this.#clients.has(ws)) return;
 		const controllers = this.#abortControllers.get(ws);
 		for (const controller of controllers ?? []) controller.abort();
 		if (this.#operations) {
 			const contextBase = {
 				hostId: this.hostId,
-				deviceId: this.#deviceIds.get(ws) ?? "local",
+				deviceId: ws.deviceId,
 				capabilities: (this.#clientCapabilities.get(ws) ?? new Set()) as OperationContext["capabilities"],
 				abortSignal: AbortSignal.abort(),
 			};
 			for (const sessionId of this.#projections.keys()) {
 				try {
-					await this.#operations.disconnect(this.#connectionIds.get(ws) ?? "local", { ...contextBase, sessionId });
+					await this.#operations.disconnect(ws.connectionId, { ...contextBase, sessionId });
 				} catch {
 					/* owner cleanup is best effort; registry always releases */
 				}
@@ -1093,18 +1149,24 @@ export class LocalAppserver implements AppserverHandle {
 		this.#hello.delete(ws);
 		this.#clientCapabilities.delete(ws);
 		this.#attached.delete(ws);
-		this.#connectionIds.delete(ws);
 		this.#deviceIds.delete(ws);
 		this.#abortControllers.delete(ws);
+		this.#remoteDecisions.delete(ws);
+		this.#remoteConnections.delete(ws);
+		this.#remoteTransports.delete(ws.connectionId);
+		for (const [socket, transport] of this.#localTransports) if (transport === ws) this.#localTransports.delete(socket);
 	}
-	private hello(ws: AppWs, frame: HelloFrame): void {
-		if (frame.authentication !== undefined)
-			throw new Error("device authentication is not accepted on local transport");
+	private async hello(ws: AppWs, frame: HelloFrame, decision?: RemoteHelloDecision): Promise<void> {
+		if (!ws.remote && frame.authentication !== undefined) throw new Error("device authentication is not accepted on local transport");
+		const capabilityCeiling = decision?.grantedCapabilities
+			? new Set(decision.grantedCapabilities)
+			: this.#supportedCapabilities;
 		const requestedCapabilities = new Set(frame.capabilities?.client ?? this.#supportedCapabilities);
-		const grantedCapabilities = [...this.#supportedCapabilities].filter(capability =>
-			requestedCapabilities.has(capability),
+		const grantedCapabilities = [...this.#supportedCapabilities].filter(
+			capability => requestedCapabilities.has(capability) && capabilityCeiling.has(capability),
 		);
 		this.#clientCapabilities.set(ws, new Set(grantedCapabilities));
+		const featureCeiling = decision?.grantedFeatures ? new Set(decision.grantedFeatures) : this.#supportedFeatures;
 		const welcome = {
 			v: "omp-app/1",
 			type: "welcome",
@@ -1116,15 +1178,75 @@ export class LocalAppserver implements AppserverHandle {
 			appserverBuild: this.#appserverBuild,
 			epoch: this.epoch,
 			grantedCapabilities,
-			grantedFeatures: frame.requestedFeatures.filter(feature => this.#supportedFeatures.has(feature)),
+			grantedFeatures: frame.requestedFeatures.filter(feature => this.#supportedFeatures.has(feature) && featureCeiling.has(feature)),
 			negotiatedLimits: { maxPayloadLength: 1024 * 1024, ringSize: this.#ringSize },
-			authentication: "local",
-			resumed: frame.savedCursors.some(
-				cursor => cursor.hostId === this.hostId && cursor.cursor.epoch === this.epoch,
-			),
+			authentication: decision?.authentication ?? (ws.remote ? "remote" : "local"),
+			resumed: frame.savedCursors.some(cursor => cursor.hostId === this.hostId && cursor.cursor.epoch === this.epoch),
 		};
-		ws.send(JSON.stringify(welcome));
-		ws.send(JSON.stringify(this.sessionsFrame()));
+		await this.#sendFrame(ws, welcome as ServerFrame);
+		await this.#sendFrame(ws, this.sessionsFrame());
+	}
+	#createLocalTransport(ws: LocalWs): AppWs {
+		let closed = false;
+		const transport: AppWs = {
+			connectionId: randomUUID(),
+			deviceId: randomUUID(),
+			remote: false,
+			send: text => {
+				if (closed) return false;
+				try {
+					const result = ws.send(text);
+					return typeof result === "number" ? result > 0 : true;
+				} catch {
+					return false;
+				}
+			},
+			close: (code, reason) => {
+				if (closed) return;
+				closed = true;
+				try {
+					ws.close(code, reason);
+				} catch {}
+			},
+		};
+		return transport;
+	}
+#remoteConnected(connection: RemoteConnection): void {
+		const transport: AppWs = {
+			connectionId: connection.connectionId,
+			deviceId: connection.peer.identity.nodeId,
+			remote: true,
+			send: text => connection.socket.send(text),
+			close: (code, reason) => connection.socket.close(code, reason),
+		};
+		this.#remoteConnections.set(transport, connection);
+		this.#remoteTransports.set(transport.connectionId, transport);
+		this.#clients.add(transport);
+		this.#clientCapabilities.set(transport, new Set());
+		this.#attached.set(transport, new Set());
+		this.#deviceIds.set(transport, transport.deviceId);
+		this.#abortControllers.set(transport, new Set());
+	}
+async #remoteMessage(connection: RemoteConnection, message: string | Uint8Array): Promise<void> {
+		const transport = this.#remoteTransports.get(connection.connectionId);
+		if (transport) await this.message(transport, typeof message === "string" ? message : new Uint8Array(message));
+	}
+async #remoteDisconnected(connection: RemoteConnection): Promise<void> {
+		const transport = this.#remoteTransports.get(connection.connectionId);
+		if (transport) await this.disconnectClient(transport);
+		if (this.#remotePolicy?.disconnected) await this.#remotePolicy.disconnected(connection);
+	}
+async #sendFrame(transport: AppWs, frame: ServerFrame): Promise<boolean> {
+		if (transport.remote) {
+			const connection = this.#remoteConnections.get(transport);
+			if (!connection || !this.#remotePolicy) return false;
+			const transformed = this.#remotePolicy.transformOutbound
+				? await this.#remotePolicy.transformOutbound(connection, frame)
+				: frame;
+			if (transformed === undefined) return false;
+			return transport.send(typeof transformed === "string" ? transformed : JSON.stringify(transformed));
+		}
+		return transport.send(JSON.stringify(frame));
 	}
 	private async loadSessions(): Promise<void> {
 		const records = await this.#discovery.list();
@@ -1180,7 +1302,7 @@ export class LocalAppserver implements AppserverHandle {
 		};
 	}
 	private broadcast(sessionId: SessionId, frame: ServerFrame): void {
-		for (const [client, sessions] of this.#attached) if (sessions.has(sessionId)) client.send(JSON.stringify(frame));
+		for (const [client, sessions] of this.#attached) if (sessions.has(sessionId)) void this.#sendFrame(client, frame);
 	}
 	private fetch(request: Request, server: Bun.Server<ServerWebSocketData>): Response | undefined {
 		const url = new URL(request.url);

@@ -1,15 +1,30 @@
 export interface RemotePeerIdentity {
-  nodeId: string;
-  hostname?: string;
-  user?: string;
-  addresses: string[];
-  source: "tailscale" | "serve" | "direct";
+  readonly nodeId: string;
+  readonly hostname?: string;
+  readonly user?: string;
+  readonly addresses: readonly string[];
+  readonly source: "tailscale" | "serve" | "direct";
 }
-export interface ListenerPeerContext { identity: RemotePeerIdentity; address: string; source: "direct" | "serve"; }
+export interface ListenerPeerContext {
+  readonly identity: RemotePeerIdentity;
+  readonly address: string;
+  readonly source: "direct" | "serve";
+}
+export interface RemoteSocket {
+  readonly connectionId: string;
+  readonly peer: ListenerPeerContext;
+  send(text: string): boolean;
+  close(code?: number, reason?: string): void;
+}
+export interface RemoteConnection {
+  readonly connectionId: string;
+  readonly peer: ListenerPeerContext;
+  readonly socket: RemoteSocket;
+}
 export interface RemoteConnectionHooks {
-  connected?(peer: ListenerPeerContext): void | Promise<void>;
-  message?(peer: ListenerPeerContext, message: string | Uint8Array): void | Promise<void>;
-  disconnected?(peer: ListenerPeerContext): void | Promise<void>;
+  connected?(connection: RemoteConnection): void | Promise<void>;
+  message?(connection: RemoteConnection, message: string | Uint8Array): void | Promise<void>;
+  disconnected?(connection: RemoteConnection): void | Promise<void>;
 }
 export interface ProcessRunOptions { timeoutMs: number; maxOutputBytes: number; }
 export interface ProcessRunner { run(argv: string[], options: ProcessRunOptions): Promise<{ stdout: string | Uint8Array; exitCode: number }>; }

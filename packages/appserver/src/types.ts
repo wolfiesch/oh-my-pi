@@ -1,8 +1,10 @@
 import type { ChildProcess } from "node:child_process";
 import type {
+	ClientFrame,
 	CommandFrame,
 	Cursor,
 	DurableEntry,
+	HelloFrame,
 	HostId,
 	ProjectId,
 	Revision,
@@ -12,6 +14,41 @@ import type {
 	SessionRef,
 } from "@oh-my-pi/app-wire";
 import type { DesktopOperationsAuthority } from "./operations/dispatcher.ts";
+import type { ListenerPeerContext, RemoteConnection, RemoteListenerConfig, RemotePeerIdentity } from "./remote/types.ts";
+import type { BunRemoteListener } from "./remote/listener.ts";
+
+export interface ConnectionTransport {
+	readonly connectionId: string;
+	readonly deviceId: string;
+	readonly remote: boolean;
+	send(text: string): boolean;
+	close(code?: number, reason?: string): void;
+}
+export interface RemoteHelloDecision {
+	authenticated: boolean;
+	grantedCapabilities?: readonly string[];
+	grantedFeatures?: readonly string[];
+	authentication?: string;
+	deviceId?: string;
+}
+export interface RemoteAuthorizationContext {
+	readonly connectionId: string;
+	readonly peer: ListenerPeerContext;
+	readonly command?: CommandFrame;
+}
+export interface RemoteConnectionPolicy {
+	authenticate(connection: RemoteConnection, hello: HelloFrame): RemoteHelloDecision | Promise<RemoteHelloDecision>;
+	authorize(
+		connection: RemoteConnection,
+		frame: ClientFrame,
+		context: RemoteAuthorizationContext,
+	): boolean | Promise<boolean>;
+	transformOutbound?(
+		connection: RemoteConnection,
+		frame: ServerFrame,
+	): ServerFrame | string | undefined | Promise<ServerFrame | string | undefined>;
+	disconnected?(connection: RemoteConnection): void | Promise<void>;
+}
 
 export interface Clock {
 	now(): Date;
@@ -82,6 +119,10 @@ export interface AppserverOptions {
 	supportedCapabilities?: readonly string[];
 	ringSize?: number;
 	now?: () => Date;
+	remoteEndpoint?: RemoteListenerConfig;
+	remotePolicy?: RemoteConnectionPolicy;
+	remoteResolver?: { resolve(address: string): Promise<RemotePeerIdentity> };
+	remoteListener?: BunRemoteListener;
 }
 export interface Projection {
 	hostId: HostId;
