@@ -8,7 +8,7 @@ export interface FileSystem {
   unlink(path: string): Promise<void>;
   stat(path: string): Promise<{ isFile(): boolean; isDirectory(): boolean; mode: number; mtimeMs: number; size: number }>;
   readdir(path: string): Promise<string[]>;
-  readFile(path: string): Promise<string>;
+  readFile(path: string): Promise<string | Uint8Array>;
 }
 export interface SessionRecord {
   sessionId: SessionId; path: string; cwd: string; projectId: ProjectId; projectName?: string;
@@ -16,17 +16,20 @@ export interface SessionRecord {
 }
 export interface SessionDiscovery { list(): Promise<SessionRecord[]>; }
 export interface ChildHandle {
-  stdin: { write(data: string | Uint8Array): void | Promise<void>; end?(): void };
+  stdin: { write(data: string): Promise<void> | void };
+  stderr?: AsyncIterable<string | Uint8Array>;
   stdout: AsyncIterable<string | Uint8Array>;
   exited: Promise<number>;
   kill(signal?: string): void;
 }
-export interface RpcChildFactory { spawn(spec: { session: SessionRecord; argv: string[]; cwd: string }): ChildHandle; }
-export interface LockCheckHook { check(session: SessionRecord): Promise<void> | void; }
+export interface RpcChildFactory { spawn(spec: { session: SessionRecord; argv: string[]; cwd: string }): ChildHandle; argv(sessionPath: string): string[]; }
+export type LockCheckHook = (session: SessionRecord) => Promise<void> | void;
 export interface AppserverOptions {
   hostId?: HostId; epoch?: string; clock?: Clock; discovery?: SessionDiscovery;
   childFactory?: RpcChildFactory; lockCheck?: LockCheckHook; socketPath?: string;
   ompVersion?: string; ompBuild?: string; appserverVersion?: string; appserverBuild?: string;
+  supportedFeatures?: readonly string[];
+  supportedCapabilities?: readonly string[];
   ringSize?: number; now?: () => Date;
 }
 export interface Projection {

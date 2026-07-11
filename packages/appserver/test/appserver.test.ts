@@ -18,7 +18,7 @@ class FakeChild implements ChildHandle {
   push(value: Record<string, unknown>) { this.output.push(JSON.stringify(value)); }
   kill() { this.killed = true; this.#queue.resolve(); }
 }
-class FakeFactory implements RpcChildFactory { children: FakeChild[] = []; spawn() { const child = new FakeChild(); this.children.push(child); return child; } }
+class FakeFactory implements RpcChildFactory { children: FakeChild[] = []; spawn() { const child = new FakeChild(); this.children.push(child); return child; } argv(path: string) { return ["omp", "--mode", "rpc", "--session", path]; } }
 class StaticDiscovery implements SessionDiscovery { constructor(private readonly records: SessionRecord[]) {} async list() { return this.records; } }
 function entry(id: string, parentId: string | null = null): DurableEntry { return { id: id as DurableEntry["id"], parentId: parentId as DurableEntry["parentId"], hostId: host, sessionId: sessionId("s"), kind: "message", timestamp: new Date(0).toISOString(), data: { id } }; }
 
@@ -27,7 +27,7 @@ describe("projection and replay", () => {
     const projection = new SessionProjection(host, record("s"), "epoch-a", 1);
     expect(projection.appendEntry(entry("a"))).toBeDefined(); expect(projection.appendEntry(entry("a"))).toBeUndefined(); projection.appendEvent({ type: "live" });
     const replay = projection.replay({ epoch: "epoch-a", seq: 0 }); expect(replay[0]?.type).toBe("gap");
-    expect(projection.value.entries.map(value => value.id)).toEqual(["a"]);
+    expect(projection.value.entries.map(value => String(value.id))).toEqual(["a"]);
   });
 });
 describe("idempotency", () => {
@@ -37,6 +37,6 @@ describe("idempotency", () => {
 });
 describe("appserver lifecycle", () => {
   test("indexes three sessions, starts one child each, and removes socket", async () => {
-    const root = await mkdtemp(join(tmpdir(), "omp-appserver-")); const socketPath = join(root, "run", "appserver.sock"); const factory = new FakeFactory(); const appserver = createAppserver({ hostId: host, epoch: "epoch-test", socketPath, discovery: new StaticDiscovery([record("a"), record("b"), record("c")]), childFactory: factory }); await appserver.start(); expect(factory.children).toHaveLength(3); const socket = await stat(socketPath); expect(socket.mode & 0o777).toBe(0o600); const parent = await stat(join(root, "run")); expect(parent.mode & 0o777).toBe(0o700); await appserver.stop(); await expect(stat(socketPath)).rejects.toThrow(); for (const child of factory.children) expect(child.killed).toBe(true);
+    const root = await mkdtemp(join(tmpdir(), "omp-appserver-")); const socketPath = join(root, "run", "appserver.sock"); const factory = new FakeFactory(); const appserver = createAppserver({ hostId: host, epoch: "epoch-test", socketPath, discovery: new StaticDiscovery([record("a"), record("b"), record("c")]), childFactory: factory }); await appserver.start(); expect(factory.children).toHaveLength(0); const socket = await stat(socketPath); expect(socket.mode & 0o777).toBe(0o600); const parent = await stat(join(root, "run")); expect(parent.mode & 0o777).toBe(0o700); await appserver.stop(); await expect(stat(socketPath)).rejects.toThrow(); for (const child of factory.children) expect(child.killed).toBe(true);
   });
 });

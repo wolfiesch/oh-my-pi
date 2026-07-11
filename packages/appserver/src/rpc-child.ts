@@ -1,41 +1,128 @@
-import type { ChildHandle, RpcChildFactory, SessionRecord } from "./types.ts";
+import { parseBounded } from "@oh-my-pi/app-wire";
 import type { RpcSessionEntryFrame, RpcResponse } from "../../coding-agent/src/modes/rpc/rpc-types.ts";
+import type { ChildHandle, RpcChildFactory, SessionRecord } from "./types.ts";
 
 const MAX_LINE_BYTES = 1024 * 1024;
+const STDERR_BYTES = 64 * 1024;
+const VALID_EVENTS = new Set(["session_entry", "subagent_lifecycle", "subagent_progress", "subagent_event", "available_commands_update", "extension_ui_request", "host_tool_call", "host_tool_cancel", "host_uri_request", "host_uri_cancel"]);
+
 export interface ChildCallbacks { entry(frame: RpcSessionEntryFrame): void; event(frame: Record<string, unknown>): void; crashed(error: Error): void; }
+
 export class BunRpcChildFactory implements RpcChildFactory {
   constructor(private readonly executable = "omp") {}
   spawn(spec: { session: SessionRecord; argv: string[]; cwd: string }): ChildHandle {
     const child = Bun.spawn(spec.argv, { cwd: spec.cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-    return { stdin: child.stdin, stdout: child.stdout as unknown as AsyncIterable<Uint8Array>, exited: child.exited, kill: signal => child.kill(signal as never) };
+    return { stdin: { write: data => Promise.resolve(child.stdin.write(data)).then(() => undefined) }, stdout: child.stdout as unknown as AsyncIterable<Uint8Array>, stderr: child.stderr as unknown as AsyncIterable<Uint8Array>, exited: child.exited, kill: signal => child.kill(signal as never) };
   }
-  argv(): string[] { return [this.executable, "--mode", "rpc"]; }
+  argv(sessionPath: string): string[] { return [this.executable, "--mode", "rpc", ...(sessionPath ? ["--session", sessionPath] : [])]; }
 }
+
+function stringBytes(value: string): number {
+  let bytes = 0;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(i + 1);
+      if (next < 0xdc00 || next > 0xdfff) throw new Error("invalid UTF-8 stdout");
+      bytes += 4; i++;
+    } else if (code >= 0xdc00 && code <= 0xdfff) throw new Error("invalid UTF-8 stdout");
+    else bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  }
+  return bytes;
+}
+
 async function* lines(stream: AsyncIterable<string | Uint8Array>): AsyncGenerator<string> {
-  const decoder = new TextDecoder(); let pending = "";
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let pending = "";
   for await (const chunk of stream) {
-    pending += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
-    let index; while ((index = pending.indexOf("\n")) >= 0) { const line = pending.slice(0, index).replace(/\r$/, ""); pending = pending.slice(index + 1); if (new TextEncoder().encode(line).byteLength > MAX_LINE_BYTES) throw new Error("rpc line exceeds 1MiB"); yield line; }
+    let text: string;
+    try { text = typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true }); } catch { throw new Error("invalid UTF-8 stdout"); }
+    pending += text;
+    if (stringBytes(pending) > MAX_LINE_BYTES) throw new Error("rpc line exceeds 1MiB");
+    let index;
+    while ((index = pending.indexOf("\n")) >= 0) {
+      const line = pending.slice(0, index).replace(/\r$/, "");
+      pending = pending.slice(index + 1);
+      yield line;
+    }
   }
-  if (pending) { if (new TextEncoder().encode(pending).byteLength > MAX_LINE_BYTES) throw new Error("rpc line exceeds 1MiB"); yield pending; }
+  try { pending += decoder.decode(); } catch { throw new Error("invalid UTF-8 stdout"); }
+  if (pending) {
+    if (stringBytes(pending) > MAX_LINE_BYTES) throw new Error("rpc line exceeds 1MiB");
+    yield pending;
+  }
 }
+
 export class RpcChildSupervisor {
-  #child?: ChildHandle; #pending = new Map<string, { resolve: (value: RpcResponse) => void; reject: (error: Error) => void }>(); #closed = false; #readyReject?: (error: Error) => void;
+  #child?: ChildHandle; #pending = new Map<string, { resolve: (value: RpcResponse) => void; reject: (error: Error) => void }>(); #closed = false; #readyReject?: (error: Error) => void; #counter = 0; #stderr = ""; #ready = false;
   constructor(private readonly factory: RpcChildFactory, private readonly session: SessionRecord, private readonly callbacks: ChildCallbacks, private readonly argv = ["omp", "--mode", "rpc"]) {}
   async start(): Promise<void> {
-    if (this.#child) throw new Error("child already started"); this.#child = this.factory.spawn({ session: this.session, argv: this.argv, cwd: this.session.cwd });
+    if (this.#child) throw new Error("child already started");
+    this.#child = this.factory.spawn({ session: this.session, argv: this.argv, cwd: this.session.cwd });
     const ready = Promise.withResolvers<void>(); this.#readyReject = ready.reject;
-    void (async () => { try { for await (const line of lines(this.#child!.stdout)) { if (!line) continue; let value: Record<string, unknown>; try { value = JSON.parse(line); } catch { throw new Error("malformed rpc stdout"); } if (value.type === "ready") { ready.resolve(); continue; } this.dispatch(value); } if (!this.#closed) this.fail(new Error("rpc child stdout EOF")); } catch (error) { this.fail(error instanceof Error ? error : new Error(String(error))); } })();
-    void this.#child.exited.then(code => { if (!this.#closed && code !== 0) this.fail(new Error(`rpc child exited (${code})`)); });
-    const timer = setTimeout(() => ready.reject(new Error("rpc child ready timeout")), 10_000); try { await ready.promise; } finally { clearTimeout(timer); }
+    void this.readStdout(ready); void this.readStderr();
+    void this.#child.exited.then(code => { if (!this.#closed && code !== 0) this.fail(new Error(`rpc child exited (${code}): ${this.#stderr}`)); });
+    const timer = setTimeout(() => ready.reject(new Error("rpc child ready timeout")), 10_000);
+    try { await ready.promise; } catch (error) { this.stop(); throw error; } finally { clearTimeout(timer); this.#readyReject = undefined; }
   }
-  async call(command: Record<string, unknown>, id: string): Promise<RpcResponse> {
-    if (!this.#child || this.#closed) throw new Error("rpc child unavailable"); const promise = Promise.withResolvers<RpcResponse>(); this.#pending.set(id, promise); try { const line = `${JSON.stringify({ ...command, id })}\n`; if (new TextEncoder().encode(line).byteLength > MAX_LINE_BYTES) throw new Error("rpc command exceeds 1MiB"); await this.#child.stdin.write(line); return await promise.promise; } catch (error) { this.#pending.delete(id); throw error; }
+  async call(command: Record<string, unknown>, requestId: string): Promise<RpcResponse> {
+    if (!this.#child || this.#closed || !this.#ready) throw new Error("rpc child unavailable");
+    const internalId = `${requestId}:${++this.#counter}`; const promise = Promise.withResolvers<RpcResponse>(); this.#pending.set(internalId, promise);
+    try {
+      const line = `${JSON.stringify({ ...command, id: internalId })}\n`;
+      if (stringBytes(line) > MAX_LINE_BYTES) throw new Error("rpc command exceeds 1MiB");
+      await this.#child.stdin.write(line); return await promise.promise;
+    } catch (error) { this.#pending.delete(internalId); throw error; }
   }
   async prompt(id: string, message: string): Promise<RpcResponse> { return this.call({ type: "prompt", message }, id); }
   async cancel(id: string): Promise<RpcResponse> { return this.call({ type: "abort" }, id); }
-  stop(): void { this.#closed = true; this.#child?.kill(); this.fail(new Error("rpc child stopped")); this.#child = undefined; }
+  stop(): void { const child = this.#child; this.#closed = true; child?.kill(); this.fail(new Error("rpc child stopped")); this.#child = undefined; }
   child(): ChildHandle | undefined { return this.#child; }
-  private dispatch(value: Record<string, unknown>): void { if (value.type === "response" && typeof value.id === "string") { const p = this.#pending.get(value.id); if (p) { this.#pending.delete(value.id); p.resolve(value as unknown as RpcResponse); } return; } if (value.type === "session_entry") { this.callbacks.entry(value as unknown as RpcSessionEntryFrame); return; } this.callbacks.event(value); }
-  private fail(error: Error): void { this.#readyReject?.(error); this.#readyReject = undefined; for (const p of this.#pending.values()) p.reject(error); this.#pending.clear(); if (!this.#closed) { this.#closed = true; this.callbacks.crashed(error); } }
+  private async readStdout(ready: { resolve: () => void; reject: (error: Error) => void }): Promise<void> {
+    try {
+      for await (const line of lines(this.#child!.stdout)) {
+        if (!line) continue;
+        let value: unknown;
+        try { value = parseBounded(line); } catch { throw new Error("malformed rpc stdout"); }
+        if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("rpc frame must be an object");
+        const frame = value as Record<string, unknown>;
+        if (frame.type === "ready") { if (this.#ready) throw new Error("duplicate rpc ready"); this.#ready = true; ready.resolve(); continue; }
+        this.dispatch(frame);
+      }
+      if (!this.#closed) this.fail(new Error("rpc child stdout EOF"));
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error)); ready.reject(failure); this.fail(failure);
+    }
+  }
+  private async readStderr(): Promise<void> {
+    if (!this.#child?.stderr) return;
+    try {
+      for await (const chunk of this.#child.stderr) {
+        const text = typeof chunk === "string" ? chunk.slice(-STDERR_BYTES) : new TextDecoder("utf-8", { fatal: false }).decode(chunk.byteLength > STDERR_BYTES ? chunk.slice(-STDERR_BYTES) : chunk);
+        this.#stderr = `${this.#stderr}${text}`.slice(-STDERR_BYTES);
+      }
+    } catch {}
+  }
+  private dispatch(value: Record<string, unknown>): void {
+    if (value.type === "response") {
+      if (typeof value.id !== "string" || typeof value.command !== "string" || typeof value.success !== "boolean") throw new Error("malformed rpc response");
+      const pending = this.#pending.get(value.id); if (!pending) throw new Error("rpc response has unknown id");
+      this.#pending.delete(value.id);
+      if (!value.success && typeof value.error !== "string") pending.reject(new Error("rpc response missing error"));
+      else pending.resolve(value as unknown as RpcResponse);
+      return;
+    }
+    if (value.type === "session_entry") {
+      if (!value.entry || typeof value.entry !== "object" || Array.isArray(value.entry)) throw new Error("malformed rpc session entry");
+      this.callbacks.entry(value as unknown as RpcSessionEntryFrame); return;
+    }
+    if (typeof value.type !== "string" || !VALID_EVENTS.has(value.type)) throw new Error("unknown rpc frame type");
+    this.callbacks.event(value);
+  }
+  private fail(error: Error): void {
+    this.#readyReject?.(error); this.#readyReject = undefined;
+    for (const pending of this.#pending.values()) pending.reject(error);
+    this.#pending.clear();
+    if (!this.#closed) { this.#closed = true; this.callbacks.crashed(error); }
+  }
 }

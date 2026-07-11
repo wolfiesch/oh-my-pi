@@ -1,9 +1,10 @@
-import { chmod, mkdir, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { chmod, link, mkdir, open, readFile, rename, rm, stat as fsStat, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
-import { decodeClientFrame, type CommandFrame, type DurableEntry, type HelloFrame, type HostId, type ResultFrame, type ServerFrame, type SessionId } from "@oh-my-pi/app-wire";
-import { COMMAND_DESCRIPTORS, DEVICE_CAPABILITIES } from "@oh-my-pi/app-wire";
+import { COMMAND_DESCRIPTORS, DEVICE_CAPABILITIES, requiredCapability } from "@oh-my-pi/app-wire";
+import { decodeClientFrame, decodeCursor, parseBounded, utf8ByteLength, type CommandFrame, type DurableEntry, type HelloFrame, type HostId, type ResultFrame, type ServerFrame, type SessionId } from "@oh-my-pi/app-wire";
 import type { AppserverHandle, AppserverOptions, ChildHandle, CommandOutcome, Clock, SessionRecord } from "./types.ts";
-import { createEpoch, createHostId, defaultSocketPath } from "./identity.ts";
+import { createEpoch, createHostId, defaultSocketPath, loadPersistentHostId, unixSocketActive } from "./identity.ts";
 import { FileSessionDiscovery } from "./discovery.ts";
 import { SessionProjection } from "./projection.ts";
 import { IdempotencyStore } from "./idempotency.ts";
@@ -13,49 +14,126 @@ const clock: Clock = { now: () => new Date() };
 function response(hostId: HostId, command: CommandFrame, ok: boolean, result?: unknown, error?: { code: string; message: string; details?: Record<string, unknown> }): ResultFrame {
   return { v: "omp-app/1", type: "response", requestId: command.requestId, commandId: command.commandId, hostId, sessionId: command.sessionId, ok, ...(ok ? { result } : { error }) } as ResultFrame;
 }
-function fromRpcEntry(raw: Record<string, unknown>, host: HostId, session: SessionId): DurableEntry | undefined {
-  if (typeof raw.id !== "string" || typeof raw.type !== "string") return undefined;
-  return { id: raw.id as DurableEntry["id"], parentId: (typeof raw.parentId === "string" ? raw.parentId : null) as DurableEntry["parentId"], hostId: host, sessionId: session, kind: raw.type, timestamp: typeof raw.timestamp === "string" ? raw.timestamp : new Date(0).toISOString(), data: Object.fromEntries(Object.entries(raw).filter(([key]) => !["id", "parentId", "type", "timestamp"].includes(key))) };
+function fromRpcEntry(raw: Record<string, unknown>, host: HostId, session: SessionId): DurableEntry {
+  if (typeof raw.id !== "string" || typeof raw.type !== "string" || !raw.type || (raw.parentId !== null && typeof raw.parentId !== "string") || typeof raw.timestamp !== "string" || !Number.isFinite(Date.parse(raw.timestamp))) throw new Error("malformed rpc session entry");
+  return { id: raw.id as DurableEntry["id"], parentId: raw.parentId as DurableEntry["parentId"], hostId: host, sessionId: session, kind: raw.type, timestamp: raw.timestamp, data: Object.fromEntries(Object.entries(raw).filter(([key]) => !["id", "parentId", "type", "timestamp"].includes(key))) };
 }
+function argumentError(command: CommandFrame): string | undefined {
+  const args = command.args;
+  if (!args || typeof args !== "object" || Array.isArray(args)) return "args must be an object";
+  const keys = Object.keys(args);
+  if (command.command === "session.prompt") {
+    if (keys.length !== 1 || keys[0] !== "message" || typeof args.message !== "string" || args.message.length === 0 || utf8ByteLength(args.message) > 65_536) return "prompt message must be a bounded non-empty UTF-8 string";
+    return undefined;
+  }
+  if (command.command === "session.attach") {
+    if (keys.length === 0) return undefined;
+    if (keys.length === 1 && keys[0] === "cursor") { try { decodeCursor(args.cursor); return undefined; } catch { return "attach cursor is invalid"; } }
+    return "attach accepts only an optional cursor";
+  }
+  if (keys.length !== 0) return "command does not accept args";
+  return undefined;
+}
+async function publishOwner(path: string, ownerId: string): Promise<void> {
+  const temp = `${path}.tmp-${ownerId}`;
+  const handle = await open(temp, "w", 0o600);
+  try { await handle.write(`${JSON.stringify({ ownerId, pid: process.pid })}\n`); await handle.sync(); } finally { await handle.close(); }
+  try { await link(temp, path); } finally { await unlink(temp).catch(() => {}); }
+}
+type AppWs = Bun.ServerWebSocket<ServerWebSocketData>;
 export class LocalAppserver implements AppserverHandle {
-  readonly hostId: HostId; readonly epoch: string; readonly socketPath: string;
-  #clock: Clock; #discovery; #factory; #lockCheck; #ringSize; #projections = new Map<SessionId, SessionProjection>(); #supervisors = new Map<SessionId, RpcChildSupervisor>(); #idempotency = new IdempotencyStore(); #server?: Bun.Server<{ socket: ServerWebSocketData }>; #clients = new Set<ServerWebSocket<{ socket: ServerWebSocketData }>>(); #started = false;
-  constructor(options: AppserverOptions = {}) { this.hostId = options.hostId ?? createHostId(); this.epoch = createEpoch(options.epoch); this.socketPath = options.socketPath ?? defaultSocketPath(); this.#clock = options.clock ?? clock; this.#discovery = options.discovery ?? new FileSessionDiscovery(`${process.env.HOME || "."}/.omp/sessions`, undefined, this.hostId); this.#factory = options.childFactory ?? new BunRpcChildFactory(); this.#lockCheck = options.lockCheck; this.#ringSize = options.ringSize ?? 256; }
+  hostId: HostId; readonly epoch: string; readonly socketPath: string;
+  #clock: Clock; #discovery; #factory; #lockCheck; #ringSize; #records = new Map<SessionId, SessionRecord>(); #projections = new Map<SessionId, SessionProjection>(); #supervisors = new Map<SessionId, RpcChildSupervisor>(); #startPromises = new Map<SessionId, Promise<RpcChildSupervisor>>(); #idempotency = new IdempotencyStore(); #server?: Bun.Server<ServerWebSocketData>; #clients = new Set<AppWs>(); #hello = new Set<AppWs>(); #clientCapabilities = new Map<AppWs, Set<string>>(); #attached = new Map<AppWs, Set<SessionId>>(); #started = false; #hostProvided: boolean; #ownerLock = false; #ownerId?: string; #ompVersion; #ompBuild; #appserverVersion; #appserverBuild; #supportedFeatures; #supportedCapabilities;
+  constructor(options: AppserverOptions = {}) {
+    this.#hostProvided = Boolean(options.hostId); this.hostId = options.hostId ?? createHostId(); this.epoch = createEpoch(options.epoch); this.socketPath = options.socketPath ?? defaultSocketPath();
+    this.#clock = options.clock ?? clock; this.#discovery = options.discovery ?? new FileSessionDiscovery(`${process.env.HOME || "."}/.omp/agent/sessions`, undefined, this.hostId); this.#factory = options.childFactory ?? new BunRpcChildFactory(); this.#lockCheck = options.lockCheck; this.#ringSize = options.ringSize ?? 256;
+    this.#ompVersion = options.ompVersion ?? "local"; this.#ompBuild = options.ompBuild ?? "local"; this.#appserverVersion = options.appserverVersion ?? "0.1.0"; this.#appserverBuild = options.appserverBuild ?? "local"; this.#supportedFeatures = new Set(options.supportedFeatures ?? ["resume", "live", "replay"]);
+    const implemented = new Set(["sessions.read", "sessions.prompt", "sessions.control"]); const requested = options.supportedCapabilities ?? [...implemented]; if (requested.some(capability => !implemented.has(capability))) throw new Error("unsupported capability has no Wave1 handler"); this.#supportedCapabilities = new Set(requested);
+  }
   async start(): Promise<void> {
-    if (this.#started) return; await this.loadSessions(); await mkdir(dirname(this.socketPath), { recursive: true, mode: 0o700 }); try { await chmod(dirname(this.socketPath), 0o700); } catch {} try { await unlink(this.socketPath); } catch {}
-    this.#server = Bun.serve<{ socket: ServerWebSocketData }>({ unix: this.socketPath, maxPayloadLength: 1024 * 1024, backpressureLimit: 1024 * 1024, closeOnBackpressureLimit: true, fetch: (request, server) => this.fetch(request, server), websocket: { open: ws => { this.#clients.add(ws); }, message: (ws, message) => { void this.message(ws, message); }, close: ws => { this.#clients.delete(ws); } } });
-    await chmod(this.socketPath, 0o600); this.#started = true;
+    if (this.#started) return;
+    if (!this.#hostProvided) this.hostId = await loadPersistentHostId();
+    this.#records.clear(); this.#projections.clear(); await this.loadSessions();
+    await mkdir(dirname(this.socketPath), { recursive: true, mode: 0o700 }); try { await chmod(dirname(this.socketPath), 0o700); } catch {}
+    const ownerPath = `${this.socketPath}.owner`; const ownerId = randomUUID();
+    try {
+      await publishOwner(ownerPath, ownerId); this.#ownerId = ownerId; this.#ownerLock = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      let existing: { ownerId?: string; pid?: number } | undefined;
+      try { existing = JSON.parse(await readFile(ownerPath, "utf8")) as { ownerId?: string; pid?: number }; } catch { throw new Error(`appserver socket has another owner: ${this.socketPath}`); }
+      let alive = false; try { process.kill(existing.pid!, 0); alive = true; } catch (probeError) { if ((probeError as NodeJS.ErrnoException).code !== "ESRCH") alive = true; }
+      if (alive) throw new Error(`appserver socket has another owner: ${this.socketPath}`);
+      const stalePath = `${ownerPath}.stale-${randomUUID()}`; try { await rename(ownerPath, stalePath); } catch { throw new Error(`appserver socket has another owner: ${this.socketPath}`); }
+      await rm(stalePath, { force: true }); await publishOwner(ownerPath, ownerId); this.#ownerId = ownerId; this.#ownerLock = true;
+    }
+    try {
+      try {
+        const existing = await fsStat(this.socketPath);
+        if (!existing.isSocket()) throw new Error(`refusing non-socket path: ${this.socketPath}`);
+        if (await unixSocketActive(this.socketPath)) throw new Error(`appserver socket is active: ${this.socketPath}`);
+        await unlink(this.socketPath);
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      this.#server = Bun.serve<ServerWebSocketData>({ unix: this.socketPath, fetch: (request, server) => this.fetch(request, server), websocket: { maxPayloadLength: 1024 * 1024, backpressureLimit: 1024 * 1024, closeOnBackpressureLimit: true, open: ws => { this.#clients.add(ws); this.#clientCapabilities.set(ws, new Set()); this.#attached.set(ws, new Set()); }, message: (ws, message) => { void this.message(ws, message); }, close: ws => { this.#clients.delete(ws); this.#hello.delete(ws); this.#clientCapabilities.delete(ws); this.#attached.delete(ws); } } });
+      await chmod(this.socketPath, 0o600); this.#started = true;
+    } catch (error) { if (this.#ownerLock && this.#ownerId) { try { const current = JSON.parse(await readFile(ownerPath, "utf8")) as { ownerId?: string }; if (current.ownerId === this.#ownerId) await unlink(ownerPath); } catch {} this.#ownerLock = false; } throw error; }
   }
   async stop(): Promise<void> {
-    if (!this.#started && !this.#server) return; for (const ws of this.#clients) ws.close(1001, "server stopping"); this.#clients.clear(); for (const supervisor of this.#supervisors.values()) supervisor.stop(); this.#supervisors.clear(); this.#server?.stop(true); this.#server = undefined; try { await unlink(this.socketPath); } catch {} this.#started = false;
+    if (!this.#started && !this.#server && !this.#ownerLock) return;
+    for (const ws of this.#clients) ws.close(1001, "server stopping");
+    this.#clients.clear(); this.#hello.clear(); this.#attached.clear();
+    for (const supervisor of this.#supervisors.values()) supervisor.stop();
+    this.#supervisors.clear(); this.#server?.stop(true); this.#server = undefined;
+    if (this.#ownerLock && this.#ownerId) { try { const existing = await fsStat(this.socketPath); if (existing.isSocket()) await unlink(this.socketPath); } catch {} try { const current = JSON.parse(await readFile(`${this.socketPath}.owner`, "utf8")) as { ownerId?: string }; if (current.ownerId === this.#ownerId) await unlink(`${this.socketPath}.owner`); } catch {} this.#ownerLock = false; }
   }
   snapshot(sessionId: SessionId) { return this.#projections.get(sessionId)?.value; }
   replay(sessionId: SessionId, cursor: { epoch: string; seq: number }): ServerFrame[] { return this.#projections.get(sessionId)?.replay(cursor) ?? []; }
   childFor(sessionId: SessionId): ChildHandle | undefined { return this.#supervisors.get(sessionId)?.child(); }
-  async command(command: CommandFrame): Promise<CommandOutcome> {
+  async command(command: CommandFrame, capabilities?: Set<string>): Promise<CommandOutcome> {
     if (command.hostId !== this.hostId) return { frame: response(this.hostId, command, false, undefined, { code: "host_mismatch", message: "command targets another host" }) };
     const descriptor = COMMAND_DESCRIPTORS[command.command]; if (!descriptor) return { frame: response(this.hostId, command, false, undefined, { code: "unsupported", message: "unknown command" }) };
-    const check = this.#idempotency.begin(command.commandId, command); if (check.kind === "replay") return check.outcome; if (check.kind === "conflict") return { frame: response(this.hostId, command, false, undefined, { code: "idempotency_conflict", message: "commandId was already used with another payload", details: { commandId: command.commandId, payloadHash: check.hash } }) };
+    const required = requiredCapability(command.command); if (capabilities && required && !capabilities.has(required)) return { frame: response(this.hostId, command, false, undefined, { code: "capability_denied", message: "client capability was not granted" }) };
+    const check = this.#idempotency.begin(command.commandId, command);
+    if (check.kind === "replay") return { frame: { ...check.outcome.frame, requestId: command.requestId } as ServerFrame, unknown: check.outcome.unknown };
+    if (check.kind === "pending") { const outcome = await check.outcome; return { frame: { ...outcome.frame, requestId: command.requestId } as ServerFrame, unknown: outcome.unknown }; }
+    if (check.kind === "conflict") return { frame: response(this.hostId, command, false, undefined, { code: "idempotency_conflict", message: "commandId was already used with another payload", details: { commandId: command.commandId, payloadHash: check.hash } }) };
+    const invalidArgs = argumentError(command);
+    if (invalidArgs) return this.finish(command, { frame: response(this.hostId, command, false, undefined, { code: "invalid_frame", message: invalidArgs }) });
     const projection = command.sessionId ? this.#projections.get(command.sessionId) : undefined;
     if (descriptor.scope === "session" && !projection) return this.finish(command, { frame: response(this.hostId, command, false, undefined, { code: "unknown_session", message: "session is not indexed" }) });
     if (command.expectedRevision && projection && command.expectedRevision !== projection.value.revision) return this.finish(command, { frame: response(this.hostId, command, false, undefined, { code: "stale_revision", message: "session revision is stale", details: { expectedRevision: command.expectedRevision, actualRevision: projection.value.revision } }) });
-    if (descriptor.confirmation === "challenge" && command.command !== "session.cancel") return this.finish(command, { frame: response(this.hostId, command, false, undefined, { code: "unsupported", message: "confirmation challenges arrive in Wave 3" }) });
+    if (descriptor.confirmation === "challenge") return this.finish(command, { frame: response(this.hostId, command, false, undefined, { code: "unsupported", message: "confirmation challenges arrive in Wave 3" }) });
     let outcome: CommandOutcome;
     try {
       if (command.command === "host.list" || command.command === "session.list") outcome = { frame: response(this.hostId, command, true, this.sessionsFrame()) };
-      else if (command.command === "session.prompt") { const supervisor = this.#supervisors.get(command.sessionId!); if (!supervisor) throw new Error("session child unavailable"); await this.#lockCheck?.(this.record(command.sessionId!)); const result = await supervisor.prompt(command.requestId, String(command.args.message ?? "")); outcome = { frame: response(this.hostId, command, result.success, result, result.success ? undefined : { code: "child_error", message: result.error }) }; }
-      else if (command.command === "session.cancel") { const supervisor = this.#supervisors.get(command.sessionId!); if (!supervisor) throw new Error("session child unavailable"); const result = await supervisor.cancel(command.requestId); outcome = { frame: response(this.hostId, command, result.success, result, result.success ? undefined : { code: "child_error", message: result.error }) }; }
+      else if (command.command === "session.attach") outcome = { frame: response(this.hostId, command, true, { attached: true, cursor: projection!.value.cursor }) };
+      else if (command.command === "session.prompt") { const supervisor = await this.ensureSupervisor(command.sessionId!); const message = command.args.message as string; const result = await supervisor.prompt(command.requestId, message); outcome = { frame: response(this.hostId, command, result.success, result, result.success ? undefined : { code: "child_error", message: result.error }) }; }
+      else if (command.command === "session.cancel") { const supervisor = await this.ensureSupervisor(command.sessionId!); const result = await supervisor.cancel(command.requestId); outcome = { frame: response(this.hostId, command, result.success, result, result.success ? undefined : { code: "child_error", message: result.error }) }; }
       else outcome = { frame: response(this.hostId, command, false, undefined, { code: "unsupported", message: "command is deferred to a later wave" }) };
     } catch (error) { outcome = { frame: response(this.hostId, command, false, undefined, { code: "outcome_unknown", message: error instanceof Error ? error.message : String(error), details: { recovery: "reconnect and replay from snapshot" } }), unknown: true }; }
     return this.finish(command, outcome);
   }
+  private record(sessionId: SessionId): SessionRecord { const record = this.#records.get(sessionId); if (!record) throw new Error("unknown session"); return record; }
   private finish(command: CommandFrame, outcome: CommandOutcome): CommandOutcome { this.#idempotency.complete(command.commandId, command, outcome); return outcome; }
-  private record(sessionId: SessionId): SessionRecord { const projection = this.#projections.get(sessionId); if (!projection) throw new Error("unknown session"); return { sessionId, path: "", cwd: projection.value.ref.project.canonicalCwd, projectId: projection.value.ref.project.projectId, title: projection.value.ref.title, updatedAt: projection.value.ref.updatedAt, status: projection.value.ref.status, entries: projection.value.entries }; }
-  private async loadSessions(): Promise<void> { const records = await this.#discovery.list(); for (const record of records) { const projection = new SessionProjection(this.hostId, record, this.epoch, this.#ringSize); this.#projections.set(record.sessionId, projection); const supervisor = new RpcChildSupervisor(this.#factory, record, { entry: frame => { const entry = fromRpcEntry(frame.entry as unknown as Record<string, unknown>, this.hostId, record.sessionId); if (entry) projection.appendEntry(entry); }, event: frame => projection.appendEvent({ type: typeof frame.type === "string" ? frame.type : "rpc", ...frame }), crashed: () => { projection.value.ref = { ...projection.value.ref, status: "closed" }; this.#supervisors.delete(record.sessionId); } }, this.#factory instanceof BunRpcChildFactory ? this.#factory.argv() : ["omp", "--mode", "rpc"]); this.#supervisors.set(record.sessionId, supervisor); try { await this.#lockCheck?.(record); await supervisor.start(); } catch { supervisor.stop(); this.#supervisors.delete(record.sessionId); projection.value.ref = { ...projection.value.ref, status: "closed" }; } } }
+  private async ensureSupervisor(sessionId: SessionId): Promise<RpcChildSupervisor> {
+    const existing = this.#supervisors.get(sessionId); if (existing) return existing;
+    const pending = this.#startPromises.get(sessionId); if (pending) return pending;
+    const start = Promise.resolve().then(() => this.startSupervisor(sessionId)); this.#startPromises.set(sessionId, start);
+    try { return await start; } finally { this.#startPromises.delete(sessionId); }
+  }
+  private async startSupervisor(sessionId: SessionId): Promise<RpcChildSupervisor> {
+    const existing = this.#supervisors.get(sessionId); if (existing) return existing;
+    const record = this.#records.get(sessionId); if (!record) throw new Error("unknown session"); await this.#lockCheck?.(this.record(sessionId));
+    const projection = this.#projections.get(sessionId)!;
+    const supervisor = new RpcChildSupervisor(this.#factory, record, { entry: frame => { const entry = fromRpcEntry(frame.entry as unknown as Record<string, unknown>, this.hostId, sessionId); const output = entry ? projection.appendEntry(entry) : undefined; if (output) this.broadcast(sessionId, output); }, event: frame => this.broadcast(sessionId, projection.appendEvent({ type: typeof frame.type === "string" ? frame.type : "rpc", ...frame })), crashed: () => { projection.value.ref = { ...projection.value.ref, status: "closed" }; this.#supervisors.delete(sessionId); } }, this.#factory.argv(record.path));
+    this.#supervisors.set(sessionId, supervisor); try { await supervisor.start(); return supervisor; } catch (error) { this.#supervisors.delete(sessionId); supervisor.stop(); throw error; }
+  }
+  private async message(ws: AppWs, raw: string | Buffer): Promise<void> { try { if (typeof raw !== "string") throw new Error("binary websocket frames are not supported"); const frame = decodeClientFrame(parseBounded(raw)); if (frame.type === "hello") { if (this.#hello.has(ws)) throw new Error("hello already received"); this.#hello.add(ws); this.hello(ws, frame); } else { if (!this.#hello.has(ws)) throw new Error("hello required before commands"); if (frame.type === "ping") ws.send(JSON.stringify({ v: "omp-app/1", type: "pong", nonce: frame.nonce, timestamp: this.#clock.now().toISOString() })); else if (frame.type === "command") { const outcome = await this.command(frame, this.#clientCapabilities.get(ws)); ws.send(JSON.stringify(outcome.frame)); if (frame.command === "session.attach" && frame.sessionId && outcome.frame.type === "response" && outcome.frame.ok) { this.#attached.get(ws)?.add(frame.sessionId); const cursor = frame.args.cursor; const outputs = cursor ? this.replay(frame.sessionId, cursor as { epoch: string; seq: number }) : [this.#projections.get(frame.sessionId)!.snapshot()]; for (const output of outputs) ws.send(JSON.stringify(output)); } } else ws.send(JSON.stringify({ v: "omp-app/1", type: "error", code: "unsupported", message: "frame is not supported" })); } } catch (error) { ws.send(JSON.stringify({ v: "omp-app/1", type: "error", code: "invalid_frame", message: error instanceof Error ? error.message : String(error) })); ws.close(1008, "invalid frame"); } }
+  private hello(ws: AppWs, frame: HelloFrame): void { const requestedCapabilities = new Set(frame.capabilities?.client ?? this.#supportedCapabilities); const grantedCapabilities = [...this.#supportedCapabilities].filter(capability => requestedCapabilities.has(capability)); this.#clientCapabilities.set(ws, new Set(grantedCapabilities)); const welcome = { v: "omp-app/1", type: "welcome", selectedProtocol: "omp-app/1", hostId: this.hostId, ompVersion: this.#ompVersion, ompBuild: this.#ompBuild, appserverVersion: this.#appserverVersion, appserverBuild: this.#appserverBuild, epoch: this.epoch, grantedCapabilities, grantedFeatures: frame.requestedFeatures.filter(feature => this.#supportedFeatures.has(feature)), negotiatedLimits: { maxPayloadLength: 1024 * 1024, ringSize: this.#ringSize }, resumed: frame.savedCursors.some(cursor => cursor.hostId === this.hostId && cursor.cursor.epoch === this.epoch) }; ws.send(JSON.stringify(welcome)); ws.send(JSON.stringify(this.sessionsFrame())); }
+  private async loadSessions(): Promise<void> { const records = await this.#discovery.list(); records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.sessionId.localeCompare(b.sessionId)); for (const record of records) { if (this.#records.has(record.sessionId)) throw new Error(`duplicate session id: ${record.sessionId}`); this.#records.set(record.sessionId, record); this.#projections.set(record.sessionId, new SessionProjection(this.hostId, record, this.epoch, this.#ringSize)); } }
   private sessionsFrame(): ServerFrame { return { v: "omp-app/1", type: "sessions", cursor: { epoch: this.epoch, seq: 0 }, sessions: [...this.#projections.values()].map(value => value.value.ref) }; }
-  private fetch(request: Request, server: Bun.Server<{ socket: ServerWebSocketData }>): Response | undefined { const url = new URL(request.url); if (url.pathname === "/health" && request.method === "GET") return Response.json({ ok: true, hostId: this.hostId, epoch: this.epoch }); if (url.pathname !== "/ws" || request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket") return new Response("Not Found", { status: 404 }); if (server.upgrade(request, { data: { socket: {} } })) return undefined; return new Response("Upgrade Required", { status: 426 }); }
-  private async message(ws: ServerWebSocket<{ socket: ServerWebSocketData }>, raw: string | Buffer): Promise<void> { try { const frame = decodeClientFrame(JSON.parse(typeof raw === "string" ? raw : raw.toString())); if (frame.type === "hello") this.hello(ws, frame); else if (frame.type === "ping") ws.send(JSON.stringify({ v: "omp-app/1", type: "pong", nonce: frame.nonce, timestamp: this.#clock.now().toISOString() })); else if (frame.type === "command") ws.send(JSON.stringify((await this.command(frame)).frame)); else ws.send(JSON.stringify({ v: "omp-app/1", type: "error", code: "unsupported", message: "frame is not supported" })); } catch (error) { ws.send(JSON.stringify({ v: "omp-app/1", type: "error", code: "invalid_frame", message: error instanceof Error ? error.message : String(error) })); ws.close(1008, "invalid frame"); } }
-  private hello(ws: ServerWebSocket<{ socket: ServerWebSocketData }>, frame: HelloFrame): void { const welcome = { v: "omp-app/1", type: "welcome", selectedProtocol: "omp-app/1", hostId: this.hostId, ompVersion: "local", ompBuild: "local", appserverVersion: "0.1.0", appserverBuild: "local", epoch: this.epoch, grantedCapabilities: [...DEVICE_CAPABILITIES], grantedFeatures: frame.requestedFeatures, negotiatedLimits: { maxPayloadLength: 1024 * 1024, ringSize: this.#ringSize }, resumed: frame.savedCursors.some(cursor => cursor.hostId === this.hostId && cursor.cursor.epoch === this.epoch) }; ws.send(JSON.stringify(welcome)); ws.send(JSON.stringify(this.sessionsFrame())); for (const saved of frame.savedCursors) if (saved.hostId === this.hostId) for (const output of this.replay(saved.sessionId, saved.cursor)) ws.send(JSON.stringify(output)); }
+  private broadcast(sessionId: SessionId, frame: ServerFrame): void { for (const [client, sessions] of this.#attached) if (sessions.has(sessionId)) client.send(JSON.stringify(frame)); }
+  private fetch(request: Request, server: Bun.Server<ServerWebSocketData>): Response | undefined { const url = new URL(request.url); if (url.pathname === "/health" && request.method === "GET") return Response.json({ ok: true, hostId: this.hostId, epoch: this.epoch }); if (url.pathname !== "/ws" || request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket") return new Response("Not Found", { status: 404 }); if (server.upgrade(request, { data: { socket: {} } })) return undefined; return new Response("Upgrade Required", { status: 426 }); }
 }
 interface ServerWebSocketData { socket: Record<string, never>; }
 export function createAppserver(options: AppserverOptions = {}): LocalAppserver { return new LocalAppserver(options); }
