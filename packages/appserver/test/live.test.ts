@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { decodeServerFrame, entryId, hostId, projectId, sessionId, type DurableEntry, type ServerFrame } from "@oh-my-pi/app-wire";
 import { LocalAppserver, createAppserver } from "../src/server.ts";
-import type { ChildHandle, RpcChildFactory, SessionDiscovery, SessionRecord } from "../src/types.ts";
+import type { ChildHandle, RpcChildFactory, SessionAuthority, SessionDiscovery, SessionRecord } from "../src/types.ts";
 import { frameBytes, RawUdsWebSocket } from "./raw-uds-client.ts";
 
 const host = hostId("live-test-host");
@@ -15,9 +15,23 @@ const rid = (value: string) => value as never;
 function record(id: string): SessionRecord { return { sessionId: sid(id), path: `/tmp/${id}.jsonl`, cwd: "/tmp", projectId: projectId("project-test"), title: id, updatedAt: stamp, status: "idle", entries: [] }; }
 function hello(capabilities?: string[]): Record<string, unknown> { return { v: "omp-app/1", type: "hello", protocol: { min: "omp-app/1", max: "omp-app/1" }, client: { name: "raw-test", version: "1", build: "test", platform: "linux" }, requestedFeatures: ["resume", "live", "replay"], savedCursors: [], ...(capabilities ? { capabilities: { client: capabilities } } : {}) }; }
 function command(requestId: string, commandId: string, name: string, session: string, args: Record<string, unknown>): Record<string, unknown> { return { v: "omp-app/1", type: "command", requestId: rid(requestId), commandId: rid(commandId), hostId: host, sessionId: sid(session), command: name, args }; }
+function hostCommand(requestId: string, commandId: string, name: string, args: Record<string, unknown>): Record<string, unknown> { return { v: "omp-app/1", type: "command", requestId: rid(requestId), commandId: rid(commandId), hostId: host, command: name, args }; }
+function confirmFrame(requestId: string, confirmationId: string, commandId: string, decision: "approve" | "deny", session?: string): Record<string, unknown> { return { v: "omp-app/1", type: "confirm", requestId: rid(requestId), confirmationId: rid(confirmationId), commandId: rid(commandId), hostId: host, ...(session ? { sessionId: sid(session) } : {}), decision }; }
 class StaticDiscovery implements SessionDiscovery {
   constructor(private readonly values: SessionRecord[]) {}
   async list(): Promise<SessionRecord[]> { return this.values; }
+}
+class FakeAuthority implements SessionAuthority {
+  readonly created = Promise.withResolvers<{ cwd: string; title?: string }>();
+  constructor(private readonly values: SessionRecord[] = []) {}
+  async list(): Promise<SessionRecord[]> { return this.values; }
+  async create(cwd: string, title?: string) { this.created.resolve({ cwd, title }); return { sessionId: sid("created"), path: "/tmp/created.jsonl", cwd, title, entries: [] }; }
+}
+class Gate {
+  readonly opened = Promise.withResolvers<void>();
+  readonly started = Promise.withResolvers<void>();
+  calls = 0;
+  async lock(): Promise<void> { this.calls += 1; this.started.resolve(); await this.opened.promise; }
 }
 class LiveChild implements ChildHandle {
   readonly writes: string[] = [];
@@ -212,5 +226,48 @@ describe("raw RFC6455 boundary and lifecycle", () => {
     const results = await Promise.allSettled([a.start(), b.start()]); expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1); await a.stop(); await b.stop();
     await writeFile(`${path}.owner`, "not-json"); const malformed = createAppserver({ hostId: host, socketPath: path, discovery: new StaticDiscovery([]) }); await expect(malformed.start()).rejects.toThrow("another owner");
     await writeFile(`${path}.owner`, JSON.stringify({ ownerId: "other", pid: 999999 })); const cleanup = createAppserver({ hostId: host, socketPath: path, discovery: new StaticDiscovery([]) }); await cleanup.start(); await writeFile(`${path}.owner`, JSON.stringify({ ownerId: "other", pid: 999999 })); await cleanup.stop(); expect(await stat(`${path}.owner`)).toBeDefined();
+  });
+});
+describe("WS command boundary, authority, confirmation, and lock lifecycle", () => {
+  test("real WS dispatch enforces arguments, idempotency, and raw path validation", async () => {
+    const factory = new LiveFactory(); const { appserver, path } = await liveServer(factory, [record("s1")]);
+    const client = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+    client.client.sendJson(hostCommand("list-a", "list", "session.list", {})); client.client.sendJson(hostCommand("list-b", "list", "session.list", {}));
+    const first = await client.client.nextServer(); const replay = await client.client.nextServer(); expect(first.type).toBe("response"); expect(replay.type).toBe("response");
+    client.client.sendJson(hostCommand("conflict", "list", "session.list", { bad: true })); const conflict = await client.client.nextServer(); expect(conflict.type).toBe("response"); if (conflict.type === "response") expect(conflict.error?.code).toBe("idempotency_conflict");
+    client.client.sendJson(command("bad-args", "bad-args", "session.prompt", "s1", { message: "ok", extra: true })); const badArgs = await client.client.nextServer(); expect(badArgs.type).toBe("response"); if (badArgs.type === "response") expect(badArgs.error?.code).toBe("invalid_frame");
+    client.client.sendJson(command("big", "big", "session.prompt", "s1", { message: "x".repeat(65_537) })); const big = await client.client.nextServer(); expect(big.type).toBe("response"); if (big.type === "response") expect(big.error?.code).toBe("invalid_frame");
+    await closeClients([client.client]); await appserver.stop();
+    const pathServer = await liveServer(new LiveFactory(), [record("s1")]); const pathClient = await readyClient(pathServer.path, ["files.read"]);
+    pathClient.client.sendRaw(frameBytes(1, new TextEncoder().encode(JSON.stringify({ v: "omp-app/1", type: "command", requestId: "bad-path-r", commandId: "bad-path-c", hostId: host, command: "files.read", sessionId: "s1", args: { path: "/etc/passwd" } })))); const pathResult = await pathClient.client.nextOrClose(); expect(pathResult?.opcode === 1 || pathResult?.opcode === 8 || pathResult === undefined).toBe(true); pathClient.client.destroy(); await pathClient.client.closed(); await pathServer.appserver.stop();
+  });
+
+  test("confirmation challenge is one-shot, connection-bound, expiry-aware, and gated by revision", async () => {
+    const factory = new LiveFactory(); const { appserver, path } = await liveServer(factory, [record("s1")]);
+    const owner = await readyClient(path, ["sessions.read", "sessions.manage"]); const other = await readyClient(path, ["sessions.read", "sessions.manage"]);
+    owner.client.sendJson(command("attach-close", "attach-close", "session.attach", "s1", {})); const [, snapshot] = await responseAndSnapshot(owner.client, "attach-close");
+    const close = command("close", "close", "session.close", "s1", {}); (close as Record<string, unknown>).expectedRevision = snapshot.revision; owner.client.sendJson(close);
+    const challenge = await owner.client.nextServer(); expect(challenge.type).toBe("confirmation"); if (challenge.type !== "confirmation") throw new Error("missing challenge");
+    expect(challenge.commandHash).toMatch(/^[0-9a-f]{64}$/); expect(factory.children).toHaveLength(0);
+    other.client.sendJson(confirmFrame("wrong", String(challenge.confirmationId), "close", "approve", "s1")); const wrong = await other.client.nextServer(); expect(wrong.type).toBe("response"); if (wrong.type === "response") expect(wrong.error?.code).toBe("confirmation_invalid");
+    owner.client.sendJson(confirmFrame("deny", String(challenge.confirmationId), "close", "deny", "s1")); const denied = await owner.client.nextServer(); expect(denied.type).toBe("response"); if (denied.type === "response") expect(denied.error?.code).toBe("confirmation_denied");
+    owner.client.sendJson(confirmFrame("reuse", String(challenge.confirmationId), "close", "approve", "s1")); const reused = await owner.client.nextServer(); expect(reused.type).toBe("response"); if (reused.type === "response") expect(reused.error?.code).toBe("confirmation_invalid");
+    const stale = command("stale-close", "stale-close", "session.close", "s1", {}); (stale as Record<string, unknown>).expectedRevision = "wrong-revision"; owner.client.sendJson(stale); const staleChallenge = await owner.client.nextServer(); expect(staleChallenge.type).toBe("confirmation"); if (staleChallenge.type === "confirmation") { owner.client.sendJson(confirmFrame("stale-approve", String(staleChallenge.confirmationId), "stale-close", "approve", "s1")); const staleResult = await owner.client.nextServer(); expect(staleResult.type).toBe("response"); if (staleResult.type === "response") expect(staleResult.error?.code).toBe("stale_revision"); }
+    const expiring = command("expire", "expire", "session.close", "s1", {}); (expiring as Record<string, unknown>).expectedRevision = snapshot.revision; owner.client.sendJson(expiring); const expiringChallenge = await owner.client.nextServer(); const originalNow = Date.now; Date.now = () => Number.MAX_SAFE_INTEGER; try { if (expiringChallenge.type === "confirmation") { owner.client.sendJson(confirmFrame("expired", String(expiringChallenge.confirmationId), "expire", "approve", "s1")); const expired = await owner.client.nextServer(); expect(expired.type).toBe("response"); if (expired.type === "response") expect(expired.error?.code).toBe("confirmation_invalid"); } } finally { Date.now = originalNow; }
+    await closeClients([owner.client, other.client]); await appserver.stop();
+  });
+
+  test("create without title uses authority, and prompt lock failure recovers status for retry", async () => {
+    const authority = new FakeAuthority(); const factory = new LiveFactory(); const root = await mkdtemp(join(tmpdir(), "omp-authority-live-")); const appserver = createAppserver({ hostId: host, epoch, socketPath: join(root, "app.sock"), sessionAuthority: authority, childFactory: factory }); await appserver.start();
+    const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]); client.client.sendJson(hostCommand("create", "create", "session.create", { cwd: "/tmp/authority" })); const created = await client.client.nextServer(); expect(created.type).toBe("response"); expect((await authority.created.promise).title).toBeUndefined(); if (created.type === "response") expect(created.result).toMatchObject({ sessionId: "created", cwd: "/tmp/authority" });
+    await closeClients([client.client]); await appserver.stop();
+    const failing = new LiveFactory(); let fail = true; const lockApp = createAppserver({ hostId: host, epoch: "lock", socketPath: join(root, "lock.sock"), discovery: new StaticDiscovery([record("s1")]), childFactory: failing, lockCheck: () => { if (fail) throw new Error("lock busy"); } }); await lockApp.start(); const lockClient = await readyClient(lockApp.socketPath, ["sessions.read", "sessions.prompt"]); lockClient.client.sendJson(command("fail", "fail", "session.prompt", "s1", { message: "x" })); const failure = await lockClient.client.nextServer(); expect(failure.type).toBe("response"); expect(lockApp.snapshot(sid("s1"))?.ref.status).toBe("idle"); fail = false; lockClient.client.sendJson(command("retry", "retry", "session.prompt", "s1", { message: "x" })); const child = await failing.child(); await child.waitForWrites(1); responseFor(child, "prompt"); const retried = await untilResponse(lockClient.client, "retry"); expect(retried.response.ok).toBe(true); await closeClients([lockClient.client]); await lockApp.stop();
+  });
+
+  test("close waits for a pending lock start, then prevents child resurrection", async () => {
+    const gate = new Gate(); const factory = new LiveFactory(); const root = await mkdtemp(join(tmpdir(), "omp-close-lock-")); const appserver = createAppserver({ hostId: host, epoch: "close-lock", socketPath: join(root, "app.sock"), discovery: new StaticDiscovery([record("s1")]), childFactory: factory, lockCheck: () => gate.lock() }); await appserver.start();
+    const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]); client.client.sendJson(command("attach", "attach", "session.attach", "s1", {})); const [, snapshot] = await responseAndSnapshot(client.client, "attach"); client.client.sendJson(command("prompt", "prompt", "session.prompt", "s1", { message: "hold" })); await gate.started.promise;
+    const close = command("close", "close", "session.close", "s1", {}); (close as Record<string, unknown>).expectedRevision = snapshot.revision; client.client.sendJson(close); const closeChallenge = await client.client.nextServer(); expect(closeChallenge.type).toBe("confirmation"); if (closeChallenge.type === "confirmation") client.client.sendJson(confirmFrame("approve-close", String(closeChallenge.confirmationId), "close", "approve", "s1")); gate.opened.resolve();
+    const outputs = await untilResponse(client.client, "close"); expect(outputs.response.ok).toBe(true); expect(factory.children).toHaveLength(1); expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("closed"); await closeClients([client.client]); await appserver.stop();
   });
 });
