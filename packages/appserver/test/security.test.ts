@@ -42,7 +42,7 @@ describe("security core", () => {
   });
 
   it("binds authorization to the authenticated capability intersection", () => {
-    const principal = { deviceId: "d", identityKey: "i", capabilities: ["sessions.read"] as const, metadata: { label: "d" }, createdAt: 1, lastSeenAt: 1, revokedAt: null, epoch: 0, authenticatedAt: 1, connectionId: "c" };
+    const principal = { deviceId: "d", identityKey: "i", capabilities: ["sessions.read"] as const, metadata: { label: "d" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: Date.now() + 86_400_000, revokedAt: null, epoch: 0, authenticatedAt: 1, connectionId: "c" };
     const registry = new FakeRegistry();
     registry.create(principal, "token");
     const guard = new DefaultAuthorizationGuard(registry);
@@ -99,7 +99,7 @@ it("rejects expired or replayed pairing and mismatched identity", () => {
 it("invalidates an authenticated principal after revoke epoch change", () => {
   const localClock = { value: 100, now() { return this.value; } };
   const registry = new FakeRegistry();
-  const record = { deviceId: "d2", identityKey: JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]), capabilities: ["sessions.read"] as const, metadata: { label: "x" }, createdAt: 1, lastSeenAt: 1, revokedAt: null, epoch: 0 };
+  const record = { deviceId: "d2", identityKey: JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]), capabilities: ["sessions.read"] as const, metadata: { label: "x" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: Date.now() + 86_400_000, revokedAt: null, epoch: 0 };
   registry.create(record, "token");
   const principal = registry.authenticate("d2", "token", identity, "c");
   registry.revoke("d2");
