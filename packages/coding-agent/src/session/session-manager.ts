@@ -1037,14 +1037,40 @@ export class SessionManager {
 		this.#acquireSessionLock();
 		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
 
-		const titleSlot = await readTitleSlotFromFile(resolvedSessionFile, this.#storage);
-		const fileEntries = await loadEntriesFromFile(resolvedSessionFile, this.#storage);
-		if (fileEntries.length === 0) {
-			// Explicit but empty/missing path (e.g. --session flag): start fresh but
-			// keep the requested path and materialize the header immediately.
-			this.#resetToNewSession(undefined, resolvedSessionFile);
-			this.#forceFileCreation = true;
-			await this.#rewriteAtomically();
+		try {
+			const titleSlot = await readTitleSlotFromFile(resolvedSessionFile, this.#storage);
+			const fileEntries = await loadEntriesFromFile(resolvedSessionFile, this.#storage);
+			if (fileEntries.length === 0) {
+				// Explicit but empty/missing path (e.g. --session flag): start fresh but
+				// keep the requested path and materialize the header immediately.
+				this.#resetToNewSession(undefined, resolvedSessionFile);
+				this.#forceFileCreation = true;
+				await this.#rewriteAtomically();
+				this.#fileIsCurrent = true;
+				return;
+			}
+
+			const migrated = migrateToCurrentVersion(fileEntries);
+			await resolveBlobRefsInEntries(fileEntries, this.#blobs);
+			// loadEntriesFromFile guarantees entries[0] is a valid session header.
+			const header = fileEntries[0] as SessionHeader;
+
+			// Adopt the loaded session's working directory. Sessions live in a dir
+			// keyed by their cwd, so resuming a session from another project must
+			// re-point cwd/sessionDir at that project — unless that project directory
+			// no longer exists on disk, in which case adopting it (and the process
+			// chdir interactive mode then performs) would fail with ENOENT. Keep the
+			// current cwd so the resumed session stays where the user already is.
+			const headerCwd = header.cwd ? path.resolve(header.cwd) : undefined;
+			if (headerCwd && headerCwd !== path.resolve(this.#cwd) && (await directoryExists(headerCwd))) {
+				this.#cwd = headerCwd;
+				this.#sessionDir = path.dirname(resolvedSessionFile);
+				this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
+			}
+
+			this.#applyEntries(header, fileEntries.slice(1) as SessionEntry[]);
+			this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
+			this.#hasTitleSlot = titleSlot !== undefined;
 			this.#fileIsCurrent = true;
 			this.#rewriteRequired = migrated;
 			this.#forceFileCreation = true;
@@ -1056,35 +1082,6 @@ export class SessionManager {
 			this.#releaseSessionLock();
 			throw error;
 		}
-
-		const migrated = migrateToCurrentVersion(fileEntries);
-		await resolveBlobRefsInEntries(fileEntries, this.#blobs);
-		// loadEntriesFromFile guarantees entries[0] is a valid session header.
-		const header = fileEntries[0] as SessionHeader;
-
-		// Adopt the loaded session's working directory. Sessions live in a dir
-		// keyed by their cwd, so resuming a session from another project must
-		// re-point cwd/sessionDir at that project — unless that project directory
-		// no longer exists on disk, in which case adopting it (and the process
-		// chdir interactive mode then performs) would fail with ENOENT. Keep the
-		// current cwd so the resumed session stays where the user already is.
-		const headerCwd = header.cwd ? path.resolve(header.cwd) : undefined;
-		if (headerCwd && headerCwd !== path.resolve(this.#cwd) && (await directoryExists(headerCwd))) {
-			this.#cwd = headerCwd;
-			this.#sessionDir = path.dirname(resolvedSessionFile);
-			this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
-		}
-
-		this.#applyEntries(header, fileEntries.slice(1) as SessionEntry[]);
-		this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
-		this.#hasTitleSlot = titleSlot !== undefined;
-		this.#fileIsCurrent = true;
-		this.#rewriteRequired = migrated;
-		this.#forceFileCreation = true;
-		this.#artifactManager = null;
-		this.#artifactManagerSessionFile = null;
-
-		if (this.sanitizeLoadedOpenAIResponsesReplayMetadata()) this.#rewriteRequired = true;
 	}
 
 	/** Start a new session. Drains and closes any existing writer first. */
@@ -1349,6 +1346,10 @@ export class SessionManager {
 		await this.#storage.drain();
 		this.#releaseSessionLock();
 		if (this.#diskFailure) throw this.#diskFailure;
+	}
+	/** Dispose this manager and release its persistence resources. */
+	async dispose(): Promise<void> {
+		await this.close();
 	}
 
 	getCwd(): string {

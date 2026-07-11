@@ -1364,8 +1364,6 @@ export interface SearchResult {
   error?: string
 }
 
-export declare function setHangulCompatJamoWidthOverride(value: number): void
-
 export interface SecureDirectoryEntry {
   name: string
   path: string
@@ -1396,6 +1394,8 @@ export interface SecureWriteFileResult {
   size: number
   revisionSha256: string
 }
+
+export declare function setHangulCompatJamoWidthOverride(value: number): void
 
 /** Options for executing a shell command via brush-core. */
 export interface ShellExecuteOptions {
