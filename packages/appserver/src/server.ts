@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, link, mkdir, open, readFile, rename, rm, stat as fsStat, unlink } from "node:fs/promises";
-import { dirname } from "node:path";
+import type { FileHandle } from "node:fs/promises";
+import { chmod, lstat, open, readlink, rename, stat as fsStat, symlink, unlink } from "node:fs/promises";
+import { join } from "node:path";
 import { COMMAND_DESCRIPTORS, requiredCapability, type ConfirmFrame, type ConfirmationChallenge } from "@oh-my-pi/app-wire";
 import { decodeClientFrame, decodeConfirm, decodeCursor, parseBounded, utf8ByteLength, type CommandFrame, type DurableEntry, type HelloFrame, type HostId, type ResultFrame, type ServerFrame, type SessionId } from "@oh-my-pi/app-wire";
 import type { AppserverHandle, AppserverOptions, ChildHandle, CommandOutcome, Clock, LockCheckHook, RpcChildFactory, SessionAuthority, SessionDiscovery, SessionRecord } from "./types.ts";
@@ -9,6 +10,7 @@ import { FileSessionDiscovery, stableProjectId } from "./discovery.ts";
 import { SessionProjection } from "./projection.ts";
 import { IdempotencyStore } from "./idempotency.ts";
 import { BunRpcChildFactory, RpcChildSupervisor } from "./rpc-child.ts";
+import { ensureSecureSocketDirectory, markerIdentity, ownerPaths, readPublicTarget, readStrictOwner, sameIdentity, unlinkIfExists, type OwnerPaths, type OwnerRecord } from "./ownership.ts";
 import { AppserverCommandHandlers } from "./command-handler.ts";
 const clock: Clock = { now: () => new Date() };
 function response(hostId: HostId, command: CommandFrame, ok: boolean, result?: unknown, error?: { code: string; message: string; details?: Record<string, unknown> }): ResultFrame {
@@ -40,16 +42,54 @@ function argumentError(command: CommandFrame): string | undefined {
   if (keys.length !== 0) return "command does not accept args";
   return undefined;
 }
-async function publishOwner(path: string, ownerId: string): Promise<void> {
-  const temp = `${path}.tmp-${ownerId}`;
-  const handle = await open(temp, "w", 0o600);
-  try { await handle.write(`${JSON.stringify({ ownerId, pid: process.pid })}\n`); await handle.sync(); } finally { await handle.close(); }
-  try { await link(temp, path); } finally { await unlink(temp).catch(() => {}); }
-}
 type AppWs = Bun.ServerWebSocket<ServerWebSocketData>;
+interface RunIdentity {
+  paths: OwnerPaths;
+  record: OwnerRecord;
+  marker: { device: number; inode: number };
+}
+function isErrno(error: unknown, code: string): boolean { return (error as NodeJS.ErrnoException).code === code; }
+async function pidIsAlive(pid: number): Promise<boolean> {
+  try { process.kill(pid, 0); return true; } catch (error) {
+    if (isErrno(error, "ESRCH")) return false;
+    return true;
+  }
+}
+async function statIdentity(path: string): Promise<{ device: number; inode: number } | undefined> {
+  try {
+    const info = await lstat(path);
+    return { device: Number(info.dev), inode: Number(info.ino) };
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return undefined;
+    throw error;
+  }
+}
+async function publishSymlink(paths: OwnerPaths): Promise<void> {
+  await symlink(paths.backingName, paths.publicPath);
+  const published = await readPublicTarget(paths.publicPath);
+  if (published.target !== paths.backingName) throw new Error("appserver public symlink target changed during publish");
+}
+async function publishOwnerAtomic(paths: OwnerPaths, record: OwnerRecord, claimed: { device: number; inode: number }): Promise<{ device: number; inode: number }> {
+  const temp = join(paths.directory, `.appserver-owner-${record.ownerId}.tmp`);
+  const handle = await open(temp, "wx", 0o600);
+  try {
+    await handle.write(`${JSON.stringify(record)}\n`, 0); await handle.sync();
+  } finally { await handle.close(); }
+  try {
+    const current = await statIdentity(paths.ownerPath);
+    if (!current || current.device !== claimed.device || current.inode !== claimed.inode) throw new Error("appserver owner marker changed during startup");
+    await rename(temp, paths.ownerPath);
+  } catch (error) {
+    await unlinkIfExists(temp);
+    throw error;
+  }
+  const final = await statIdentity(paths.ownerPath);
+  if (!final) throw new Error("appserver owner marker disappeared during startup");
+  return final;
+}
 export class LocalAppserver implements AppserverHandle {
   hostId: HostId; readonly epoch: string; readonly socketPath: string;
-  #clock: Clock; #discovery: SessionDiscovery; #authority?: SessionAuthority; #factory: RpcChildFactory; #lockCheck: LockCheckHook; #ringSize: number; #handlers = new AppserverCommandHandlers(); #challenges = new Map<string, { command: CommandFrame; ws: AppWs; expiresAt: number; hash: string }>(); #records = new Map<SessionId, SessionRecord>(); #projections = new Map<SessionId, SessionProjection>(); #supervisors = new Map<SessionId, RpcChildSupervisor>(); #startPromises = new Map<SessionId, Promise<RpcChildSupervisor>>(); #closedSessions = new Set<SessionId>(); #idempotency = new IdempotencyStore(); #server?: Bun.Server<ServerWebSocketData>; #clients = new Set<AppWs>(); #hello = new Set<AppWs>(); #clientCapabilities = new Map<AppWs, Set<string>>(); #attached = new Map<AppWs, Set<SessionId>>(); #started = false; #stopping = false; #hostProvided: boolean; #ownerLock = false; #ownerId?: string; #ompVersion; #ompBuild; #appserverVersion; #appserverBuild; #supportedFeatures; #supportedCapabilities;
+  #clock: Clock; #discovery: SessionDiscovery; #authority?: SessionAuthority; #factory: RpcChildFactory; #lockCheck: LockCheckHook; #ringSize: number; #handlers = new AppserverCommandHandlers(); #challenges = new Map<string, { command: CommandFrame; ws: AppWs; expiresAt: number; hash: string }>(); #records = new Map<SessionId, SessionRecord>(); #projections = new Map<SessionId, SessionProjection>(); #supervisors = new Map<SessionId, RpcChildSupervisor>(); #startPromises = new Map<SessionId, Promise<RpcChildSupervisor>>(); #closedSessions = new Set<SessionId>(); #idempotency = new IdempotencyStore(); #server?: Bun.Server<ServerWebSocketData>; #clients = new Set<AppWs>(); #hello = new Set<AppWs>(); #clientCapabilities = new Map<AppWs, Set<string>>(); #attached = new Map<AppWs, Set<SessionId>>(); #started = false; #stopping = false; #hostProvided: boolean; #ownerLock = false; #ownerId?: string; #ownerPaths?: OwnerPaths; #ownerHandle?: FileHandle; #runIdentity?: RunIdentity; #partialBacking?: { path: string; identity: { device: number; inode: number } }; #partialMarker?: { device: number; inode: number }; #ompVersion; #ompBuild; #appserverVersion; #appserverBuild; #supportedFeatures; #supportedCapabilities;
   constructor(options: AppserverOptions = {}) {
     this.#hostProvided = Boolean(options.hostId); this.hostId = options.hostId ?? createHostId(); this.epoch = createEpoch(options.epoch); this.socketPath = options.socketPath ?? defaultSocketPath();
     this.#clock = options.clock ?? clock; this.#authority = options.sessionAuthority; this.#discovery = options.discovery ?? options.sessionAuthority ?? { list: async () => [] }; this.#factory = options.childFactory ?? new BunRpcChildFactory(); this.#lockCheck = options.lockCheck ?? (() => undefined); this.#ringSize = options.ringSize ?? 256;
@@ -63,39 +103,164 @@ export class LocalAppserver implements AppserverHandle {
     this.#stopping = false; this.#closedSessions.clear();
     if (!this.#hostProvided) this.hostId = await loadPersistentHostId();
     this.#records.clear(); this.#projections.clear(); await this.loadSessions();
-    await mkdir(dirname(this.socketPath), { recursive: true, mode: 0o700 }); try { await chmod(dirname(this.socketPath), 0o700); } catch {}
-    const ownerPath = `${this.socketPath}.owner`; const ownerId = randomUUID();
+    await ensureSecureSocketDirectory(this.socketPath);
+    const ownerId = randomUUID();
+    const paths = ownerPaths(this.socketPath, ownerId);
+    const initial: OwnerRecord = { version: 2, ownerId, pid: process.pid, backingName: paths.backingName, device: 0, inode: 0 };
+    let ownerHandle: FileHandle;
     try {
-      await publishOwner(ownerPath, ownerId); this.#ownerId = ownerId; this.#ownerLock = true;
+      ownerHandle = await open(`${this.socketPath}.owner`, "wx", 0o600);
+      await ownerHandle.write(`${JSON.stringify(initial)}\n`); await ownerHandle.sync();
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      let existing: { ownerId?: string; pid?: number } | undefined;
-      try { existing = JSON.parse(await readFile(ownerPath, "utf8")) as { ownerId?: string; pid?: number }; } catch { throw new Error(`appserver socket has another owner: ${this.socketPath}`); }
-      let alive = false; try { process.kill(existing.pid!, 0); alive = true; } catch (probeError) { if ((probeError as NodeJS.ErrnoException).code !== "ESRCH") alive = true; }
-      if (alive) throw new Error(`appserver socket has another owner: ${this.socketPath}`);
-      const stalePath = `${ownerPath}.stale-${randomUUID()}`; try { await rename(ownerPath, stalePath); } catch { throw new Error(`appserver socket has another owner: ${this.socketPath}`); }
-      await rm(stalePath, { force: true }); await publishOwner(ownerPath, ownerId); this.#ownerId = ownerId; this.#ownerLock = true;
+      if (!isErrno(error, "EEXIST")) throw error;
+      const existing = await readStrictOwner(`${this.socketPath}.owner`);
+      if (await pidIsAlive(existing.record.pid)) throw new Error(`appserver socket has another owner: ${this.socketPath}`);
+      await this.recoverStale(ownerPaths(this.socketPath, existing.record.ownerId), existing.record, existing.stat);
+      ownerHandle = await open(`${this.socketPath}.owner`, "wx", 0o600);
+      await ownerHandle.write(`${JSON.stringify(initial)}\n`); await ownerHandle.sync();
     }
+    this.#ownerHandle = ownerHandle; this.#ownerLock = true; this.#ownerId = ownerId; this.#ownerPaths = paths;
     try {
-      try {
-        const existing = await fsStat(this.socketPath);
-        if (!existing.isSocket()) throw new Error(`refusing non-socket path: ${this.socketPath}`);
-        if (await unixSocketActive(this.socketPath)) throw new Error(`appserver socket is active: ${this.socketPath}`);
-        await unlink(this.socketPath);
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      this.#server = Bun.serve<ServerWebSocketData>({ unix: this.socketPath, fetch: (request, server) => this.fetch(request, server), websocket: { maxPayloadLength: 1024 * 1024, backpressureLimit: 1024 * 1024, closeOnBackpressureLimit: true, open: ws => { this.#clients.add(ws); this.#clientCapabilities.set(ws, new Set()); this.#attached.set(ws, new Set()); }, message: (ws, message) => { void this.message(ws, message); }, close: ws => { this.#clients.delete(ws); this.#hello.delete(ws); this.#clientCapabilities.delete(ws); this.#attached.delete(ws); } } });
-      await chmod(this.socketPath, 0o600); this.#started = true;
-    } catch (error) { if (this.#ownerLock && this.#ownerId) { try { const current = JSON.parse(await readFile(ownerPath, "utf8")) as { ownerId?: string }; if (current.ownerId === this.#ownerId) await unlink(ownerPath); } catch {} this.#ownerLock = false; } throw error; }
+      await this.preparePublic(paths);
+      this.#server = Bun.serve<ServerWebSocketData>({ unix: paths.backingPath, fetch: (request, server) => this.fetch(request, server), websocket: { maxPayloadLength: 1024 * 1024, backpressureLimit: 1024 * 1024, closeOnBackpressureLimit: true, open: ws => { this.#clients.add(ws); this.#clientCapabilities.set(ws, new Set()); this.#attached.set(ws, new Set()); }, message: (ws, message) => { void this.message(ws, message); }, close: ws => { this.#clients.delete(ws); this.#hello.delete(ws); this.#clientCapabilities.delete(ws); this.#attached.delete(ws); } } });
+      await chmod(paths.backingPath, 0o600);
+      if (this.#stopping) throw new Error("appserver is stopping");
+      const backing = await fsStat(paths.backingPath);
+      const record: OwnerRecord = { version: 2, ownerId, pid: process.pid, backingName: paths.backingName, device: Number(backing.dev), inode: Number(backing.ino) };
+      this.#partialBacking = { path: paths.backingPath, identity: { device: Number(backing.dev), inode: Number(backing.ino) } };
+      const claimed = await markerIdentity(ownerHandle);
+      const finalMarker = await publishOwnerAtomic(paths, record, claimed);
+      this.#partialMarker = finalMarker;
+      const currentRecord = await readStrictOwner(paths.ownerPath);
+      if (currentRecord.record.ownerId !== ownerId || !sameIdentity(currentRecord.record, record)) throw new Error("appserver owner marker changed during startup");
+      await publishSymlink(paths);
+      if (this.#stopping) throw new Error("appserver is stopping");
+      this.#runIdentity = { paths, record, marker: finalMarker };
+      this.#started = true;
+    } catch (error) {
+      await this.cleanupPartial();
+      throw error;
+    }
   }
   async stop(): Promise<void> {
     if (!this.#started && !this.#server && !this.#ownerLock && this.#startPromises.size === 0) return;
     this.#stopping = true;
     for (const ws of this.#clients) ws.close(1001, "server stopping");
     this.#clients.clear(); this.#hello.clear(); this.#attached.clear();
-    await Promise.allSettled([...this.#startPromises.values()]);
+    const server = this.#server; this.#server = undefined;
+    let displaced: string | undefined;
+    if (this.#runIdentity) {
+      const current = await statIdentity(this.#runIdentity.paths.backingPath);
+      if (current && !sameIdentity(current, this.#runIdentity.record)) {
+        displaced = join(this.#runIdentity.paths.directory, `.appserver-displaced-${this.#runIdentity.record.ownerId}-${randomUUID()}`);
+        await rename(this.#runIdentity.paths.backingPath, displaced);
+      }
+    }
+    server?.stop(true);
+    if (displaced) {
+      try { await rename(displaced, this.#runIdentity?.paths.backingPath ?? ""); } catch (error) { process.emitWarning(error instanceof Error ? error.message : String(error)); }
+    }
     for (const supervisor of this.#supervisors.values()) supervisor.stop();
-    this.#supervisors.clear(); this.#startPromises.clear(); this.#server?.stop(true); this.#server = undefined; this.#started = false;
-    if (this.#ownerLock && this.#ownerId) { try { const existing = await fsStat(this.socketPath); if (existing.isSocket()) await unlink(this.socketPath); } catch {} try { const current = JSON.parse(await readFile(`${this.socketPath}.owner`, "utf8")) as { ownerId?: string }; if (current.ownerId === this.#ownerId) await unlink(`${this.socketPath}.owner`); } catch {} this.#ownerLock = false; }
+    this.#supervisors.clear();
+    await Promise.allSettled([...this.#startPromises.values()]);
+    this.#startPromises.clear(); this.#started = false;
+    const identity = this.#runIdentity;
+    if (identity) await this.cleanupOwned(identity);
+    else await this.cleanupPartial();
+    this.#runIdentity = undefined; this.#ownerLock = false; this.#ownerId = undefined; this.#ownerPaths = undefined;
+    await this.#ownerHandle?.close(); this.#ownerHandle = undefined;
+  }
+  private async recoverStale(paths: OwnerPaths, record: OwnerRecord, markerStat: { dev: number; ino: number }): Promise<void> {
+    if (record.backingName !== paths.backingName) throw new Error(`appserver socket has another owner: ${this.socketPath}`);
+    try {
+      const publicStat = await lstat(paths.publicPath);
+      if (!publicStat.isSymbolicLink()) throw new Error(`appserver socket has another owner: ${this.socketPath}`);
+      const target = await readlink(paths.publicPath);
+      if (target !== paths.backingName) throw new Error(`appserver socket has another owner: ${this.socketPath}`);
+      const backing = await statIdentity(paths.backingPath);
+      if (backing && !sameIdentity(backing, record)) throw new Error(`appserver socket has another owner: ${this.socketPath}`);
+      const latest = await lstat(paths.publicPath);
+      const latestTarget = await readlink(paths.publicPath);
+      const latestBacking = await statIdentity(paths.backingPath);
+      if (latest.dev !== publicStat.dev || latest.ino !== publicStat.ino || !latest.isSymbolicLink() || latestTarget !== paths.backingName || (latestBacking && !sameIdentity(latestBacking, record))) throw new Error(`appserver socket has another owner: ${this.socketPath}`);
+      await unlink(paths.publicPath);
+    } catch (error) {
+      if (!isErrno(error, "ENOENT")) throw error;
+    }
+    const backing = await statIdentity(paths.backingPath);
+    if (backing) {
+      if (!sameIdentity(backing, record) || await unixSocketActive(paths.backingPath)) throw new Error(`appserver socket has another owner: ${this.socketPath}`);
+      await unlink(paths.backingPath);
+    }
+    const current = await statIdentity(paths.ownerPath);
+    if (!current || current.device !== Number(markerStat.dev) || current.inode !== Number(markerStat.ino)) throw new Error(`appserver socket has another owner: ${this.socketPath}`);
+    await unlink(paths.ownerPath);
+  }
+  private async preparePublic(paths: OwnerPaths): Promise<void> {
+    try {
+      const info = await lstat(paths.publicPath);
+      throw new Error(`${info.isSocket() ? "refusing existing public socket" : "refusing non-socket public path"}: ${paths.publicPath}`);
+    } catch (error) {
+      if (!isErrno(error, "ENOENT")) throw error;
+    }
+  }
+  private async cleanupPartial(): Promise<void> {
+    const paths = this.#ownerPaths;
+    const marker = this.#partialMarker ?? (this.#ownerHandle ? await markerIdentity(this.#ownerHandle) : undefined);
+    this.#server?.stop(true); this.#server = undefined;
+    if (paths) {
+      const publicInfo = await statIdentity(paths.publicPath);
+      if (publicInfo) {
+        try {
+          const target = await readPublicTarget(paths.publicPath);
+          const latest = await lstat(paths.publicPath);
+          const latestTarget = await readlink(paths.publicPath);
+          const backing = await statIdentity(paths.backingPath);
+          if (latest.dev === publicInfo.device && latest.ino === publicInfo.inode && latest.isSymbolicLink() && latestTarget === paths.backingName && (!backing || (this.#partialBacking && sameIdentity(backing, this.#partialBacking.identity)))) await unlink(paths.publicPath);
+          else if (target.target !== paths.backingName) process.emitWarning(`appserver socket ownership conflict; preserving ${paths.publicPath}`);
+        } catch (error) { if (!isErrno(error, "ENOENT")) process.emitWarning(error instanceof Error ? error.message : String(error)); }
+      }
+      const backing = await statIdentity(paths.backingPath);
+      if (backing && this.#partialBacking && sameIdentity(backing, this.#partialBacking.identity)) {
+        const latestBacking = await statIdentity(paths.backingPath);
+        if (latestBacking && sameIdentity(latestBacking, backing)) await unlink(paths.backingPath);
+      }
+      if (marker) {
+        const current = await statIdentity(paths.ownerPath);
+        const latest = await statIdentity(paths.ownerPath);
+        if (current && latest && current.device === marker.device && current.inode === marker.inode && latest.device === current.device && latest.inode === current.inode) await unlink(paths.ownerPath);
+      }
+    }
+    if (this.#ownerHandle) { await this.#ownerHandle.close(); this.#ownerHandle = undefined; }
+    this.#ownerLock = false;
+    this.#partialBacking = undefined;
+    this.#partialMarker = undefined;
+  }
+  private async cleanupOwned(identity: RunIdentity): Promise<void> {
+    const { paths, record, marker } = identity;
+    const markerNow = await statIdentity(paths.ownerPath);
+    let conflict = !markerNow || markerNow.device !== marker.device || markerNow.inode !== marker.inode;
+    try {
+      const markerValue = await readStrictOwner(paths.ownerPath);
+      if (markerValue.record.ownerId !== record.ownerId || markerValue.record.pid !== record.pid || markerValue.record.backingName !== record.backingName || !sameIdentity(markerValue.record, record)) conflict = true;
+    } catch (error) { if (!isErrno(error, "ENOENT")) conflict = true; }
+    let publicStat: { device: number; inode: number } | undefined;
+    try {
+      publicStat = (await readPublicTarget(paths.publicPath)).stat;
+      if ((await readPublicTarget(paths.publicPath)).target !== record.backingName) conflict = true;
+    } catch (error) { if (!isErrno(error, "ENOENT")) conflict = true; }
+    const backing = await statIdentity(paths.backingPath);
+    if (backing && !sameIdentity(backing, record)) conflict = true;
+    if (conflict) { process.emitWarning(`appserver socket ownership conflict; preserving ${paths.publicPath}`); return; }
+    if (publicStat) {
+      const check = await statIdentity(paths.publicPath);
+      if (!check || check.device !== publicStat.device || check.inode !== publicStat.inode) { process.emitWarning(`appserver socket ownership conflict; preserving ${paths.publicPath}`); return; }
+      await unlink(paths.publicPath);
+    }
+    const markerCheck = await statIdentity(paths.ownerPath);
+    if (markerCheck && markerCheck.device === marker.device && markerCheck.inode === marker.inode) await unlink(paths.ownerPath);
+    const backingCheck = await statIdentity(paths.backingPath);
+    if (backingCheck && sameIdentity(backingCheck, record)) await unlink(paths.backingPath);
   }
   snapshot(sessionId: SessionId) { return this.#projections.get(sessionId)?.value; }
   replay(sessionId: SessionId, cursor: { epoch: string; seq: number }): ServerFrame[] { return this.#projections.get(sessionId)?.replay(cursor) ?? []; }

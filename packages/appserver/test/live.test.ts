@@ -231,11 +231,13 @@ describe("raw RFC6455 boundary and lifecycle", () => {
   test("owner crash residue and concurrent stale recovery are deterministic", async () => {
     const root = await mkdtemp(join(tmpdir(), "omp-owner-live-")); const path = join(root, "run", "app.sock"); await mkdir(join(root, "run"), { recursive: true }); await writeFile(`${path}.owner.tmp-orphan`, "orphan");
     const first = createAppserver({ hostId: host, epoch: "owner-a", socketPath: path, discovery: new StaticDiscovery([]) }); await first.start(); await first.stop();
-    await writeFile(`${path}.owner`, JSON.stringify({ ownerId: "dead", pid: 999999 }));
+    const staleOwner = "22222222-2222-4222-8222-222222222222";
+    await writeFile(`${path}.owner`, JSON.stringify({ version: 2, ownerId: staleOwner, pid: 999999, backingName: `.appserver-${staleOwner}.sock`, device: 0, inode: 0 }), { mode: 0o600 });
     const a = createAppserver({ hostId: host, epoch: "owner-b", socketPath: path, discovery: new StaticDiscovery([]) }); const b = createAppserver({ hostId: host, epoch: "owner-c", socketPath: path, discovery: new StaticDiscovery([]) });
     const results = await Promise.allSettled([a.start(), b.start()]); expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1); await a.stop(); await b.stop();
-    await writeFile(`${path}.owner`, "not-json"); const malformed = createAppserver({ hostId: host, socketPath: path, discovery: new StaticDiscovery([]) }); await expect(malformed.start()).rejects.toThrow("another owner");
-    await writeFile(`${path}.owner`, JSON.stringify({ ownerId: "other", pid: 999999 })); const cleanup = createAppserver({ hostId: host, socketPath: path, discovery: new StaticDiscovery([]) }); await cleanup.start(); await writeFile(`${path}.owner`, JSON.stringify({ ownerId: "other", pid: 999999 })); await cleanup.stop(); expect(await stat(`${path}.owner`)).toBeDefined();
+    await writeFile(`${path}.owner`, "not-json", { mode: 0o600 }); const malformed = createAppserver({ hostId: host, socketPath: path, discovery: new StaticDiscovery([]) }); await expect(malformed.start()).rejects.toThrow("malformed appserver");
+    const foreignOwner = "33333333-3333-4333-8333-333333333333";
+    await writeFile(`${path}.owner`, JSON.stringify({ version: 2, ownerId: foreignOwner, pid: 999999, backingName: `.appserver-${foreignOwner}.sock`, device: 0, inode: 0 }), { mode: 0o600 }); const cleanup = createAppserver({ hostId: host, socketPath: path, discovery: new StaticDiscovery([]) }); await cleanup.start(); await writeFile(`${path}.owner`, JSON.stringify({ version: 2, ownerId: foreignOwner, pid: 999999, backingName: `.appserver-${foreignOwner}.sock`, device: 0, inode: 0 }), { mode: 0o600 }); await cleanup.stop(); expect(await stat(`${path}.owner`)).toBeDefined();
   });
 });
 describe("WS command boundary, authority, confirmation, and lock lifecycle", () => {

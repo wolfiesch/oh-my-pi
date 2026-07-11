@@ -1,5 +1,5 @@
 import { chmod, mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
-import { createConnection, createServer } from "node:net";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -87,8 +87,8 @@ describe("identity and socket ownership", () => {
   });
   test("recovers confirmed-dead owner residue with stale socket", async () => {
     const root = await mkdtemp(join(tmpdir(), "omp-stale-")); const path = join(root, "app.sock");
-    const stale = createServer(); await new Promise<void>(resolve => stale.listen(path, resolve)); await new Promise<void>(resolve => stale.close(() => resolve()));
-    await writeFile(`${path}.owner`, JSON.stringify({ ownerId: "dead-owner", pid: 999999 }));
+    const ownerId = "11111111-1111-4111-8111-111111111111";
+    await writeFile(`${path}.owner`, JSON.stringify({ version: 2, ownerId, pid: 999999, backingName: `.appserver-${ownerId}.sock`, device: 0, inode: 0 }), { mode: 0o600 });
     const appserver = createAppserver({ hostId: host, socketPath: path, discovery: new StaticDiscovery([]) }); await appserver.start(); await appserver.stop();
     await expect(stat(`${path}.owner`)).rejects.toThrow();
   });

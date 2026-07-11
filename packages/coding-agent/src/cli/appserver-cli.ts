@@ -1,6 +1,7 @@
 import * as http from "node:http";
 import { defaultSocketPath } from "@oh-my-pi/appserver";
 import type { AppserverHandle } from "@oh-my-pi/appserver";
+import { postmortem } from "@oh-my-pi/pi-utils";
 
 export type AppserverAction = "serve" | "status";
 
@@ -26,6 +27,7 @@ export interface AppserverRunnerDeps {
 	timeoutMs?: number;
 	onSignal?: (signal: NodeJS.Signals, handler: () => void) => void;
 	removeSignal?: (signal: NodeJS.Signals, handler: () => void) => void;
+	registerCleanup?: (id: string, callback: (reason: unknown) => void | Promise<void>) => () => void;
 }
 
 const MAX_HEALTH_BYTES = 16 * 1024;
@@ -116,7 +118,7 @@ async function defaultCreateAppserver(): Promise<AppserverHandle> {
 }
 
 function defaultOnSignal(signal: NodeJS.Signals, handler: () => void): void {
-	process.once(signal, handler);
+	process.on(signal, handler);
 }
 
 function defaultRemoveSignal(signal: NodeJS.Signals, handler: () => void): void {
@@ -124,47 +126,45 @@ function defaultRemoveSignal(signal: NodeJS.Signals, handler: () => void): void 
 }
 
 export async function runAppserverServe(deps: AppserverRunnerDeps = {}): Promise<void> {
-	const create = deps.createAppserver ?? defaultCreateAppserver;
-	const onSignal = deps.onSignal ?? defaultOnSignal;
-	const removeSignal = deps.removeSignal ?? defaultRemoveSignal;
-	const appserver = await create();
-	const stopped = Promise.withResolvers<void>();
-	let started = false;
-	let stopRequested = false;
-	let stopStarted = false;
-	const stopOnce = (): void => {
-		if (stopStarted) return;
-		stopStarted = true;
-		void appserver.stop().then(stopped.resolve, stopped.reject);
-	};
-	const shutdown = (): void => {
-		stopRequested = true;
-		if (started) stopOnce();
-	};
-	onSignal("SIGINT", shutdown);
-	onSignal("SIGTERM", shutdown);
-	try {
-		let startError: unknown;
-		try {
-			await appserver.start();
-			started = true;
-		} catch (error) {
-			startError = error;
-		}
-		if (startError !== undefined) {
-			if (stopRequested) {
-				try {
-					await appserver.stop();
-				} catch {}
-			}
-			throw startError;
-		}
-		if (stopRequested) stopOnce();
-		await stopped.promise;
-	} finally {
-		removeSignal("SIGINT", shutdown);
-		removeSignal("SIGTERM", shutdown);
-	}
+  const create = deps.createAppserver ?? defaultCreateAppserver;
+  const registerCleanup = deps.registerCleanup ?? ((id: string, callback: (reason: unknown) => void | Promise<void>) => postmortem.register(id, callback));
+  const stopped = Promise.withResolvers<void>();
+  let appserver: AppserverHandle | undefined;
+  let stopRequested = false;
+  let stopStarted = false;
+  let cleanupRequested = false;
+  const stopOnce = (): void => {
+    if (stopStarted || !appserver) return;
+    stopStarted = true;
+    void appserver.stop().then(stopped.resolve, stopped.reject);
+  };
+  const shutdown = (): void => { cleanupRequested = true; stopRequested = true; stopOnce(); };
+  const unregister = registerCleanup("omp-appserver", async reason => {
+    if (reason !== "sigint" && reason !== "sigterm") return;
+    shutdown();
+    if (appserver) await stopped.promise;
+  });
+  if (deps.onSignal) {
+    deps.onSignal("SIGINT", shutdown);
+    deps.onSignal("SIGTERM", shutdown);
+  }
+  try {
+    appserver = await create();
+    try {
+      await appserver.start();
+    } catch (error) {
+      if (cleanupRequested) { stopOnce(); if (stopStarted) await stopped.promise; return; }
+      throw error;
+    }
+    if (stopRequested) stopOnce();
+    await stopped.promise;
+  } finally {
+    if (deps.removeSignal && deps.onSignal) {
+      deps.removeSignal("SIGINT", shutdown);
+      deps.removeSignal("SIGTERM", shutdown);
+    }
+    unregister();
+  }
 }
 
 export async function runAppserverStatus(deps: AppserverRunnerDeps = {}): Promise<AppserverStatus> {
