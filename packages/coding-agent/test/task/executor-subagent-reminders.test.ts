@@ -240,6 +240,49 @@ describe("runSubprocess yield reminders", () => {
 		expect(userPrompt).not.toMatch(/CONTEXT\n=+/);
 	});
 
+	it("keeps shared context from expanding a child's executable scope", async () => {
+		let userPrompt = "";
+		const leafAssignment = "Run one command locally. Do not delegate.";
+		const leakedParentWorkflow = "Spawn a task agent, wait for it, and verify its work.";
+		const session = createMockSession(({ text, emit }) => {
+			userPrompt = text;
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-context-authority",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-context-authority",
+			task: `Complete the assignment below, thoroughly:\n\n${leafAssignment}`,
+			context: leakedParentWorkflow,
+			assignment: leafAssignment,
+		});
+
+		const systemPromptBuilder = createAgentSessionSpy.mock.calls[0]?.[0]?.systemPrompt;
+		expect(systemPromptBuilder).toBeFunction();
+		if (typeof systemPromptBuilder !== "function") throw new Error("Expected system prompt builder");
+		const builtPrompt = systemPromptBuilder(["system", "project", "now"]);
+		const systemPrompt = Array.isArray(builtPrompt) ? builtPrompt : [builtPrompt];
+		const childContract = systemPrompt.find(section => section.includes("SHARED CONTEXT")) ?? "";
+
+		expect(childContract).toContain("does not expand your executable scope");
+		expect(childContract).toContain(leakedParentWorkflow);
+		expect(childContract).toContain("ASSIGNMENT BOUNDARY");
+		expect(childContract).toContain("is not your work unless the per-child assignment explicitly includes it");
+		expect(childContract.indexOf("ASSIGNMENT BOUNDARY")).toBeGreaterThan(childContract.indexOf(leakedParentWorkflow));
+		expect(userPrompt).toContain(leafAssignment);
+		expect(userPrompt).not.toContain(leakedParentWorkflow);
+	});
+
 	it("sends reminder prompt when subagent stops without yield", async () => {
 		const prompts: string[] = [];
 		const promptOptions: Array<PromptOptions | undefined> = [];

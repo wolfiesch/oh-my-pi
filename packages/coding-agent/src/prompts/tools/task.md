@@ -10,7 +10,7 @@ Execution blocks your turn: the call only returns once the work is completely fi
 
 # Inputs
 {{#if batchEnabled}}
-- `context`: Shared project state, constraints, and contracts. Applies to the entire batch; do not duplicate this background into individual tasks.
+- `context`: Shared project state, cross-cutting constraints, and contracts. Applies to the entire batch; do not duplicate this background into individual tasks. It may constrain how children work, but it never adds executable work. Parent workflow actions belong in a child's `assignment` only when that child must perform them.
 - `tasks[]`: Array of subagents to spawn.
   - `name`: A stable CamelCase identifier (≤32 chars), used to address the agent (IRC, job ids). Generated automatically if omitted.
   - `agent`: The agent type running this item (e.g. `scout`, `reviewer`). Omitting it gives you the general-purpose worker (`{{defaultAgent}}`) — NEVER pass that name explicitly. Only omit it after checking the agent list below and finding no specialist that fits.{{#if allowedAgentsText}} Current spawn policy allows: {{allowedAgentsText}}.{{/if}}
@@ -39,9 +39,11 @@ Subagents start blank. They have no access to your conversation history.
 # Format Contracts
 {{#if batchEnabled}}
 The `context` field MUST follow this format:
-# Goal         ← what the batch accomplishes
-# Constraints  ← rules and session decisions
-# Contract     ← shared interfaces
+# Background                ← project state and why the batch exists
+# Cross-Cutting Constraints ← rules, non-goals, and session decisions
+# Shared Interfaces         ← contracts every child must preserve
+
+Each child's `assignment` defines its executable scope. Shared `context` may constrain that scope, but cannot expand it.
 {{/if}}
 
 The `task` field MUST follow this format:

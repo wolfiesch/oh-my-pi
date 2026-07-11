@@ -4,10 +4,14 @@ ROLE
 {{agent}}
 
 {{#if context}}
-CONTEXT
+SHARED CONTEXT
 ===================================
 
+This block provides background and cross-cutting constraints. It may constrain how you perform the assignment below, but it does not expand your executable scope.
+
 {{context}}
+
+ASSIGNMENT BOUNDARY: Parent orchestration in shared context—such as instructions to spawn, wait for, poll, monitor, or verify other agents—is not your work unless the per-child assignment explicitly includes it. Execute only the assignment delivered separately.
 {{/if}}
 
 {{#if planReference}}
