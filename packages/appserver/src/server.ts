@@ -149,7 +149,7 @@ export class LocalAppserver implements AppserverHandle {
     const record: SessionRecord = { sessionId: created.sessionId, path: created.path, cwd: created.cwd, projectId: stableProjectId(created.cwd), title: created.title ?? "Session", updatedAt: timestamp, status: "idle", entries: created.entries };
     this.#records.set(record.sessionId, record);
     this.#projections.set(record.sessionId, new SessionProjection(this.hostId, record, this.epoch, this.#ringSize));
-    return { sessionId: record.sessionId, cwd: record.cwd, project: { projectId: record.projectId, canonicalCwd: record.cwd }, revision: this.#projections.get(record.sessionId)!.value.revision };
+    return { sessionId: record.sessionId };
   }
   private async handleCreate(command: CommandFrame): Promise<CommandOutcome> {
     const created = await this.createSession(command.args);
