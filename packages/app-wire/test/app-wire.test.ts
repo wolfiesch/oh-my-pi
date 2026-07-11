@@ -342,11 +342,36 @@ describe("app-wire authority", () => {
 		expect(() => decodeCommandResult("host.watch", { watchId: "w" })).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("settings.write", { values: { nested: [{ ok: true }] } })).not.toThrow();
 		const supportedSettings = Object.fromEntries(
-			Array.from({ length: 410 }, (_, index) => [`setting-${index}`, index]),
+			Array.from({ length: 410 }, (_, index) => [`setting-${index}`, { configured: true, sensitive: false }]),
 		);
 		expect(() =>
 			decodeCommandResult("settings.read", { revision: "revision-1", settings: supportedSettings }),
 		).not.toThrow();
+		expect(() =>
+			decodeCommandResult("settings.read", {
+				revision: "revision-1",
+				settings: {
+					...supportedSettings,
+					"auth.broker.token": {
+						configured: true,
+						effectiveSource: "global",
+						sensitive: true,
+					},
+				},
+			}),
+		).not.toThrow();
+		expect(() =>
+			decodeCommandResult("settings.read", {
+				revision: "revision-1",
+				settings: {
+					"auth.broker.token": {
+						configured: true,
+						effective: "must-not-cross",
+						sensitive: true,
+					},
+				},
+			}),
+		).toThrow(AppWireError);
 		const oversizedSettings = Object.fromEntries(
 			Array.from({ length: MAX_MAP_KEYS + 1 }, (_, index) => [`setting-${index}`, index]),
 		);

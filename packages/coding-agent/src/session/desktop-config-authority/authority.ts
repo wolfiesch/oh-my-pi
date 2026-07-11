@@ -260,7 +260,23 @@ export class DesktopConfigAuthority {
 	}
 	#revisionData(paths?: readonly string[]): Record<string, unknown> {
 		const settings: Record<string, unknown> = {};
-		for (const path of [...(paths && paths.length > 0 ? paths : Object.keys(SETTINGS_SCHEMA))].sort()) { const def = settingDefinition(path); if (!def) continue; const sensitive = settingSensitive(path); settings[path] = { ...controlMetadata(def), default: sensitive ? undefined : safeMetadata(def.default), effective: sensitive ? undefined : safeMetadata(this.#settings.get(path as SettingPath)), effectiveSource: sourceFor(this.#settings, path as SettingPath), configured: this.#settings.isConfigured?.(path as SettingPath) ?? false, sensitive }; }
+		for (const path of [...(paths && paths.length > 0 ? paths : Object.keys(SETTINGS_SCHEMA))].sort()) {
+			const def = settingDefinition(path);
+			if (!def) continue;
+			const sensitive = settingSensitive(path);
+			settings[path] = {
+				...controlMetadata(def),
+				...(sensitive
+					? {}
+					: {
+							default: safeMetadata(def.default),
+							effective: safeMetadata(this.#settings.get(path as SettingPath)),
+						}),
+				effectiveSource: sourceFor(this.#settings, path as SettingPath),
+				configured: this.#settings.isConfigured?.(path as SettingPath) ?? false,
+				sensitive,
+			};
+		}
 		return { settings };
 	}
 	#revision(): string { return revisionFor(this.#revisionData()); }

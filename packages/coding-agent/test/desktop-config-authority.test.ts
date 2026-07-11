@@ -34,7 +34,9 @@ describe("DesktopConfigAuthority", () => {
 		expect(first.revision).toBe(second.revision);
 		expect(first.settings["compaction.enabled"]).toMatchObject({ effective: true, effectiveSource: "global" });
 		expect(first.settings["auth.broker.token"]).toMatchObject({ sensitive: true, configured: true });
-		expect(first.settings["auth.broker.token"]).not.toHaveProperty("effective", "do-not-return");
+		expect(first.settings["auth.broker.token"]).not.toHaveProperty("effective");
+		expect(first.settings["auth.broker.token"]).not.toHaveProperty("default");
+		expect(JSON.stringify(first)).not.toContain("do-not-return");
 	});
 
 	test("validates writes, session override, reset, and revision conflicts", async () => {
