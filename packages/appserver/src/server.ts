@@ -103,6 +103,7 @@ export class LocalAppserver implements AppserverHandle {
   async #command(command: CommandFrame, capabilities?: Set<string>, approved = false): Promise<CommandOutcome> {
     if (command.hostId !== this.hostId) return { frame: response(this.hostId, command, false, undefined, { code: "host_mismatch", message: "command targets another host" }) };
     const descriptor = COMMAND_DESCRIPTORS[command.command]; if (!descriptor) return { frame: response(this.hostId, command, false, undefined, { code: "unsupported", message: "unknown command" }) };
+    if (descriptor.confirmation === "challenge" && !approved) return { frame: response(this.hostId, command, false, undefined, { code: "confirmation_invalid", message: "command requires a consumed confirmation" }) };
     const required = requiredCapability(command.command); if (capabilities && required && !capabilities.has(required)) return { frame: response(this.hostId, command, false, undefined, { code: "capability_denied", message: "client capability was not granted" }) };
     const check = this.#idempotency.begin(command.commandId, command);
     if (check.kind === "replay") return { frame: { ...check.outcome.frame, requestId: command.requestId } as ServerFrame, unknown: check.outcome.unknown };
@@ -194,7 +195,14 @@ export class LocalAppserver implements AppserverHandle {
       if (frame.type === "confirm") { ws.send(JSON.stringify((await this.confirm(ws, frame)).frame)); return; }
       if (frame.type !== "command") { ws.send(JSON.stringify({ v: "omp-app/1", type: "error", code: "unsupported", message: "frame is not supported" })); return; }
       const descriptor = COMMAND_DESCRIPTORS[frame.command];
-      if (descriptor?.confirmation === "challenge" && frame.confirmationId === undefined) { ws.send(JSON.stringify(this.challenge(ws, frame))); return; }
+      if (descriptor?.confirmation === "challenge") {
+        if (frame.confirmationId !== undefined) {
+          ws.send(JSON.stringify(response(this.hostId, frame, false, undefined, { code: "confirmation_invalid", message: "command confirmation must be approved through a confirm frame" })));
+          return;
+        }
+        ws.send(JSON.stringify(this.challenge(ws, frame)));
+        return;
+      }
       const outcome = await this.#command(frame, this.#clientCapabilities.get(ws));
       ws.send(JSON.stringify(outcome.frame));
       if (frame.command === "session.attach" && frame.sessionId && outcome.frame.type === "response" && outcome.frame.ok) {
