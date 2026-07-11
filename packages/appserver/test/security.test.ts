@@ -77,7 +77,7 @@ describe("security core", () => {
 
   it("rate limits and never drops terminal queue messages", () => {
     const limiter = new TokenBucketLimiter(1, 0, clock);
-    expect(limiter.allow("ip")).toBe(true);
+    expect(limiter.allowAuthenticated("device", "connection")).toBe(true);
     const queue = new OutboundQueue(100);
     queue.push({ kind: "result", payload: "done" });
     expect(() => queue.push({ kind: "event", payload: "drop-me" })).not.toThrow();
