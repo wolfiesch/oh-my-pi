@@ -1002,7 +1002,6 @@ export async function runRpcMode(
 			case "new_session":
 			case "switch_session":
 			case "branch": {
-				sessionEntrySubscription.unbind();
 				try {
 					const result = await handleRpcSessionChange(session, command, subagentRegistry);
 					sessionEntrySubscription.bind(session.sessionManager);

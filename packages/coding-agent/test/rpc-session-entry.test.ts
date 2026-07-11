@@ -87,13 +87,12 @@ describe("RPC durable session-entry frames", () => {
 		expect(newManager.unsubscribeCalls).toBe(1);
 	});
 
-	test("failed session changes can rebind the active manager", () => {
+	test("failed session changes keep the active manager subscribed", () => {
 		const manager = new FakeSessionManager();
 		const frames: RpcSessionEntryFrame[] = [];
 		const subscription = createRpcSessionEntrySubscription(frame => frames.push(frame));
 		subscription.bind(manager);
 
-		subscription.unbind();
 		try {
 			throw new Error("switch rejected");
 		} catch {
@@ -102,8 +101,27 @@ describe("RPC durable session-entry frames", () => {
 		manager.append(entry("after-failed-switch", null, "2026-07-11T12:01:03.000Z"));
 
 		expect(frames.map(frame => frame.entry.id)).toEqual(["after-failed-switch"]);
-		expect(manager.subscribeCalls).toBe(2);
-		expect(manager.unsubscribeCalls).toBe(1);
+		expect(manager.subscribeCalls).toBe(1);
+		expect(manager.unsubscribeCalls).toBe(0);
+		subscription.dispose();
+	});
+
+	test("keeps the listener during an async transition and avoids duplicate rebinds", async () => {
+		const manager = new FakeSessionManager();
+		const frames: RpcSessionEntryFrame[] = [];
+		const subscription = createRpcSessionEntrySubscription(frame => frames.push(frame));
+		subscription.bind(manager);
+
+		await (async () => {
+			await Promise.resolve();
+			manager.append(entry("during-transition", null, "2026-07-11T12:01:04.000Z"));
+			subscription.bind(manager);
+		})();
+		manager.append(entry("after-transition", "during-transition", "2026-07-11T12:01:05.000Z"));
+
+		expect(frames.map(frame => frame.entry.id)).toEqual(["during-transition", "after-transition"]);
+		expect(manager.subscribeCalls).toBe(1);
+		expect(manager.unsubscribeCalls).toBe(0);
 		subscription.dispose();
 	});
 

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	APP_WIRE_VERSION,
 	AppWireError,
 	MAX_FILE_BYTES,
 	MAX_INPUT_BYTES,
@@ -179,10 +180,35 @@ describe("app-wire authority", () => {
 				args: {},
 			}),
 		).toThrow(AppWireError);
+		expect(() =>
+			decodeClientFrame({
+				v: "omp-app/1",
+				type: "command",
+				requestId: "r",
+				commandId: "c",
+				hostId: "h",
+				sessionId: "s",
+				command: "session.list",
+				args: {},
+			}),
+		).toThrow(AppWireError);
+		expect(() =>
+			decodeClientFrame({
+				v: "omp-app/1",
+				type: "command",
+				requestId: "r",
+				commandId: "c",
+				hostId: "h",
+				sessionId: "s",
+				command: "files.write",
+				args: {},
+			}),
+		).toThrow(AppWireError);
 		expect(Object.values(COMMAND_DESCRIPTORS).every(descriptor => typeof descriptor.capability === "string")).toBe(
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
+		expect(APP_WIRE_VERSION).toBe("0.1.0");
 	});
 	test("session identity remains host scoped", () => {
 		expect(sameSession({ hostId: "h", sessionId: "s" }, { hostId: "other", sessionId: "s" })).toBe(false);

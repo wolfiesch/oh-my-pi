@@ -24,7 +24,7 @@ export interface ConfirmationChallenge {
 	confirmationId: ConfirmationId;
 	commandId: CommandId;
 	hostId: HostId;
-	sessionId: SessionId;
+	sessionId?: SessionId;
 	commandHash: string;
 	revision: Revision;
 	expiresAt: string;
@@ -38,7 +38,7 @@ export interface ConfirmFrame {
 	confirmationId: ConfirmationId;
 	commandId: CommandId;
 	hostId: HostId;
-	sessionId: SessionId;
+	sessionId?: SessionId;
 	decision: "approve" | "deny";
 }
 export interface PairStartFrame {
@@ -94,7 +94,7 @@ export function decodeConfirmation(input: unknown): ConfirmationChallenge {
 	confirmationId(frame.confirmationId);
 	commandId(frame.commandId);
 	hostId(frame.hostId);
-	sessionId(frame.sessionId);
+	if (frame.sessionId !== undefined) sessionId(frame.sessionId);
 	controlFree(frame.commandHash, "commandHash", 256);
 	revision(frame.revision);
 	controlFree(frame.expiresAt, "expiresAt", 128);
@@ -110,7 +110,7 @@ export function decodeConfirm(input: unknown): ConfirmFrame {
 	confirmationId(frame.confirmationId);
 	commandId(frame.commandId);
 	hostId(frame.hostId);
-	sessionId(frame.sessionId);
+	if (frame.sessionId !== undefined) sessionId(frame.sessionId);
 	if (frame.decision !== "approve" && frame.decision !== "deny")
 		fail("CONFIRMATION_INVALID", "decision must approve or deny", "decision");
 	return frame as unknown as ConfirmFrame;

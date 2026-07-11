@@ -19,23 +19,35 @@ import type { DeviceCapability } from "./capabilities.ts";
 export interface CommandDescriptor {
 	capability: DeviceCapability;
 	scope: "host" | "session";
+	revision: "none" | "optional" | "required";
+	confirmation: "none" | "challenge";
 }
 export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = {
-	"host.list": { capability: "sessions.read", scope: "host" },
-	"session.list": { capability: "sessions.read", scope: "host" },
-	"session.prompt": { capability: "sessions.prompt", scope: "session" },
-	"session.cancel": { capability: "sessions.control", scope: "session" },
-	"session.close": { capability: "sessions.manage", scope: "session" },
-	"files.read": { capability: "files.read", scope: "session" },
-	"files.write": { capability: "files.read", scope: "session" },
-	"files.patch": { capability: "files.read", scope: "session" },
-	"review.read": { capability: "files.read", scope: "session" },
-	"review.apply": { capability: "files.read", scope: "session" },
-	"agent.cancel": { capability: "agents.control", scope: "session" },
-	"bash.run": { capability: "bash.run", scope: "session" },
-	"term.open": { capability: "term.open", scope: "session" },
-	"audit.read": { capability: "audit.read", scope: "host" },
-	"config.write": { capability: "config.write", scope: "host" },
+	"host.list": { capability: "sessions.read", scope: "host", revision: "none", confirmation: "none" },
+	"session.list": { capability: "sessions.read", scope: "host", revision: "none", confirmation: "none" },
+	"session.prompt": { capability: "sessions.prompt", scope: "session", revision: "optional", confirmation: "none" },
+	"session.cancel": {
+		capability: "sessions.control",
+		scope: "session",
+		revision: "optional",
+		confirmation: "challenge",
+	},
+	"session.close": {
+		capability: "sessions.manage",
+		scope: "session",
+		revision: "required",
+		confirmation: "challenge",
+	},
+	"files.read": { capability: "files.read", scope: "session", revision: "optional", confirmation: "none" },
+	"files.write": { capability: "files.write", scope: "session", revision: "required", confirmation: "challenge" },
+	"files.patch": { capability: "files.write", scope: "session", revision: "required", confirmation: "challenge" },
+	"review.read": { capability: "files.read", scope: "session", revision: "optional", confirmation: "none" },
+	"review.apply": { capability: "files.write", scope: "session", revision: "required", confirmation: "challenge" },
+	"agent.cancel": { capability: "agents.control", scope: "session", revision: "optional", confirmation: "challenge" },
+	"bash.run": { capability: "bash.run", scope: "session", revision: "optional", confirmation: "challenge" },
+	"term.open": { capability: "term.open", scope: "session", revision: "optional", confirmation: "challenge" },
+	"audit.read": { capability: "audit.read", scope: "host", revision: "none", confirmation: "none" },
+	"config.write": { capability: "config.write", scope: "host", revision: "required", confirmation: "challenge" },
 };
 export const COMMAND_CAPABILITIES: Readonly<Record<string, DeviceCapability>> = Object.fromEntries(
 	Object.entries(COMMAND_DESCRIPTORS).map(([name, descriptor]) => [name, descriptor.capability]),
@@ -72,7 +84,13 @@ export function decodeCommand(input: unknown): CommandFrame {
 	const session = frame.sessionId === undefined ? undefined : sessionId(frame.sessionId);
 	if (descriptor.scope === "session" && session === undefined)
 		fail("INVALID_FRAME", "sessionId is required for session command", "sessionId");
+	if (descriptor.scope === "host" && session !== undefined)
+		fail("INVALID_FRAME", "sessionId is forbidden for host command", "sessionId");
+	if (descriptor.revision === "required" && frame.expectedRevision === undefined)
+		fail("STALE_REVISION", "expectedRevision is required", "expectedRevision");
 	if (frame.expectedRevision !== undefined) revision(frame.expectedRevision);
+	if (descriptor.confirmation === "none" && frame.confirmationId !== undefined)
+		fail("CONFIRMATION_INVALID", "confirmationId is not valid for this command", "confirmationId");
 	if (frame.confirmationId !== undefined) confirmationId(frame.confirmationId);
 	const args = frame.args === undefined ? {} : boundedMap(frame.args, "args");
 	if (FILE_COMMANDS[command])

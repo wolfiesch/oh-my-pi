@@ -8,6 +8,7 @@ export const DEVICE_CAPABILITIES = [
 	"bash.run",
 	"term.open",
 	"files.read",
+	"files.write",
 	"agents.control",
 	"audit.read",
 	"config.write",
