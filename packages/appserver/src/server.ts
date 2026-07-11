@@ -247,6 +247,7 @@ export class LocalAppserver implements AppserverHandle {
 	#remoteDecisions = new Map<AppWs, RemoteHelloDecision>();
 	#remoteListener?: BunRemoteListener;
 	#remotePolicy?: RemoteConnectionPolicy;
+	#admin?: AppserverOptions["admin"];
 	#remoteEndpoint?: RemoteListenerConfig;
 	#remoteResolver?: AppserverOptions["remoteResolver"];
 	#started = false;
@@ -259,12 +260,12 @@ export class LocalAppserver implements AppserverHandle {
 	#runIdentity?: RunIdentity;
 	#partialBacking?: { path: string; identity: { device: number; inode: number } };
 	#partialMarker?: { device: number; inode: number };
-	#ompVersion;
-	#ompBuild;
-	#appserverVersion;
-	#appserverBuild;
-	#supportedFeatures;
-	#supportedCapabilities;
+	#ompVersion: string;
+	#ompBuild: string;
+	#appserverVersion: string;
+	#appserverBuild: string;
+	#supportedFeatures: Set<string>;
+	#supportedCapabilities: Set<string>;
 	#projectRootForProject?: AppserverOptions["projectRootForProject"];
 	constructor(options: AppserverOptions = {}) {
 		this.#hostProvided = Boolean(options.hostId);
@@ -274,6 +275,7 @@ export class LocalAppserver implements AppserverHandle {
 		this.#remotePolicy = options.remotePolicy;
 		this.#remoteEndpoint = options.remoteEndpoint;
 		this.#remoteResolver = options.remoteResolver;
+		this.#admin = options.admin;
 		this.#remoteListener = options.remoteListener;
 		this.#clock = options.clock ?? clock;
 		this.#authority = options.sessionAuthority;
@@ -292,8 +294,9 @@ export class LocalAppserver implements AppserverHandle {
 		this.#ompBuild = options.ompBuild ?? "local";
 		this.#appserverVersion = options.appserverVersion ?? "0.1.0";
 		this.#appserverBuild = options.appserverBuild ?? "local";
-		const unsupportedAdditiveFeatures = new Set(["host.watch", "session.watch", "controller.lease", "prompt.lease"]);
+		const unsupportedAdditiveFeatures = new Set(["host.watch", "session.watch", "prompt.lease"]);
 		const implementedFeatures = new Set<string>(["resume"]);
+		if (options.remotePolicy) implementedFeatures.add("controller.lease");
 		const operationAuthority = options.operationsAuthority;
 		if (operationAuthority?.catalogGet) implementedFeatures.add("catalog.metadata");
 		if (operationAuthority?.settingsRead) implementedFeatures.add("settings.metadata");
@@ -1334,10 +1337,13 @@ async #remoteDisconnected(connection: RemoteConnection): Promise<void> {
 	private broadcast(sessionId: SessionId, frame: ServerFrame): void {
 		for (const [client, sessions] of this.#attached) if (sessions.has(sessionId)) void this.#sendFrame(client, frame);
 	}
-	private fetch(request: Request, server: Bun.Server<ServerWebSocketData>): Response | undefined {
+	private async fetch(request: Request, server: Bun.Server<ServerWebSocketData>): Promise<Response | undefined> {
 		const url = new URL(request.url);
 		if (url.pathname === "/health" && request.method === "GET")
 			return Response.json({ ok: true, hostId: this.hostId, epoch: this.epoch });
+		if (url.pathname === "/admin/pair-ticket") return this.adminPairTicket(request);
+		if (url.pathname === "/admin/devices") return this.adminDevices(request);
+		if (url.pathname === "/admin/revoke") return this.adminRevoke(request);
 		if (
 			url.pathname !== "/ws" ||
 			request.method !== "GET" ||
@@ -1346,6 +1352,75 @@ async #remoteDisconnected(connection: RemoteConnection): Promise<void> {
 			return new Response("Not Found", { status: 404 });
 		if (server.upgrade(request, { data: { socket: {} } })) return undefined;
 		return new Response("Upgrade Required", { status: 426 });
+	}
+	private adminError(status = 400): Response {
+		return Response.json({ error: "invalid admin request" }, { status });
+	}
+	private async adminJson(request: Request, keys: readonly string[]): Promise<Record<string, unknown> | Response> {
+		if (request.method !== "POST" || request.headers.get("content-type") !== "application/json") return this.adminError(405);
+		const length = request.headers.get("content-length");
+		if (length !== null && (!/^\d+$/u.test(length) || Number(length) > 16_384)) return this.adminError(413);
+		let bytes: ArrayBuffer;
+		try {
+			bytes = await request.arrayBuffer();
+		} catch {
+			return this.adminError();
+		}
+		if (bytes.byteLength > 16_384) return this.adminError(413);
+		let value: unknown;
+		try {
+			value = JSON.parse(new TextDecoder().decode(bytes));
+		} catch {
+			return this.adminError();
+		}
+		if (!value || typeof value !== "object" || Array.isArray(value)) return this.adminError();
+		const body = value as Record<string, unknown>;
+		if (Object.keys(body).some(key => !keys.includes(key))) return this.adminError();
+		return body;
+	}
+	private async adminPairTicket(request: Request): Promise<Response> {
+		if (!this.#admin || request.method !== "POST") return this.adminError(404);
+		const body = await this.adminJson(request, ["capabilities", "ttlMs", "expectedNodeId"]);
+		if (body instanceof Response) return body;
+		const capabilities = body.capabilities;
+		if (
+			!Array.isArray(capabilities) ||
+			capabilities.length === 0 ||
+			capabilities.length > 32 ||
+			capabilities.some(value => typeof value !== "string" || value.length === 0 || value.length > 128)
+		)
+			return this.adminError();
+		const ttl = body.ttlMs;
+		if (ttl !== undefined && (typeof ttl !== "number" || !Number.isSafeInteger(ttl) || ttl <= 0 || ttl > 600_000))
+			return this.adminError();
+		const nodeId = body.expectedNodeId;
+		if (nodeId !== undefined && (typeof nodeId !== "string" || nodeId.length === 0 || nodeId.length > 512))
+			return this.adminError();
+		try {
+			return Response.json(this.#admin.issuePairingTicket(capabilities, ttl, nodeId));
+		} catch {
+			return this.adminError();
+		}
+	}
+	private adminDevices(request: Request): Response {
+		if (!this.#admin || request.method !== "GET") return this.adminError(404);
+		try {
+			return Response.json({ devices: this.#admin.listDevices() });
+		} catch {
+			return this.adminError(500);
+		}
+	}
+	private async adminRevoke(request: Request): Promise<Response> {
+		if (!this.#admin || request.method !== "POST") return this.adminError(404);
+		const body = await this.adminJson(request, ["deviceId"]);
+		if (body instanceof Response) return body;
+		if (typeof body.deviceId !== "string" || body.deviceId.length === 0 || body.deviceId.length > 512)
+			return this.adminError();
+		try {
+			return Response.json(this.#admin.revokeDevice(body.deviceId));
+		} catch {
+			return this.adminError();
+		}
 	}
 }
 interface ServerWebSocketData {

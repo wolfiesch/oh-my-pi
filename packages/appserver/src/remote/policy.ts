@@ -121,9 +121,29 @@ export class TailscaleRemotePolicy implements RemoteConnectionPolicy {
     this.#supportedCapabilities = (options.supportedCapabilities ?? DEVICE_CAPABILITIES).filter((value): value is Capability => (DEVICE_CAPABILITIES as readonly string[]).includes(value));
     this.#supportedFeatures = [...(options.supportedFeatures ?? ["resume", "controller.lease", "terminal.io", "files.list", "files.diff", "catalog.metadata", "settings.metadata"])];
   }
-  issuePairingTicket(allowedCapabilities: readonly Capability[], ttlMs = 120_000, nodeId?: string): { readonly code: string; readonly expiresAt: number } {
-    if (!this.#localPairing) throw new Error("local pairing issuer unavailable");
-    return this.#localPairing.issue(allowedCapabilities, ttlMs, nodeId);
+  issuePairingTicket(allowedCapabilities: readonly string[], ttlMs = 120_000, nodeId?: string): { readonly code: string; readonly expiresAt: number } {
+    if (!this.#localPairing || allowedCapabilities.length === 0 || allowedCapabilities.some(value => !DEVICE_CAPABILITIES.includes(value as Capability)))
+      throw new Error("local pairing capabilities invalid");
+    return this.#localPairing.issue(allowedCapabilities as Capability[], ttlMs, nodeId);
+  }
+  listDeviceSummaries() {
+    return this.#registry.list().map(device => ({
+      deviceId: device.deviceId,
+      label: device.metadata.label,
+      ...(device.metadata.platform ? { platform: device.metadata.platform } : {}),
+      capabilities: [...device.capabilities],
+      createdAt: device.createdAt,
+      lastSeenAt: device.lastSeenAt,
+      revokedAt: device.revokedAt,
+    }));
+  }
+  revokeDevice(deviceId: string): { readonly revoked: true } {
+    if (!safeString(deviceId, 512)) throw new Error("device id invalid");
+    this.#registry.revoke(deviceId);
+    return { revoked: true };
+  }
+  close(): void {
+    this.#registry.close();
   }
   authenticate(connection: RemoteConnection, hello: HelloFrame): RemoteHelloDecision {
     const state: ConnectionState = { connection, capabilities: [], features: [], paired: false, justPaired: false, ready: false, commandContexts: new Map() };

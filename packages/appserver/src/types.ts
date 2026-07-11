@@ -103,6 +103,23 @@ export interface RpcChildFactory {
 	spawn(spec: { session: SessionRecord; argv: string[]; cwd: string }): ChildHandle;
 	argv(sessionPath: string): string[];
 }
+export interface AppserverAdminCallbacks {
+	issuePairingTicket(
+		capabilities: readonly string[],
+		ttlMs?: number,
+		expectedNodeId?: string,
+	): { readonly code: string; readonly expiresAt: number };
+	listDevices(): readonly {
+		readonly deviceId: string;
+		readonly label: string;
+		readonly platform?: string;
+		readonly capabilities: readonly string[];
+		readonly createdAt: number;
+		readonly lastSeenAt: number | null;
+		readonly revokedAt: number | null;
+	}[];
+	revokeDevice(deviceId: string): { readonly revoked: true };
+}
 export interface AppserverOptions {
 	hostId?: HostId;
 	epoch?: string;
@@ -126,6 +143,7 @@ export interface AppserverOptions {
 	remotePolicy?: RemoteConnectionPolicy;
 	remoteResolver?: { resolve(address: string): Promise<RemotePeerIdentity> };
 	remoteListener?: BunRemoteListener;
+	admin?: AppserverAdminCallbacks;
 }
 export interface Projection {
 	hostId: HostId;
