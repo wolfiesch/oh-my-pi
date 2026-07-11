@@ -2,7 +2,7 @@ import { constants } from "node:fs";
 import { access, chmod, lstat, mkdir, open, readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { createAppserver } from "../server.ts";
+import { appserverSupportedCapabilities, appserverSupportedFeatures, createAppserver } from "../server.ts";
 import type { AppserverHandle, AppserverOptions } from "../types.ts";
 import { LocalPairingTicketIssuer, SqliteDeviceRegistry } from "../security/index.ts";
 import { TailscaleRemotePolicy } from "./policy.ts";
@@ -130,7 +130,13 @@ export async function createRemoteAppserver(options: RemoteAppserverOptions): Pr
   const key = await loadPairingKey(options.stateDir);
   const registry = new SqliteDeviceRegistry(join(options.stateDir, "devices.sqlite"));
   const issuer = new LocalPairingTicketIssuer(registry, key);
-  const policy = new TailscaleRemotePolicy({ registry, localPairing: issuer });
+  const appserverOptions = options.appserver;
+  const policy = new TailscaleRemotePolicy({
+    registry,
+    localPairing: issuer,
+    supportedCapabilities: appserverSupportedCapabilities(appserverOptions ?? {}),
+    supportedFeatures: appserverSupportedFeatures(appserverOptions ?? {}, true),
+  });
   const endpoint = options.remoteEndpoint;
   let resolver: TailscaleWhoisResolver | undefined;
   try {

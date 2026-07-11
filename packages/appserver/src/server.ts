@@ -214,6 +214,23 @@ async function publishOwnerAtomic(
 	if (!final) throw new Error("appserver owner marker disappeared during startup");
 	return final;
 }
+export function appserverSupportedFeatures(options: Pick<AppserverOptions, "operationsAuthority" | "supportedFeatures"> & { readonly remotePolicy?: AppserverOptions["remotePolicy"] }, includeRemotePolicy = false): string[] {
+	const unsupportedAdditiveFeatures = new Set(["host.watch", "session.watch", "prompt.lease"]);
+	const implementedFeatures = new Set<string>(["resume"]);
+	if (includeRemotePolicy || options.remotePolicy) implementedFeatures.add("controller.lease");
+	const authority = options.operationsAuthority;
+	if (authority?.catalogGet) implementedFeatures.add("catalog.metadata");
+	if (authority?.settingsRead) implementedFeatures.add("settings.metadata");
+	if (authority?.termOpen && authority.terminalInput && authority.terminalResize && authority.terminalClose) implementedFeatures.add("terminal.io");
+	if (authority?.filesList) implementedFeatures.add("files.list");
+	if (authority?.filesDiff) implementedFeatures.add("files.diff");
+	if (authority?.previewLaunch && authority.previewState && authority.previewNavigate && authority.previewCapture) implementedFeatures.add("preview.control");
+	return [...(options.supportedFeatures ?? implementedFeatures)].filter(feature => implementedFeatures.has(feature) && !unsupportedAdditiveFeatures.has(feature));
+}
+export function appserverSupportedCapabilities(options: Pick<AppserverOptions, "operationsAuthority" | "supportedCapabilities">): string[] {
+	const implemented = new Set(["sessions.read", "sessions.manage", "sessions.prompt", "sessions.control", ...operationCapabilities(options.operationsAuthority)]);
+	return [...(options.supportedCapabilities ?? implemented)];
+}
 export class LocalAppserver implements AppserverHandle {
 	hostId: HostId;
 	readonly epoch: string;
@@ -294,36 +311,9 @@ export class LocalAppserver implements AppserverHandle {
 		this.#ompBuild = options.ompBuild ?? "local";
 		this.#appserverVersion = options.appserverVersion ?? "0.1.0";
 		this.#appserverBuild = options.appserverBuild ?? "local";
-		const unsupportedAdditiveFeatures = new Set(["host.watch", "session.watch", "prompt.lease"]);
-		const implementedFeatures = new Set<string>(["resume"]);
-		if (options.remotePolicy) implementedFeatures.add("controller.lease");
-		const operationAuthority = options.operationsAuthority;
-		if (operationAuthority?.catalogGet) implementedFeatures.add("catalog.metadata");
-		if (operationAuthority?.settingsRead) implementedFeatures.add("settings.metadata");
-		if (
-			operationAuthority?.termOpen &&
-			operationAuthority.terminalInput &&
-			operationAuthority.terminalResize &&
-			operationAuthority.terminalClose
-		)
-			implementedFeatures.add("terminal.io");
-		if (operationAuthority?.filesList) implementedFeatures.add("files.list");
-		if (operationAuthority?.filesDiff) implementedFeatures.add("files.diff");
-		if (
-			operationAuthority?.previewLaunch &&
-			operationAuthority.previewState &&
-			operationAuthority.previewNavigate &&
-			operationAuthority.previewCapture
-		)
-			implementedFeatures.add("preview.control");
-		this.#supportedFeatures = new Set(
-			(options.supportedFeatures ?? [...implementedFeatures]).filter(
-				feature => implementedFeatures.has(feature) && !unsupportedAdditiveFeatures.has(feature),
-			),
-		);
-		const builtIn = new Set(["sessions.read", "sessions.manage", "sessions.prompt", "sessions.control"]);
-		const implemented = new Set([...builtIn, ...operationCapabilities(options.operationsAuthority)]);
-		const requested = options.supportedCapabilities ?? [...implemented];
+		this.#supportedFeatures = new Set(appserverSupportedFeatures(options));
+		const requested = appserverSupportedCapabilities(options);
+		const implemented = new Set(["sessions.read", "sessions.manage", "sessions.prompt", "sessions.control", ...operationCapabilities(options.operationsAuthority)]);
 		if (requested.some(capability => !implemented.has(capability)))
 			throw new Error("unsupported capability has no handler");
 		this.#supportedCapabilities = new Set(requested);

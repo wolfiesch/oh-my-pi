@@ -6,7 +6,7 @@ import type { RemoteConnection } from "../src/remote/types.ts";
 
 const identity: RemotePeerIdentity = { nodeId: "node", login: "user@example", hostId: "host", tailnetIp: "100.64.0.2" };
 const identityKey = JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]);
-const record: DeviceRecord = { deviceId: "device", identityKey, capabilities: ["sessions.read", "sessions.control", "files.write", "term.input"], metadata: { label: "test" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: 9_999_999, revokedAt: null, epoch: 0 };
+const record: DeviceRecord = { deviceId: "device", identityKey, capabilities: ["sessions.read", "sessions.control", "files.write", "term.input", "preview.read"], metadata: { label: "test" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: 9_999_999, revokedAt: null, epoch: 0 };
 class Registry implements DeviceRegistry {
   readonly listeners = new Set<(deviceId: string) => void>();
   readonly active = new Map<string, AuthenticatedPrincipal>();
@@ -50,8 +50,9 @@ test("controller lease feature gates interception and replay is idempotent", () 
   expect(policy.authorize(reconnect, acquire, { connectionId: "lease-ready", peer: reconnect.peer })).toBe(true);
   const first = policy.handleCommand(reconnect, acquire);
   expect(first).toBeDefined();
-  expect(policy.authorize(reconnect, acquire, { connectionId: "lease-ready", peer: reconnect.peer })).toBe(true);
-  expect(policy.handleCommand(reconnect, acquire)).toEqual(first);
+  const retry = { ...acquire, requestId: "request-retry" } as CommandFrame;
+  expect(policy.authorize(reconnect, retry, { connectionId: "lease-ready", peer: reconnect.peer })).toBe(true);
+  expect(policy.handleCommand(reconnect, retry)).toMatchObject({ type: "response", requestId: "request-retry", commandId: "acquire" });
   expect(policy.authorize(reconnect, command("acquire", "controller.lease.acquire", "other"), { connectionId: "lease-ready", peer: reconnect.peer })).toBe(false);
   policy.close();
 });
@@ -96,6 +97,19 @@ test("controller lease gates session mutations for the owning connection and exp
   expect(policy.authorize(owner, command("expired", "files.write", "session", { leaseId, path: "file.txt", content: "late" }), { connectionId: owner.connectionId, peer: owner.peer })).toBe(false);
   policy.close();
 });
+test("preview commands require negotiated preview.control and preview capability", () => {
+  const registry = new Registry();
+  const policy = new TailscaleRemotePolicy({ registry, supportedFeatures: ["preview.control"] });
+  const connectionValue = connection("preview", { count: 0 });
+  policy.authenticate(connectionValue, hello("preview", ["preview.read"], []));
+  const preview = command("preview", "preview.state", "session", {});
+  expect(policy.authorize(connectionValue, preview, { connectionId: "preview", peer: connectionValue.peer })).toBe(false);
+  const negotiated = connection("preview-ready", { count: 0 });
+  policy.authenticate(negotiated, hello("preview-ready", ["preview.read"], ["preview.control"]));
+  expect(policy.authorize(negotiated, { ...preview, requestId: "request-preview-ready" } as CommandFrame, { connectionId: "preview-ready", peer: negotiated.peer })).toBe(true);
+  policy.close();
+});
+
 
 test("terminal input needs terminal.io even when term.input is granted", () => {
   const registry = new Registry();

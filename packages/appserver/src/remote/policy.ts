@@ -333,7 +333,8 @@ export class TailscaleRemotePolicy implements RemoteConnectionPolicy {
     let fingerprint: string;
     try { fingerprint = commandFingerprint(frame); } catch { return undefined; }
     if (cached.fingerprint !== fingerprint) return undefined;
-    return cached.response;
+    if (cached.response.type !== "response") return undefined;
+    return { ...cached.response, requestId: frame.requestId, commandId: frame.commandId };
   }
   #authorizeConfirm(state: ConnectionState, frame: ConfirmFrame, principal: AuthenticatedPrincipal): boolean {
     const context = state.commandContexts.get(String(frame.commandId));
