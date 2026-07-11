@@ -118,6 +118,9 @@
 ### Removed
 
 - Removed the bundled plan subagent from available task agents.
+### Fixed
+
+- Added configured concurrency-cap guidance to GPT-5.6 eager delegation prompts and reserved active supervision guidance for top-level agents ([#5132](https://github.com/can1357/oh-my-pi/pull/5132) by [@lyc-aon](https://github.com/lyc-aon)).
 
 ## [16.4.2] - 2026-07-10
 

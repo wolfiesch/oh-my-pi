@@ -138,6 +138,56 @@ describe("system prompt model identifier", () => {
 	});
 });
 
+describe("GPT-5.6 delegation prompt policy", () => {
+	async function renderDelegationPrompt(eagerTasks: boolean, isSubagent = false): Promise<string> {
+		const cwd = process.cwd();
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd,
+			contextFiles: [],
+			skills: [],
+			rules: [],
+			toolNames: ["task"],
+			workspaceTree: { ...EMPTY_TREE, rootPath: cwd },
+			activeRepoContext: null,
+			model: "openai/gpt-5.6-luna",
+			includeModelInPrompt: false,
+			eagerTasks,
+			isSubagent,
+			taskBatch: true,
+			taskMaxConcurrency: 12,
+		});
+		return systemPrompt.join("\n\n");
+	}
+
+	it("keeps default GPT-5.6 sessions non-delegating", async () => {
+		const rendered = await renderDelegationPrompt(false);
+
+		expect(rendered).toContain("Do not spawn sub-agents unless");
+		expect(rendered).not.toContain("Proactive multi-agent delegation is active");
+		expect(rendered).not.toContain("Maximize parallelism");
+	});
+
+	it("gives eager GPT-5.6 sessions bounded, supervised delegation guidance", async () => {
+		const rendered = await renderDelegationPrompt(true);
+
+		expect(rendered).toContain("Proactive multi-agent delegation is active");
+		expect(rendered).toContain("Keep ownership of the overall task");
+		expect(rendered).toContain("Monitor sub-agents for stalls");
+		expect(rendered).toContain("At most 12 subagents");
+		expect(rendered).not.toContain("Do not spawn sub-agents unless");
+		expect(rendered).not.toContain("Maximize parallelism");
+	});
+
+	it("reserves active delegation supervision for the top-level GPT-5.6 agent", async () => {
+		const rendered = await renderDelegationPrompt(true, true);
+
+		expect(rendered).toContain("Proactive multi-agent delegation is active");
+		expect(rendered).toContain("At most 12 subagents");
+		expect(rendered).not.toContain("Keep ownership of the overall task");
+		expect(rendered).not.toContain("Monitor sub-agents for stalls");
+	});
+});
+
 describe("AgentSession model-change prompt refresh", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;

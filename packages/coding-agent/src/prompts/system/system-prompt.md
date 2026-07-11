@@ -146,6 +146,12 @@ You SHOULD use syntax-aware tools before text hacks:
 {{#if useCodexTaskPrompt}}
 {{#if eagerTasks}}
 Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.
+{{#unless isSubagent}}
+- Keep ownership of the overall task. Monitor sub-agents for stalls, repeated tool errors, scope drift, or disproportionate effort; intervene when needed and verify their results before relying on them.
+{{/unless}}
+{{#when MAX_CONCURRENCY ">" 0}}
+- **Concurrency cap:** At most {{pluralize MAX_CONCURRENCY "subagent" "subagents"}} run at once in this session. Keep each fan-out at or under that cap; excess tasks only queue.
+{{/when}}
 {{else}}
 Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.
 {{/if}}

@@ -483,6 +483,8 @@ export interface BuildSystemPromptOptions {
 	eagerTasks?: boolean;
 	/** When true, the Eager Tasks section uses the hard MUST/ONLY wording (`task.eager: always`) rather than the softer `preferred` nudge. */
 	eagerTasksAlways?: boolean;
+	/** Whether this prompt belongs to a spawned task agent rather than the top-level agent. */
+	isSubagent?: boolean;
 	/** Whether `task.batch` is enabled; selects the centralized delegation guidance's call shape. */
 	taskBatch?: boolean;
 	/** Effective task concurrency limit displayed in centralized delegation guidance. Zero means unlimited. */
@@ -543,6 +545,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		mcpDiscoveryServerSummaries = [],
 		eagerTasks = false,
 		eagerTasksAlways = false,
+		isSubagent = false,
 		taskBatch = true,
 		taskMaxConcurrency = 0,
 		taskIrcEnabled = false,
@@ -791,6 +794,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		mcpDiscoveryServerSummaries,
 		eagerTasks,
 		eagerTasksAlways,
+		isSubagent,
 		taskBatch,
 		MAX_CONCURRENCY: normalizeConcurrencyLimit(taskMaxConcurrency),
 		taskIrcEnabled,

@@ -2445,6 +2445,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				mcpDiscoveryServerSummaries: discoverableToolSummary.servers.map(formatDiscoverableToolServerSummary),
 				eagerTasks,
 				eagerTasksAlways,
+				isSubagent: agentKind === "sub",
 				taskBatch: settings.get("task.batch"),
 				taskMaxConcurrency: settings.get("task.maxConcurrency"),
 				taskIrcEnabled: isIrcEnabled(settings, options.taskDepth ?? 0),
