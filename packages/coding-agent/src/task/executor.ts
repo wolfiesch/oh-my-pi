@@ -790,6 +790,14 @@ export function createSubagentSettings(
 	snapshot["tier.openai"] = subagentTiers.openai ?? "none";
 	snapshot["tier.anthropic"] = subagentTiers.anthropic ?? "none";
 	snapshot["tier.google"] = subagentTiers.google ?? "none";
+	const nestedEager = baseSettings.get("task.nestedEager");
+	if (nestedEager !== "inherit") {
+		snapshot["task.eager"] = nestedEager;
+	}
+	const maxNestedConcurrency = baseSettings.get("task.maxNestedConcurrency");
+	if (maxNestedConcurrency >= 0) {
+		snapshot["task.maxConcurrency"] = maxNestedConcurrency;
+	}
 	return Settings.isolated({
 		...snapshot,
 		"async.enabled": false,

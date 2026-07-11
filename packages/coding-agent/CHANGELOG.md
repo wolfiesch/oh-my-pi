@@ -121,6 +121,9 @@
 ### Fixed
 
 - Added configured concurrency-cap guidance to GPT-5.6 eager delegation prompts and reserved active supervision guidance for top-level agents ([#5132](https://github.com/can1357/oh-my-pi/pull/5132) by [@lyc-aon](https://github.com/lyc-aon)).
+### Added
+
+- Added separate delegation guidance and per-session concurrency controls for descendant task agents ([#5133](https://github.com/can1357/oh-my-pi/pull/5133) by [@lyc-aon](https://github.com/lyc-aon)).
 
 ## [16.4.2] - 2026-07-10
 

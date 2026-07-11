@@ -4057,6 +4057,24 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.nestedEager": {
+		type: "enum",
+		values: ["inherit", "default", "preferred", "always"] as const,
+		default: "inherit",
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Nested Task Delegation",
+			description: "Delegation guidance applied to every descendant task session",
+			options: [
+				{ value: "inherit", label: "Inherit", description: "Keep the parent's effective setting" },
+				{ value: "default", label: "Default", description: "Use the normal model-specific policy" },
+				{ value: "preferred", label: "Preferred", description: "Add proactive delegation guidance" },
+				{ value: "always", label: "Always", description: "Strongly require delegation" },
+			],
+		},
+	},
+
 	"task.batch": {
 		type: "boolean",
 		default: true,
@@ -4078,6 +4096,29 @@ export const SETTINGS_SCHEMA = {
 			label: "Max Concurrent Tasks",
 			description: "Maximum number of subagents running concurrently",
 			options: [
+				{ value: "0", label: "Unlimited" },
+				{ value: "1", label: "1 task" },
+				{ value: "2", label: "2 tasks" },
+				{ value: "4", label: "4 tasks" },
+				{ value: "8", label: "8 tasks" },
+				{ value: "16", label: "16 tasks" },
+				{ value: "32", label: "32 tasks" },
+				{ value: "64", label: "64 tasks" },
+			],
+		},
+	},
+
+	"task.maxNestedConcurrency": {
+		type: "number",
+		default: -1,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Max Nested Concurrent Tasks",
+			description:
+				"Maximum subagents and eval parallel/pipeline workers each child session may run concurrently. This is a per-child cap, not a global tree cap.",
+			options: [
+				{ value: "-1", label: "Inherit", description: "Use the parent's effective limit" },
 				{ value: "0", label: "Unlimited" },
 				{ value: "1", label: "1 task" },
 				{ value: "2", label: "2 tasks" },
