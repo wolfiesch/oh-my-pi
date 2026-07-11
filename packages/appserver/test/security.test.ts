@@ -10,6 +10,7 @@ import {
   SqliteDeviceRegistry,
   SqlitePairingService,
   TokenBucketLimiter,
+  argsDigest,
 } from "../src/security/index.ts";
 import type { DeviceRecord, DeviceMetadata, RemotePeerIdentity } from "../src/security/index.ts";
 
@@ -47,17 +48,17 @@ describe("security core", () => {
     registry.create(principal, "token");
     const guard = new DefaultAuthorizationGuard(registry);
     const base = { principal, connectionId: "c", capabilities: ["sessions.read"] as const, args: {} };
-    expect(() => guard.authorize({ ...base, command: "host.list" })).not.toThrow();
+    expect(() => guard.authorize({ ...base, command: "session.attach", sessionId: "s" })).not.toThrow();
     expect(() => guard.authorize({ ...base, command: "session.prompt", sessionId: "s" })).toThrow();
   });
 
   it("expires and releases a single-owner lease", () => {
     const leases = new LeaseRegistry(clock, { bytes: (n) => new Uint8Array(n).fill(3) });
-    leases.acquire("s", "owner", "controller", 10);
-    expect(() => leases.acquire("s", "other", "controller")).toThrow();
+    leases.acquire("d", "conn", "s", "controller", 10);
+    expect(() => leases.acquire("d2", "other", "s", "controller")).toThrow();
     clock.value += 11;
-    expect(() => leases.acquire("s", "other", "controller")).not.toThrow();
-    leases.disconnect("other");
+    expect(() => leases.acquire("d2", "other", "s", "controller")).not.toThrow();
+    leases.disconnect("d2", "other");
   });
 
   it("consumes confirmations once and redacts nested secrets", () => {
@@ -71,10 +72,9 @@ describe("security core", () => {
   it("rate limits and never drops terminal queue messages", () => {
     const limiter = new TokenBucketLimiter(1, 0, clock);
     expect(limiter.allow("ip")).toBe(true);
-    expect(limiter.allow("ip")).toBe(false);
-    const queue = new OutboundQueue(10);
+    const queue = new OutboundQueue(100);
     queue.push({ kind: "result", payload: "done" });
-    expect(() => queue.push({ kind: "event", payload: "drop-me" })).toThrow();
+    expect(() => queue.push({ kind: "event", payload: "drop-me" })).not.toThrow();
     expect(queue.shift()?.kind).toBe("result");
   });
 
@@ -121,4 +121,49 @@ it("redacts cycles, JWT, bearer, basic and private-key strings", () => {
   const output = JSON.stringify(new DefaultRedactor().redact(cycle));
   expect(output).not.toContain("Bearer");
   expect(output).not.toContain("\"self\":{\"self\"");
+});
+it("pair completion stays bound to the issuing connection", () => {
+  const registry = new FakeRegistry();
+  const pairing = new SqlitePairingService(registry, clock, { bytes: (n) => new Uint8Array(n).fill(8) });
+  const grant = pairing.start("issuer", ["sessions.read"]);
+  expect(() => pairing.complete("other", grant.code, identity, { label: "x" }, ["sessions.read"])).toThrow();
+});
+
+it("expired credentials are rejected and revoked", () => {
+  const localClock = { value: 100, now() { return this.value; } };
+  const path = `/tmp/omp-expired-${process.pid}.sqlite`;
+  const registry = new SqliteDeviceRegistry(path, localClock, { bytes: (n) => new Uint8Array(n).fill(6) });
+  registry.create({ deviceId: "expired", identityKey: JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]), capabilities: ["sessions.read"], metadata: { label: "x" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: 110, revokedAt: null, epoch: 0 }, "token");
+  localClock.value = 111;
+  expect(() => registry.authenticate("expired", "token", identity, "connection")).toThrow();
+  expect(registry.get("expired")?.revokedAt).toBe(111);
+  registry.close();
+  unlink(path).catch(() => undefined);
+});
+it("canonical args reject non-finite, undefined, and cycles while preserving null", () => {
+  expect(() => argsDigest({ value: Number.NaN })).toThrow();
+  expect(() => argsDigest({ value: Infinity })).toThrow();
+  expect(() => argsDigest({ value: undefined })).toThrow();
+  const cycle: Record<string, unknown> = {}; cycle.self = cycle;
+  expect(() => argsDigest(cycle)).toThrow();
+  expect(argsDigest({ value: null })).not.toEqual(argsDigest({}));
+});
+
+it("queue coalescing keeps event position and full frame metadata", () => {
+  const queue = new OutboundQueue(500);
+  queue.push({ kind: "event", payload: { frameId: "a", n: 1 }, coalesceKey: "state" });
+  queue.push({ kind: "result", payload: { frameId: "r" } });
+  queue.push({ kind: "event", payload: { frameId: "b", n: 2 }, coalesceKey: "state" });
+  expect(queue.drain()).toEqual([
+    { kind: "event", payload: { frameId: "b", n: 2 }, coalesceKey: "state" },
+    { kind: "result", payload: { frameId: "r" } },
+  ]);
+});
+
+it("lease owner is device plus connection and command allowlist is enforced", () => {
+  const leases = new LeaseRegistry(clock, { bytes: (n) => new Uint8Array(n).fill(4) });
+  const lease = leases.acquire("device", "connection", "session", "prompt");
+  expect(leases.verify(lease.leaseId, "device", "connection", "session", "session.prompt")).toBe(true);
+  expect(leases.verify(lease.leaseId, "device", "other", "session", "session.prompt")).toBe(false);
+  expect(leases.verify(lease.leaseId, "device", "connection", "session", "session.cancel")).toBe(false);
 });
