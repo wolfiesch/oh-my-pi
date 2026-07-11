@@ -4,6 +4,7 @@ import { access, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { decodeCatalog } from "@oh-my-pi/app-wire";
 import {
+	Process as NativeProcess,
 	PtySession,
 	type SecureDirectoryEntry,
 	type SecureListDirectoryResult,
@@ -298,12 +299,12 @@ async function runArgv(
 		const pid = proc.pid;
 		try {
 			if (process.platform !== "win32" && typeof pid === "number") process.kill(-pid, "SIGTERM");
-			else proc.kill("SIGTERM");
+			else if (typeof pid === "number") NativeProcess.fromPid(pid)?.killTree(15);
 		} catch {}
 		hardKillTimer = setTimeout(() => {
 			try {
 				if (process.platform !== "win32" && typeof pid === "number") process.kill(-pid, "SIGKILL");
-				else proc.kill("SIGKILL");
+				else if (typeof pid === "number") NativeProcess.fromPid(pid)?.killTree(9);
 			} catch {}
 		}, 100);
 		hardKillTimer.unref?.();

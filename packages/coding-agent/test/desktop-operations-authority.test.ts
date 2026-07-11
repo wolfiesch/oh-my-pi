@@ -124,4 +124,24 @@ describe("CodingAgentDesktopAuthority jailed files", () => {
 			code: "UNSUPPORTED",
 		});
 	});
+	test("kills a child and grandchild process group on timeout", async () => {
+		if (process.platform === "win32") return;
+		const { value } = await authority();
+		const result = await value.runBash({
+			command: 'sh -c \'trap "" TERM; sleep 30\' & echo $!; trap "" TERM; sleep 30',
+			timeout: 30,
+		});
+		const childPid = Number.parseInt(result.output.trim().split(/\s+/u)[0] ?? "", 10);
+		expect(result.timedOut).toBe(true);
+		expect(Number.isSafeInteger(childPid)).toBe(true);
+		for (let attempt = 0; attempt < 20; attempt++) {
+			try {
+				process.kill(childPid, 0);
+				await Bun.sleep(10);
+			} catch {
+				break;
+			}
+		}
+		expect(() => process.kill(childPid, 0)).toThrow();
+	});
 });
