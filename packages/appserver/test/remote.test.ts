@@ -1,4 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import * as http from "node:http";
+import { requestId, type HelloFrame, type PairStartFrame } from "@oh-my-pi/app-wire";
+import { runAppserverPair } from "../../coding-agent/src/cli/appserver-cli.ts";
+import { createAppserver } from "../src/server.ts";
+import { LocalPairingTicketIssuer, SqliteDeviceRegistry } from "../src/security/index.ts";
+import { TailscaleRemotePolicy } from "../src/remote/policy.ts";
 import { TailscaleWhoisResolver } from "../src/remote/resolver.ts";
 import { createListenerPlan, createServeProxyPlan, directPeer, isTailnetAddress, originAllowed, resolveServePeer } from "../src/remote/listener.ts";
 
@@ -23,4 +32,59 @@ describe("bounded tailscale whois", () => {
   test("rejects injection, bad JSON, failure, and oversized output", async () => {
     const runner = { run: async () => ({ exitCode: 0, stdout: "{" }) }; await expect(new TailscaleWhoisResolver(runner).resolve("100.64.0.1")).rejects.toThrow(); await expect(new TailscaleWhoisResolver(runner).resolve("100.64.0.1; rm -rf /")).rejects.toThrow(); await expect(new TailscaleWhoisResolver({ run: async () => ({ exitCode: 1, stdout: "" }) }).resolve("100.64.0.1")).rejects.toThrow();
   });
+});
+async function udsAdmin(socketPath: string, path: string, method: "GET" | "POST", body?: Record<string, unknown>): Promise<unknown> {
+	const gate = Promise.withResolvers<unknown>();
+	const payload = body === undefined ? undefined : JSON.stringify(body);
+	const request = http.request({ socketPath, path, method, headers: payload ? { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } : undefined }, response => {
+		const chunks: Buffer[] = [];
+		response.on("data", chunk => chunks.push(Buffer.from(chunk)));
+		response.on("end", () => {
+			try { gate.resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); } catch (error) { gate.reject(error); }
+		});
+		response.on("error", gate.reject);
+	});
+	request.on("error", gate.reject);
+	if (payload) request.write(payload);
+	request.end();
+	return gate.promise;
+}
+
+test("pair CLI admin ticket reaches the in-process issuer and is one-use across reconnect", async () => {
+	const root = await mkdtemp(join(tmpdir(), "omp-admin-e2e-"));
+	const registry = new SqliteDeviceRegistry(join(root, "devices.sqlite"));
+	const issuer = new LocalPairingTicketIssuer(registry, new Uint8Array(32).fill(7));
+	const policy = new TailscaleRemotePolicy({ registry, localPairing: issuer });
+	const appserver = createAppserver({
+		socketPath: join(root, "app.sock"),
+		remotePolicy: policy,
+		admin: {
+			issuePairingTicket: (capabilities, ttlMs, nodeId) => policy.issuePairingTicket(capabilities, ttlMs, nodeId),
+			listDevices: () => policy.listDeviceSummaries(),
+			revokeDevice: deviceId => policy.revokeDevice(deviceId),
+		},
+	});
+	await appserver.start();
+	const originalWrite = process.stdout.write;
+	let output = "";
+	process.stdout.write = ((chunk: string | Uint8Array) => { output += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk); return true; }) as typeof process.stdout.write;
+	try {
+		await runAppserverPair({ socketPath: () => appserver.socketPath, adminRequest: udsAdmin }, { json: true, capabilities: ["sessions.read"], ttlSeconds: 30 });
+	} finally {
+		process.stdout.write = originalWrite;
+	}
+	const ticket = JSON.parse(output) as { code: string };
+	const connection = {
+		connectionId: "connection-1",
+		peer: { address: "100.64.0.2", source: "direct" as const, identity: { nodeId: "node-1", addresses: ["100.64.0.2"], source: "direct" as const } },
+		socket: { send: () => true, close: () => undefined },
+	};
+	const hello: HelloFrame = { v: "omp-app/1", type: "hello", protocol: { min: "1", max: "1" }, client: { name: "test", version: "1", build: "test" }, requestedFeatures: [], savedCursors: [] };
+	expect(policy.authenticate(connection, hello).authentication).toBe("pairing-required");
+	const frame: PairStartFrame = { v: "omp-app/1", type: "pair.start", requestId: requestId("pair-request"), code: ticket.code, deviceId: "device-1", deviceName: "test", platform: "test", requestedCapabilities: ["sessions.read"] };
+	expect(policy.pairStart(connection, frame)?.type).toBe("pair.ok");
+	expect(policy.pairStart({ ...connection, connectionId: "connection-2" }, frame)).toBeUndefined();
+	await appserver.stop();
+	policy.close();
+	await rm(root, { recursive: true, force: true });
 });
