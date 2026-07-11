@@ -17,7 +17,8 @@ const recordValue = (value: unknown): Record<string, unknown> | null => value !=
 const stringField = (row: Record<string, unknown>, key: string): string => { const value = safe(row[key]); if (!value) throw new Error("invalid persisted row"); return value; };
 const numberField = (row: Record<string, unknown>, key: string): number => { const value = row[key]; if (typeof value !== "number" || !Number.isFinite(value)) throw new Error("invalid persisted row"); return value; };
 const nullableNumber = (row: Record<string, unknown>, key: string): number | null => { const value = row[key]; if (value === null) return null; return numberField(row, key); };
-const canonicalIdentity = (identity: RemotePeerIdentity): string => JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp ?? null]);
+const isTailnetIp = (value: string): boolean => { const parts = value.split("."); return parts.length === 4 && parts.every((part) => /^\d+$/u.test(part) && Number(part) >= 0 && Number(part) <= 255) && parts[0] === "100" && Number(parts[1]) >= 64 && Number(parts[1]) <= 127; };
+const canonicalIdentity = (identity: RemotePeerIdentity): string => { if (!safe(identity.nodeId) || !safe(identity.login) || !safe(identity.hostId) || !safe(identity.tailnetIp) || !isTailnetIp(identity.tailnetIp)) throw new Error("invalid tailscale identity"); return JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]); };
 const caps = (value: readonly string[]): readonly Capability[] => [...new Set(value.filter(isCapability))];
 
 export interface PairingService { start(connectionId: string, allowedCapabilities: readonly Capability[], ttlMs?: number): PairStart; complete(connectionId: string, code: string, identity: RemotePeerIdentity, metadata: DeviceMetadata, requestedCapabilities: readonly Capability[]): { readonly deviceId: string; readonly token: string; readonly expiresAt: number }; }
