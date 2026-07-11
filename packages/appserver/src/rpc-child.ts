@@ -23,7 +23,8 @@ export function resolveRpcChildInvocation(overrides: RpcChildInvocationOverrides
   const executable = overrides.executable ?? process.execPath;
   if (typeof executable !== "string" || executable.trim().length === 0) throw new Error("rpc child executable is empty");
   const compiled = overrides.compiled ?? process.env.PI_COMPILED === "true";
-  const main = overrides.main ?? Bun.main;
+  const runningAppserverEntrypoint = typeof Bun.main === "string" && Bun.main.endsWith("/packages/appserver/bin/ompd.ts");
+  const main = overrides.main ?? (runningAppserverEntrypoint ? new URL("../../coding-agent/src/cli.ts", import.meta.url).pathname : Bun.main);
   if (!compiled && (typeof main !== "string" || main.trim().length === 0)) throw new Error("rpc child CLI entry is empty");
   return { executable, prefixArgv: Object.freeze(compiled ? [] : [main]) };
 }

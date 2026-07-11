@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { hostId, revision, type DurableEntry, type HostId, type SessionEvent, type SessionId, type ServerFrame } from "@oh-my-pi/app-wire";
+import { hostId, revision, type DurableEntry, type HostId, type SessionEvent, type SessionId, type SessionRef, type ServerFrame } from "@oh-my-pi/app-wire";
 import type { Projection, SessionRecord } from "./types.ts";
 
 export class SessionProjection {
@@ -14,6 +14,9 @@ export class SessionProjection {
     for (const entry of entries) this.#revisionHash.update(`${JSON.stringify(entry)}\n`);
     const currentRevision = revision(`r-${this.#revisionHash.copy().digest("hex").slice(0, 24)}`);
     this.value = { hostId: host, sessionId: record.sessionId, revision: currentRevision, cursor: { epoch, seq: 0 }, entries, ref: { hostId: host, sessionId: record.sessionId, project: { projectId: record.projectId, canonicalCwd: record.cwd, name: record.projectName }, revision: currentRevision, title: record.title, status: record.status, updatedAt: record.updatedAt }, ring: [] };
+  }
+  setStatus(status: SessionRef["status"]): void {
+    this.value.ref = { ...this.value.ref, status };
   }
   appendEntry(entry: DurableEntry): ServerFrame | undefined {
     const previous = this.#byId.get(entry.id);
