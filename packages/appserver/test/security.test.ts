@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { unlink } from "node:fs/promises";
+import { Database } from "bun:sqlite";
+import { mkdir, mkdtemp, stat, writeFile, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   DefaultAuthorizationGuard,
   DefaultRedactor,
@@ -77,7 +80,8 @@ describe("security core", () => {
 
   it("rate limits and never drops terminal queue messages", () => {
     const limiter = new TokenBucketLimiter(1, 0, clock);
-    expect(limiter.allowAuthenticated("device", "connection")).toBe(true);
+    const principal = { deviceId: "device", identityKey: JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]), capabilities: ["sessions.read"] as const, metadata: { label: "device" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: Date.now() + 86_400_000, revokedAt: null, epoch: 0, authenticatedAt: 1, connectionId: "connection" };
+    expect(limiter.allowAuthenticated(principal, identity, "100.64.0.2")).toBe(true);
     const queue = new OutboundQueue(100);
     queue.push({ kind: "result", payload: "done" });
     expect(() => queue.push({ kind: "event", payload: "drop-me" })).not.toThrow();
@@ -185,10 +189,10 @@ it("audit dispose releases single-writer ownership", async () => {
   const path = `/tmp/omp-audit-dispose-${process.pid}/audit.jsonl`;
   const first = new JsonlAuditSink(path);
   await first.write({ ok: true });
-  first.dispose();
-  first.close();
+  await first.dispose();
+  await first.close();
   const second = new JsonlAuditSink(path);
-  second.dispose();
+  await second.dispose();
   await unlink(path).catch(() => undefined);
 });
 
@@ -210,4 +214,88 @@ it("lease renew and release reject command-kind bypasses", () => {
   expect(() => leases.renew(lease.leaseId, "device", "connection", 30_000, 0, undefined, "session.cancel")).toThrow();
   leases.release(lease.leaseId, "device", "connection", 0, undefined, "session.cancel");
   expect(leases.verify(lease.leaseId, "device", "connection", "session", "session.prompt", 0)).toBe(true);
+});
+it("authenticated limiter rejects caller-supplied identity and isolates verified source addresses", () => {
+  const limiter = new TokenBucketLimiter(1, 0, clock);
+  const principal = { deviceId: "limit-device", identityKey: JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]), capabilities: ["sessions.read"] as const, metadata: { label: "x" }, createdAt: 1, lastSeenAt: 1, tokenExpiresAt: Date.now() + 86_400_000, revokedAt: null, epoch: 0, authenticatedAt: 1, connectionId: "limit-connection" };
+  expect(limiter.allowAuthenticated(principal, identity, "100.64.0.2")).toBe(true);
+  expect(limiter.allowAuthenticated(principal, identity, "100.64.0.2")).toBe(false);
+  expect(limiter.allowAuthenticated(principal, identity, "100.64.0.3")).toBe(true);
+  expect(limiter.allowAuthenticated(principal, { ...identity, tailnetIp: "100.64.0.3" }, "100.64.0.3")).toBe(false);
+});
+
+it("unauthenticated pairing limiter derives identity and source internally", () => {
+  const limiter = new TokenBucketLimiter(1, 0, clock);
+  const other = { nodeId: "node-b", login: "bob@example.com", hostId: "host-b", tailnetIp: "100.64.0.3" };
+  expect(limiter.allowPairing(identity, "100.64.0.2")).toBe(true);
+  expect(limiter.allowPairing(identity, "100.64.0.2")).toBe(false);
+  expect(limiter.allowPairing(identity, "100.64.0.3")).toBe(true);
+  expect(limiter.allowUnauthenticatedPairing(other, "100.64.0.2")).toBe(true);
+  expect(limiter.allowPairing(identity, "not-an-ip")).toBe(false);
+});
+
+it("device schema version is durable across close and reopen", async () => {
+  const root = await mkdtemp(join(tmpdir(), "omp-schema-"));
+  const path = join(root, "device.sqlite");
+  const first = new SqliteDeviceRegistry(path, clock);
+  first.close();
+  const database = new Database(path);
+  expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 1 });
+  database.close();
+  const second = new SqliteDeviceRegistry(path, clock);
+  second.close();
+});
+
+it("future device schema versions fail closed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "omp-future-schema-"));
+  const path = join(root, "device.sqlite");
+  const database = new Database(path);
+  database.run("PRAGMA user_version = 99");
+  database.close();
+  expect(() => new SqliteDeviceRegistry(path, clock)).toThrow("unsupported device schema");
+});
+
+it("failed device migration rolls back table changes and schema version", async () => {
+  const root = await mkdtemp(join(tmpdir(), "omp-rollback-schema-"));
+  const path = join(root, "device.sqlite");
+  const database = new Database(path);
+  database.run("CREATE TABLE devices(other TEXT)");
+  database.close();
+  expect(() => new SqliteDeviceRegistry(path, clock)).toThrow("unsupported device schema");
+  const reopened = new Database(path);
+  expect(reopened.query("PRAGMA user_version").get()).toEqual({ user_version: 0 });
+  expect(reopened.query("PRAGMA table_info(devices)").all()).toHaveLength(1);
+  reopened.close();
+});
+
+it("audit stale dead owner recovery uses complete lock records", async () => {
+  const root = await mkdtemp(join(tmpdir(), "omp-audit-stale-"));
+  const path = join(root, "audit.jsonl");
+  await writeFile(`${path}.lock`, JSON.stringify({ pid: 2_000_000_000, ownerId: "dead", processStart: "123", createdAt: 1 }), { mode: 0o600 });
+  const sink = new JsonlAuditSink(path);
+  await sink.write({ ok: true });
+  expect(await Bun.file(path).text()).toContain("\"ok\":true");
+  expect(await stat(`${path}.lock`).catch(() => null)).toBeNull();
+  await sink.dispose();
+});
+
+it("audit malformed or empty lock is never treated as an owned lock", async () => {
+  const root = await mkdtemp(join(tmpdir(), "omp-audit-empty-"));
+  const path = join(root, "audit.jsonl");
+  await writeFile(`${path}.lock`, "");
+  const sink = new JsonlAuditSink(path);
+  await expect(sink.write({ ok: true })).rejects.toThrow("audit writer busy");
+  await unlink(`${path}.lock`);
+  await sink.dispose();
+});
+
+it("audit lock with live pid and unknown start token is preserved", async () => {
+  const root = await mkdtemp(join(tmpdir(), "omp-audit-live-"));
+  const path = join(root, "audit.jsonl");
+  await writeFile(`${path}.lock`, JSON.stringify({ pid: process.pid, ownerId: "foreign", processStart: "unknown", createdAt: 1 }), { mode: 0o600 });
+  const sink = new JsonlAuditSink(path);
+  await expect(sink.write({ ok: true })).rejects.toThrow("audit writer busy");
+  expect(await Bun.file(`${path}.lock`).text()).toContain("\"foreign\"");
+  await unlink(`${path}.lock`);
+  await sink.dispose();
 });
