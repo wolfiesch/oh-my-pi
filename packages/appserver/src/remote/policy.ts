@@ -4,6 +4,7 @@ import {
   DEVICE_CAPABILITIES,
   isSecretLikeKey,
   MAX_ARRAY_ITEMS,
+  MAX_MAP_KEYS,
   pairingId,
   REMOTE_DEFAULT_CAPABILITIES,
   type ClientFrame,
@@ -367,12 +368,13 @@ export class TailscaleRemotePolicy implements RemoteConnectionPolicy {
 
 function sanitizeRemoteFrame(frame: ServerFrame): ServerFrame | undefined {
   const seen = new WeakSet<object>();
-  const walk = (value: unknown, key: string, depth: number): unknown => {
+  const walk = (value: unknown, depth: number): unknown => {
     if (depth > 12) throw new Error("outbound depth exceeded");
     if (typeof value === "string") {
       if (value.length > 65_536) throw new Error("outbound string exceeded");
       if (/^(?:[A-Za-z]+\s+)?[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u.test(value) || /^Bearer\s+/iu.test(value)) return "[redacted]";
-      if ((key === "path" || key === "cwd" || key === "root" || key === "endpoint" || key === "projectRoot") && (value.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(value))) return "[relative-path-redacted]";
+      if (value.startsWith("/") || value.startsWith("\\\\") || /^[A-Za-z]:[\\/]/u.test(value))
+        return "[relative-path-redacted]";
       return value;
     }
     if (value === null || typeof value !== "object") return value;
@@ -380,13 +382,13 @@ function sanitizeRemoteFrame(frame: ServerFrame): ServerFrame | undefined {
     seen.add(value);
     if (Array.isArray(value)) {
       if (value.length > MAX_ARRAY_ITEMS) throw new Error("outbound array exceeded");
-      const result = value.map(item => walk(item, key, depth + 1));
+      const result = value.map(item => walk(item, depth + 1));
       seen.delete(value);
       return result;
     }
     const result: Record<string, unknown> = {};
     const entries = Object.entries(value);
-    if (entries.length > 128) throw new Error("outbound object exceeded");
+    if (entries.length > MAX_MAP_KEYS) throw new Error("outbound object exceeded");
     for (const [childKey, child] of entries) {
       if (
         (frame.type === "welcome" && depth === 0 && childKey === "authentication") ||
@@ -395,13 +397,13 @@ function sanitizeRemoteFrame(frame: ServerFrame): ServerFrame | undefined {
         result[childKey] = child;
       } else if (childKey === "deviceToken" || isSecretLikeKey(childKey)) {
         result[childKey] = "[redacted]";
-      } else result[childKey] = walk(child, childKey, depth + 1);
+      } else result[childKey] = walk(child, depth + 1);
     }
     seen.delete(value);
     return result;
   };
   try {
-    const output = walk(frame, "", 0);
+    const output = walk(frame, 0);
     return output && typeof output === "object" && !Array.isArray(output) ? output as ServerFrame : undefined;
   } catch {
     return undefined;

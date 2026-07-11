@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as http from "node:http";
-import { decodeServerFrame, decodeSessions, MAX_ARRAY_ITEMS, requestId, type HelloFrame, type PairStartFrame, type ServerFrame } from "@oh-my-pi/app-wire";
+import { decodeServerFrame, decodeSessions, MAX_ARRAY_ITEMS, MAX_MAP_KEYS, requestId, type HelloFrame, type PairStartFrame, type ServerFrame } from "@oh-my-pi/app-wire";
 import { runAppserverPair } from "../../coding-agent/src/cli/appserver-cli.ts";
 import { createAppserver } from "../src/server.ts";
 import { LocalPairingTicketIssuer, SqliteDeviceRegistry } from "../src/security/index.ts";
@@ -106,6 +106,50 @@ test("remote sessions inventory preserves protocol-sized arrays and rejects over
 		expect(outbound).toBeDefined();
 		expect(decodeSessions(outbound).sessions).toHaveLength(318);
 		const oversized = { ...frame, sessions: Array.from({ length: MAX_ARRAY_ITEMS + 1 }, () => sessions[0]) } as unknown as ServerFrame;
+		expect(policy.transformOutbound(connection, oversized)).toBeUndefined();
+	} finally {
+		policy.close();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+test("remote settings preserve protocol-sized maps and redact local paths by value", () => {
+	const root = mkdtempSync(join(tmpdir(), "omp-remote-settings-"));
+	const registry = new SqliteDeviceRegistry(join(root, "devices.sqlite"));
+	const policy = new TailscaleRemotePolicy({ registry });
+	const connection = {
+		connectionId: "settings-connection",
+		peer: { address: "100.64.0.2", source: "direct" as const, identity: { nodeId: "node-1", addresses: ["100.64.0.2"], source: "direct" as const } },
+		socket: { connectionId: "settings-connection", peer: undefined as never, send: () => true, close: () => undefined },
+	};
+	try {
+		const hello: HelloFrame = { v: "omp-app/1", type: "hello", protocol: { min: "1", max: "1" }, client: { name: "test", version: "1", build: "test", platform: "linux" }, requestedFeatures: [], savedCursors: [] };
+		expect(policy.authenticate(connection, hello).authentication).toBe("pairing-required");
+		const settings: Record<string, unknown> = Object.fromEntries(
+			Array.from({ length: 406 }, (_, index) => [`setting-${index}`, `value-${index}`]),
+		);
+		settings.workspaceDirectory = "/home/operator/project";
+		settings.windowsDirectory = "C:\\Users\\operator\\project";
+		settings.networkShare = "\\\\server\\share";
+		settings.documentationUrl = "https://docs.example/settings";
+		expect(Object.keys(settings)).toHaveLength(410);
+		const frame = {
+			v: "omp-app/1", type: "response", requestId: "request-settings", commandId: "command-settings",
+			command: "settings.read", hostId: "host", ok: true, result: { revision: "revision-1", settings },
+		} as unknown as ServerFrame;
+		const outbound = policy.transformOutbound(connection, frame) as Record<string, unknown>;
+		const result = outbound.result as Record<string, unknown>;
+		const sanitized = result.settings as Record<string, unknown>;
+		expect(sanitized.workspaceDirectory).toBe("[relative-path-redacted]");
+		expect(sanitized.windowsDirectory).toBe("[relative-path-redacted]");
+		expect(sanitized.networkShare).toBe("[relative-path-redacted]");
+		expect(sanitized.documentationUrl).toBe("https://docs.example/settings");
+		const oversized = {
+			...frame,
+			result: {
+				revision: "revision-1",
+				settings: Object.fromEntries(Array.from({ length: MAX_MAP_KEYS + 1 }, (_, index) => [`setting-${index}`, index])),
+			},
+		} as unknown as ServerFrame;
 		expect(policy.transformOutbound(connection, oversized)).toBeUndefined();
 	} finally {
 		policy.close();

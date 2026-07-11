@@ -4,6 +4,7 @@ import {
 	AppWireError,
 	MAX_FILE_BYTES,
 	MAX_INPUT_BYTES,
+	MAX_MAP_KEYS,
 	COMMAND_DESCRIPTORS,
 	COMMAND_ARGUMENT_DECODERS,
 	COMMAND_RESULT_DECODERS,
@@ -241,7 +242,7 @@ describe("app-wire authority", () => {
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
-		expect(APP_WIRE_VERSION).toBe("0.4.2");
+		expect(APP_WIRE_VERSION).toBe("0.4.3");
 	});
 	test("exported wire version matches package metadata", async () => {
 		const metadata = (await Bun.file(new URL("../package.json", import.meta.url)).json()) as { version: string };
@@ -340,6 +341,18 @@ describe("app-wire authority", () => {
 		expect(decodeCommandResult("controller.lease.renew", { leaseId: "l", cursor: { epoch: "e", seq: 1 } }).leaseId).toBe("l");
 		expect(() => decodeCommandResult("host.watch", { watchId: "w" })).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("settings.write", { values: { nested: [{ ok: true }] } })).not.toThrow();
+		const supportedSettings = Object.fromEntries(
+			Array.from({ length: 410 }, (_, index) => [`setting-${index}`, index]),
+		);
+		expect(() =>
+			decodeCommandResult("settings.read", { revision: "revision-1", settings: supportedSettings }),
+		).not.toThrow();
+		const oversizedSettings = Object.fromEntries(
+			Array.from({ length: MAX_MAP_KEYS + 1 }, (_, index) => [`setting-${index}`, index]),
+		);
+		expect(() =>
+			decodeCommandResult("settings.read", { revision: "revision-1", settings: oversizedSettings }),
+		).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("settings.write", { values: { password: "nope" } })).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("settings.write", { value: Number.NaN })).toThrow(AppWireError);
 		const deep: Record<string, unknown> = {};
