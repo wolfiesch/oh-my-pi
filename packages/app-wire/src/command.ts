@@ -25,8 +25,8 @@ export interface CommandDescriptor {
 export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = {
 	"host.list": { capability: "sessions.read", scope: "host", revision: "none", confirmation: "none" },
 	"session.list": { capability: "sessions.read", scope: "host", revision: "none", confirmation: "none" },
-	"session.create": { capability: "sessions.manage", scope: "host", revision: "none", confirmation: "challenge" },
-	"session.attach": { capability: "sessions.manage", scope: "host", revision: "none", confirmation: "none" },
+	"session.create": { capability: "sessions.manage", scope: "host", revision: "none", confirmation: "none" },
+	"session.attach": { capability: "sessions.read", scope: "session", revision: "none", confirmation: "none" },
 	"session.prompt": { capability: "sessions.prompt", scope: "session", revision: "optional", confirmation: "none" },
 	"session.cancel": {
 		capability: "sessions.control",
@@ -88,6 +88,8 @@ export function decodeCommand(input: unknown): CommandFrame {
 		fail("INVALID_FRAME", "sessionId is required for session command", "sessionId");
 	if (descriptor.scope === "host" && session !== undefined)
 		fail("INVALID_FRAME", "sessionId is forbidden for host command", "sessionId");
+	if (descriptor.revision === "none" && frame.expectedRevision !== undefined)
+		fail("STALE_REVISION", "expectedRevision is forbidden for this command", "expectedRevision");
 	if (descriptor.revision === "required" && frame.expectedRevision === undefined)
 		fail("STALE_REVISION", "expectedRevision is required", "expectedRevision");
 	if (frame.expectedRevision !== undefined) revision(frame.expectedRevision);

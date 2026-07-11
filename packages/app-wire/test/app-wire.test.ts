@@ -204,6 +204,25 @@ describe("app-wire authority", () => {
 				args: {},
 			}),
 		).toThrow(AppWireError);
+		const base = { v: "omp-app/1", type: "command", requestId: "r", commandId: "c", hostId: "h", args: {} } as const;
+		expect(() => decodeClientFrame({ ...base, command: "session.create" })).not.toThrow();
+		expect(() => decodeClientFrame({ ...base, command: "session.attach" })).toThrow(AppWireError);
+		expect(() => decodeClientFrame({ ...base, sessionId: "s", command: "session.attach" })).not.toThrow();
+		expect(() => decodeClientFrame({ ...base, command: "session.create", expectedRevision: "rev" })).toThrow(
+			AppWireError,
+		);
+		expect(COMMAND_DESCRIPTORS["session.create"]).toEqual({
+			capability: "sessions.manage",
+			scope: "host",
+			revision: "none",
+			confirmation: "none",
+		});
+		expect(COMMAND_DESCRIPTORS["session.attach"]).toEqual({
+			capability: "sessions.read",
+			scope: "session",
+			revision: "none",
+			confirmation: "none",
+		});
 		expect(Object.values(COMMAND_DESCRIPTORS).every(descriptor => typeof descriptor.capability === "string")).toBe(
 			true,
 		);
