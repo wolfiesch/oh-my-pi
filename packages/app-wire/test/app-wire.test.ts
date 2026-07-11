@@ -8,6 +8,8 @@ import {
 	COMMAND_ARGUMENT_DECODERS,
 	COMMAND_RESULT_DECODERS,
 	decodeClientFrame,
+	decodeCommandArguments,
+	decodeCommandResult,
 	decodeDurableEntryFrame,
 	decodeEntry,
 	decodeServerFrame,
@@ -265,6 +267,22 @@ describe("app-wire authority", () => {
 			if (descriptor?.revision === "required") frame.expectedRevision = "rev";
 			expect(() => decodeClientFrame(frame)).not.toThrow();
 		}
+	});
+	test("terminal direction and command payload/result contracts are explicit", () => {
+		const base = { v: "omp-app/1", hostId: "h", sessionId: "s", terminalId: "t" };
+		expect(decodeClientFrame({ ...base, type: "terminal.input", data: "x" }).type).toBe("terminal.input");
+		expect(decodeClientFrame({ ...base, type: "terminal.resize", cols: 80, rows: 24 }).type).toBe("terminal.resize");
+		expect(() => decodeServerFrame({ ...base, type: "terminal.input", data: "x" })).toThrow(AppWireError);
+		expect(decodeServerFrame({ ...base, type: "terminal.output", cursor: { epoch: "e", seq: 1 }, stream: "stdout", data: "x" }).type).toBe("terminal.output");
+		expect(() => decodeClientFrame({ ...base, type: "terminal.output", cursor: { epoch: "e", seq: 1 }, stream: "stdout", data: "x" })).toThrow(AppWireError);
+		expect(() => decodeCommandArguments("session.prompt", { prompt: "wrong" })).toThrow(AppWireError);
+		expect(decodeCommandArguments("session.prompt", { message: "hello" }).message).toBe("hello");
+		expect(() => decodeCommandArguments("preview.launch", { url: "javascript:alert(1)" })).toThrow(AppWireError);
+		expect(() => decodeCommandArguments("settings.write", { apiKey: "secret" })).toThrow(AppWireError);
+		expect(decodeCommandResult("session.list", { cursor: { epoch: "e", seq: 1 }, sessions: [] }).sessions).toEqual([]);
+		expect(() => decodeCommandResult("session.list", { sessions: [] })).toThrow(AppWireError);
+		expect(decodeCommandResult("session.attach", { attached: true, cursor: { epoch: "e", seq: 1 } }).attached).toBe(true);
+		expect(() => decodeCommandResult("session.create", { session: {} })).toThrow(AppWireError);
 	});
 	test("session identity remains host scoped", () => {
 		expect(sameSession({ hostId: "h", sessionId: "s" }, { hostId: "other", sessionId: "s" })).toBe(false);

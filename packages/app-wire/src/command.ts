@@ -2,103 +2,39 @@ import { fail } from "./errors.ts";
 import { commandId, confirmationId, hostId, requestId, revision, sessionId, type CommandId, type ConfirmationId, type HostId, type RequestId, type Revision, type SessionId } from "./ids.ts";
 import { boundedArray, boundedMap, boundedText, controlFree, inputObject, safeRelativePath, safeSeq } from "./guards.ts";
 import { MAX_FILE_BYTES, PROTOCOL_VERSION } from "./limits.ts";
+import { decodeCursor, type Cursor } from "./cursor.ts";
+import { decodeSessionRef, type SessionRef } from "./session-index.ts";
 import type { DeviceCapability } from "./capabilities.ts";
-export interface CommandDescriptor { capability: DeviceCapability; scope: "host" | "session"; revision: "none" | "optional" | "required"; confirmation: "none" | "challenge"; }
-export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = {
-  "host.list": { capability: "sessions.read", scope: "host", revision: "none", confirmation: "none" },
-  "session.list": { capability: "sessions.read", scope: "host", revision: "none", confirmation: "none" },
-  "session.create": { capability: "sessions.manage", scope: "host", revision: "none", confirmation: "none" },
-  "session.attach": { capability: "sessions.read", scope: "session", revision: "none", confirmation: "none" },
-  "session.prompt": { capability: "sessions.prompt", scope: "session", revision: "optional", confirmation: "none" },
-  "session.cancel": { capability: "sessions.control", scope: "session", revision: "optional", confirmation: "challenge" },
-  "session.close": { capability: "sessions.manage", scope: "session", revision: "required", confirmation: "challenge" },
-  "files.read": { capability: "files.read", scope: "session", revision: "optional", confirmation: "none" },
-  "files.write": { capability: "files.write", scope: "session", revision: "required", confirmation: "challenge" },
-  "files.patch": { capability: "files.write", scope: "session", revision: "required", confirmation: "challenge" },
-  "files.list": { capability: "files.list", scope: "session", revision: "optional", confirmation: "none" },
-  "files.diff": { capability: "files.diff", scope: "session", revision: "optional", confirmation: "none" },
-  "review.read": { capability: "files.read", scope: "session", revision: "optional", confirmation: "none" },
-  "review.apply": { capability: "files.write", scope: "session", revision: "required", confirmation: "challenge" },
-  "agent.cancel": { capability: "agents.control", scope: "session", revision: "optional", confirmation: "challenge" },
-  "bash.run": { capability: "bash.run", scope: "session", revision: "optional", confirmation: "challenge" },
-  "term.open": { capability: "term.open", scope: "session", revision: "optional", confirmation: "challenge" },
-  "audit.read": { capability: "audit.read", scope: "host", revision: "none", confirmation: "none" },
-  "audit.tail": { capability: "audit.read", scope: "host", revision: "none", confirmation: "none" },
-  "config.write": { capability: "config.write", scope: "host", revision: "required", confirmation: "challenge" },
-  "settings.read": { capability: "config.read", scope: "host", revision: "none", confirmation: "none" },
-  "settings.write": { capability: "config.write", scope: "host", revision: "required", confirmation: "challenge" },
-  "catalog.get": { capability: "catalog.read", scope: "host", revision: "none", confirmation: "none" },
-  "host.watch": { capability: "sessions.read", scope: "host", revision: "none", confirmation: "none" },
-  "session.watch": { capability: "sessions.read", scope: "session", revision: "none", confirmation: "none" },
-  "controller.lease.acquire": { capability: "sessions.control", scope: "session", revision: "required", confirmation: "none" },
-  "controller.lease.renew": { capability: "sessions.control", scope: "session", revision: "required", confirmation: "none" },
-  "controller.lease.release": { capability: "sessions.control", scope: "session", revision: "required", confirmation: "none" },
-  "prompt.lease.acquire": { capability: "sessions.prompt", scope: "session", revision: "required", confirmation: "none" },
-  "prompt.lease.renew": { capability: "sessions.prompt", scope: "session", revision: "required", confirmation: "none" },
-  "prompt.lease.release": { capability: "sessions.prompt", scope: "session", revision: "required", confirmation: "none" },
-  "preview.launch": { capability: "preview.control", scope: "session", revision: "optional", confirmation: "challenge" },
-  "preview.state": { capability: "preview.read", scope: "session", revision: "optional", confirmation: "none" },
-  "preview.navigate": { capability: "preview.control", scope: "session", revision: "optional", confirmation: "none" },
-  "preview.capture": { capability: "preview.read", scope: "session", revision: "optional", confirmation: "none" },
+export interface CommandDescriptor { capability: DeviceCapability; scope: "host"|"session"; revision: "none"|"optional"|"required"; confirmation: "none"|"challenge"; }
+export const COMMAND_DESCRIPTORS: Readonly<Record<string,CommandDescriptor>> = {
+  "host.list":{capability:"sessions.read",scope:"host",revision:"none",confirmation:"none"},"session.list":{capability:"sessions.read",scope:"host",revision:"none",confirmation:"none"},"session.create":{capability:"sessions.manage",scope:"host",revision:"none",confirmation:"none"},"session.attach":{capability:"sessions.read",scope:"session",revision:"none",confirmation:"none"},"session.prompt":{capability:"sessions.prompt",scope:"session",revision:"optional",confirmation:"none"},"session.cancel":{capability:"sessions.control",scope:"session",revision:"optional",confirmation:"challenge"},"session.close":{capability:"sessions.manage",scope:"session",revision:"required",confirmation:"challenge"},
+  "files.read":{capability:"files.read",scope:"session",revision:"optional",confirmation:"none"},"files.write":{capability:"files.write",scope:"session",revision:"required",confirmation:"challenge"},"files.patch":{capability:"files.write",scope:"session",revision:"required",confirmation:"challenge"},"files.list":{capability:"files.list",scope:"session",revision:"optional",confirmation:"none"},"files.diff":{capability:"files.diff",scope:"session",revision:"optional",confirmation:"none"},"review.read":{capability:"files.read",scope:"session",revision:"optional",confirmation:"none"},"review.apply":{capability:"files.write",scope:"session",revision:"required",confirmation:"challenge"},"agent.cancel":{capability:"agents.control",scope:"session",revision:"optional",confirmation:"challenge"},"bash.run":{capability:"bash.run",scope:"session",revision:"optional",confirmation:"challenge"},"term.open":{capability:"term.open",scope:"session",revision:"optional",confirmation:"challenge"},
+  "audit.read":{capability:"audit.read",scope:"host",revision:"none",confirmation:"none"},"audit.tail":{capability:"audit.read",scope:"host",revision:"none",confirmation:"none"},"config.write":{capability:"config.write",scope:"host",revision:"required",confirmation:"challenge"},"settings.read":{capability:"config.read",scope:"host",revision:"none",confirmation:"none"},"settings.write":{capability:"config.write",scope:"host",revision:"required",confirmation:"challenge"},"catalog.get":{capability:"catalog.read",scope:"host",revision:"none",confirmation:"none"},"host.watch":{capability:"sessions.read",scope:"host",revision:"none",confirmation:"none"},"session.watch":{capability:"sessions.read",scope:"session",revision:"none",confirmation:"none"},
+  "controller.lease.acquire":{capability:"sessions.control",scope:"session",revision:"required",confirmation:"none"},"controller.lease.renew":{capability:"sessions.control",scope:"session",revision:"required",confirmation:"none"},"controller.lease.release":{capability:"sessions.control",scope:"session",revision:"required",confirmation:"none"},"prompt.lease.acquire":{capability:"sessions.prompt",scope:"session",revision:"required",confirmation:"none"},"prompt.lease.renew":{capability:"sessions.prompt",scope:"session",revision:"required",confirmation:"none"},"prompt.lease.release":{capability:"sessions.prompt",scope:"session",revision:"required",confirmation:"none"},"preview.launch":{capability:"preview.control",scope:"session",revision:"optional",confirmation:"challenge"},"preview.state":{capability:"preview.read",scope:"session",revision:"optional",confirmation:"none"},"preview.navigate":{capability:"preview.control",scope:"session",revision:"optional",confirmation:"none"},"preview.capture":{capability:"preview.read",scope:"session",revision:"optional",confirmation:"none"},
 };
-export const COMMAND_CAPABILITIES: Readonly<Record<string, DeviceCapability>> = Object.fromEntries(Object.entries(COMMAND_DESCRIPTORS).map(([name, descriptor]) => [name, descriptor.capability]));
-export interface CommandFrame { v: typeof PROTOCOL_VERSION; type: "command"; requestId: RequestId; commandId: CommandId; hostId: HostId; sessionId?: SessionId; command: string; expectedRevision?: Revision; confirmationId?: ConfirmationId; args: Record<string, unknown>; }
-const FILE_COMMANDS: Record<string, true> = { "files.read": true, "files.write": true, "files.patch": true, "files.list": true, "files.diff": true, "review.read": true, "review.apply": true };
-export function decodeCommand(input: unknown): CommandFrame {
-  const frame = inputObject(input);
-  if (frame.v !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v");
-  if (frame.type !== "command") fail("INVALID_FRAME", "expected command frame", "type");
-  requestId(frame.requestId); commandId(frame.commandId); const host = hostId(frame.hostId);
-  const command = controlFree(frame.command, "command", 128); const descriptor = COMMAND_DESCRIPTORS[command];
-  if (descriptor === undefined) fail("INVALID_FRAME", "unknown command", "command");
-  const session = frame.sessionId === undefined ? undefined : sessionId(frame.sessionId);
-  if (descriptor.scope === "session" && session === undefined) fail("INVALID_FRAME", "sessionId is required for session command", "sessionId");
-  if (descriptor.scope === "host" && session !== undefined) fail("INVALID_FRAME", "sessionId is forbidden for host command", "sessionId");
-  if (descriptor.revision === "none" && frame.expectedRevision !== undefined) fail("STALE_REVISION", "expectedRevision is forbidden for this command", "expectedRevision");
-  if (descriptor.revision === "required" && frame.expectedRevision === undefined) fail("STALE_REVISION", "expectedRevision is required", "expectedRevision");
-  if (frame.expectedRevision !== undefined) revision(frame.expectedRevision);
-  // A missing confirmationId is the intentional first attempt; the server must issue a challenge. Present tokens are bounded and validated below.
-  if (descriptor.confirmation === "none" && frame.confirmationId !== undefined) fail("CONFIRMATION_INVALID", "confirmationId is not valid for this command", "confirmationId");
-  if (frame.confirmationId !== undefined) confirmationId(frame.confirmationId);
-  const args = frame.args === undefined ? {} : boundedMap(frame.args, "args");
-  if (FILE_COMMANDS[command] === true) for (const key of ["path", "filePath", "targetPath", "cwd"]) if (args[key] !== undefined) safeRelativePath(args[key], `args.${key}`);
-  return { ...frame, hostId: host, sessionId: session, command, args } as unknown as CommandFrame;
-}
-export function requiredCapability(command: string): DeviceCapability | undefined { return COMMAND_DESCRIPTORS[command]?.capability; }
-
-export type CommandArguments = Record<string, unknown>;
-export type CommandResult = Record<string, unknown>;
-function requireArgs(value: unknown, path = "args"): Record<string, unknown> { return boundedMap(value, path); }
-function requiredPath(args: Record<string, unknown>): string { return safeRelativePath(args.path); }
-function emptyArgs(value: unknown): CommandArguments { return requireArgs(value); }
-function emptyResult(value: unknown): CommandResult { return requireArgs(value, "result"); }
-function listResult(value: unknown): CommandResult { const result = requireArgs(value, "result"); boundedArray(result.items ?? result.entries, "result.items"); return result; }
-export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown) => CommandArguments>> = {
-  "host.list": emptyArgs, "session.list": emptyArgs, "session.create": emptyArgs, "session.attach": emptyArgs,
-  "session.prompt": value => { const args=requireArgs(value); boundedText(args.prompt,"args.prompt",MAX_FILE_BYTES); return args; },
-  "session.cancel": emptyArgs, "session.close": emptyArgs, "files.read": value => { const args=requireArgs(value); requiredPath(args); return args; },
-  "files.write": value => { const args=requireArgs(value); requiredPath(args); boundedText(args.content,"args.content",MAX_FILE_BYTES); return args; },
-  "files.patch": value => { const args=requireArgs(value); requiredPath(args); boundedText(args.patch,"args.patch",MAX_FILE_BYTES); return args; },
-  "files.list": value => { const args=requireArgs(value); if(args.path!==undefined) safeRelativePath(args.path); return args; },
-  "files.diff": value => { const args=requireArgs(value); requiredPath(args); return args; },
-  "review.read": emptyArgs, "review.apply": emptyArgs, "agent.cancel": emptyArgs, "bash.run": value => { const args=requireArgs(value); boundedText(args.command,"args.command",MAX_FILE_BYTES); return args; },
-  "term.open": emptyArgs, "audit.read": emptyArgs, "audit.tail": emptyArgs, "config.write": value => requireArgs(value),
-  "settings.read": emptyArgs, "settings.write": value => requireArgs(value), "catalog.get": emptyArgs,
-  "host.watch": emptyArgs, "session.watch": emptyArgs,
-  "controller.lease.acquire": emptyArgs, "controller.lease.renew": emptyArgs, "controller.lease.release": emptyArgs,
-  "prompt.lease.acquire": emptyArgs, "prompt.lease.renew": emptyArgs, "prompt.lease.release": emptyArgs,
-  "preview.launch": emptyArgs, "preview.state": emptyArgs, "preview.navigate": value => { const args=requireArgs(value); controlFree(args.url,"args.url",4096); return args; }, "preview.capture": emptyArgs,
+export const COMMAND_CAPABILITIES: Readonly<Record<string,DeviceCapability>>=Object.fromEntries(Object.entries(COMMAND_DESCRIPTORS).map(([name,descriptor])=>[name,descriptor.capability]));
+export interface CommandFrame { v:typeof PROTOCOL_VERSION; type:"command"; requestId:RequestId; commandId:CommandId; hostId:HostId; sessionId?:SessionId; command:string; expectedRevision?:Revision; confirmationId?:ConfirmationId; args:Record<string,unknown>; }
+export function decodeCommand(input:unknown):CommandFrame { const frame=inputObject(input); if(frame.v!==PROTOCOL_VERSION) fail("MISSING_VERSION",`expected ${PROTOCOL_VERSION}`,"v"); if(frame.type!=="command") fail("INVALID_FRAME","expected command frame","type"); requestId(frame.requestId); commandId(frame.commandId); const host=hostId(frame.hostId); const command=controlFree(frame.command,"command",128); const descriptor=COMMAND_DESCRIPTORS[command]; if(descriptor===undefined) fail("INVALID_FRAME","unknown command","command"); const session=frame.sessionId===undefined?undefined:sessionId(frame.sessionId); if(descriptor.scope==="session"&&session===undefined) fail("INVALID_FRAME","sessionId is required for session command","sessionId"); if(descriptor.scope==="host"&&session!==undefined) fail("INVALID_FRAME","sessionId is forbidden for host command","sessionId"); if(descriptor.revision==="none"&&frame.expectedRevision!==undefined) fail("STALE_REVISION","expectedRevision is forbidden","expectedRevision"); if(descriptor.revision==="required"&&frame.expectedRevision===undefined) fail("STALE_REVISION","expectedRevision is required","expectedRevision"); if(frame.expectedRevision!==undefined) revision(frame.expectedRevision); /* Missing confirmationId is intentional first attempt; server must challenge. */ if(descriptor.confirmation==="none"&&frame.confirmationId!==undefined) fail("CONFIRMATION_INVALID","confirmationId is not valid","confirmationId"); if(frame.confirmationId!==undefined) confirmationId(frame.confirmationId); const args=frame.args===undefined?{}:boundedMap(frame.args,"args"); for(const key of ["path","filePath","targetPath"]) if(args[key]!==undefined) safeRelativePath(args[key],`args.${key}`); return {...frame,hostId:host,sessionId:session,command,args} as unknown as CommandFrame; }
+export function requiredCapability(command:string):DeviceCapability|undefined { return COMMAND_DESCRIPTORS[command]?.capability; }
+export type CommandArguments=Record<string,unknown>; export type CommandResult=Record<string,unknown>;
+function args(value:unknown,path="args"):Record<string,unknown>{return boundedMap(value,path);} function result(value:unknown):Record<string,unknown>{return boundedMap(value,"result");}
+function absPath(value:unknown,path:string):string { const text=controlFree(value,path,4096); if(!text.startsWith("/")) fail("UNSAFE_PATH","cwd must be absolute",path); return text; }
+function url(value:unknown,path:string):string { const text=controlFree(value,path,4096); let parsed:URL; try{parsed=new URL(text);}catch{fail("INVALID_FRAME","invalid URL",path);} if((parsed.protocol!=="http:"&&parsed.protocol!=="https:")||parsed.username!==""||parsed.password!=="") fail("INVALID_FRAME","URL must be http(s) without credentials",path); return text; }
+const SECRET=/password|passwd|secret|token|credential|api[_-]?key|private[_-]?key/iu;
+function metadata(value:unknown,path:string):Record<string,unknown>{const root=inputObject(value); const walk=(node:unknown,current:string):void=>{if(node===null||typeof node!=="object")return; const map=boundedMap(node,current); for(const [key,val] of Object.entries(map)){if(SECRET.test(key))fail("INVALID_FRAME","secret-like key is forbidden",`${current}.${key}`);walk(val,`${current}.${key}`);}};walk(root,path);return boundedMap(root,path);}
+function decodeSessions(value:unknown):CommandResult{const x=result(value), cursor=decodeCursor(x.cursor,"result.cursor"), values=boundedArray(x.sessions,"result.sessions"); const sessions=values.map((v,i)=>decodeSessionRef(v,`result.sessions[${i}]`)); return {...x,cursor,sessions};}
+function decodeCreate(value:unknown):CommandResult{const x=result(value);return {...x,session:decodeSessionRef(x.session,"result.session")};}
+function decodeAttach(value:unknown):CommandResult{const x=result(value);if(typeof x.attached!=="boolean")fail("INVALID_FRAME","attached must be boolean","result.attached");return {...x,attached:x.attached,cursor:decodeCursor(x.cursor,"result.cursor")};}
+function boolResult(value:unknown):CommandResult{const x=result(value);if(typeof x.ok!=="boolean")fail("INVALID_FRAME","ok must be boolean","result.ok");return {...x,ok:x.ok};}
+function decodeEntries(value:unknown):CommandResult{const x=result(value), values=boundedArray(x.entries,"result.entries"); for(const [i,v] of values.entries()) {const item=boundedMap(v,`result.entries[${i}]`);safeRelativePath(item.path,`result.entries[${i}].path`);controlFree(item.kind,`result.entries[${i}].kind`,32);} return {...x,entries:values};}
+function decodeAuditResult(value:unknown):CommandResult{const x=result(value), events=boundedArray(x.events,"result.events"); for(const [i,v] of events.entries()){const event=boundedMap(v,`result.events[${i}]`);controlFree(event.action,`result.events[${i}].action`,128);controlFree(event.actor,`result.events[${i}].actor`,256);} return {...x,events};}
+function decodeCatalogResult(value:unknown):CommandResult{const x=result(value);return {...x,items:boundedArray(x.items,"result.items").map((v,i)=>metadata(v,`result.items[${i}]`))};}
+export const COMMAND_ARGUMENT_DECODERS:Readonly<Record<string,(value:unknown)=>CommandArguments>>={
+  "host.list":args,"session.list":args,"session.create":value=>{const x=args(value);if(x.cwd!==undefined)absPath(x.cwd,"args.cwd");if(x.title!==undefined)boundedText(x.title,"args.title",512);return x;},"session.attach":value=>{const x=args(value);if(x.cursor!==undefined)decodeCursor(x.cursor,"args.cursor");return x;},"session.prompt":value=>{const x=args(value);boundedText(x.message,"args.message",MAX_FILE_BYTES);return x;},"session.cancel":args,"session.close":args,
+  "files.read":value=>{const x=args(value);safeRelativePath(x.path);return x;},"files.write":value=>{const x=args(value);safeRelativePath(x.path);boundedText(x.content,"args.content",MAX_FILE_BYTES);return x;},"files.patch":value=>{const x=args(value);safeRelativePath(x.path);boundedText(x.patch,"args.patch",MAX_FILE_BYTES);return x;},"files.list":args,"files.diff":value=>{const x=args(value);safeRelativePath(x.path);return x;},"review.read":args,"review.apply":args,"agent.cancel":value=>{const x=args(value);controlFree(x.agentId,"args.agentId",256);return x;},"bash.run":value=>{const x=args(value);boundedText(x.command,"args.command",MAX_FILE_BYTES);return x;},
+  "term.open":value=>{const x=args(value);if(x.cwd!==undefined)absPath(x.cwd,"args.cwd");if(x.shell!==undefined)controlFree(x.shell,"args.shell",256);if(x.env!==undefined){const env=boundedMap(x.env,"args.env");for(const [key,val] of Object.entries(env)){controlFree(key,`args.env.${key}`,128);boundedText(val,`args.env.${key}`,4096);}}if(x.cols!==undefined){const cols=safeSeq(x.cols,"args.cols");if(cols===0||cols>1000)fail("BOUNDS","invalid cols","args.cols");}if(x.rows!==undefined){const rows=safeSeq(x.rows,"args.rows");if(rows===0||rows>500)fail("BOUNDS","invalid rows","args.rows");}return x;},"audit.read":args,"audit.tail":args,"config.write":value=>metadata(value,"args"),"settings.read":args,"settings.write":value=>metadata(value,"args"),"catalog.get":args,"host.watch":args,"session.watch":args,"controller.lease.acquire":args,"controller.lease.renew":args,"controller.lease.release":args,"prompt.lease.acquire":args,"prompt.lease.renew":args,"prompt.lease.release":args,"preview.launch":value=>{const x=args(value);url(x.url,"args.url");return x;},"preview.state":args,"preview.navigate":value=>{const x=args(value);url(x.url,"args.url");return x;},"preview.capture":args,
 };
-export const COMMAND_RESULT_DECODERS: Readonly<Record<string, (value: unknown) => CommandResult>> = {
-  "host.list": listResult, "session.list": listResult, "session.create": emptyResult, "session.attach": emptyResult,
-  "session.prompt": emptyResult, "session.cancel": emptyResult, "session.close": emptyResult, "files.read": value => { const result=requireArgs(value,"result"); boundedText(result.content,"result.content",MAX_FILE_BYTES); return result; },
-  "files.write": emptyResult, "files.patch": emptyResult, "files.list": listResult, "files.diff": value => { const result=requireArgs(value,"result"); boundedText(result.diff,"result.diff",MAX_FILE_BYTES); return result; },
-  "review.read": emptyResult, "review.apply": emptyResult, "agent.cancel": emptyResult, "bash.run": emptyResult, "term.open": emptyResult,
-  "audit.read": emptyResult, "audit.tail": value => { const result=requireArgs(value,"result"); boundedArray(result.events,"result.events").forEach((entry,i)=>boundedMap(entry,`result.events[${i}]`)); return result; },
-  "config.write": emptyResult, "settings.read": emptyResult, "settings.write": emptyResult, "catalog.get": value => { const result=requireArgs(value,"result"); boundedArray(result.items,"result.items").forEach((item,i)=>boundedMap(item,`result.items[${i}]`)); return result; },
-  "host.watch": emptyResult, "session.watch": emptyResult, "controller.lease.acquire": emptyResult, "controller.lease.renew": emptyResult, "controller.lease.release": emptyResult,
-  "prompt.lease.acquire": emptyResult, "prompt.lease.renew": emptyResult, "prompt.lease.release": emptyResult,
-  "preview.launch": emptyResult, "preview.state": emptyResult, "preview.navigate": emptyResult, "preview.capture": value => { const result=requireArgs(value,"result"); boundedText(result.content,"result.content",MAX_FILE_BYTES); return result; },
+export const COMMAND_RESULT_DECODERS:Readonly<Record<string,(value:unknown)=>CommandResult>>={
+  "host.list":decodeSessions,"session.list":decodeSessions,"session.create":decodeCreate,"session.attach":decodeAttach,"session.prompt":result,"session.cancel":boolResult,"session.close":boolResult,"files.read":value=>{const x=result(value);boundedText(x.content,"result.content",MAX_FILE_BYTES);return x;},"files.write":result,"files.patch":result,"files.list":decodeEntries,"files.diff":value=>{const x=result(value);boundedText(x.diff,"result.diff",MAX_FILE_BYTES);return x;},"review.read":result,"review.apply":result,"agent.cancel":boolResult,"bash.run":result,"term.open":result,"audit.read":decodeAuditResult,"audit.tail":decodeAuditResult,"config.write":value=>metadata(value,"result"),"settings.read":value=>metadata(value,"result"),"settings.write":value=>metadata(value,"result"),"catalog.get":decodeCatalogResult,"host.watch":result,"session.watch":result,"controller.lease.acquire":result,"controller.lease.renew":result,"controller.lease.release":result,"prompt.lease.acquire":result,"prompt.lease.renew":result,"prompt.lease.release":result,"preview.launch":result,"preview.state":result,"preview.navigate":result,"preview.capture":value=>{const x=result(value);boundedText(x.content,"result.content",MAX_FILE_BYTES);return x;},
 };
-export function decodeCommandArguments(command: string, value: unknown): CommandArguments { const decoder=COMMAND_ARGUMENT_DECODERS[command]; if(decoder===undefined) fail("INVALID_FRAME","command has no typed argument decoder","command"); return decoder(value); }
-export function decodeCommandResult(command: string, value: unknown): CommandResult { const decoder=COMMAND_RESULT_DECODERS[command]; if(decoder===undefined) fail("INVALID_FRAME","command has no typed result decoder","command"); return decoder(value); }
+export function decodeCommandArguments(command:string,value:unknown):CommandArguments{const decoder=COMMAND_ARGUMENT_DECODERS[command];if(decoder===undefined)fail("INVALID_FRAME","command has no typed argument decoder","command");return decoder(value);} export function decodeCommandResult(command:string,value:unknown):CommandResult{const decoder=COMMAND_RESULT_DECODERS[command];if(decoder===undefined)fail("INVALID_FRAME","command has no typed result decoder","command");return decoder(value);}
