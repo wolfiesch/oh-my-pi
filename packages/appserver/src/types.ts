@@ -37,6 +37,7 @@ export type LockCheckHook = (session: SessionRecord) => Promise<void> | void;
 export interface RpcChildFactory { spawn(spec: { session: SessionRecord; argv: string[]; cwd: string }): ChildHandle; argv(sessionPath: string): string[]; }
 export interface AppserverOptions {
   hostId?: HostId; epoch?: string; clock?: Clock; discovery?: SessionDiscovery; sessionAuthority?: SessionAuthority;
+  projectRootForProject?: (projectId: ProjectId) => Promise<string> | string;
   childFactory?: RpcChildFactory; lockCheck?: LockCheckHook; socketPath?: string;
   ompVersion?: string; ompBuild?: string; appserverVersion?: string; appserverBuild?: string;
   supportedFeatures?: readonly string[];

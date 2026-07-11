@@ -20,3 +20,4 @@ Every command descriptor declares both its revision policy and its owner:
 - `none`: host/session listing and attachment, audit, settings reads, catalog, and watch commands. These commands reject `expectedRevision`.
 
 `revision: "none"` always has `revisionOwner: "none"`; optional and required revisions always name either `session` or `authority`.
+`session.create` accepts an opaque `projectId` and optional title. The server resolves that ID to a local project root; clients cannot send a filesystem path. `term.open.args.cwd`, when present, is a safe relative path beneath the selected project root.

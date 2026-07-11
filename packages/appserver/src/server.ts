@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
 import { chmod, lstat, open, readlink, rename, stat as fsStat, symlink, unlink } from "node:fs/promises";
 import { join } from "node:path";
-import { COMMAND_DESCRIPTORS, requiredCapability, type ConfirmFrame, type ConfirmationChallenge } from "@oh-my-pi/app-wire";
+import { COMMAND_DESCRIPTORS, projectId, requiredCapability, type ConfirmFrame, type ConfirmationChallenge } from "@oh-my-pi/app-wire";
 import { decodeClientFrame, decodeConfirm, decodeCursor, parseBounded, utf8ByteLength, type CommandFrame, type DurableEntry, type HelloFrame, type HostId, type ResultFrame, type ServerFrame, type SessionId } from "@oh-my-pi/app-wire";
 import type { AppserverHandle, AppserverOptions, ChildHandle, CommandOutcome, Clock, LockCheckHook, RpcChildFactory, SessionAuthority, SessionDiscovery, SessionRecord } from "./types.ts";
 import { createEpoch, createHostId, defaultSocketPath, loadPersistentHostId, unixSocketActive } from "./identity.ts";
@@ -34,8 +34,8 @@ function argumentError(command: CommandFrame): string | undefined {
     return "attach accepts only an optional cursor";
   }
   if (command.command === "session.create") {
-    if (keys.some(key => key !== "cwd" && key !== "title")) return "create accepts only cwd and title";
-    if (args.cwd !== undefined && (typeof args.cwd !== "string" || args.cwd.length === 0 || utf8ByteLength(args.cwd) > 4_096)) return "create cwd must be a bounded non-empty UTF-8 string";
+    if (keys.some(key => key !== "projectId" && key !== "title")) return "create accepts only projectId and title";
+    if (typeof args.projectId !== "string" || args.projectId.length === 0 || utf8ByteLength(args.projectId) > 256) return "create projectId must be a bounded non-empty UTF-8 string";
     if (args.title !== undefined && (typeof args.title !== "string" || args.title.length === 0 || utf8ByteLength(args.title) > 512)) return "create title must be a bounded non-empty UTF-8 string";
     return undefined;
   }
@@ -90,9 +90,10 @@ async function publishOwnerAtomic(paths: OwnerPaths, record: OwnerRecord, claime
 export class LocalAppserver implements AppserverHandle {
   hostId: HostId; readonly epoch: string; readonly socketPath: string;
   #clock: Clock; #discovery: SessionDiscovery; #authority?: SessionAuthority; #factory: RpcChildFactory; #lockCheck: LockCheckHook; #ringSize: number; #handlers = new AppserverCommandHandlers(); #challenges = new Map<string, { command: CommandFrame; ws: AppWs; expiresAt: number; hash: string }>(); #records = new Map<SessionId, SessionRecord>(); #projections = new Map<SessionId, SessionProjection>(); #supervisors = new Map<SessionId, RpcChildSupervisor>(); #startPromises = new Map<SessionId, Promise<RpcChildSupervisor>>(); #closedSessions = new Set<SessionId>(); #idempotency = new IdempotencyStore(); #server?: Bun.Server<ServerWebSocketData>; #clients = new Set<AppWs>(); #hello = new Set<AppWs>(); #clientCapabilities = new Map<AppWs, Set<string>>(); #attached = new Map<AppWs, Set<SessionId>>(); #started = false; #stopping = false; #hostProvided: boolean; #ownerLock = false; #ownerId?: string; #ownerPaths?: OwnerPaths; #ownerHandle?: FileHandle; #runIdentity?: RunIdentity; #partialBacking?: { path: string; identity: { device: number; inode: number } }; #partialMarker?: { device: number; inode: number }; #ompVersion; #ompBuild; #appserverVersion; #appserverBuild; #supportedFeatures; #supportedCapabilities;
+  #projectRootForProject?: AppserverOptions["projectRootForProject"];
   constructor(options: AppserverOptions = {}) {
     this.#hostProvided = Boolean(options.hostId); this.hostId = options.hostId ?? createHostId(); this.epoch = createEpoch(options.epoch); this.socketPath = options.socketPath ?? defaultSocketPath();
-    this.#clock = options.clock ?? clock; this.#authority = options.sessionAuthority; this.#discovery = options.discovery ?? options.sessionAuthority ?? { list: async () => [] }; this.#factory = options.childFactory ?? new BunRpcChildFactory(); this.#lockCheck = options.lockCheck ?? (() => undefined); this.#ringSize = options.ringSize ?? 256;
+    this.#clock = options.clock ?? clock; this.#authority = options.sessionAuthority; this.#projectRootForProject = options.projectRootForProject; this.#discovery = options.discovery ?? options.sessionAuthority ?? { list: async () => [] }; this.#factory = options.childFactory ?? new BunRpcChildFactory(); this.#lockCheck = options.lockCheck ?? (() => undefined); this.#ringSize = options.ringSize ?? 256;
     this.#ompVersion = options.ompVersion ?? "local"; this.#ompBuild = options.ompBuild ?? "local"; this.#appserverVersion = options.appserverVersion ?? "0.1.0"; this.#appserverBuild = options.appserverBuild ?? "local"; this.#supportedFeatures = new Set(options.supportedFeatures ?? ["resume"]);
     const implemented = new Set(["sessions.read", "sessions.manage", "sessions.prompt", "sessions.control"]); const requested = options.supportedCapabilities ?? [...implemented]; if (requested.some(capability => !implemented.has(capability))) throw new Error("unsupported capability has no Wave1 handler"); this.#supportedCapabilities = new Set(requested);
     this.#handlers.register("session.create", command => this.handleCreate(command));
@@ -308,7 +309,11 @@ export class LocalAppserver implements AppserverHandle {
   }
   private async createSession(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (!this.#authority) throw new Error("session creation is unavailable");
-    const requestedCwd = typeof args.cwd === "string" ? args.cwd : process.cwd();
+    if (!this.#projectRootForProject) throw new Error("session project resolver is unavailable");
+    const requestedProjectId = args.projectId;
+    if (typeof requestedProjectId !== "string") throw new Error("session projectId is invalid");
+    const requestedCwd = await this.#projectRootForProject(projectId(requestedProjectId));
+    if (typeof requestedCwd !== "string" || !requestedCwd.startsWith("/")) throw new Error("project resolver returned an invalid local root");
     const title = typeof args.title === "string" ? args.title : undefined;
     const created = await this.#authority.create(requestedCwd, title);
     const timestamp = this.#clock.now().toISOString();

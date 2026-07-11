@@ -213,7 +213,11 @@ describe("app-wire authority", () => {
 		).toThrow(AppWireError);
 		expect(() => decodeClientFrame({ v: "omp-app/1", type: "command", requestId: "r", commandId: "c", hostId: "h", sessionId: "s", command: "files.write", args: { path: "a", content: "x" } })).toThrow(AppWireError);
 		const base = { v: "omp-app/1", type: "command", requestId: "r", commandId: "c", hostId: "h", args: {} } as const;
-		expect(() => decodeClientFrame({ ...base, command: "session.create" })).not.toThrow();
+		expect(() => decodeClientFrame({ ...base, command: "session.create", args: { projectId: "project-1" } })).not.toThrow();
+		expect(() => decodeClientFrame({ ...base, command: "session.create", args: { cwd: "/tmp/project" } })).toThrow(AppWireError);
+		expect(() => decodeCommandArguments("term.open", { cwd: "/tmp/project" })).toThrow(AppWireError);
+		expect(() => decodeCommandArguments("term.open", { cwd: "../project" })).toThrow(AppWireError);
+		expect(decodeCommandArguments("term.open", { cwd: "src/project" }).cwd).toBe("src/project");
 		expect(() => decodeClientFrame({ ...base, command: "session.attach" })).toThrow(AppWireError);
 		expect(() => decodeClientFrame({ ...base, sessionId: "s", command: "session.attach" })).not.toThrow();
 		expect(() => decodeClientFrame({ ...base, command: "session.create", expectedRevision: "rev" })).toThrow(
@@ -237,7 +241,7 @@ describe("app-wire authority", () => {
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
-		expect(APP_WIRE_VERSION).toBe("0.4.1");
+		expect(APP_WIRE_VERSION).toBe("0.4.2");
 	});
 	test("exported wire version matches package metadata", async () => {
 		const metadata = (await Bun.file(new URL("../package.json", import.meta.url)).json()) as { version: string };
