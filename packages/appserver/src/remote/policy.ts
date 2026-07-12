@@ -3,6 +3,7 @@ import {
   COMMAND_DESCRIPTORS,
   DEVICE_CAPABILITIES,
   isSecretLikeKey,
+  leaseId as wireLeaseId,
   MAX_ARRAY_ITEMS,
   MAX_MAP_KEYS,
   pairingId,
@@ -98,7 +99,10 @@ function featureIntersection(granted: readonly string[], requested: readonly str
   const allowed = new Set(granted);
   return supported.filter(value => requestedSet.has(value) && allowed.has(value));
 }
-function leaseId(args: Record<string, unknown>): string | undefined { return typeof args.leaseId === "string" ? args.leaseId : undefined; }
+function leaseId(args: Record<string, unknown>): string | undefined {
+  if (!Object.hasOwn(args, "leaseId") || args.leaseId === undefined) return undefined;
+  try { return wireLeaseId(args.leaseId, "args.leaseId"); } catch { return undefined; }
+}
 function mutation(command: string): boolean {
   return command === "session.prompt" || command === "session.close" || command === "session.cancel" || command === "files.write" || command === "files.patch" || command === "review.apply" || command === "bash.run" || command === "agent.cancel" || command === "preview.launch" || command === "preview.navigate";
 }
@@ -166,7 +170,7 @@ export class TailscaleRemotePolicy implements RemoteConnectionPolicy {
     this.#confirmations = options.confirmations;
     this.#clock = options.clock ?? { now: () => Date.now() };
     this.#supportedCapabilities = (options.supportedCapabilities ?? DEVICE_CAPABILITIES).filter((value): value is Capability => (DEVICE_CAPABILITIES as readonly string[]).includes(value));
-    this.#supportedFeatures = [...(options.supportedFeatures ?? ["resume", "controller.lease", "terminal.io", "files.list", "files.diff", "catalog.metadata", "settings.metadata"])];
+    this.#supportedFeatures = [...(options.supportedFeatures ?? ["resume", "controller.lease", "prompt.lease", "terminal.io", "files.list", "files.diff", "catalog.metadata", "settings.metadata"])];
     this.#unsubscribeInvalidation = options.registry.onInvalidation?.(deviceId => this.#invalidateDevice(deviceId));
   }
   issuePairingTicket(allowedCapabilities: readonly string[], ttlMs = 120_000, nodeId?: string): { readonly code: string; readonly expiresAt: number } {
@@ -298,13 +302,23 @@ export class TailscaleRemotePolicy implements RemoteConnectionPolicy {
     const lease = leaseId(frame.args);
     let leaseResult: Lease | undefined;
     let released = false;
-    if (frame.command === "controller.lease.acquire") {
+    if (frame.command === "controller.lease.acquire" || frame.command === "prompt.lease.acquire") {
       if (!frame.sessionId) return false;
-      try { leaseResult = this.#leases.acquire(principal.deviceId, connection.connectionId, frame.sessionId, "controller", 30_000, principal.epoch, frame.expectedRevision); } catch { return false; }
-    } else if (frame.command === "controller.lease.renew" || frame.command === "controller.lease.release") {
-      if (!lease) return false;
-      if (frame.command.endsWith("renew")) { try { leaseResult = this.#leases.renew(lease, principal.deviceId, connection.connectionId, 30_000, principal.epoch, frame.expectedRevision, frame.command); } catch { return false; } }
-      else { this.#leases.release(lease, principal.deviceId, connection.connectionId, principal.epoch, frame.expectedRevision, frame.command); released = true; }
+      const kind = frame.command.startsWith("prompt.") ? "prompt" : "controller";
+      try { leaseResult = this.#leases.acquire(principal.deviceId, connection.connectionId, frame.sessionId, kind, 30_000, principal.epoch, frame.expectedRevision); } catch { return false; }
+    } else if (
+      frame.command === "controller.lease.renew" ||
+      frame.command === "controller.lease.release" ||
+      frame.command === "prompt.lease.renew" ||
+      frame.command === "prompt.lease.release"
+    ) {
+      if (!frame.sessionId || !lease || !this.#leases.verify(lease, principal.deviceId, connection.connectionId, frame.sessionId, frame.command, principal.epoch, frame.expectedRevision)) return false;
+      if (frame.command.endsWith("renew")) {
+        try { leaseResult = this.#leases.renew(lease, principal.deviceId, connection.connectionId, 30_000, principal.epoch, frame.expectedRevision, frame.command); } catch { return false; }
+      } else {
+        this.#leases.release(lease, principal.deviceId, connection.connectionId, principal.epoch, frame.expectedRevision, frame.command);
+        released = true;
+      }
     } else if (mutation(frame.command)) {
       if (!frame.sessionId || !lease || !this.#leases.verify(lease, principal.deviceId, connection.connectionId, frame.sessionId, frame.command, principal.epoch, frame.expectedRevision)) return false;
     }
@@ -312,7 +326,7 @@ export class TailscaleRemotePolicy implements RemoteConnectionPolicy {
     if (this.#guard) {
       try { this.#guard.authorize({ principal, command: frame.command, capabilities: state.capabilities, connectionId: connection.connectionId, sessionId: frame.sessionId, revision: frame.expectedRevision, leaseId: lease, confirmationId: frame.confirmationId, args: frame.args }); }
       catch {
-        if (leaseResult) this.#leases.release(leaseResult.leaseId, principal.deviceId, connection.connectionId, principal.epoch, frame.expectedRevision, "controller.lease.release");
+        if (leaseResult) this.#leases.release(leaseResult.leaseId, principal.deviceId, connection.connectionId, principal.epoch, frame.expectedRevision, leaseResult.kind === "prompt" ? "prompt.lease.release" : "controller.lease.release");
         return false;
       }
     }
@@ -324,7 +338,8 @@ export class TailscaleRemotePolicy implements RemoteConnectionPolicy {
   handleCommand(connection: RemoteConnection, frame: CommandFrame): ServerFrame | undefined {
     const state = this.#states.get(connection.connectionId);
     const principal = state ? this.#livePrincipal(state) : undefined;
-    if (!state || !principal || state.justPaired || !state.features.includes("controller.lease") || !frame.command.startsWith("controller.lease.")) return undefined;
+    const feature = commandFeature(frame.command);
+    if (!state || !principal || state.justPaired || feature === undefined || !state.features.includes(feature) || !(frame.command.endsWith(".lease.acquire") || frame.command.endsWith(".lease.renew") || frame.command.endsWith(".lease.release"))) return undefined;
     const cached = state.idempotency.get(String(frame.commandId));
     if (!cached) return undefined;
     const now = this.#clock.now();

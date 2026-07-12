@@ -6,7 +6,7 @@ import { decodeCursor, type Cursor } from "./cursor.ts";
 import { decodeEntry, type DurableEntry } from "./entry.ts";
 import { decodeSessionRef, type SessionRef } from "./session-index.ts";
 
-export const ADDITIVE_FEATURES = ["host.watch","session.watch","session.state","session.delta","controller.lease","agent.lifecycle","agent.progress","agent.event","agent.transcript","terminal.io","files.list","files.diff","audit.tail","catalog.metadata","settings.metadata","preview.control"] as const;
+export const ADDITIVE_FEATURES = ["host.watch","session.watch","session.state","session.delta","controller.lease","prompt.lease","agent.lifecycle","agent.progress","agent.event","agent.transcript","terminal.io","files.list","files.diff","audit.tail","catalog.metadata","settings.metadata","preview.control"] as const;
 export type AdditiveFeature = (typeof ADDITIVE_FEATURES)[number];
 export type WireFeature = AdditiveFeature | "resume";
 function frame(input: unknown, expected: readonly string[]): Record<string, unknown> { const x = inputObject(input); if (x.v !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v"); if (typeof x.type !== "string" || !expected.includes(x.type)) fail("UNKNOWN_FRAME", "unknown discriminant", "type"); if (x.metadata !== undefined) boundedMetadata(x.metadata, "metadata", isSecretLikeKey); return x; }

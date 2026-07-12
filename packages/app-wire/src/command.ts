@@ -1,7 +1,7 @@
 import { fail } from "./errors.ts";
-import { commandId, confirmationId, hostId, leaseId, projectId, requestId, revision, sessionId, terminalId, type CommandId, type ConfirmationId, type HostId, type RequestId, type Revision, type SessionId } from "./ids.ts";
+import { commandId, confirmationId, hostId, leaseId, projectId, requestId, revision, sessionId, terminalId, type CommandId, type ConfirmationId, type HostId, type LeaseId, type RequestId, type Revision, type SessionId } from "./ids.ts";
 import { boundedArray, boundedMap, boundedMetadata, boundedText, controlFree, inputObject, isSecretLikeKey, safeRelativePath, safeSeq } from "./guards.ts";
-import { MAX_FILE_BYTES, PROTOCOL_VERSION } from "./limits.ts";
+import { MAX_FILE_BYTES, MAX_STRING_BYTES, PROTOCOL_VERSION } from "./limits.ts";
 import { decodeCursor, type Cursor } from "./cursor.ts";
 import { decodeSessionListResult, decodeSessionRef, type SessionListResult, type SessionRef } from "./session-index.ts";
 import type { DeviceCapability } from "./capabilities.ts";
@@ -52,6 +52,7 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 };
 export const COMMAND_CAPABILITIES: Readonly<Record<string,DeviceCapability>>=Object.fromEntries(Object.entries(COMMAND_DESCRIPTORS).map(([name,descriptor])=>[name,descriptor.capability]));
 export interface CommandFrame { v:typeof PROTOCOL_VERSION; type:"command"; requestId:RequestId; commandId:CommandId; hostId:HostId; sessionId?:SessionId; command:string; expectedRevision?:Revision; confirmationId?:ConfirmationId; args:Record<string,unknown>; }
+export interface SessionPromptArguments { readonly message: string; readonly leaseId?: LeaseId; }
 export function validateCommandDescriptor(command: string, descriptor: CommandDescriptor): void {
   const validRevision = descriptor.revision === "none" || descriptor.revision === "optional" || descriptor.revision === "required";
   const validOwner = descriptor.revisionOwner === "none" || descriptor.revisionOwner === "session" || descriptor.revisionOwner === "authority";
@@ -121,8 +122,18 @@ function decodeSettingsResult(value: unknown): CommandResult {
   }
   return { ...x, settings };
 }
+export function decodeSessionPromptArguments(value: unknown): SessionPromptArguments {
+  const x = args(value);
+  const keys = Object.keys(x);
+  if (!Object.hasOwn(x, "message") || keys.some(key => key !== "message" && key !== "leaseId"))
+    fail("INVALID_FRAME", "session.prompt accepts only message and optional leaseId", "args");
+  const message = boundedText(x.message, "args.message", MAX_STRING_BYTES);
+  if (message.length === 0) fail("BOUNDS", "prompt message must be non-empty", "args.message");
+  const lease = x.leaseId === undefined ? undefined : leaseId(x.leaseId, "args.leaseId");
+  return lease === undefined ? { message } : { message, leaseId: lease };
+}
 export const COMMAND_ARGUMENT_DECODERS:Readonly<Record<string,(value:unknown)=>CommandArguments>>={
-  "host.list":args,"session.list":args,"session.create":value=>{const x=args(value);if(x.cwd!==undefined)fail("UNSAFE_PATH","cwd is not accepted; use projectId","args.cwd");projectId(x.projectId,"args.projectId");if(x.title!==undefined)boundedText(x.title,"args.title",512);return x;},"session.attach":value=>{const x=args(value);if(x.cursor!==undefined)decodeCursor(x.cursor,"args.cursor");return x;},"session.prompt":value=>{const x=args(value);boundedText(x.message,"args.message",MAX_FILE_BYTES);return x;},"session.cancel":args,"session.close":args,
+  "host.list":args,"session.list":args,"session.create":value=>{const x=args(value);if(x.cwd!==undefined)fail("UNSAFE_PATH","cwd is not accepted; use projectId","args.cwd");projectId(x.projectId,"args.projectId");if(x.title!==undefined)boundedText(x.title,"args.title",512);return x;},"session.attach":value=>{const x=args(value);if(x.cursor!==undefined)decodeCursor(x.cursor,"args.cursor");return x;},"session.prompt":value=>decodeSessionPromptArguments(value) as unknown as CommandArguments,"session.cancel":args,"session.close":args,
   "files.read":value=>{const x=args(value);safeRelativePath(x.path);return x;},"files.write":value=>{const x=args(value);safeRelativePath(x.path);boundedText(x.content,"args.content",MAX_FILE_BYTES);return x;},"files.patch":value=>{const x=args(value);safeRelativePath(x.path);boundedText(x.patch,"args.patch",MAX_FILE_BYTES);return x;},"files.list":value=>{const x=args(value);if(x.path!==undefined)safeRelativePath(x.path,"args.path");return x;},"files.diff":value=>{const x=args(value);safeRelativePath(x.path);return x;},"review.read":value=>{const x=args(value);controlFree(x.reviewId,"args.reviewId",256);return x;},"review.apply":value=>{const x=args(value);controlFree(x.reviewId,"args.reviewId",256);return x;},"agent.cancel":value=>{const x=args(value);controlFree(x.agentId,"args.agentId",256);return x;},"bash.run":value=>{const x=args(value);boundedText(x.command,"args.command",MAX_FILE_BYTES);return x;},
   "term.open":value=>{const x=args(value);if(x.cwd!==undefined)safeRelativePath(x.cwd,"args.cwd");if(x.shell!==undefined)controlFree(x.shell,"args.shell",256);if(x.env!==undefined){const env=boundedMap(x.env,"args.env");for(const [key,val] of Object.entries(env)){controlFree(key,`args.env.${key}`,128);boundedText(val,`args.env.${key}`,4096);}}if(x.cols!==undefined){const cols=safeSeq(x.cols,"args.cols");if(cols===0||cols>1000)fail("BOUNDS","invalid cols","args.cols");}if(x.rows!==undefined){const rows=safeSeq(x.rows,"args.rows");if(rows===0||rows>500)fail("BOUNDS","invalid rows","args.rows");}return x;},"audit.read":args,"audit.tail":value=>{const x=args(value);decodeCursor(x.cursor,"args.cursor");return x;},"config.write":value=>metadata(value,"args"),"settings.read":args,"settings.write":value=>metadata(value,"args"),"catalog.get":args,"host.watch":value=>{const x=args(value);decodeCursor(x.cursor,"args.cursor");return x;},"session.watch":value=>{const x=args(value);decodeCursor(x.cursor,"args.cursor");return x;},"controller.lease.acquire":value=>{const x=args(value);controlFree(x.ownerId,"args.ownerId",256);return x;},"controller.lease.renew":value=>{const x=args(value);leaseId(x.leaseId,"args.leaseId");return x;},"controller.lease.release":value=>{const x=args(value);leaseId(x.leaseId,"args.leaseId");return x;},"prompt.lease.acquire":value=>{const x=args(value);controlFree(x.ownerId,"args.ownerId",256);return x;},"prompt.lease.renew":value=>{const x=args(value);leaseId(x.leaseId,"args.leaseId");return x;},"prompt.lease.release":value=>{const x=args(value);leaseId(x.leaseId,"args.leaseId");return x;},"preview.launch":value=>{const x=args(value);url(x.url,"args.url");return x;},"preview.state":args,"preview.navigate":value=>{const x=args(value);url(x.url,"args.url");return x;},"preview.capture":args,
 };

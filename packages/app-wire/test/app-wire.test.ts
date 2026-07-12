@@ -345,6 +345,10 @@ describe("app-wire authority", () => {
 		expect(() => decodeClientFrame({ ...base, type: "terminal.output", cursor: { epoch: "e", seq: 1 }, stream: "stdout", data: "x" })).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("session.prompt", { prompt: "wrong" })).toThrow(AppWireError);
 		expect(decodeCommandArguments("session.prompt", { message: "hello" }).message).toBe("hello");
+		expect(decodeCommandArguments("session.prompt", { message: "hello", leaseId: "lease-1" })).toMatchObject({ message: "hello", leaseId: "lease-1" });
+		expect(() => decodeCommandArguments("session.prompt", { message: "hello", unexpected: true })).toThrow(AppWireError);
+		expect(() => decodeCommandArguments("session.prompt", { message: "" })).toThrow(AppWireError);
+		expect(() => decodeCommandArguments("session.prompt", { message: "hello", leaseId: "bad\u0000lease" })).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("preview.launch", { url: "javascript:alert(1)" })).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("settings.write", { apiKey: "secret" })).toThrow(AppWireError);
 		expect(() => decodeClientFrame({ v: "omp-app/1", type: "command", requestId: "r", commandId: "c", hostId: "h", sessionId: "s", command: "session.prompt", args: { prompt: "wrong" } })).toThrow(AppWireError);

@@ -304,8 +304,8 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
     client.client.sendJson(hostCommand("list-a", "list", "session.list", {})); client.client.sendJson(hostCommand("list-b", "list", "session.list", {}));
     const first = await client.client.nextServer(); const replay = await client.client.nextServer(); expect(first.type).toBe("response"); expect(replay.type).toBe("response");
     client.client.sendJson(hostCommand("conflict", "list", "session.list", { bad: true })); const conflict = await client.client.nextServer(); expect(conflict.type).toBe("response"); if (conflict.type === "response") expect(conflict.error?.code).toBe("idempotency_conflict");
-    client.client.sendJson(command("bad-args", "bad-args", "session.prompt", "s1", { message: "ok", extra: true })); const badArgs = await client.client.nextServer(); expect(badArgs.type).toBe("response"); if (badArgs.type === "response") expect(badArgs.error?.code).toBe("invalid_frame");
-    client.client.sendJson(command("big", "big", "session.prompt", "s1", { message: "x".repeat(65_537) })); const big = await client.client.nextServer(); expect(big.type).toBe("response"); if (big.type === "response") expect(big.error?.code).toBe("invalid_frame");
+    client.client.sendJson(command("bad-args", "bad-args", "session.prompt", "s1", { message: "ok", extra: true })); const badArgs = await client.client.nextServer(); expect(badArgs.type).toBe("error"); if (badArgs.type === "error") expect(badArgs.code).toBe("invalid_frame");
+    client.client.sendJson(command("big", "big", "session.prompt", "s1", { message: "x".repeat(65_537) })); const big = await client.client.nextOrClose(); expect(big?.opcode).toBe(0x8);
     await closeClients([client.client]); await appserver.stop();
 
     const pathServer = await liveServer(new LiveFactory(), [record("s1")]); const pathClient = await readyClient(pathServer.path, ["files.read"]);

@@ -9,6 +9,7 @@ import {
 	type ConfirmFrame,
 	decodeClientFrame,
 	decodeCursor,
+	decodeSessionPromptArguments,
 	type HelloFrame,
 	type HostId,
 	parseBounded,
@@ -88,15 +89,12 @@ function argumentError(command: CommandFrame): string | undefined {
 	if (!args || typeof args !== "object" || Array.isArray(args)) return "args must be an object";
 	const keys = Object.keys(args);
 	if (command.command === "session.prompt") {
-		if (
-			keys.length !== 1 ||
-			keys[0] !== "message" ||
-			typeof args.message !== "string" ||
-			args.message.length === 0 ||
-			utf8ByteLength(args.message) > 65_536
-		)
-			return "prompt message must be a bounded non-empty UTF-8 string";
-		return undefined;
+		try {
+			decodeSessionPromptArguments(args);
+			return undefined;
+		} catch {
+			return "prompt arguments are invalid";
+		}
 	}
 	if (command.command === "session.attach") {
 		if (keys.length === 0) return undefined;
@@ -194,9 +192,12 @@ async function publishOwnerAtomic(
 	return final;
 }
 export function appserverSupportedFeatures(options: Pick<AppserverOptions, "operationsAuthority" | "supportedFeatures"> & { readonly remotePolicy?: AppserverOptions["remotePolicy"] }, includeRemotePolicy = false): string[] {
-	const unsupportedAdditiveFeatures = new Set(["host.watch", "session.watch", "prompt.lease"]);
+	const unsupportedAdditiveFeatures = new Set(["host.watch", "session.watch"]);
 	const implementedFeatures = new Set<string>(["resume"]);
-	if (includeRemotePolicy || options.remotePolicy) implementedFeatures.add("controller.lease");
+	if (includeRemotePolicy || options.remotePolicy) {
+		implementedFeatures.add("controller.lease");
+		implementedFeatures.add("prompt.lease");
+	}
 	const authority = options.operationsAuthority;
 	if (authority?.catalogGet) implementedFeatures.add("catalog.metadata");
 	if (authority?.settingsRead) implementedFeatures.add("settings.metadata");
@@ -744,7 +745,7 @@ export class LocalAppserver implements AppserverHandle {
 				if (this.#closedSessions.has(command.sessionId!)) throw new Error("session is closed");
 				projection!.setStatus("active");
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
-				const result = await supervisor.prompt(command.requestId, command.args.message as string, controller.signal);
+				const result = await supervisor.prompt(command.requestId, decodeSessionPromptArguments(command.args).message, controller.signal);
 				projection!.setStatus(result.success ? "idle" : "closed");
 				outcome = {
 					frame: response(

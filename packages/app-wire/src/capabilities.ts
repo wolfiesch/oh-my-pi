@@ -7,7 +7,7 @@ export const DEVICE_CAPABILITIES = [
 ] as const;
 export type DeviceCapability = (typeof DEVICE_CAPABILITIES)[number];
 export const PROTOCOL_FEATURES = [
-  "resume", "host.watch", "session.watch", "session.state", "session.delta", "controller.lease",
+  "resume", "host.watch", "session.watch", "session.state", "session.delta", "controller.lease", "prompt.lease",
   "agent.lifecycle", "agent.progress", "agent.event", "agent.transcript", "terminal.io", "files.list",
   "files.diff", "audit.tail", "catalog.metadata", "settings.metadata", "preview.control",
 ] as const;

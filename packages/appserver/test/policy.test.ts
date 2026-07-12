@@ -97,6 +97,29 @@ test("controller lease gates session mutations for the owning connection and exp
   expect(policy.authorize(owner, command("expired", "files.write", "session", { leaseId, path: "file.txt", content: "late" }), { connectionId: owner.connectionId, peer: owner.peer })).toBe(false);
   policy.close();
 });
+test("prompt lease gates prompt mutations by device, connection, session, revision, and expiry", () => {
+  let now = 1_000;
+  const registry = new Registry();
+  registry.current = { ...record, capabilities: [...record.capabilities, "sessions.prompt"] };
+  const policy = new TailscaleRemotePolicy({ registry, clock: { now: () => now }, supportedFeatures: ["prompt.lease"] });
+  const owner = connection("prompt-owner", { count: 0 });
+  policy.authenticate(owner, hello("prompt-owner", ["sessions.prompt"], ["prompt.lease"]));
+  const acquire = { ...command("prompt-acquire", "prompt.lease.acquire", "session"), expectedRevision: "r" } as CommandFrame;
+  expect(policy.authorize(owner, acquire, { connectionId: owner.connectionId, peer: owner.peer })).toBe(true);
+  const leaseResponse = policy.handleCommand(owner, acquire);
+  const leaseId = String((leaseResponse as { result?: { leaseId?: string } } | undefined)?.result?.leaseId);
+  const prompt = { ...command("prompt", "session.prompt", "session", { message: "hello", leaseId }), expectedRevision: "r" } as CommandFrame;
+  expect(policy.authorize(owner, prompt, { connectionId: owner.connectionId, peer: owner.peer })).toBe(true);
+  expect(policy.authorize(owner, { ...prompt, sessionId: "other", commandId: "wrong-session" } as CommandFrame, { connectionId: owner.connectionId, peer: owner.peer })).toBe(false);
+  expect(policy.authorize(owner, { ...prompt, expectedRevision: "other", commandId: "wrong-revision" } as CommandFrame, { connectionId: owner.connectionId, peer: owner.peer })).toBe(false);
+  const other = connection("prompt-other", { count: 0 });
+  policy.authenticate(other, hello("prompt-other", ["sessions.prompt"], ["prompt.lease"]));
+  expect(policy.authorize(other, { ...prompt, commandId: "wrong-connection" } as CommandFrame, { connectionId: other.connectionId, peer: other.peer })).toBe(false);
+  expect(policy.authorize(owner, { ...prompt, commandId: "malformed", args: { message: "hello", leaseId: "bad\u0000lease" } } as unknown as CommandFrame, { connectionId: owner.connectionId, peer: owner.peer })).toBe(false);
+  now += 31_000;
+  expect(policy.authorize(owner, { ...prompt, commandId: "expired" } as CommandFrame, { connectionId: owner.connectionId, peer: owner.peer })).toBe(false);
+  policy.close();
+});
 test("preview commands require negotiated preview.control and preview capability", () => {
   const registry = new Registry();
   const policy = new TailscaleRemotePolicy({ registry, supportedFeatures: ["preview.control"] });
