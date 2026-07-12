@@ -88,7 +88,9 @@ export interface RpcSessionEntrySubscription {
  * detaches the listener before rethrowing; SessionManager isolates that error
  * from persistence and other subscribers.
  */
-export function createRpcSessionEntrySubscription(output: (frame: RpcSessionEntryFrame) => void): RpcSessionEntrySubscription {
+export function createRpcSessionEntrySubscription(
+	output: (frame: RpcSessionEntryFrame) => void,
+): RpcSessionEntrySubscription {
 	let boundManager: RpcSessionEntryManager | undefined;
 	let unsubscribe: (() => void) | undefined;
 	let disposed = false;
@@ -138,7 +140,6 @@ export function createRpcSessionEntrySubscription(output: (frame: RpcSessionEntr
 		},
 	};
 }
-
 
 export type RpcSessionChangeCommand = Extract<
 	RpcCommand,
@@ -1033,6 +1034,7 @@ export async function runRpcMode(
 			}
 
 			case "get_state": {
+				const queued = session.getQueuedMessages();
 				const state: RpcSessionState = {
 					model: session.model,
 					thinkingLevel: session.thinkingLevel,
@@ -1048,7 +1050,10 @@ export async function runRpcMode(
 					autoCompactionEnabled: session.autoCompactionEnabled,
 					messageCount: session.messages.length,
 					queuedMessageCount: session.queuedMessageCount,
-					queuedMessages: { steering: [...session.getQueuedMessages().steering], followUp: [...session.getQueuedMessages().followUp] },
+					queuedMessages: {
+						steering: queued.steering.slice(0, 128).map(text => text.slice(0, 65_536)),
+						followUp: queued.followUp.slice(0, 128).map(text => text.slice(0, 65_536)),
+					},
 					todoPhases: session.getTodoPhases(),
 					systemPrompt: session.systemPrompt,
 					dumpTools: session.agent.state.tools.map(tool => ({

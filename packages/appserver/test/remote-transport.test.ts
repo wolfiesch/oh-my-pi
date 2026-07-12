@@ -3,7 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { hostId, projectId, sessionId } from "@oh-my-pi/app-wire";
-import type { ListenerPeerContext, RemoteConnection, RemoteConnectionHooks, RemoteListenerConfig, RemotePeerIdentity } from "../src/remote/types.ts";
+import type {
+	ListenerPeerContext,
+	RemoteConnection,
+	RemoteConnectionHooks,
+	RemoteListenerConfig,
+	RemotePeerIdentity,
+} from "../src/remote/types.ts";
 import type { AppserverOptions, ChildHandle, RpcChildFactory, SessionRecord } from "../src/types.ts";
 import { createAppserver } from "../src/server.ts";
 import { BunRemoteListener, createListenerPlan } from "../src/remote/listener.ts";
@@ -35,10 +41,19 @@ class FakeBunServer {
 	readonly config: FakeServeConfig;
 	readonly stopCalls: boolean[] = [];
 	lastUpgrade?: { data: FakeSocketData };
-	constructor(config: FakeServeConfig) { this.config = config; }
-	requestIP(): { address: string } { return { address: "100.64.0.1" }; }
-	upgrade(_request: Request, options: { data: FakeSocketData }): boolean { this.lastUpgrade = options; return true; }
-	stop(force?: boolean): void { this.stopCalls.push(force === true); }
+	constructor(config: FakeServeConfig) {
+		this.config = config;
+	}
+	requestIP(): { address: string } {
+		return { address: "100.64.0.1" };
+	}
+	upgrade(_request: Request, options: { data: FakeSocketData }): boolean {
+		this.lastUpgrade = options;
+		return true;
+	}
+	stop(force?: boolean): void {
+		this.stopCalls.push(force === true);
+	}
 }
 class FakeBunHarness {
 	readonly servers: FakeBunServer[] = [];
@@ -53,7 +68,9 @@ class FakeBunHarness {
 			return server;
 		};
 	}
-	restore(): void { (Bun as unknown as { serve: (config: unknown) => unknown }).serve = this.original; }
+	restore(): void {
+		(Bun as unknown as { serve: (config: unknown) => unknown }).serve = this.original;
+	}
 	remote(): FakeBunServer {
 		const server = this.servers.find(candidate => candidate.config.hostname !== undefined);
 		if (!server) throw new Error("remote fake server missing");
@@ -70,8 +87,13 @@ class FakeSocket implements FakeWebSocket {
 	sends: string[] = [];
 	closes: FakeClose[] = [];
 	sendResult = 1;
-	send(text: string): number { this.sends.push(text); return this.sendResult; }
-	close(code?: number, reason?: string): void { this.closes.push({ code, reason }); }
+	send(text: string): number {
+		this.sends.push(text);
+		return this.sendResult;
+	}
+	close(code?: number, reason?: string): void {
+		this.closes.push({ code, reason });
+	}
 }
 class LeaseChild implements ChildHandle {
 	readonly writes: string[] = [];
@@ -94,7 +116,7 @@ class LeaseChild implements ChildHandle {
 	async *stream(): AsyncGenerator<string> {
 		yield `${JSON.stringify({ type: "ready" })}\n`;
 		while (true) {
-			const line = this.#lines.shift() ?? await this.nextLine();
+			const line = this.#lines.shift() ?? (await this.nextLine());
 			if (line === undefined) return;
 			yield line;
 		}
@@ -130,8 +152,12 @@ class LeaseFactory implements RpcChildFactory {
 		this.#spawned.resolve(child);
 		return child;
 	}
-	argv(path: string): string[] { return ["fake-omp", "--mode", "rpc", "--session", path]; }
-	child(): Promise<LeaseChild> { return Promise.resolve(this.children[0] ?? this.#spawned.promise); }
+	argv(path: string): string[] {
+		return ["fake-omp", "--mode", "rpc", "--session", path];
+	}
+	child(): Promise<LeaseChild> {
+		return Promise.resolve(this.children[0] ?? this.#spawned.promise);
+	}
 }
 function leaseSessionRecord(): SessionRecord {
 	return {
@@ -148,16 +174,43 @@ function leaseSessionRecord(): SessionRecord {
 function sentFrames(socket: FakeSocket): Array<Record<string, unknown>> {
 	return socket.sends.map(text => JSON.parse(text) as Record<string, unknown>);
 }
-function peerIdentity(nodeId: string): RemotePeerIdentity { return { nodeId, hostname: `${nodeId}.tail`, user: `${nodeId}@example`, addresses: ["100.64.0.1"], source: "tailscale" }; }
+function peerIdentity(nodeId: string): RemotePeerIdentity {
+	return {
+		nodeId,
+		hostname: `${nodeId}.tail`,
+		user: `${nodeId}@example`,
+		addresses: ["100.64.0.1"],
+		source: "tailscale",
+	};
+}
 function hello(requestedFeatures: string[] = ["resume"]): string {
-	return JSON.stringify({ v: "omp-app/1", type: "hello", protocol: { min: "omp-app/1", max: "omp-app/1" }, client: { name: "test", version: "1", build: "b", platform: "linux" }, requestedFeatures, savedCursors: [] });
+	return JSON.stringify({
+		v: "omp-app/1",
+		type: "hello",
+		protocol: { min: "omp-app/1", max: "omp-app/1" },
+		client: { name: "test", version: "1", build: "b", platform: "linux" },
+		requestedFeatures,
+		savedCursors: [],
+	});
 }
 function listCommand(requestId: string): string {
-	return JSON.stringify({ v: "omp-app/1", type: "command", requestId, commandId: `command-${requestId}`, hostId: "host", command: "session.list", args: {} });
+	return JSON.stringify({
+		v: "omp-app/1",
+		type: "command",
+		requestId,
+		commandId: `command-${requestId}`,
+		hostId: "host",
+		command: "session.list",
+		args: {},
+	});
 }
-function ping(): string { return JSON.stringify({ v: "omp-app/1", type: "ping", nonce: "nonce", timestamp: "2026-01-01T00:00:00.000Z" }); }
+function ping(): string {
+	return JSON.stringify({ v: "omp-app/1", type: "ping", nonce: "nonce", timestamp: "2026-01-01T00:00:00.000Z" });
+}
 
-async function flush(): Promise<void> { for (let index = 0; index < 20; index++) await Promise.resolve(); }
+async function flush(): Promise<void> {
+	for (let index = 0; index < 20; index++) await Promise.resolve();
+}
 async function openRemote(server: FakeBunServer): Promise<FakeSocket> {
 	if (!server.config.fetch || !server.config.websocket?.open) throw new Error("remote config incomplete");
 	await server.config.fetch(new Request("http://remote.test/v1/ws"), server);
@@ -186,25 +239,51 @@ async function grantedFeatures(options: AppserverOptions): Promise<string[]> {
 		const local = harness.local();
 		const socket = new FakeSocket();
 		local.config.websocket?.open?.(socket);
-		await local.config.websocket?.message?.(socket, hello(["resume", "catalog.metadata", "settings.metadata", "terminal.io", "files.list", "files.diff", "preview.control"]));
+		await local.config.websocket?.message?.(
+			socket,
+			hello([
+				"resume",
+				"catalog.metadata",
+				"settings.metadata",
+				"terminal.io",
+				"files.list",
+				"files.diff",
+				"preview.control",
+			]),
+		);
 		await flush();
 		const welcome = JSON.parse(socket.sends[0] ?? "{}") as { grantedFeatures?: unknown };
 		const features = welcome.grantedFeatures;
-		if (!Array.isArray(features) || !features.every((feature): feature is string => typeof feature === "string")) throw new Error("feature welcome missing");
+		if (!Array.isArray(features) || !features.every((feature): feature is string => typeof feature === "string"))
+			throw new Error("feature welcome missing");
 		await appserver.stop();
 		return features;
-	} finally { harness.restore(); }
+	} finally {
+		harness.restore();
+	}
 }
 
 describe("remote socket lifecycle", () => {
 	test("IDs are unique, peer snapshots immutable, sends are bounded, and close cleans the map", async () => {
 		const harness = new FakeBunHarness();
 		try {
-		harness.install();
+			harness.install();
 			const disconnected: string[] = [];
 			const connected: RemoteConnection[] = [];
-			const hooks: RemoteConnectionHooks = { connected: connection => { connected.push(connection); }, disconnected: connection => { disconnected.push(connection.connectionId); } };
-			const listener = new BunRemoteListener(createListenerPlan({ address: "100.64.0.1", port: 1 }), hooks, { address: "100.64.0.1", port: 1 }, { resolve: async () => peerIdentity("node") });
+			const hooks: RemoteConnectionHooks = {
+				connected: connection => {
+					connected.push(connection);
+				},
+				disconnected: connection => {
+					disconnected.push(connection.connectionId);
+				},
+			};
+			const listener = new BunRemoteListener(
+				createListenerPlan({ address: "100.64.0.1", port: 1 }),
+				hooks,
+				{ address: "100.64.0.1", port: 1 },
+				{ resolve: async () => peerIdentity("node") },
+			);
 			listener.start();
 			const server = harness.remote();
 			const first = await openRemote(server);
@@ -224,7 +303,9 @@ describe("remote socket lifecycle", () => {
 			expect(disconnected).toEqual([first.data.connectionId]);
 			await listener.stop();
 			expect(second.closes).toHaveLength(1);
-		} finally { harness.restore(); }
+		} finally {
+			harness.restore();
+		}
 	});
 });
 
@@ -241,8 +322,14 @@ describe("remote appserver policy transport", () => {
 				remoteEndpoint: { address: "100.64.0.1", port: 1 },
 				remoteResolver: { resolve: async () => peerIdentity("node") },
 				remotePolicy: {
-					authenticate: async () => { calls.push("authenticate"); return { authenticated: true, authentication: "paired" }; },
-					authorize: async (_connection, frame) => { calls.push(`authorize:${frame.type}`); return frame.type !== "command"; },
+					authenticate: async () => {
+						calls.push("authenticate");
+						return { authenticated: true, authentication: "paired" };
+					},
+					authorize: async (_connection, frame) => {
+						calls.push(`authorize:${frame.type}`);
+						return frame.type !== "command";
+					},
 				},
 			});
 			await appserver.start();
@@ -259,14 +346,23 @@ describe("remote appserver policy transport", () => {
 			expect(socket.closes.at(-1)).toMatchObject({ code: 1008, reason: "remote policy denied" });
 			expect((socket.closes.at(-1)?.reason ?? "").length).toBeLessThanOrEqual(123);
 			await appserver.stop();
-		} finally { harness.restore(); }
+		} finally {
+			harness.restore();
+		}
 	});
 
 	test("authentication rejection sends no Welcome or core state", async () => {
 		const harness = new FakeBunHarness();
 		harness.install();
 		try {
-			const appserver = createAppserver({ hostId: "host" as never, socketPath: join(mkdtempSync(join(tmpdir(), "omp-proof-")), "app.sock"), discovery: { list: async () => [] }, remoteEndpoint: { address: "100.64.0.1", port: 1 }, remoteResolver: { resolve: async () => peerIdentity("node") }, remotePolicy: { authenticate: async () => ({ authenticated: false }), authorize: async () => true } });
+			const appserver = createAppserver({
+				hostId: "host" as never,
+				socketPath: join(mkdtempSync(join(tmpdir(), "omp-proof-")), "app.sock"),
+				discovery: { list: async () => [] },
+				remoteEndpoint: { address: "100.64.0.1", port: 1 },
+				remoteResolver: { resolve: async () => peerIdentity("node") },
+				remotePolicy: { authenticate: async () => ({ authenticated: false }), authorize: async () => true },
+			});
 			await appserver.start();
 			const server = harness.remote();
 			const socket = await openRemote(server);
@@ -274,7 +370,9 @@ describe("remote appserver policy transport", () => {
 			expect(socket.sends).toEqual([]);
 			expect(socket.closes).toEqual([{ code: 1008, reason: "remote authentication denied" }]);
 			await appserver.stop();
-		} finally { harness.restore(); }
+		} finally {
+			harness.restore();
+		}
 	});
 
 	test("outbound transforms run once, deny drops, and throw fails closed without raw leakage", async () => {
@@ -282,7 +380,23 @@ describe("remote appserver policy transport", () => {
 		harness.install();
 		let transforms = 0;
 		try {
-			const appserver = createAppserver({ hostId: "host" as never, socketPath: join(mkdtempSync(join(tmpdir(), "omp-proof-")), "app.sock"), discovery: { list: async () => [] }, remoteEndpoint: { address: "100.64.0.1", port: 1 }, remoteResolver: { resolve: async () => peerIdentity("node") }, remotePolicy: { authenticate: async () => ({ authenticated: true }), authorize: async () => true, transformOutbound: async (_connection, frame) => { transforms++; if (frame.type === "sessions") return undefined; if (frame.type === "pong") throw new Error("deny"); return frame; } } });
+			const appserver = createAppserver({
+				hostId: "host" as never,
+				socketPath: join(mkdtempSync(join(tmpdir(), "omp-proof-")), "app.sock"),
+				discovery: { list: async () => [] },
+				remoteEndpoint: { address: "100.64.0.1", port: 1 },
+				remoteResolver: { resolve: async () => peerIdentity("node") },
+				remotePolicy: {
+					authenticate: async () => ({ authenticated: true }),
+					authorize: async () => true,
+					transformOutbound: async (_connection, frame) => {
+						transforms++;
+						if (frame.type === "sessions") return undefined;
+						if (frame.type === "pong") throw new Error("deny");
+						return frame;
+					},
+				},
+			});
 			await appserver.start();
 			const server = harness.remote();
 			const socket = await openRemote(server);
@@ -293,10 +407,12 @@ describe("remote appserver policy transport", () => {
 			await server.config.websocket?.message?.(socket, ping());
 			await flush();
 			expect(transforms).toBe(3);
-			expect(socket.sends).not.toContain(expect.stringContaining("\"type\":\"pong\""));
+			expect(socket.sends).not.toContain(expect.stringContaining('"type":"pong"'));
 			expect(socket.closes).toEqual([{ code: 1011, reason: "remote policy failed" }]);
 			await appserver.stop();
-		} finally { harness.restore(); }
+		} finally {
+			harness.restore();
+		}
 	});
 
 	test("paired prompt lease authorizes one remote prompt and release blocks the next", async () => {
@@ -319,23 +435,38 @@ describe("remote appserver policy transport", () => {
 		});
 		try {
 			await appserver.start();
+			const local = harness.local();
+			const localSocket = new FakeSocket();
+			local.config.websocket?.open?.(localSocket);
+			await local.config.websocket?.message?.(localSocket, hello(["resume", "controller.lease", "prompt.lease"]));
+			await flush();
+			expect(sentFrames(localSocket).find(frame => frame.type === "welcome")).toMatchObject({
+				grantedFeatures: ["resume"],
+			});
+			local.config.websocket?.close?.(localSocket);
 			const remote = harness.remote();
 			const pairingSocket = await openRemote(remote);
 			await remote.config.websocket?.message?.(pairingSocket, hello(["prompt.lease"]));
-			await remote.config.websocket?.message?.(pairingSocket, JSON.stringify({
-				v: "omp-app/1",
-				type: "pair.start",
-				requestId: "pair-request",
-				code: ticket.code,
-				deviceId: "device-lease",
-				deviceName: "Lease test",
-				platform: "linux",
-				requestedCapabilities: ["sessions.prompt"],
-			}));
+			await remote.config.websocket?.message?.(
+				pairingSocket,
+				JSON.stringify({
+					v: "omp-app/1",
+					type: "pair.start",
+					requestId: "pair-request",
+					code: ticket.code,
+					deviceId: "device-lease",
+					deviceName: "Lease test",
+					platform: "linux",
+					requestedCapabilities: ["sessions.prompt"],
+				}),
+			);
 			await flush();
 			const pairingFrames = sentFrames(pairingSocket);
 			const pairOk = pairingFrames.find(frame => frame.type === "pair.ok");
-			if (!pairOk) throw new Error(`pairing failed: ${JSON.stringify({ frames: pairingFrames, closes: pairingSocket.closes })}`);
+			if (!pairOk)
+				throw new Error(
+					`pairing failed: ${JSON.stringify({ frames: pairingFrames, closes: pairingSocket.closes })}`,
+				);
 			const deviceToken = pairOk?.deviceToken;
 			expect(typeof deviceToken).toBe("string");
 			remote.config.websocket?.close?.(pairingSocket);
@@ -362,17 +493,20 @@ describe("remote appserver policy transport", () => {
 			const revision = firstSession.revision;
 			if (typeof revision !== "string") throw new Error("paired session revision missing");
 
-			await remote.config.websocket?.message?.(socket, JSON.stringify({
-				v: "omp-app/1",
-				type: "command",
-				requestId: "lease-acquire-request",
-				commandId: "lease-acquire-command",
-				hostId: "host",
-				sessionId: "session",
-				command: "prompt.lease.acquire",
-				expectedRevision: revision,
-				args: { ownerId: "desktop" },
-			}));
+			await remote.config.websocket?.message?.(
+				socket,
+				JSON.stringify({
+					v: "omp-app/1",
+					type: "command",
+					requestId: "lease-acquire-request",
+					commandId: "lease-acquire-command",
+					hostId: "host",
+					sessionId: "session",
+					command: "prompt.lease.acquire",
+					expectedRevision: revision,
+					args: { ownerId: "desktop" },
+				}),
+			);
 			await flush();
 			const acquire = sentFrames(socket).find(frame => frame.requestId === "lease-acquire-request");
 			const acquireResult = acquire?.result;
@@ -382,17 +516,20 @@ describe("remote appserver policy transport", () => {
 			const acquiredLeaseId = (acquireResult as Record<string, unknown>).leaseId;
 			if (typeof acquiredLeaseId !== "string") throw new Error("prompt lease id missing");
 
-			const promptDispatch = remote.config.websocket?.message?.(socket, JSON.stringify({
-				v: "omp-app/1",
-				type: "command",
-				requestId: "prompt-request",
-				commandId: "prompt-command",
-				hostId: "host",
-				sessionId: "session",
-				command: "session.prompt",
-				expectedRevision: revision,
-				args: { message: "hello", leaseId: acquiredLeaseId },
-			}));
+			const promptDispatch = remote.config.websocket?.message?.(
+				socket,
+				JSON.stringify({
+					v: "omp-app/1",
+					type: "command",
+					requestId: "prompt-request",
+					commandId: "prompt-command",
+					hostId: "host",
+					sessionId: "session",
+					command: "session.prompt",
+					expectedRevision: revision,
+					args: { message: "hello", leaseId: acquiredLeaseId },
+				}),
+			);
 			const child = await factory.child();
 			await child.waitForWrites(1);
 			const rpcPrompt = JSON.parse(child.writes[0] ?? "{}") as Record<string, unknown>;
@@ -413,36 +550,47 @@ describe("remote appserver policy transport", () => {
 				ok: true,
 			});
 
-			await remote.config.websocket?.message?.(socket, JSON.stringify({
-				v: "omp-app/1",
-				type: "command",
-				requestId: "lease-release-request",
-				commandId: "lease-release-command",
-				hostId: "host",
-				sessionId: "session",
-				command: "prompt.lease.release",
-				expectedRevision: revision,
-				args: { leaseId: acquiredLeaseId },
-			}));
+			await remote.config.websocket?.message?.(
+				socket,
+				JSON.stringify({
+					v: "omp-app/1",
+					type: "command",
+					requestId: "lease-release-request",
+					commandId: "lease-release-command",
+					hostId: "host",
+					sessionId: "session",
+					command: "prompt.lease.release",
+					expectedRevision: revision,
+					args: { leaseId: acquiredLeaseId },
+				}),
+			);
 			await flush();
 			expect(sentFrames(socket).find(frame => frame.requestId === "lease-release-request")).toMatchObject({
 				type: "response",
 				ok: true,
 			});
 
-			await remote.config.websocket?.message?.(socket, JSON.stringify({
-				v: "omp-app/1",
-				type: "command",
-				requestId: "prompt-after-release-request",
-				commandId: "prompt-after-release-command",
-				hostId: "host",
-				sessionId: "session",
-				command: "session.prompt",
-				expectedRevision: revision,
-				args: { message: "must not run", leaseId: acquiredLeaseId },
-			}));
+			await remote.config.websocket?.message?.(
+				socket,
+				JSON.stringify({
+					v: "omp-app/1",
+					type: "command",
+					requestId: "prompt-after-release-request",
+					commandId: "prompt-after-release-command",
+					hostId: "host",
+					sessionId: "session",
+					command: "session.prompt",
+					expectedRevision: revision,
+					args: { message: "must not run", leaseId: acquiredLeaseId },
+				}),
+			);
 			await flush();
-			expect(child.writes).toHaveLength(1);
+			expect(
+				child.writes.filter(line => {
+					const frame = JSON.parse(line) as Record<string, unknown>;
+					return frame.type === "prompt";
+				}),
+			).toHaveLength(1);
 			expect(socket.closes.at(-1)).toMatchObject({ code: 1008, reason: "remote policy denied" });
 			expect(JSON.stringify(socket.closes)).not.toContain(acquiredLeaseId);
 		} finally {
@@ -457,7 +605,22 @@ describe("remote appserver policy transport", () => {
 		harness.install();
 		const order: string[] = [];
 		try {
-			const appserver = createAppserver({ hostId: "host" as never, socketPath: join(mkdtempSync(join(tmpdir(), "omp-proof-")), "app.sock"), discovery: { list: async () => [] }, remoteEndpoint: { address: "100.64.0.1", port: 1 }, remoteResolver: { resolve: async () => peerIdentity("node") }, remotePolicy: { authenticate: async connection => ({ authenticated: true, authentication: "paired", deviceId: connection.connectionId }), authorize: async () => true, transformOutbound: async (connection, frame) => ({ ...frame, marker: connection.connectionId }) } });
+			const appserver = createAppserver({
+				hostId: "host" as never,
+				socketPath: join(mkdtempSync(join(tmpdir(), "omp-proof-")), "app.sock"),
+				discovery: { list: async () => [] },
+				remoteEndpoint: { address: "100.64.0.1", port: 1 },
+				remoteResolver: { resolve: async () => peerIdentity("node") },
+				remotePolicy: {
+					authenticate: async connection => ({
+						authenticated: true,
+						authentication: "paired",
+						deviceId: connection.connectionId,
+					}),
+					authorize: async () => true,
+					transformOutbound: async (connection, frame) => ({ ...frame, marker: connection.connectionId }),
+				},
+			});
 			await appserver.start();
 			const remote = harness.remote();
 			const first = await openRemote(remote);
@@ -479,19 +642,64 @@ describe("remote appserver policy transport", () => {
 			expect(first.closes).toHaveLength(0);
 			expect(second.closes).toHaveLength(1);
 			expect(harness.local().stopCalls).toEqual([true]);
-		} finally { harness.restore(); }
+		} finally {
+			harness.restore();
+		}
 		expect(order).toEqual(["remote-stop"]);
 	});
 });
 
 describe("default feature authority matrix", () => {
 	test("resume is always available and additive features require coherent handlers", async () => {
-		const base = { hostId: "host" as never, socketPath: join(mkdtempSync(join(tmpdir(), "omp-feature-")), "app.sock") };
+		const base = {
+			hostId: "host" as never,
+			socketPath: join(mkdtempSync(join(tmpdir(), "omp-feature-")), "app.sock"),
+		};
 		await expect(grantedFeatures({ ...base })).resolves.toEqual(["resume"]);
-		const full = operations({ catalogGet: true, settingsRead: true, termOpen: true, terminalInput: true, terminalResize: true, terminalClose: true, filesList: true, filesDiff: true, previewLaunch: true, previewState: true, previewNavigate: true, previewCapture: true });
-		await expect(grantedFeatures({ ...base, socketPath: join(mkdtempSync(join(tmpdir(), "omp-feature-")), "app.sock"), operationsAuthority: full })).resolves.toEqual(["resume", "catalog.metadata", "settings.metadata", "terminal.io", "files.list", "files.diff", "preview.control"]);
+		const full = operations({
+			catalogGet: true,
+			settingsRead: true,
+			termOpen: true,
+			terminalInput: true,
+			terminalResize: true,
+			terminalClose: true,
+			filesList: true,
+			filesDiff: true,
+			previewLaunch: true,
+			previewState: true,
+			previewNavigate: true,
+			previewCapture: true,
+		});
+		await expect(
+			grantedFeatures({
+				...base,
+				socketPath: join(mkdtempSync(join(tmpdir(), "omp-feature-")), "app.sock"),
+				operationsAuthority: full,
+			}),
+		).resolves.toEqual([
+			"resume",
+			"catalog.metadata",
+			"settings.metadata",
+			"terminal.io",
+			"files.list",
+			"files.diff",
+			"preview.control",
+		]);
 		const incomplete = operations({ termOpen: true });
-		await expect(grantedFeatures({ ...base, socketPath: join(mkdtempSync(join(tmpdir(), "omp-feature-")), "app.sock"), operationsAuthority: incomplete })).resolves.toEqual(["resume"]);
-		await expect(grantedFeatures({ ...base, socketPath: join(mkdtempSync(join(tmpdir(), "omp-feature-")), "app.sock"), operationsAuthority: full, supportedFeatures: ["files.list", "catalog.metadata", "resume", "host.watch"] })).resolves.toEqual(["resume", "catalog.metadata", "files.list"]);
+		await expect(
+			grantedFeatures({
+				...base,
+				socketPath: join(mkdtempSync(join(tmpdir(), "omp-feature-")), "app.sock"),
+				operationsAuthority: incomplete,
+			}),
+		).resolves.toEqual(["resume"]);
+		await expect(
+			grantedFeatures({
+				...base,
+				socketPath: join(mkdtempSync(join(tmpdir(), "omp-feature-")), "app.sock"),
+				operationsAuthority: full,
+				supportedFeatures: ["files.list", "catalog.metadata", "resume", "host.watch"],
+			}),
+		).resolves.toEqual(["resume", "catalog.metadata", "files.list"]);
 	});
 });
