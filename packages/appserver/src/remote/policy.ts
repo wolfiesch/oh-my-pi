@@ -228,6 +228,33 @@ function leaseResponse(
 		result,
 	} as ServerFrame;
 }
+function leaseErrorResponse(
+	frame: CommandFrame,
+	code: string,
+	message: string,
+	details?: Record<string, unknown>,
+): ServerFrame {
+	return {
+		v: "omp-app/1",
+		type: "response",
+		requestId: frame.requestId,
+		commandId: frame.commandId,
+		command: frame.command,
+		hostId: frame.hostId,
+		sessionId: frame.sessionId,
+		ok: false,
+		error: {
+			code,
+			message,
+			...(details ? { details } : {}),
+		},
+	} as ServerFrame;
+}
+function boundedRevisionDetails(expected: unknown, actual: unknown): Record<string, unknown> | undefined {
+	return safeString(expected) && safeString(actual)
+		? { expectedRevision: expected, actualRevision: actual }
+		: undefined;
+}
 
 export class TailscaleRemotePolicy implements RemoteConnectionPolicy {
 	readonly #states = new Map<string, ConnectionState>();
@@ -434,7 +461,7 @@ export class TailscaleRemotePolicy implements RemoteConnectionPolicy {
 			return undefined;
 		}
 	}
-	authorize(connection: RemoteConnection, frame: ClientFrame, _context: RemoteAuthorizationContext): boolean {
+	authorize(connection: RemoteConnection, frame: ClientFrame, context: RemoteAuthorizationContext): boolean {
 		const state = this.#states.get(connection.connectionId);
 		if (!state) return false;
 		const principal = this.#livePrincipal(state);
@@ -461,12 +488,28 @@ export class TailscaleRemotePolicy implements RemoteConnectionPolicy {
 			if (cached.expiresAt <= now) state.idempotency.delete(commandKey);
 			else return cached.fingerprint === fingerprint;
 		}
+		const cacheResponse = (response: ServerFrame): true => {
+			state.idempotency.set(commandKey, { fingerprint, response, expiresAt: now + 300_000 });
+			while (state.idempotency.size > 128)
+				state.idempotency.delete(state.idempotency.keys().next().value ?? commandKey);
+			return true;
+		};
 		const lease = leaseId(frame.args);
 		let leaseResult: Lease | undefined;
 		let released = false;
 		let releasePending = false;
 		if (frame.command === "controller.lease.acquire" || frame.command === "prompt.lease.acquire") {
-			if (!frame.sessionId) return false;
+			if (!frame.sessionId || context.sessionRevision === undefined)
+				return cacheResponse(leaseErrorResponse(frame, "unknown_session", "session is not indexed"));
+			if (frame.expectedRevision === undefined || frame.expectedRevision !== context.sessionRevision)
+				return cacheResponse(
+					leaseErrorResponse(
+						frame,
+						"stale_revision",
+						frame.expectedRevision === undefined ? "expectedRevision is required" : "session revision is stale",
+						boundedRevisionDetails(frame.expectedRevision, context.sessionRevision),
+					),
+				);
 			const kind = frame.command.startsWith("prompt.") ? "prompt" : "controller";
 			try {
 				leaseResult = this.#leases.acquire(

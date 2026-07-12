@@ -36,6 +36,7 @@ export interface RemoteAuthorizationContext {
 	readonly connectionId: string;
 	readonly peer: ListenerPeerContext;
 	readonly command?: CommandFrame;
+	readonly sessionRevision?: Revision;
 }
 export interface RemoteConnectionPolicy {
 	authenticate(connection: RemoteConnection, hello: HelloFrame): RemoteHelloDecision | Promise<RemoteHelloDecision>;

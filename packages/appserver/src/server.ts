@@ -1196,10 +1196,17 @@ export class LocalAppserver implements AppserverHandle {
 			if (ws.remote) {
 				const connection = this.#remoteConnections.get(ws);
 				if (!connection || !this.#remotePolicy) throw new Error("remote connection is unavailable");
+				const remoteProjection =
+					frame.type === "command" &&
+					COMMAND_DESCRIPTORS[frame.command]?.scope === "session" &&
+					frame.sessionId !== undefined
+						? this.#projections.get(frame.sessionId)
+						: undefined;
 				const allowed = await this.#remotePolicy.authorize(connection, frame, {
 					connectionId: ws.connectionId,
 					peer: connection.peer,
 					...(frame.type === "command" ? { command: frame } : {}),
+					...(remoteProjection ? { sessionRevision: remoteProjection.value.revision } : {}),
 				});
 				if (!allowed) {
 					if (!this.#remotePolicy.isClosed?.(connection)) ws.close(1008, "remote policy denied");

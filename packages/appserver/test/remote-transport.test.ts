@@ -498,6 +498,31 @@ describe("remote appserver policy transport", () => {
 				JSON.stringify({
 					v: "omp-app/1",
 					type: "command",
+					requestId: "stale-acquire-request",
+					commandId: "stale-acquire-command",
+					hostId: "host",
+					sessionId: "session",
+					command: "prompt.lease.acquire",
+					expectedRevision: "stale",
+					args: { ownerId: "desktop" },
+				}),
+			);
+			await flush();
+			expect(sentFrames(socket).find(frame => frame.requestId === "stale-acquire-request")).toMatchObject({
+				type: "response",
+				ok: false,
+				error: {
+					code: "stale_revision",
+					details: { expectedRevision: "stale", actualRevision: revision },
+				},
+			});
+			expect(socket.closes).toEqual([]);
+
+			await remote.config.websocket?.message?.(
+				socket,
+				JSON.stringify({
+					v: "omp-app/1",
+					type: "command",
 					requestId: "lease-acquire-request",
 					commandId: "lease-acquire-command",
 					hostId: "host",

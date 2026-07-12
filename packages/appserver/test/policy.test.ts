@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { ClientFrame, CommandFrame, HelloFrame } from "@oh-my-pi/app-wire";
+import type { ClientFrame, CommandFrame, HelloFrame, Revision } from "@oh-my-pi/app-wire";
 import { TailscaleRemotePolicy } from "../src/remote/policy.ts";
 import {
 	DefaultAuthorizationGuard,
@@ -10,6 +10,7 @@ import {
 	type RemotePeerIdentity,
 } from "../src/security/index.ts";
 import type { RemoteConnection } from "../src/remote/types.ts";
+const revisionValue = "r" as Revision;
 
 const identity: RemotePeerIdentity = { nodeId: "node", login: "user@example", hostId: "host", tailnetIp: "100.64.0.2" };
 const identityKey = JSON.stringify([identity.nodeId, identity.login, identity.hostId, identity.tailnetIp]);
@@ -140,12 +141,24 @@ test("controller lease feature gates interception and replay is idempotent", () 
 	expect(
 		policy.authenticate(reconnect, hello("lease-ready", ["sessions.control"], ["controller.lease"])).grantedFeatures,
 	).toEqual(["controller.lease"]);
-	const acquire = command("acquire", "controller.lease.acquire");
-	expect(policy.authorize(reconnect, acquire, { connectionId: "lease-ready", peer: reconnect.peer })).toBe(true);
+	const acquire = { ...command("acquire", "controller.lease.acquire"), expectedRevision: "r" } as CommandFrame;
+	expect(
+		policy.authorize(reconnect, acquire, {
+			connectionId: "lease-ready",
+			peer: reconnect.peer,
+			sessionRevision: revisionValue,
+		}),
+	).toBe(true);
 	const first = policy.handleCommand(reconnect, acquire);
 	expect(first).toBeDefined();
 	const retry = { ...acquire, requestId: "request-retry" } as CommandFrame;
-	expect(policy.authorize(reconnect, retry, { connectionId: "lease-ready", peer: reconnect.peer })).toBe(true);
+	expect(
+		policy.authorize(reconnect, retry, {
+			connectionId: "lease-ready",
+			peer: reconnect.peer,
+			sessionRevision: revisionValue,
+		}),
+	).toBe(true);
 	expect(policy.handleCommand(reconnect, retry)).toMatchObject({
 		type: "response",
 		requestId: "request-retry",
@@ -159,6 +172,36 @@ test("controller lease feature gates interception and replay is idempotent", () 
 	).toBe(false);
 	policy.close();
 });
+test("stale lease acquire is typed and does not allocate before a fresh acquire", () => {
+	const registry = new Registry();
+	const policy = new TailscaleRemotePolicy({ registry, supportedFeatures: ["controller.lease"] });
+	const connectionValue = connection("stale-acquire", { count: 0 });
+	policy.authenticate(connectionValue, hello("stale-acquire", ["sessions.control"], ["controller.lease"]));
+	const context = {
+		connectionId: connectionValue.connectionId,
+		peer: connectionValue.peer,
+		sessionRevision: "fresh" as Revision,
+	};
+	const stale = { ...command("stale", "controller.lease.acquire"), expectedRevision: "old" } as CommandFrame;
+	expect(policy.authorize(connectionValue, stale, context)).toBe(true);
+	expect(policy.handleCommand(connectionValue, stale)).toMatchObject({
+		type: "response",
+		ok: false,
+		error: {
+			code: "stale_revision",
+			details: { expectedRevision: "old", actualRevision: "fresh" },
+		},
+	});
+	const fresh = { ...command("fresh", "controller.lease.acquire"), expectedRevision: "fresh" } as CommandFrame;
+	expect(policy.authorize(connectionValue, fresh, context)).toBe(true);
+	expect(policy.handleCommand(connectionValue, fresh)).toMatchObject({
+		type: "response",
+		ok: true,
+		result: { leaseId: expect.any(String) },
+	});
+	policy.close();
+});
+
 
 test("registry invalidation closes once and clears authorization state", () => {
 	const registry = new Registry();
@@ -166,10 +209,17 @@ test("registry invalidation closes once and clears authorization state", () => {
 	const policy = new TailscaleRemotePolicy({ registry, supportedFeatures: ["controller.lease"] });
 	const connectionValue = connection("revoke", calls);
 	policy.authenticate(connectionValue, hello("revoke", ["sessions.control"], ["controller.lease"]));
-	const acquire = command("acquire", "controller.lease.acquire");
-	expect(policy.authorize(connectionValue, acquire, { connectionId: "revoke", peer: connectionValue.peer })).toBe(
-		true,
-	);
+	const acquire = {
+		...command("acquire", "controller.lease.acquire"),
+		expectedRevision: "r",
+	} as CommandFrame;
+	expect(
+		policy.authorize(connectionValue, acquire, {
+			connectionId: "revoke",
+			peer: connectionValue.peer,
+			sessionRevision: revisionValue,
+		}),
+	).toBe(true);
 	registry.revoke("device");
 	expect(calls.count).toBe(1);
 	expect(policy.authorize(connectionValue, acquire, { connectionId: "revoke", peer: connectionValue.peer })).toBe(
@@ -192,8 +242,17 @@ test("controller lease gates session mutations for the owning connection and exp
 	});
 	const owner = connection("mutation-owner", { count: 0 });
 	policy.authenticate(owner, hello("mutation-owner", ["sessions.control", "files.write"], ["controller.lease"]));
-	const acquire = command("mutation-lease", "controller.lease.acquire", "session");
-	expect(policy.authorize(owner, acquire, { connectionId: owner.connectionId, peer: owner.peer })).toBe(true);
+	const acquire = {
+		...command("mutation-lease", "controller.lease.acquire", "session"),
+		expectedRevision: "r",
+	} as CommandFrame;
+	expect(
+		policy.authorize(owner, acquire, {
+			connectionId: owner.connectionId,
+			peer: owner.peer,
+			sessionRevision: revisionValue,
+		}),
+	).toBe(true);
 	const leaseResponse = policy.handleCommand(owner, acquire);
 	const leaseId = String((leaseResponse as { result?: { leaseId?: string } } | undefined)?.result?.leaseId);
 	expect(leaseId).not.toBe("undefined");
@@ -238,7 +297,13 @@ test("prompt lease gates prompt mutations by device, connection, session, revisi
 		...command("prompt-acquire", "prompt.lease.acquire", "session"),
 		expectedRevision: "r",
 	} as CommandFrame;
-	expect(policy.authorize(owner, acquire, { connectionId: owner.connectionId, peer: owner.peer })).toBe(true);
+	expect(
+		policy.authorize(owner, acquire, {
+			connectionId: owner.connectionId,
+			peer: owner.peer,
+			sessionRevision: revisionValue,
+		}),
+	).toBe(true);
 	const leaseResponse = policy.handleCommand(owner, acquire);
 	const leaseId = String((leaseResponse as { result?: { leaseId?: string } } | undefined)?.result?.leaseId);
 	const prompt = {
@@ -302,7 +367,7 @@ test("prompt lease release remains authorized by the default guard before revoca
 	});
 	const owner = connection("guarded-prompt-owner", { count: 0 });
 	policy.authenticate(owner, hello(owner.connectionId, ["sessions.prompt"], ["prompt.lease"]));
-	const context = { connectionId: owner.connectionId, peer: owner.peer };
+	const context = { connectionId: owner.connectionId, peer: owner.peer, sessionRevision: revisionValue };
 	const acquire = {
 		...command("guarded-acquire", "prompt.lease.acquire", "session"),
 		expectedRevision: "r",
