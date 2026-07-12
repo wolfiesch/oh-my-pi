@@ -63,7 +63,16 @@ export interface FileSystem {
 	unlink(path: string): Promise<void>;
 	stat(
 		path: string,
-	): Promise<{ isFile(): boolean; isDirectory(): boolean; mode: number; mtimeMs: number; size: number }>;
+	): Promise<{
+		isFile(): boolean;
+		isDirectory(): boolean;
+		mode: number;
+		mtimeMs: number;
+		size: number;
+		ctimeMs?: number;
+		dev?: number;
+		ino?: number;
+	}>;
 	readdir(path: string): Promise<string[]>;
 	readFile(path: string): Promise<string | Uint8Array>;
 }

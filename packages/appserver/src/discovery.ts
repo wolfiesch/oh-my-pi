@@ -458,6 +458,7 @@ export class FileSessionDiscovery implements SessionDiscovery {
     try { files = await this.files(this.root); } catch { return []; }
     const found: SessionRecord[] = [];
     const seen = new Set<string>();
+    files.sort();
     for (const path of files) {
       let identity: string;
       try { identity = realpathSync.native(path); } catch { identity = resolve(path); }
@@ -469,12 +470,15 @@ export class FileSessionDiscovery implements SessionDiscovery {
           this.index.delete(identity);
           continue;
         }
-        const signature = `${fileStat.size}:${fileStat.mtimeMs}`;
+        const signature = `${fileStat.size}:${fileStat.mtimeMs}:${fileStat.ctimeMs ?? ""}:${fileStat.dev ?? ""}:${fileStat.ino ?? ""}`;
         const cached = this.index.get(identity);
         let record = cached?.signature === signature ? cached.record : undefined;
         if (!record) {
           record = parseTranscript(await this.fs.readFile(path), path, this.host);
           record.updatedAt = new Date(fileStat.mtimeMs).toISOString();
+          this.index.set(identity, { signature, record });
+        } else if (record.path !== path) {
+          record = { ...record, path };
           this.index.set(identity, { signature, record });
         }
         found.push(record);
