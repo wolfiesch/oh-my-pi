@@ -69,10 +69,12 @@ describe("app-wire authority", () => {
 			sessions,
 			totalCount: 5_000,
 			truncated: true,
+			future: "keep",
 		});
 		expect(result.sessions).toHaveLength(1_000);
 		expect(result.totalCount).toBe(5_000);
 		expect(result.truncated).toBe(true);
+		expect((result as unknown as Record<string, unknown>).future).toBe("keep");
 	});
 	test("hello and durable lineage decode in string and parsed modes", () => {
 		expect(decodeClientFrame(hello).type).toBe("hello");

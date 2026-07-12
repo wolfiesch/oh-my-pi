@@ -31,7 +31,7 @@ export function decodeSessionListResult(value: unknown): SessionListResult {
   const cursor = decodeCursor(result.cursor, "result.cursor");
   const values = boundedArray(result.sessions, "result.sessions");
   const sessions = values.map((entry, index) => decodeSessionRef(entry, `result.sessions[${index}]`));
-  return { cursor, sessions, ...decodeListMetadata(result, "result", sessions.length) };
+  return { ...result, cursor, sessions, ...decodeListMetadata(result, "result", sessions.length) } as SessionListResult;
 }
 export function decodeSessions(input: unknown): SessionsFrame {
   const frame = inputObject(input);
