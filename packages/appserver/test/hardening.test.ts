@@ -161,11 +161,11 @@ describe("child supervision", () => {
     const supervisor = new RpcChildSupervisor({ spawn: () => child, argv: path => ["omp", "--mode", "rpc", "--session", path] }, record("s"), { entry: () => {}, event: () => {}, crashed: () => {} });
     await expect(supervisor.start()).rejects.toThrow("exceeds 1MiB");
   });
-  test("unknown child frames are fatal", async () => {
-    const crashed = Promise.withResolvers<Error>(); const exited = Promise.withResolvers<number>();
-    const child: ChildHandle = { stdin: { write: () => {} }, stdout: (async function* () { yield `${JSON.stringify({ type: "ready" })}\n`; yield `${JSON.stringify({ type: "unknown_frame" })}\n`; })(), stderr: (async function* () {})(), exited: exited.promise, kill: () => exited.resolve(1) };
-    const supervisor = new RpcChildSupervisor({ spawn: () => child, argv: path => ["omp", "--mode", "rpc", "--session", path] }, record("s"), { entry: () => {}, event: () => {}, crashed: crashed.resolve });
-    await supervisor.start(); expect((await crashed.promise).message).toContain("unknown rpc frame");
+  test("unknown string-typed child frames do not crash the supervisor", async () => {
+    const gate = Promise.withResolvers<void>(); const exited = Promise.withResolvers<number>(); const seen = Promise.withResolvers<void>(); const events: Record<string, unknown>[] = []; const crashed: Error[] = [];
+    const child: ChildHandle = { stdin: { write: () => {} }, stdout: (async function* () { yield `${JSON.stringify({ type: "ready" })}\n`; yield `${JSON.stringify({ type: "unknown_frame", payload: "future" })}\n`; await gate.promise; })(), stderr: (async function* () {})(), exited: exited.promise, kill: () => { gate.resolve(); exited.resolve(0); } };
+    const supervisor = new RpcChildSupervisor({ spawn: () => child, argv: path => ["omp", "--mode", "rpc", "--session", path] }, record("s"), { entry: () => {}, event: frame => { events.push(frame); seen.resolve(); }, crashed: error => crashed.push(error) });
+    await supervisor.start(); await seen.promise; expect(events).toEqual([{ type: "unknown_frame", payload: "future" }]); expect(crashed).toHaveLength(0); supervisor.stop(); expect(crashed).toHaveLength(0);
   });
   test("real Unix WebSocket upgrades on the local socket", async () => {
     const root = await mkdtemp(join(tmpdir(), "omp-ws-")); const path = join(root, "app.sock"); const appserver = createAppserver({ hostId: host, socketPath: path, discovery: new StaticDiscovery([]) }); await appserver.start();

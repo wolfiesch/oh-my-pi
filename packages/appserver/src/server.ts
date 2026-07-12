@@ -43,6 +43,7 @@ import {
 } from "./ownership.ts";
 import { SessionProjection } from "./projection.ts";
 import { BunRpcChildFactory, RpcChildSupervisor } from "./rpc-child.ts";
+import { TranscriptEventTranslator, asAppWireEvent } from "./transcript-events.ts";
 import type {
 	AppserverHandle,
 	AppserverOptions,
@@ -897,6 +898,7 @@ export class LocalAppserver implements AppserverHandle {
 		await this.#lockCheck(record);
 		if (this.#stopping || this.#closedSessions.has(sessionId)) throw new Error("session is closed");
 		const projection = this.#projections.get(sessionId)!;
+		const transcript = new TranscriptEventTranslator();
 		const projector = new SessionEntryProjector(this.hostId, sessionId, "live", projection.value.entries);
 		const supervisor = new RpcChildSupervisor(
 			this.#factory,
@@ -906,16 +908,17 @@ export class LocalAppserver implements AppserverHandle {
 					const value: unknown = frame.entry;
 					const raw = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 					if (!raw) return;
+					transcript.observeSessionEntry(raw);
 					for (const entry of projector.project(raw)) {
 						const output = projection.appendEntry(entry);
 						if (output) this.broadcast(sessionId, output);
 					}
 				},
-				event: frame =>
-					this.broadcast(
-						sessionId,
-						projection.appendEvent({ type: typeof frame.type === "string" ? frame.type : "rpc", ...frame }),
-					),
+				event: frame => {
+					for (const event of transcript.translate(frame)) {
+						this.broadcast(sessionId, projection.appendEvent(asAppWireEvent(event)));
+					}
+				},
 				crashed: () => {
 					projection.setStatus("closed");
 					this.#supervisors.delete(sessionId);

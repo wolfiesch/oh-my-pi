@@ -4,7 +4,6 @@ import type { ChildHandle, RpcChildFactory, SessionRecord } from "./types.ts";
 
 const MAX_LINE_BYTES = 1024 * 1024;
 const STDERR_BYTES = 64 * 1024;
-const VALID_EVENTS = new Set(["session_entry", "subagent_lifecycle", "subagent_progress", "subagent_event", "available_commands_update", "extension_ui_request", "host_tool_call", "host_tool_cancel", "host_uri_request", "host_uri_cancel"]);
 
 export interface ChildCallbacks { entry(frame: RpcSessionEntryFrame): void; event(frame: Record<string, unknown>): void; crashed(error: Error): void; }
 
@@ -187,7 +186,7 @@ export class RpcChildSupervisor {
       if (!value.entry || typeof value.entry !== "object" || Array.isArray(value.entry)) throw new Error("malformed rpc session entry");
       this.callbacks.entry(value as unknown as RpcSessionEntryFrame); return;
     }
-    if (typeof value.type !== "string" || !VALID_EVENTS.has(value.type)) throw new Error("unknown rpc frame type");
+    if (typeof value.type !== "string") throw new Error("rpc frame type is missing");
     this.callbacks.event(value);
   }
   private fail(error: Error): void {

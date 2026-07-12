@@ -132,17 +132,18 @@ describe("live Unix websocket protocol", () => {
   });
 
   test("cursor attach replays contiguous frames, while an evicted cursor gets gap and snapshot", async () => {
-    const factory = new LiveFactory(); const { appserver, path } = await liveServer(factory, [record("s1")], 2);
+    const factory = new LiveFactory(); const { appserver, path } = await liveServer(factory, [record("s1")], 3);
     const first = await readyClient(path, ["sessions.read", "sessions.prompt"]);
     first.client.sendJson(command("attach-1", "attach-1", "session.attach", "s1", {}));
     await responseAndSnapshot(first.client, "attach-1");
     first.client.sendJson(command("prompt-1", "prompt-1", "session.prompt", "s1", { message: "hello" }));
     const child = await factory.child(); await child.waitForWrites(1);
     child.push({ type: "session_entry", entry: { id: "entry-1", parentId: null, type: "message", timestamp: stamp, text: "hello" } });
-    child.push({ type: "subagent_progress", payload: { message: "working" } });
+    child.push({ type: "turn_start" });
+    child.push({ type: "turn_end" });
     responseFor(child, "prompt");
     const firstOutput = await untilResponse(first.client, "prompt-1");
-    expect(firstOutput.frames.map(frame => frame.type)).toEqual(["entry", "event", "response"]);
+    expect(firstOutput.frames.map(frame => frame.type)).toEqual(["entry", "event", "event", "response"]);
     const replayClient = await readyClient(path, ["sessions.read"]);
     replayClient.client.sendJson(command("attach-replay", "attach-replay", "session.attach", "s1", { cursor: { epoch, seq: 0 } }));
     const replayResponse = await replayClient.client.nextServer(); const replayOne = await replayClient.client.nextServer(); const replayTwo = await replayClient.client.nextServer();
@@ -154,7 +155,7 @@ describe("live Unix websocket protocol", () => {
     const source = await readyClient(evicted.path, ["sessions.read", "sessions.prompt"]);
     source.client.sendJson(command("attach-e", "attach-e", "session.attach", "s1", {})); await responseAndSnapshot(source.client, "attach-e");
     source.client.sendJson(command("prompt-e", "prompt-e", "session.prompt", "s1", { message: "hello" })); const evictChild = await evictFactory.child(); await evictChild.waitForWrites(1);
-    evictChild.push({ type: "subagent_progress", payload: { message: "one" } }); evictChild.push({ type: "subagent_progress", payload: { message: "two" } }); responseFor(evictChild, "prompt"); await untilResponse(source.client, "prompt-e");
+    evictChild.push({ type: "turn_start" }); evictChild.push({ type: "turn_end" }); responseFor(evictChild, "prompt"); await untilResponse(source.client, "prompt-e");
     const gapClient = await readyClient(evicted.path, ["sessions.read"]); gapClient.client.sendJson(command("attach-gap", "attach-gap", "session.attach", "s1", { cursor: { epoch, seq: 0 } }));
     const gapResponse = await gapClient.client.nextServer(); const gap = await gapClient.client.nextServer(); const snapshot = await gapClient.client.nextServer();
     expect(gapResponse.type).toBe("response"); expect(gap.type).toBe("gap"); expect(snapshot.type).toBe("snapshot");
@@ -191,7 +192,7 @@ describe("live Unix websocket protocol", () => {
     s1.client.sendJson(command("prompt-s1", "prompt-s1", "session.prompt", "s1", { message: "event" })); const child = await factory.child(); await child.waitForWrites(1);
     child.push({ type: "session_entry", entry: { id: "broadcast-entry", parentId: null, type: "message", timestamp: stamp, text: "entry" } });
     child.push({ type: "subagent_progress", payload: { message: "progress" } }); responseFor(child, "prompt");
-    const received = await untilResponse(s1.client, "prompt-s1"); expect(received.frames.map(frame => frame.type)).toEqual(["entry", "event", "response"]);
+    const received = await untilResponse(s1.client, "prompt-s1"); expect(received.frames.map(frame => frame.type)).toEqual(["entry", "response"]);
     s2.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "s2", timestamp: stamp }); unattached.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "none", timestamp: stamp });
     const s2Pong = await s2.client.nextServer(); const unattachedPong = await unattached.client.nextServer(); expect(s2Pong.type).toBe("pong"); expect(unattachedPong.type).toBe("pong");
     await s1.client.close(); await s1.client.closed();
@@ -225,6 +226,34 @@ describe("live Unix websocket protocol", () => {
     expect(JSON.stringify(output.frames)).not.toContain("systemPrompt");
     expect(JSON.stringify(output.frames)).not.toContain("authorization");
     expect(JSON.stringify(output.frames)).not.toContain("/home/lycaon");
+    await closeClients([client.client]); await appserver.stop();
+  });
+  test("translates a live RPC turn once and survives meta/future frames", async () => {
+    const factory = new LiveFactory(); const { appserver, path } = await liveServer(factory, [record("s1")]);
+    const client = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+    client.client.sendJson(command("attach-pipeline", "attach-pipeline", "session.attach", "s1", {})); await responseAndSnapshot(client.client, "attach-pipeline");
+    client.client.sendJson(command("prompt-pipeline", "prompt-pipeline", "session.prompt", "s1", { message: "go" }));
+    const child = await factory.child(); await child.waitForWrites(1);
+    child.push({ type: "turn_start" });
+    child.push({ type: "message_start", message: { role: "assistant", content: [] } });
+    child.push({ type: "message_update", message: { role: "assistant", timestamp: 10, content: [{ type: "thinking", thinking: "plan" }, { type: "text", text: "hello" }] } });
+    child.push({ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: { path: "x" } });
+    child.push({ type: "tool_execution_update", toolCallId: "call-1", partialResult: "working" });
+    child.push({ type: "tool_execution_end", toolCallId: "call-1", isError: false, result: { content: [{ type: "text", text: "done" }] } });
+    child.push({ type: "message_end", message: { role: "assistant", timestamp: 10, content: [{ type: "thinking", thinking: "plan" }, { type: "text", text: "hello" }] } });
+    child.push({ type: "session_entry", entry: { id: "assistant-1", parentId: null, type: "message", timestamp: stamp, message: { role: "assistant", timestamp: 10, content: [{ type: "thinking", thinking: "plan" }, { type: "text", text: "hello" }] } } });
+    child.push({ type: "prompt_result", agentInvoked: true });
+    child.push({ type: "future_frame", payload: "ignored" });
+    child.push({ type: "turn_end" });
+    responseFor(child, "prompt");
+    const output = await untilResponse(client.client, "prompt-pipeline");
+    const eventFrames = output.frames.filter(frame => frame.type === "event");
+    expect(eventFrames.map(frame => frame.type === "event" ? frame.event.type : "")).toEqual(["turn.start", "message.update", "tool.start", "tool.progress", "tool.result", "turn.end"]);
+    expect(eventFrames.filter(frame => frame.type === "event" && frame.event.type === "message.update")).toHaveLength(1);
+    expect(eventFrames.filter(frame => frame.type === "event" && frame.event.type === "tool.start")).toHaveLength(1);
+    expect(eventFrames.filter(frame => frame.type === "event" && frame.event.type === "tool.result")).toHaveLength(1);
+    expect(JSON.stringify(eventFrames)).not.toContain("future_frame");
+    expect(JSON.stringify(eventFrames)).not.toContain("message_update");
     await closeClients([client.client]); await appserver.stop();
   });
 });
