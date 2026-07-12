@@ -128,7 +128,10 @@ export class RpcChildSupervisor {
 			const line = `${JSON.stringify({ ...command, id: internalId })}\n`;
 			if (stringBytes(line) > MAX_LINE_BYTES) throw new Error("rpc command exceeds 1MiB");
 			await this.#child.stdin.write(line);
-			return await promise.promise;
+			const response = await promise.promise;
+			if (response.type !== "response" || response.command !== command.type || typeof response.success !== "boolean")
+				throw new Error("rpc response command mismatch");
+			return response;
 		} catch (error) {
 			this.#pending.delete(internalId);
 			throw error;
@@ -141,6 +144,12 @@ export class RpcChildSupervisor {
 	}
 	async cancel(id: string): Promise<RpcResponse> {
 		return this.call({ type: "abort" }, id);
+	}
+	async respondUi(requestId: string, payload: { value?: string; confirmed?: boolean; cancelled?: true }): Promise<void> {
+		if (!this.#child || this.#closed || !this.#ready) throw new Error("rpc child unavailable");
+		const line = `${JSON.stringify({ type: "extension_ui_response", id: requestId, ...payload })}\n`;
+		if (stringBytes(line) > MAX_LINE_BYTES) throw new Error("rpc command exceeds 1MiB");
+		await this.#child.stdin.write(line);
 	}
   stop(): void { const child = this.#child; this.#closed = true; child?.kill(); this.fail(new Error("rpc child stopped")); this.#child = undefined; }
   child(): ChildHandle | undefined { return this.#child; }

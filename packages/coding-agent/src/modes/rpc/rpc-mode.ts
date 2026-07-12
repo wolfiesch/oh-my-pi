@@ -13,6 +13,7 @@
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isRecord, readJsonl, Snowflake } from "@oh-my-pi/pi-utils";
+import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -990,6 +991,20 @@ export async function runRpcMode(
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				return success(id, "abort");
 			}
+			case "retry": {
+				const retried = await session.retry();
+				return success(id, "retry", { retried });
+			}
+
+			case "pause": {
+				const changed = agentPauseGate.pause();
+				return success(id, "pause", { paused: agentPauseGate.paused, changed });
+			}
+
+			case "resume": {
+				const resumed = agentPauseGate.resume() !== undefined;
+				return success(id, "resume", { paused: agentPauseGate.paused, resumed });
+			}
 
 			case "abort_and_prompt": {
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
@@ -1023,6 +1038,7 @@ export async function runRpcMode(
 					thinkingLevel: session.thinkingLevel,
 					isStreaming: session.isStreaming,
 					isCompacting: session.isCompacting,
+					isPaused: agentPauseGate.paused,
 					steeringMode: session.steeringMode,
 					followUpMode: session.followUpMode,
 					interruptMode: session.interruptMode,
@@ -1032,6 +1048,7 @@ export async function runRpcMode(
 					autoCompactionEnabled: session.autoCompactionEnabled,
 					messageCount: session.messages.length,
 					queuedMessageCount: session.queuedMessageCount,
+					queuedMessages: { steering: [...session.getQueuedMessages().steering], followUp: [...session.getQueuedMessages().followUp] },
 					todoPhases: session.getTodoPhases(),
 					systemPrompt: session.systemPrompt,
 					dumpTools: session.agent.state.tools.map(tool => ({

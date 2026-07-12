@@ -18,6 +18,7 @@ export * from "./limits.ts";
 export * from "./pairing-confirm.ts";
 export * from "./result.ts";
 export * from "./session-index.ts";
+export * from "./session-state.ts";
 export * from "./snapshot.ts";
 export * from "./terminal.ts";
 export * from "./user-terminals.ts";

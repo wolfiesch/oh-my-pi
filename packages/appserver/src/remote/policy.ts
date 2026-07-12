@@ -104,7 +104,7 @@ function leaseId(args: Record<string, unknown>): string | undefined {
   try { return wireLeaseId(args.leaseId, "args.leaseId"); } catch { return undefined; }
 }
 function mutation(command: string): boolean {
-  return command === "session.prompt" || command === "session.close" || command === "session.cancel" || command === "files.write" || command === "files.patch" || command === "review.apply" || command === "bash.run" || command === "agent.cancel" || command === "preview.launch" || command === "preview.navigate";
+  return ["session.prompt", "session.steer", "session.followUp", "session.ui.respond", "session.rename", "session.retry", "session.compact", "session.pause", "session.resume", "session.model.set", "session.thinking.set", "session.close", "session.cancel", "files.write", "files.patch", "review.apply", "bash.run", "agent.cancel", "preview.launch", "preview.navigate"].includes(command);
 }
 function commandFeature(command: string): string | undefined {
   if (command.startsWith("controller.lease.")) return "controller.lease";

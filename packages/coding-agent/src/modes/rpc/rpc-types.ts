@@ -32,6 +32,9 @@ export type RpcCommand =
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "new_session"; parentSession?: string }
+	| { id?: string; type: "retry" }
+	| { id?: string; type: "pause" }
+	| { id?: string; type: "resume" }
 
 	// State
 	| { id?: string; type: "get_state" }
@@ -96,10 +99,12 @@ export interface RpcSessionState {
 	isStreaming: boolean;
 	isCompacting: boolean;
 	steeringMode: "all" | "one-at-a-time";
+	isPaused?: boolean;
 	followUpMode: "all" | "one-at-a-time";
 	interruptMode: "immediate" | "wait";
 	sessionFile?: string;
 	sessionId: string;
+	queuedMessages: { steering: string[]; followUp: string[] };
 	sessionName?: string;
 	autoCompactionEnabled: boolean;
 	messageCount: number;
@@ -174,6 +179,9 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "follow_up"; success: true }
 	| { id?: string; type: "response"; command: "abort"; success: true }
 	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
+	| { id?: string; type: "response"; command: "retry"; success: true; data: { retried: boolean } }
+	| { id?: string; type: "response"; command: "pause"; success: true; data: { paused: boolean; changed: boolean } }
+	| { id?: string; type: "response"; command: "resume"; success: true; data: { paused: boolean; resumed: boolean } }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
 
 	// State

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { hostId, revision, type DurableEntry, type HostId, type SessionEvent, type SessionId, type SessionRef, type ServerFrame } from "@oh-my-pi/app-wire";
+import { hostId, revision, type DurableEntry, type HostId, type SessionEvent, type SessionId, type SessionRef, type ServerFrame, type SessionStateResult } from "@oh-my-pi/app-wire";
 import type { Projection, SessionRecord } from "./types.ts";
 
 function frameCursor(frame: ServerFrame): { epoch: string; seq: number } | undefined {
@@ -36,6 +36,31 @@ export class SessionProjection {
     this.value.revision = revision(`r-${this.#revisionHash.copy().digest("hex").slice(0, 24)}`);
     this.value.ref = { ...this.value.ref, revision: this.value.revision, updatedAt: entry.timestamp };
     return this.appendFrame({ v: "omp-app/1", type: "entry", cursor: this.nextCursor(), revision: this.value.revision, hostId: this.value.hostId, sessionId: this.value.sessionId, entry });
+  }
+  updateState(state: SessionStateResult): ServerFrame | undefined {
+    const next: SessionRef = { ...this.value.ref };
+    const liveState = { ...(next.liveState ?? {}) };
+    delete liveState.modelId; delete liveState.modelProvider; delete liveState.modelDisplayName;
+    if (state.queuedMessages) liveState.queuedMessages = state.queuedMessages;
+    else delete liveState.queuedMessages;
+    if (state.sessionName !== undefined) next.title = state.sessionName;
+    if (state.model !== undefined) {
+      next.model = `${state.model.provider}/${state.model.id}`;
+      liveState.modelId = state.model.id; liveState.modelProvider = state.model.provider; if (state.model.displayName) liveState.modelDisplayName = state.model.displayName;
+    } else delete next.model;
+    if (state.thinking !== undefined) next.thinking = state.thinking;
+    else delete next.thinking;
+    if (state.contextUsage !== undefined) next.contextUsage = state.contextUsage;
+    else delete next.contextUsage;
+    if (next.status !== "closed") next.status = state.isStreaming ? "active" : "idle";
+    next.liveState = { ...liveState, isStreaming: state.isStreaming, isCompacting: state.isCompacting, isPaused: state.isPaused, messageCount: state.messageCount, queuedMessageCount: state.queuedMessageCount, steeringMode: state.steeringMode, followUpMode: state.followUpMode, interruptMode: state.interruptMode };
+    if (JSON.stringify(next) === JSON.stringify(this.value.ref)) return undefined;
+    this.#revisionHash.update(`state:${JSON.stringify(next)}\n`);
+    const nextRevision = revision(`r-${this.#revisionHash.copy().digest("hex").slice(0, 24)}`);
+    next.revision = nextRevision;
+    this.value.revision = nextRevision;
+    this.value.ref = next;
+    return this.appendFrame({ v: "omp-app/1", type: "session.delta", cursor: this.nextCursor(), revision: nextRevision, hostId: this.value.hostId, sessionId: this.value.sessionId, upsert: next });
   }
   appendEvent(event: SessionEvent): ServerFrame {
     return this.appendFrame({ v: "omp-app/1", type: "event", cursor: this.nextCursor(), hostId: this.value.hostId, sessionId: this.value.sessionId, event });

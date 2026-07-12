@@ -8,6 +8,7 @@ import {
 	type ConfirmationChallenge,
 	type ConfirmFrame,
 	decodeClientFrame,
+	decodeSessionStateResult,
 	decodeCursor,
 	decodeSessionPromptArguments,
 	type HelloFrame,
@@ -17,6 +18,7 @@ import {
 	type ResultFrame,
 	requiredCapability,
 	type ServerFrame,
+	type SessionStateResult,
 	type SessionRef,
 	type SessionId,
 	utf8ByteLength,
@@ -130,6 +132,33 @@ function argumentError(command: CommandFrame): string | undefined {
 		return undefined;
 	if (keys.length !== 0) return "command does not accept args";
 	return undefined;
+}
+function safeSessionState(value: unknown): SessionStateResult {
+	const raw = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+	if (!raw) throw new Error("rpc state is not an object");
+	const model = raw.model && typeof raw.model === "object" && !Array.isArray(raw.model) ? raw.model as Record<string, unknown> : undefined;
+	const context = raw.contextUsage && typeof raw.contextUsage === "object" && !Array.isArray(raw.contextUsage) ? raw.contextUsage as Record<string, unknown> : undefined;
+	const queued = raw.queuedMessages && typeof raw.queuedMessages === "object" && !Array.isArray(raw.queuedMessages) ? raw.queuedMessages as Record<string, unknown> : undefined;
+	const state = {
+		isStreaming: raw.isStreaming,
+		isCompacting: raw.isCompacting,
+		isPaused: raw.isPaused === true,
+		messageCount: raw.messageCount,
+		queuedMessageCount: raw.queuedMessageCount,
+		steeringMode: raw.steeringMode,
+		followUpMode: raw.followUpMode,
+		interruptMode: raw.interruptMode,
+		...(model ? { model: { id: model.id, provider: model.provider, ...(typeof model.name === "string" ? { displayName: model.name } : {}) } } : {}),
+		...(raw.thinkingLevel === undefined ? {} : { thinking: raw.thinkingLevel }),
+		...(raw.sessionName === undefined ? {} : { sessionName: raw.sessionName }),
+		...(queued ? { queuedMessages: { steering: queued.steering, followUp: queued.followUp } } : {}),
+	};
+	return decodeSessionStateResult(state);
+}
+function childBoolean(value: unknown, key: string): boolean {
+	const record = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+	if (!record || typeof record[key] !== "boolean") throw new Error("rpc child result is malformed");
+	return record[key] as boolean;
 }
 type AppWs = ConnectionTransport;
 type LocalWs = Bun.ServerWebSocket<ServerWebSocketData>;
@@ -741,6 +770,35 @@ export class LocalAppserver implements AppserverHandle {
 				outcome = {
 					frame: response(this.hostId, command, true, { attached: true, cursor: projection!.value.cursor }),
 				};
+			else if (command.command === "session.state.get") {
+				const supervisor = await this.ensureSupervisor(command.sessionId!);
+				const result = await supervisor.call({ type: "get_state" }, command.requestId, controller.signal);
+				if (!result.success || !("data" in result)) throw new Error("rpc state query failed");
+				outcome = { frame: response(this.hostId, command, true, safeSessionState(result.data)) };
+			} else if (command.command === "session.steer" || command.command === "session.followUp") {
+				const supervisor = await this.ensureSupervisor(command.sessionId!);
+				const type = command.command === "session.steer" ? "steer" : "follow_up";
+				const result = await supervisor.call({ type, message: command.args.message }, command.requestId, controller.signal);
+				outcome = { frame: response(this.hostId, command, result.success, { accepted: result.success }, result.success ? undefined : { code: "child_error", message: "session command failed" }) };
+				this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId);
+			} else if (command.command === "session.ui.respond") {
+				const supervisor = await this.ensureSupervisor(command.sessionId!);
+				const { requestId, value, confirmed, cancelled } = command.args;
+				await supervisor.respondUi(requestId as string, { ...(value === undefined ? {} : { value: value as string }), ...(confirmed === undefined ? {} : { confirmed: confirmed as boolean }), ...(cancelled === undefined ? {} : { cancelled: cancelled as true }) });
+				outcome = { frame: response(this.hostId, command, true, { accepted: true }) };
+			} else if (command.command === "session.retry" || command.command === "session.pause" || command.command === "session.resume" || command.command === "session.compact" || command.command === "session.rename" || command.command === "session.model.set" || command.command === "session.thinking.set") {
+				const supervisor = await this.ensureSupervisor(command.sessionId!);
+				const type = command.command === "session.retry" ? "retry" : command.command === "session.pause" ? "pause" : command.command === "session.resume" ? "resume" : command.command === "session.compact" ? "compact" : command.command === "session.rename" ? "set_session_name" : command.command === "session.model.set" ? "set_model" : "set_thinking_level";
+				const args = command.command === "session.compact" ? { customInstructions: command.args.instructions } : command.command === "session.rename" ? { name: command.args.name } : command.command === "session.model.set" ? { provider: command.args.provider, modelId: command.args.modelId } : command.command === "session.thinking.set" ? { level: command.args.level } : {};
+				const result = await supervisor.call({ type, ...args }, command.requestId, controller.signal);
+				if (!result.success) outcome = { frame: response(this.hostId, command, false, undefined, { code: "child_error", message: "session command failed" }) };
+				else {
+					const childData = "data" in result ? result.data : undefined;
+					const data = command.command === "session.retry" ? { retried: childBoolean(childData, "retried") } : command.command === "session.pause" ? { paused: childBoolean(childData, "paused"), changed: childBoolean(childData, "changed") } : command.command === "session.resume" ? { resumed: childBoolean(childData, "resumed"), paused: childBoolean(childData, "paused") } : command.command === "session.compact" ? { compacted: true } : command.command === "session.rename" ? { renamed: true } : { accepted: true };
+					outcome = { frame: response(this.hostId, command, true, data) };
+				}
+				this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId);
+			}
 			else if (command.command === "session.prompt") {
 				if (this.#closedSessions.has(command.sessionId!)) throw new Error("session is closed");
 				projection!.setStatus("active");
@@ -756,6 +814,7 @@ export class LocalAppserver implements AppserverHandle {
 						result.success ? undefined : { code: "child_error", message: "session command failed" },
 					),
 				};
+				this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId);
 			} else if (command.command === "session.cancel") {
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
 				const result = await supervisor.cancel(command.requestId);
@@ -874,6 +933,19 @@ export class LocalAppserver implements AppserverHandle {
 	private finish(command: CommandFrame, outcome: CommandOutcome): CommandOutcome {
 		this.#idempotency.complete(command.commandId, command, outcome);
 		return outcome;
+	}
+	private async refreshState(sessionId: SessionId, supervisor: RpcChildSupervisor, requestId: string): Promise<SessionStateResult> {
+		const result = await supervisor.call({ type: "get_state" }, `${requestId}:state`);
+		if (!result.success || !("data" in result)) throw new Error("rpc state query failed");
+		const state = safeSessionState(result.data);
+		const projection = this.#projections.get(sessionId);
+		if (!projection) throw new Error("unknown session");
+		const frame = projection.updateState(state);
+		if (frame) this.broadcast(sessionId, frame);
+		return state;
+	}
+	private scheduleStateRefresh(sessionId: SessionId, supervisor: RpcChildSupervisor, requestId: string): void {
+		void this.refreshState(sessionId, supervisor, requestId).catch(() => undefined);
 	}
 	private async ensureSupervisor(sessionId: SessionId): Promise<RpcChildSupervisor> {
 		if (this.#stopping) throw new Error("appserver is stopping");

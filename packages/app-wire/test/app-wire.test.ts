@@ -323,6 +323,7 @@ describe("app-wire authority", () => {
 	test("every descriptor declares an exhaustive revision owner", () => {
 		const expected: Record<string, string> = {
 			"session.prompt": "session", "session.cancel": "session", "session.close": "session", "agent.cancel": "session", "bash.run": "session", "term.open": "session",
+			"session.state.get": "none", "session.steer": "session", "session.followUp": "session", "session.rename": "session", "session.retry": "session", "session.compact": "session", "session.pause": "session", "session.resume": "session", "session.model.set": "session", "session.thinking.set": "session", "session.ui.respond": "session",
 			"controller.lease.acquire": "session", "controller.lease.renew": "session", "controller.lease.release": "session", "prompt.lease.acquire": "session", "prompt.lease.renew": "session", "prompt.lease.release": "session",
 			"preview.launch": "session", "preview.state": "session", "preview.navigate": "session", "preview.capture": "session",
 			"files.read": "authority", "files.write": "authority", "files.patch": "authority", "files.list": "authority", "files.diff": "authority", "review.read": "authority", "review.apply": "authority", "config.write": "authority", "settings.write": "authority",
