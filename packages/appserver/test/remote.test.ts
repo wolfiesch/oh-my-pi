@@ -125,12 +125,17 @@ test("remote settings preserve protocol-sized maps and redact local paths by val
 		const hello: HelloFrame = { v: "omp-app/1", type: "hello", protocol: { min: "1", max: "1" }, client: { name: "test", version: "1", build: "test", platform: "linux" }, requestedFeatures: [], savedCursors: [] };
 		expect(policy.authenticate(connection, hello).authentication).toBe("pairing-required");
 		const settings: Record<string, unknown> = Object.fromEntries(
-			Array.from({ length: 406 }, (_, index) => [`setting-${index}`, `value-${index}`]),
+			Array.from({ length: 404 }, (_, index) => [
+				`setting-${index}`,
+				{ type: "string", sensitive: false, default: null, effective: `value-${index}` },
+			]),
 		);
-		settings.workspaceDirectory = "/home/operator/project";
-		settings.windowsDirectory = "C:\\Users\\operator\\project";
-		settings.networkShare = "\\\\server\\share";
-		settings.documentationUrl = "https://docs.example/settings";
+		settings.workspaceDirectory = { type: "string", sensitive: false, effective: "/home/operator/project" };
+		settings.windowsDirectory = { type: "string", sensitive: false, effective: "C:\\Users\\operator\\project" };
+		settings.networkShare = { type: "string", sensitive: false, effective: "\\\\server\\share" };
+		settings.documentationUrl = { type: "string", sensitive: false, effective: "https://docs.example/settings" };
+		settings["branchSummary.reserveTokens"] = { type: "number", sensitive: false, default: 1024, effective: 2048 };
+		settings["auth.broker.token"] = { type: "string", sensitive: true };
 		expect(Object.keys(settings)).toHaveLength(410);
 		const frame = {
 			v: "omp-app/1", type: "response", requestId: "request-settings", commandId: "command-settings",
@@ -138,11 +143,14 @@ test("remote settings preserve protocol-sized maps and redact local paths by val
 		} as unknown as ServerFrame;
 		const outbound = policy.transformOutbound(connection, frame) as Record<string, unknown>;
 		const result = outbound.result as Record<string, unknown>;
-		const sanitized = result.settings as Record<string, unknown>;
-		expect(sanitized.workspaceDirectory).toBe("[relative-path-redacted]");
-		expect(sanitized.windowsDirectory).toBe("[relative-path-redacted]");
-		expect(sanitized.networkShare).toBe("[relative-path-redacted]");
-		expect(sanitized.documentationUrl).toBe("https://docs.example/settings");
+		const sanitized = result.settings as Record<string, Record<string, unknown>>;
+		expect(sanitized.workspaceDirectory?.effective).toBe("[relative-path-redacted]");
+		expect(sanitized.windowsDirectory?.effective).toBe("[relative-path-redacted]");
+		expect(sanitized.networkShare?.effective).toBe("[relative-path-redacted]");
+		expect(sanitized.documentationUrl?.effective).toBe("https://docs.example/settings");
+		expect(sanitized["branchSummary.reserveTokens"]).toEqual({ type: "number", sensitive: false, default: 1024, effective: 2048 });
+		expect(sanitized["auth.broker.token"]).toEqual({ type: "string", sensitive: true });
+		expect(decodeServerFrame(outbound)).toMatchObject({ type: "response", command: "settings.read" });
 		const oversized = {
 			...frame,
 			result: {

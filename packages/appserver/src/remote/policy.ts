@@ -711,7 +711,7 @@ export class TailscaleRemotePolicy implements RemoteConnectionPolicy {
 
 function sanitizeRemoteFrame(frame: ServerFrame): ServerFrame | undefined {
 	const seen = new WeakSet<object>();
-	const walk = (value: unknown, depth: number): unknown => {
+	const walk = (value: unknown, depth: number, settingsMap = false): unknown => {
 		if (depth > 12) throw new Error("outbound depth exceeded");
 		if (typeof value === "string") {
 			if (value.length > 65_536) throw new Error("outbound string exceeded");
@@ -737,14 +737,19 @@ function sanitizeRemoteFrame(frame: ServerFrame): ServerFrame | undefined {
 		const entries = Object.entries(value);
 		if (entries.length > MAX_MAP_KEYS) throw new Error("outbound object exceeded");
 		for (const [childKey, child] of entries) {
+			const childIsSettingsMap =
+				frame.type === "response" &&
+				frame.command === "settings.read" &&
+				depth === 1 &&
+				childKey === "settings";
 			if (
 				(frame.type === "welcome" && depth === 0 && childKey === "authentication") ||
 				(frame.type === "response" && depth === 0 && childKey === "command")
 			) {
 				result[childKey] = child;
-			} else if (childKey === "deviceToken" || isSecretLikeKey(childKey)) {
+			} else if (!settingsMap && (childKey === "deviceToken" || isSecretLikeKey(childKey))) {
 				result[childKey] = "[redacted]";
-			} else result[childKey] = walk(child, depth + 1);
+			} else result[childKey] = walk(child, depth + 1, childIsSettingsMap);
 		}
 		seen.delete(value);
 		return result;
