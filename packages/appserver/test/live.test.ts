@@ -297,7 +297,7 @@ describe("live Unix websocket protocol", () => {
 
 	test("cursor attach replays contiguous frames, while an evicted cursor gets gap and snapshot", async () => {
 		const factory = new LiveFactory();
-		const { appserver, path } = await liveServer(factory, [record("s1")], 3);
+		const { appserver, path } = await liveServer(factory, [record("s1")], 5);
 		const first = await readyClient(path, ["sessions.read", "sessions.prompt"]);
 		first.client.sendJson(command("attach-1", "attach-1", "session.attach", "s1", {}));
 		await responseAndSnapshot(first.client, "attach-1");
@@ -312,18 +312,39 @@ describe("live Unix websocket protocol", () => {
 		child.push({ type: "turn_end" });
 		responseFor(child, "prompt");
 		const firstOutput = await untilResponse(first.client, "prompt-1");
-		expect(firstOutput.frames.map(frame => frame.type)).toEqual(["entry", "event", "event", "response"]);
+		expect(firstOutput.frames.map(frame => frame.type)).toEqual([
+			"session.delta",
+			"entry",
+			"event",
+			"event",
+			"session.delta",
+			"response",
+		]);
 		const replayClient = await readyClient(path, ["sessions.read"]);
 		replayClient.client.sendJson(
 			command("attach-replay", "attach-replay", "session.attach", "s1", { cursor: { epoch, seq: 0 } }),
 		);
 		const replayResponse = await replayClient.client.nextServer();
-		const replayOne = await replayClient.client.nextServer();
-		const replayTwo = await replayClient.client.nextServer();
+		const replayFrames = [
+			await replayClient.client.nextServer(),
+			await replayClient.client.nextServer(),
+			await replayClient.client.nextServer(),
+			await replayClient.client.nextServer(),
+			await replayClient.client.nextServer(),
+		];
 		expect(replayResponse.type).toBe("response");
-		expect([replayOne.type, replayTwo.type]).toEqual(["entry", "event"]);
-		if (replayOne.type === "entry" && replayTwo.type === "event")
-			expect([replayOne.cursor.seq, replayTwo.cursor.seq]).toEqual([1, 2]);
+		expect(replayFrames.map(frame => frame.type)).toEqual([
+			"session.delta",
+			"entry",
+			"event",
+			"event",
+			"session.delta",
+		]);
+		expect(
+			replayFrames.map(frame =>
+				frame.type === "entry" || frame.type === "event" || frame.type === "session.delta" ? frame.cursor.seq : -1,
+			),
+		).toEqual([1, 2, 3, 4, 5]);
 		await closeClients([first.client, replayClient.client]);
 		await appserver.stop();
 
@@ -410,7 +431,7 @@ describe("live Unix websocket protocol", () => {
 		child.push({ type: "subagent_progress", payload: { message: "progress" } });
 		responseFor(child, "prompt");
 		const received = await untilResponse(s1.client, "prompt-s1");
-		expect(received.frames.map(frame => frame.type)).toEqual(["entry", "response"]);
+		expect(received.frames.map(frame => frame.type)).toEqual(["session.delta", "entry", "response"]);
 		s2.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "s2", timestamp: stamp });
 		unattached.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "none", timestamp: stamp });
 		const s2Pong = await s2.client.nextServer();
@@ -435,6 +456,8 @@ describe("live Unix websocket protocol", () => {
 		client.client.sendJson(command("prompt-project", "prompt-project", "session.prompt", "s1", { message: "go" }));
 		const child = await factory.child();
 		await child.waitForWrites(1);
+		const active = await client.client.nextServer();
+		expect(active.type).toBe("session.delta");
 		child.push({
 			type: "session_entry",
 			entry: {
@@ -619,6 +642,13 @@ describe("live Unix websocket protocol", () => {
 			"tool.result",
 			"turn.end",
 		]);
+		expect(output.frames).toContainEqual(
+			expect.objectContaining({
+				type: "session.delta",
+				upsert: expect.objectContaining({ status: "idle" }),
+			}),
+		);
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
 		expect(eventFrames.filter(frame => frame.type === "event" && frame.event.type === "message.update")).toHaveLength(
 			1,
 		);
@@ -626,6 +656,42 @@ describe("live Unix websocket protocol", () => {
 		expect(eventFrames.filter(frame => frame.type === "event" && frame.event.type === "tool.result")).toHaveLength(1);
 		expect(JSON.stringify(eventFrames)).not.toContain("future_frame");
 		expect(JSON.stringify(eventFrames)).not.toContain("message_update");
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+	test("tracks response-before-end and queued turn status transitions", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory, [record("s1")]);
+		const client = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+		client.client.sendJson(command("attach-status", "attach-status", "session.attach", "s1", {}));
+		const [, initial] = await responseAndSnapshot(client.client, "attach-status");
+		client.client.sendJson(command("prompt-status", "prompt-status", "session.prompt", "s1", { message: "go" }));
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		const active = await client.client.nextServer();
+		expect(active.type).toBe("session.delta");
+		if (active.type === "session.delta") {
+			expect(active.upsert?.status).toBe("active");
+			expect(active.revision).not.toBe(initial.revision);
+			expect(active.upsert?.revision).toBe(active.revision);
+		}
+		responseFor(child, "prompt");
+		const acknowledged = await untilResponse(client.client, "prompt-status");
+		expect(acknowledged.response.ok).toBe(true);
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("active");
+		child.push({ type: "turn_end" });
+		const turnEnd = await client.client.nextServer();
+		const idle = await client.client.nextServer();
+		expect(turnEnd.type === "event" ? turnEnd.event.type : turnEnd.type).toBe("turn.end");
+		expect(idle.type).toBe("session.delta");
+		if (idle.type === "session.delta") expect(idle.upsert?.status).toBe("idle");
+		child.push({ type: "turn_start" });
+		const turnStart = await client.client.nextServer();
+		const queuedActive = await client.client.nextServer();
+		expect(turnStart.type === "event" ? turnStart.event.type : turnStart.type).toBe("turn.start");
+		expect(queuedActive.type).toBe("session.delta");
+		if (queuedActive.type === "session.delta") expect(queuedActive.upsert?.status).toBe("active");
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("active");
 		await closeClients([client.client]);
 		await appserver.stop();
 	});
@@ -1197,8 +1263,11 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		const [, snapshot] = await responseAndSnapshot(client.client, "attach");
 		client.client.sendJson(command("prompt", "prompt", "session.prompt", "s1", { message: "hold" }));
 		await gate.started.promise;
+		const active = await client.client.nextServer();
+		expect(active.type).toBe("session.delta");
 		const close = command("close", "close", "session.close", "s1", {});
-		(close as Record<string, unknown>).expectedRevision = snapshot.revision;
+		(close as Record<string, unknown>).expectedRevision =
+			active.type === "session.delta" ? active.revision : snapshot.revision;
 		client.client.sendJson(close);
 		const closeChallenge = await client.client.nextServer();
 		expect(closeChallenge.type).toBe("confirmation");

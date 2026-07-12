@@ -921,14 +921,14 @@ export class LocalAppserver implements AppserverHandle {
 				this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId);
 			} else if (command.command === "session.prompt") {
 				if (this.#closedSessions.has(command.sessionId!)) throw new Error("session is closed");
-				projection!.setStatus("active");
+				this.updateStatus(command.sessionId!, "active");
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
 				const result = await supervisor.prompt(
 					command.requestId,
 					decodeSessionPromptArguments(command.args).message,
 					controller.signal,
 				);
-				projection!.setStatus(result.success ? "idle" : "closed");
+				if (!result.success) this.updateStatus(command.sessionId!, "closed");
 				outcome = {
 					frame: response(
 						this.hostId,
@@ -979,7 +979,7 @@ export class LocalAppserver implements AppserverHandle {
 				failedProjection.value.ref.status === "active" &&
 				!this.#closedSessions.has(command.sessionId!)
 			)
-				failedProjection.setStatus("idle");
+				this.updateStatus(command.sessionId!, "idle");
 			const operation =
 				this.#operations &&
 				ws &&
@@ -1054,13 +1054,17 @@ export class LocalAppserver implements AppserverHandle {
 		this.#supervisors.delete(sessionId);
 		this.#transcripts.delete(sessionId);
 		this.#subagents.delete(sessionId);
-		projection.setStatus("closed");
+		this.updateStatus(sessionId, "closed");
 		this.broadcast(sessionId, projection.appendEvent({ type: "session_closed" }));
 		return { frame: response(this.hostId, command, true, { closed: true, sessionId }) };
 	}
 	private finish(command: CommandFrame, outcome: CommandOutcome): CommandOutcome {
 		this.#idempotency.complete(command.commandId, command, outcome);
 		return outcome;
+	}
+	private updateStatus(sessionId: SessionId, status: SessionRef["status"]): void {
+		const frame = this.#projections.get(sessionId)?.updateStatus(status);
+		if (frame) this.broadcast(sessionId, frame);
 	}
 	private async refreshState(
 		sessionId: SessionId,
@@ -1130,10 +1134,12 @@ export class LocalAppserver implements AppserverHandle {
 					if (agentFrame) this.broadcast(sessionId, agentFrame);
 					for (const event of transcript.translate(frame)) {
 						this.broadcast(sessionId, projection.appendEvent(asAppWireEvent(event)));
+						if (event.type === "turn.start") this.updateStatus(sessionId, "active");
+						else if (event.type === "turn.end") this.updateStatus(sessionId, "idle");
 					}
 				},
 				crashed: () => {
-					projection.setStatus("closed");
+					this.updateStatus(sessionId, "closed");
 					this.#supervisors.delete(sessionId);
 					this.#transcripts.delete(sessionId);
 					this.#subagents.delete(sessionId);
