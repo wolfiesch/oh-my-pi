@@ -425,7 +425,22 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
   return { sessionId: sid, path, cwd, projectId: stableProjectId(cwd), projectName: basename(cwd), title: cleanText(title, 512, true) || "Untitled", updatedAt: "", status: "idle", ...(normalized.model ? { model: normalized.model } : {}), ...(normalized.thinking ? { thinking: normalized.thinking } : {}), entries: normalized.entries };
 }
 
+interface FileIndexEntry {
+  readonly signature: string;
+  readonly record: SessionRecord;
+}
+
+export function compareSessionRecords(a: SessionRecord, b: SessionRecord): number {
+  if (a.updatedAt < b.updatedAt) return 1;
+  if (a.updatedAt > b.updatedAt) return -1;
+  if (a.sessionId < b.sessionId) return -1;
+  if (a.sessionId > b.sessionId) return 1;
+  return 0;
+}
+
 export class FileSessionDiscovery implements SessionDiscovery {
+  private readonly index = new Map<string, FileIndexEntry>();
+
   constructor(private readonly root: string, private readonly fs: FileSystem = realFs, private readonly host: HostId = hostId("discovery")) {}
   private async files(path: string): Promise<string[]> {
     const children = await this.fs.readdir(path);
@@ -442,16 +457,33 @@ export class FileSessionDiscovery implements SessionDiscovery {
     let files: string[];
     try { files = await this.files(this.root); } catch { return []; }
     const found: SessionRecord[] = [];
+    const seen = new Set<string>();
     for (const path of files) {
+      let identity: string;
+      try { identity = realpathSync.native(path); } catch { identity = resolve(path); }
+      if (seen.has(identity)) continue;
+      seen.add(identity);
       try {
         const fileStat = await this.fs.stat(path);
-        if (fileStat.size > MAX_TRANSCRIPT_BYTES) continue;
-        const record = parseTranscript(await this.fs.readFile(path), path, this.host);
-        record.updatedAt = new Date(fileStat.mtimeMs).toISOString();
+        if (fileStat.size > MAX_TRANSCRIPT_BYTES) {
+          this.index.delete(identity);
+          continue;
+        }
+        const signature = `${fileStat.size}:${fileStat.mtimeMs}`;
+        const cached = this.index.get(identity);
+        let record = cached?.signature === signature ? cached.record : undefined;
+        if (!record) {
+          record = parseTranscript(await this.fs.readFile(path), path, this.host);
+          record.updatedAt = new Date(fileStat.mtimeMs).toISOString();
+          this.index.set(identity, { signature, record });
+        }
         found.push(record);
-      } catch {}
+      } catch {
+        this.index.delete(identity);
+      }
     }
-    found.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.sessionId.localeCompare(b.sessionId));
+    for (const identity of this.index.keys()) if (!seen.has(identity)) this.index.delete(identity);
+    found.sort(compareSessionRecords);
     return found;
   }
 }

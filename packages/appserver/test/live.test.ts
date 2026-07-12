@@ -278,8 +278,29 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
     client.client.sendJson(command("bad-args", "bad-args", "session.prompt", "s1", { message: "ok", extra: true })); const badArgs = await client.client.nextServer(); expect(badArgs.type).toBe("response"); if (badArgs.type === "response") expect(badArgs.error?.code).toBe("invalid_frame");
     client.client.sendJson(command("big", "big", "session.prompt", "s1", { message: "x".repeat(65_537) })); const big = await client.client.nextServer(); expect(big.type).toBe("response"); if (big.type === "response") expect(big.error?.code).toBe("invalid_frame");
     await closeClients([client.client]); await appserver.stop();
+
     const pathServer = await liveServer(new LiveFactory(), [record("s1")]); const pathClient = await readyClient(pathServer.path, ["files.read"]);
     pathClient.client.sendRaw(frameBytes(1, new TextEncoder().encode(JSON.stringify({ v: "omp-app/1", type: "command", requestId: "bad-path-r", commandId: "bad-path-c", hostId: host, command: "files.read", sessionId: "s1", args: { path: "/etc/passwd" } })))); const pathResult = await pathClient.client.nextOrClose(); expect(pathResult?.opcode === 1 || pathResult?.opcode === 8 || pathResult === undefined).toBe(true); pathClient.client.destroy(); await pathClient.client.closed(); await pathServer.appserver.stop();
+  });
+
+  test("caps session list wire refs while preserving total metadata and projections", async () => {
+    const records = Array.from({ length: 5_000 }, (_, index) => record(`session-${index}`));
+    const factory = new LiveFactory();
+    const { appserver, path } = await liveServer(factory, records);
+    const client = await readyClient(path, ["sessions.read"]);
+    const projection = appserver.snapshot(sid("session-0"));
+    client.client.sendJson(hostCommand("list-capped", "list-capped", "session.list", {}));
+    const frame = await client.client.nextServer();
+    expect(frame.type).toBe("response");
+    if (frame.type === "response") {
+      const result = frame.result as { sessions: unknown[]; totalCount: number; truncated: boolean };
+      expect(result.sessions).toHaveLength(1_000);
+      expect(result.totalCount).toBe(5_000);
+      expect(result.truncated).toBe(true);
+    }
+    expect(appserver.snapshot(sid("session-0"))).toBe(projection);
+    await closeClients([client.client]);
+    await appserver.stop();
   });
 
   test("confirmation challenge is one-shot, connection-bound, expiry-aware, and gated by revision", async () => {

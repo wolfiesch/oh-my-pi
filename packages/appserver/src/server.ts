@@ -16,12 +16,13 @@ import {
 	type ResultFrame,
 	requiredCapability,
 	type ServerFrame,
+	type SessionRef,
 	type SessionId,
 	utf8ByteLength,
 } from "@oh-my-pi/app-wire";
 import { AppserverCommandHandlers } from "./command-handler.ts";
 import { IdempotencyStore } from "./idempotency.ts";
-import { SessionEntryProjector, stableProjectId } from "./discovery.ts";
+import { SessionEntryProjector, compareSessionRecords, stableProjectId } from "./discovery.ts";
 import { createEpoch, createHostId, defaultSocketPath, loadPersistentHostId, unixSocketActive } from "./identity.ts";
 import {
 	DesktopOperationDispatcher,
@@ -731,7 +732,7 @@ export class LocalAppserver implements AppserverHandle {
 				outcome = {
 					frame: response(this.hostId, command, true, {
 						cursor: { epoch: this.epoch, seq: 0 },
-						sessions: [...this.#projections.values()].map(value => value.value.ref),
+						...this.sessionListResult(),
 					}),
 				};
 			else if (command.command === "session.attach")
@@ -1260,7 +1261,7 @@ async #remoteDisconnected(connection: RemoteConnection): Promise<void> {
 	}
 	private async loadSessions(): Promise<void> {
 		const records = await this.#discovery.list();
-		records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.sessionId.localeCompare(b.sessionId));
+		records.sort(compareSessionRecords);
 		for (const record of records) {
 			if (this.#records.has(record.sessionId)) throw new Error(`duplicate session id: ${record.sessionId}`);
 			this.#records.set(record.sessionId, record);
@@ -1303,12 +1304,24 @@ async #remoteDisconnected(connection: RemoteConnection): Promise<void> {
 			this.#supervisors.delete(sessionId);
 		}
 	}
+	private sessionListResult(): { sessions: SessionRef[]; totalCount: number; truncated: boolean } {
+		const sessions = [...this.#projections.values()].map(value => value.value.ref);
+		sessions.sort((a, b) => {
+			if (a.updatedAt < b.updatedAt) return 1;
+			if (a.updatedAt > b.updatedAt) return -1;
+			if (a.sessionId < b.sessionId) return -1;
+			if (a.sessionId > b.sessionId) return 1;
+			return 0;
+		});
+		const totalCount = sessions.length;
+		return { sessions: sessions.slice(0, 1000), totalCount, truncated: totalCount > 1000 };
+	}
 	private sessionsFrame(): ServerFrame {
 		return {
 			v: "omp-app/1",
 			type: "sessions",
 			cursor: { epoch: this.epoch, seq: 0 },
-			sessions: [...this.#projections.values()].map(value => value.value.ref),
+			...this.sessionListResult(),
 		};
 	}
 	private broadcast(sessionId: SessionId, frame: ServerFrame): void {

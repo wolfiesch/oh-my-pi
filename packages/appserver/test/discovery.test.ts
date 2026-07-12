@@ -121,3 +121,53 @@ function transcript(entries: Record<string, unknown>[], title?: string): string 
     expect(() => parseBounded(snapshotText)).not.toThrow();
   });
 });
+
+test("incrementally indexes a large corpus and evicts only deleted or changed files", async () => {
+  const files: Record<string, string> = {};
+  const mtimes = new Map<string, number>();
+  for (let index = 0; index < 5000; index++) {
+    const path = `/root/session-${index}.jsonl`;
+    files[path] = JSON.stringify({ type: "session", version: 3, id: `session-${index}`, cwd: "/tmp/project", timestamp: stamp });
+    mtimes.set(path, index);
+  }
+  let reads = 0;
+  const fs: FileSystem = {
+    mkdir: async () => undefined,
+    chmod: async () => undefined,
+    unlink: async () => undefined,
+    stat: async path => ({
+      isFile: () => path in files,
+      isDirectory: () => path === "/root",
+      mode: 0o600,
+      mtimeMs: mtimes.get(path) ?? 0,
+      size: files[path]?.length ?? 0,
+    }),
+    readdir: async path => path === "/root" ? Object.keys(files) : [],
+    readFile: async path => {
+      reads++;
+      return files[path] ?? "";
+    },
+  };
+  const discovery = new FileSessionDiscovery("/root", fs, host);
+  const cold = await discovery.list();
+  expect(cold).toHaveLength(5000);
+  expect(reads).toBe(5000);
+  expect(cold.slice(0, 3).map(value => String(value.sessionId))).toEqual(["session-4999", "session-4998", "session-4997"]);
+  reads = 0;
+  const warm = await discovery.list();
+  expect(warm).toHaveLength(5000);
+  expect(reads).toBe(0);
+  const changedPath = "/root/session-2500.jsonl";
+  files[changedPath] = JSON.stringify({ type: "session", version: 3, id: "session-2500", cwd: "/tmp/changed", timestamp: stamp });
+  mtimes.set(changedPath, 10_000);
+  const changed = await discovery.list();
+  expect(reads).toBe(1);
+  expect(changed.find(value => String(value.sessionId) === "session-2500")?.cwd).toBe("/tmp/changed");
+  delete files["/root/session-10.jsonl"];
+  mtimes.delete("/root/session-10.jsonl");
+  reads = 0;
+  const deleted = await discovery.list();
+  expect(deleted).toHaveLength(4999);
+  expect(deleted.some(value => String(value.sessionId) === "session-10")).toBe(false);
+  expect(reads).toBe(0);
+});

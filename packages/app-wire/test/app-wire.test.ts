@@ -18,6 +18,7 @@ import {
 	decodeAdditiveServerFrame,
 	inputObject,
 	safeRelativePath,
+	decodeSessionListResult,
 	sameSession,
 	isServerFrame,
 } from "../src/index.ts";
@@ -52,6 +53,26 @@ describe("app-wire authority", () => {
 			else if (client.has(name)) decodeClientFrame(value);
 			else expect(isServerFrame(value)).toBe(true);
 		}
+	});
+	test("session list metadata remains bounded at the wire cap", () => {
+		const sessions = Array.from({ length: 1_000 }, (_, index) => ({
+			hostId: "h",
+			sessionId: `session-${index}`,
+			project: { projectId: "project-test" },
+			revision: "revision-test",
+			title: `Session ${index}`,
+			status: "idle",
+			updatedAt: new Date(index).toISOString(),
+		}));
+		const result = decodeSessionListResult({
+			cursor: { epoch: "epoch", seq: 0 },
+			sessions,
+			totalCount: 5_000,
+			truncated: true,
+		});
+		expect(result.sessions).toHaveLength(1_000);
+		expect(result.totalCount).toBe(5_000);
+		expect(result.truncated).toBe(true);
 	});
 	test("hello and durable lineage decode in string and parsed modes", () => {
 		expect(decodeClientFrame(hello).type).toBe("hello");

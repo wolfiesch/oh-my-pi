@@ -3,7 +3,7 @@ import { commandId, confirmationId, hostId, leaseId, projectId, requestId, revis
 import { boundedArray, boundedMap, boundedMetadata, boundedText, controlFree, inputObject, isSecretLikeKey, safeRelativePath, safeSeq } from "./guards.ts";
 import { MAX_FILE_BYTES, PROTOCOL_VERSION } from "./limits.ts";
 import { decodeCursor, type Cursor } from "./cursor.ts";
-import { decodeSessionRef, type SessionRef } from "./session-index.ts";
+import { decodeSessionListResult, decodeSessionRef, type SessionListResult, type SessionRef } from "./session-index.ts";
 import type { DeviceCapability } from "./capabilities.ts";
 export type RevisionOwner = "none" | "session" | "authority";
 export interface CommandDescriptor {
@@ -86,7 +86,10 @@ export type CommandArguments=Record<string,unknown>; export type CommandResult=R
 function args(value:unknown,path="args"):Record<string,unknown>{return boundedMap(value,path);} function result(value:unknown):Record<string,unknown>{return boundedMap(value,"result");}
 function url(value:unknown,path:string):string { const text=controlFree(value,path,4096); let parsed:URL; try{parsed=new URL(text);}catch{fail("INVALID_FRAME","invalid URL",path);} if((parsed.protocol!=="http:"&&parsed.protocol!=="https:")||parsed.username!==""||parsed.password!=="") fail("INVALID_FRAME","URL must be http(s) without credentials",path); return text; }
 function metadata(value:unknown,path:string):Record<string,unknown>{return boundedMetadata(value,path,isSecretLikeKey);}
-function decodeSessions(value:unknown):CommandResult{const x=result(value), cursor=decodeCursor(x.cursor,"result.cursor"), values=boundedArray(x.sessions,"result.sessions"); const sessions=values.map((v,i)=>decodeSessionRef(v,`result.sessions[${i}]`)); return {...x,cursor,sessions};}
+function decodeSessions(value: unknown): CommandResult {
+  const result: SessionListResult = decodeSessionListResult(value);
+  return result as unknown as CommandResult;
+}
 function decodeCreate(value:unknown):CommandResult{const x=result(value);return {...x,session:decodeSessionRef(x.session,"result.session")};}
 function decodeAttach(value:unknown):CommandResult{const x=result(value);if(typeof x.attached!=="boolean")fail("INVALID_FRAME","attached must be boolean","result.attached");return {...x,attached:x.attached,cursor:decodeCursor(x.cursor,"result.cursor")};}
 function boolField(value:unknown,key:string):CommandResult{const x=result(value);if(typeof x[key]!=="boolean")fail("INVALID_FRAME",`${key} must be boolean`,`result.${key}`);return {...x,[key]:x[key]};}
