@@ -142,6 +142,16 @@ export interface RpcHandoffResult {
 }
 
 export type RpcSubagentSubscriptionLevel = "off" | "progress" | "events";
+export type RpcSubagentStatus = AgentProgress["status"] | "idle" | "parked";
+export interface RpcSubagentLifecyclePayload extends Omit<SubagentLifecyclePayload, "status"> {
+	status: RpcSubagentStatus;
+	task?: string;
+	lastUpdate?: number;
+	resumable?: boolean;
+}
+export interface RpcSubagentProgressPayload extends SubagentProgressPayload {
+	resumable?: boolean;
+}
 
 export interface RpcSubagentSnapshot {
 	id: string;
@@ -149,13 +159,14 @@ export interface RpcSubagentSnapshot {
 	agent: string;
 	agentSource: AgentProgress["agentSource"];
 	description?: string;
-	status: AgentProgress["status"];
+	status: RpcSubagentStatus;
 	task?: string;
 	assignment?: string;
 	sessionFile?: string;
 	lastUpdate: number;
 	progress?: AgentProgress;
 	parentToolCallId?: string;
+	resumable?: boolean;
 }
 
 export interface RpcSubagentMessagesResult {
@@ -317,12 +328,12 @@ export interface RpcSessionEntryFrame {
 
 export interface RpcSubagentLifecycleFrame {
 	type: "subagent_lifecycle";
-	payload: SubagentLifecyclePayload;
+	payload: RpcSubagentLifecyclePayload;
 }
 
 export interface RpcSubagentProgressFrame {
 	type: "subagent_progress";
-	payload: SubagentProgressPayload;
+	payload: RpcSubagentProgressPayload;
 }
 
 export interface RpcSubagentEventFrame {

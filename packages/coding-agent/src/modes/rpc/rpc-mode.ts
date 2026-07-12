@@ -627,7 +627,13 @@ export async function runRpcMode(
 	const pendingExtensionRequests = new Map<string, PendingExtensionRequest>();
 	const hostToolBridge = new RpcHostToolBridge(output);
 	const hostUriBridge = new RpcHostUriBridge(output);
-	const subagentRegistry = eventBus ? new RpcSubagentRegistry(eventBus, output) : undefined;
+	const requestedSubagentSubscription = process.env.OMP_APP_SUBAGENT_SUBSCRIPTION;
+	const initialSubagentSubscription = isSubagentSubscriptionLevel(requestedSubagentSubscription)
+		? requestedSubagentSubscription
+		: "off";
+	const subagentRegistry = eventBus
+		? new RpcSubagentRegistry(eventBus, output, initialSubagentSubscription)
+		: undefined;
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };

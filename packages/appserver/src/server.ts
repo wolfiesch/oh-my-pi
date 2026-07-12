@@ -47,6 +47,7 @@ import {
 import { SessionProjection } from "./projection.ts";
 import { BunRpcChildFactory, RpcChildSupervisor } from "./rpc-child.ts";
 import { TranscriptEventTranslator, asAppWireEvent } from "./transcript-events.ts";
+import { SubagentProjection } from "./subagent-projection.ts";
 import type {
 	AppserverHandle,
 	AppserverOptions,
@@ -292,6 +293,7 @@ export class LocalAppserver implements AppserverHandle {
 	#projections = new Map<SessionId, SessionProjection>();
 	#supervisors = new Map<SessionId, RpcChildSupervisor>();
 	#transcripts = new Map<SessionId, TranscriptEventTranslator>();
+	#subagents = new Map<SessionId, SubagentProjection>();
 	#startPromises = new Map<SessionId, Promise<RpcChildSupervisor>>();
 	#closedSessions = new Set<SessionId>();
 	#idempotency = new IdempotencyStore();
@@ -528,6 +530,7 @@ export class LocalAppserver implements AppserverHandle {
 		for (const supervisor of this.#supervisors.values()) supervisor.stop();
 		this.#supervisors.clear();
 		this.#transcripts.clear();
+		this.#subagents.clear();
 		await Promise.allSettled([...this.#startPromises.values()]);
 		this.#startPromises.clear();
 		this.#started = false;
@@ -1050,6 +1053,7 @@ export class LocalAppserver implements AppserverHandle {
 		this.#supervisors.get(sessionId)?.stop();
 		this.#supervisors.delete(sessionId);
 		this.#transcripts.delete(sessionId);
+		this.#subagents.delete(sessionId);
 		projection.setStatus("closed");
 		this.broadcast(sessionId, projection.appendEvent({ type: "session_closed" }));
 		return { frame: response(this.hostId, command, true, { closed: true, sessionId }) };
@@ -1101,6 +1105,8 @@ export class LocalAppserver implements AppserverHandle {
 		const projection = this.#projections.get(sessionId)!;
 		const transcript = new TranscriptEventTranslator();
 		this.#transcripts.set(sessionId, transcript);
+		const subagents = new SubagentProjection(this.hostId, sessionId);
+		this.#subagents.set(sessionId, subagents);
 		const projector = new SessionEntryProjector(this.hostId, sessionId, "live", projection.value.entries);
 		const supervisor = new RpcChildSupervisor(
 			this.#factory,
@@ -1120,6 +1126,8 @@ export class LocalAppserver implements AppserverHandle {
 					}
 				},
 				event: frame => {
+					const agentFrame = subagents.applyFrame(frame);
+					if (agentFrame) this.broadcast(sessionId, agentFrame);
 					for (const event of transcript.translate(frame)) {
 						this.broadcast(sessionId, projection.appendEvent(asAppWireEvent(event)));
 					}
@@ -1128,6 +1136,7 @@ export class LocalAppserver implements AppserverHandle {
 					projection.setStatus("closed");
 					this.#supervisors.delete(sessionId);
 					this.#transcripts.delete(sessionId);
+					this.#subagents.delete(sessionId);
 				},
 			},
 			this.#factory.argv(record.path),
@@ -1139,6 +1148,7 @@ export class LocalAppserver implements AppserverHandle {
 		} catch (error) {
 			this.#supervisors.delete(sessionId);
 			this.#transcripts.delete(sessionId);
+			this.#subagents.delete(sessionId);
 			supervisor.stop();
 			throw error;
 		}
@@ -1303,6 +1313,8 @@ export class LocalAppserver implements AppserverHandle {
 					? this.replay(frame.sessionId, cursor as { epoch: string; seq: number })
 					: [this.#projections.get(frame.sessionId)!.snapshot()];
 				for (const output of outputs) await this.#sendFrame(ws, output);
+				for (const agentFrame of this.#subagents.get(frame.sessionId)?.frames() ?? [])
+					await this.#sendFrame(ws, agentFrame);
 			}
 		} catch {
 			if (ws.remote) {
@@ -1553,6 +1565,8 @@ export class LocalAppserver implements AppserverHandle {
 			this.#closedSessions.delete(sessionId);
 			this.#supervisors.get(sessionId)?.stop();
 			this.#supervisors.delete(sessionId);
+			this.#transcripts.delete(sessionId);
+			this.#subagents.delete(sessionId);
 		}
 	}
 	private sessionListResult(): { sessions: SessionRef[]; totalCount: number; truncated: boolean } {

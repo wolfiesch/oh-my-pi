@@ -757,6 +757,94 @@ describe("live Unix websocket protocol", () => {
 		await closeClients([client.client]);
 		await appserver.stop();
 	});
+
+	test("projects live subagent progress and replays current agent state on attach", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory, [record("s1")]);
+		const first = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+		first.client.sendJson(command("attach-agent", "attach-agent", "session.attach", "s1", {}));
+		await responseAndSnapshot(first.client, "attach-agent");
+		first.client.sendJson(command("prompt-agent", "prompt-agent", "session.prompt", "s1", { message: "go" }));
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		child.push({
+			type: "subagent_lifecycle",
+			payload: {
+				id: "WorkerA",
+				index: 0,
+				agent: "task",
+				agentSource: "bundled",
+				description: "Worker",
+				status: "started",
+				lastUpdate: 100,
+			},
+		});
+		child.push({
+			type: "subagent_progress",
+			payload: {
+				index: 0,
+				agent: "task",
+				agentSource: "bundled",
+				task: "Implement",
+				progress: {
+					id: "WorkerA",
+					agent: "task",
+					status: "running",
+					lastIntent: "Editing /home/lycaon/private.ts",
+					contextTokens: 250,
+					contextWindow: 1_000,
+					tokens: 500,
+					toolCount: 2,
+					durationMs: 100,
+				},
+			},
+		});
+		child.push({
+			type: "subagent_lifecycle",
+			payload: {
+				id: "WorkerA",
+				index: 0,
+				agent: "task",
+				agentSource: "bundled",
+				status: "parked",
+				resumable: true,
+			},
+		});
+		responseFor(child, "prompt");
+		const output = await untilResponse(first.client, "prompt-agent");
+		const agentFrames = output.frames.filter(frame => frame.type === "agent");
+		expect(agentFrames.map(frame => (frame.type === "agent" ? frame.state : ""))).toEqual([
+			"started",
+			"running",
+			"parked",
+		]);
+		expect(agentFrames[1]).toMatchObject({
+			type: "agent",
+			agentId: "WorkerA",
+			detail: {
+				title: "Implement",
+				progress: "Editing [path]",
+				contextUsage: { used: 250, limit: 1_000 },
+			},
+		});
+		expect(agentFrames[2]).toMatchObject({
+			type: "agent",
+			state: "parked",
+			detail: { resumable: true },
+		});
+
+		const second = await readyClient(path, ["sessions.read"]);
+		second.client.sendJson(command("attach-agent-2", "attach-agent-2", "session.attach", "s1", {}));
+		await responseAndSnapshot(second.client, "attach-agent-2");
+		expect(await second.client.nextServer()).toMatchObject({
+			type: "agent",
+			agentId: "WorkerA",
+			state: "parked",
+			detail: { resumable: true },
+		});
+		await closeClients([first.client, second.client]);
+		await appserver.stop();
+	});
 });
 
 describe("raw RFC6455 boundary and lifecycle", () => {

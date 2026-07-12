@@ -11,6 +11,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import {
 	type AgentProgress,
 	type SubagentEventPayload,
@@ -169,6 +170,47 @@ describe("RPC subagent registry", () => {
 		]);
 
 		registry.dispose();
+	});
+
+	test("emits idle and parked resumable lifecycle states from the process registry", () => {
+		AgentRegistry.resetGlobalForTests();
+		const globalRegistry = AgentRegistry.global();
+		globalRegistry.register({
+			id: "SubagentA",
+			displayName: "Worker",
+			kind: "sub",
+			session: null,
+			sessionFile: "/tmp/subagent.jsonl",
+			status: "running",
+		});
+		const eventBus = new EventBus();
+		const frames: RpcSubagentFrame[] = [];
+		const registry = new RpcSubagentRegistry(eventBus, frame => frames.push(frame), "progress");
+		eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+			id: "SubagentA",
+			index: 0,
+			agent: "task",
+			agentSource: "bundled",
+			status: "started",
+			sessionFile: "/tmp/subagent.jsonl",
+		} satisfies SubagentLifecyclePayload);
+		globalRegistry.setStatus("SubagentA", "idle");
+		globalRegistry.setStatus("SubagentA", "parked");
+
+		expect(frames.map(frame => frame.type)).toEqual([
+			"subagent_lifecycle",
+			"subagent_lifecycle",
+			"subagent_lifecycle",
+		]);
+		expect(frames.at(-1)).toMatchObject({
+			type: "subagent_lifecycle",
+			payload: { status: "parked", resumable: true },
+		});
+		expect(registry.getSubagents()).toMatchObject([{ id: "SubagentA", status: "parked", resumable: true }]);
+		globalRegistry.unregister("SubagentA");
+		expect(registry.getSubagents()).toHaveLength(0);
+		registry.dispose();
+		AgentRegistry.resetGlobalForTests();
 	});
 
 	test("clears stale snapshots when the active RPC session changes", () => {
