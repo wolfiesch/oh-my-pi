@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { decodeServerFrame, hostId, parseBounded } from "@oh-my-pi/app-wire";
+import { decodeServerFrame, entryId, hostId, parseBounded } from "@oh-my-pi/app-wire";
 import { FileSessionDiscovery } from "../src/discovery.ts";
 import { SessionProjection } from "../src/projection.ts";
 import type { FileSystem } from "../src/types.ts";
@@ -349,10 +349,28 @@ describe("current OMP JSONL projection", () => {
 			),
 		).toBe(true);
 		if (!session) throw new Error("session not discovered");
-		const snapshot = new SessionProjection(host, session, "epoch-test").snapshot();
+		const initialOmitted = Number(session.entries[0]?.data.omitted);
+		const projection = new SessionProjection(host, session, "epoch-test");
+		for (let i = 0; i < 100; i++)
+			projection.appendEntry({
+				id: entryId(`live-after-discovery-${i}`),
+				parentId: null,
+				hostId: host,
+				sessionId: session.sessionId,
+				kind: "message",
+				timestamp: stamp,
+				data: { role: "assistant", text: `${"y".repeat(8192)} ${i}` },
+			});
+		const snapshot = projection.snapshot();
 		const snapshotText = JSON.stringify(snapshot);
 		expect(new TextEncoder().encode(snapshotText).byteLength).toBeLessThan(1_048_576);
 		expect(() => parseBounded(snapshotText)).not.toThrow();
+		if (snapshot.type !== "snapshot") throw new Error("expected snapshot");
+		const notices = snapshot.entries.filter(entry => entry.data.snapshotOmission === true);
+		expect(notices).toHaveLength(1);
+		const projectedEntries = projection.value.entries.filter(entry => entry.data.snapshotOmission !== true).length;
+		const retainedEntries = snapshot.entries.filter(entry => entry.data.snapshotOmission !== true).length;
+		expect(Number(notices[0]?.data.omitted)).toBe(initialOmitted + projectedEntries - retainedEntries);
 	});
 });
 

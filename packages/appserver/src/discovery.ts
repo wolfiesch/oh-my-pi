@@ -4,17 +4,15 @@ import { chmod, mkdir, open, readdir, readFile, stat, unlink } from "node:fs/pro
 import { join, resolve } from "node:path";
 import type { DurableEntry, EntryId, HostId, ProjectId, SessionId } from "@oh-my-pi/app-wire";
 import { entryId, hostId, parseBounded, projectId, sessionId } from "@oh-my-pi/app-wire";
+import { boundSnapshotEntries, uniqueEntryId } from "./snapshot-limits.ts";
 import type { FileSystem, SessionDiscovery, SessionRecord } from "./types.ts";
 
 const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 const MAX_METADATA_BYTES = 128 * 1024;
 const MAX_LINE_BYTES = 1024 * 1024;
-const MAX_SNAPSHOT_ENTRIES = 1000;
-const MAX_SNAPSHOT_BYTES = 512 * 1024;
 const MAX_TEXT_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 64 * 1024;
 const MAX_ARGUMENT_BYTES = 128 * 1024;
-const MAX_SNAPSHOT_NODES = 16_000;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 type DiscoveryFileSystem = FileSystem & {
@@ -93,12 +91,6 @@ function safeValue(value: unknown, key = "", depth = 0): unknown {
 	}
 	return undefined;
 }
-function jsonNodeCount(value: unknown): number {
-	if (value === null || typeof value !== "object") return 1;
-	if (Array.isArray(value)) return 1 + value.reduce((count, item) => count + jsonNodeCount(item), 0);
-	return 1 + Object.values(value).reduce((count, item) => count + jsonNodeCount(item), 0);
-}
-
 function asObject(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 }
@@ -117,13 +109,6 @@ function contentText(content: unknown): string {
 export function projectNameFromCwd(cwd: string): string {
 	const pieces = cwd.replace(/[\\/]+$/u, "").split(/[\\/]/u);
 	return cleanText(pieces.at(-1) ?? "", 256, true);
-}
-
-function uniqueEntryId(base: string, used: Set<string>): EntryId {
-	const first = entryId(boundUtf8(base, 256));
-	if (!used.has(first)) return first;
-	const suffix = createHash("sha256").update(base).digest("hex").slice(0, 16);
-	return entryId(`snapshot-${suffix}-${used.size}`);
 }
 
 type ProjectionMode = "batch" | "live";
@@ -420,52 +405,8 @@ function normalizeEntries(
 	}
 	projector.finish();
 	const entries = projector.entries;
-	const retainedReverse: DurableEntry[] = [];
-	let payloadBytes = 2;
-	let payloadNodes = 1;
-	for (let i = entries.length - 1; i >= 0 && retainedReverse.length < MAX_SNAPSHOT_ENTRIES - 1; i--) {
-		const entryBytes = encoder.encode(JSON.stringify(entries[i])).byteLength;
-		const entryNodes = jsonNodeCount(entries[i]);
-		const separatorBytes = retainedReverse.length === 0 ? 0 : 1;
-		if (
-			payloadBytes + separatorBytes + entryBytes > MAX_SNAPSHOT_BYTES ||
-			payloadNodes + entryNodes > MAX_SNAPSHOT_NODES
-		) {
-			if (retainedReverse.length === 0) continue;
-			break;
-		}
-		retainedReverse.push(entries[i]);
-		payloadBytes += separatorBytes + entryBytes;
-		payloadNodes += entryNodes;
-	}
-	const retained = retainedReverse.reverse();
-	const omitted = entries.length - retained.length;
-	if (omitted === 0)
-		return {
-			entries: retained,
-			firstUserText: projector.firstUserText,
-			titleChange: projector.titleChange,
-			model: projector.model,
-			thinking: projector.thinking,
-		};
-	const retainedIds = new Set(retained.map(entry => entry.id));
-	for (let i = 0; i < retained.length; i++) {
-		const parentId = retained[i].parentId;
-		if (parentId && !retainedIds.has(parentId)) retained[i] = { ...retained[i], parentId: null };
-	}
-	const noticeTimestamp = retained[0]?.timestamp ?? headerTimestamp;
-	const noticeId = uniqueEntryId(`snapshot-truncation-${sid}`, new Set(retained.map(entry => entry.id)));
-	retained.unshift({
-		id: noticeId,
-		parentId: null,
-		hostId: host,
-		sessionId: sid,
-		kind: "compaction",
-		timestamp: noticeTimestamp,
-		data: { summary: `Older transcript entries were omitted from this snapshot (${omitted} entries).`, omitted },
-	});
 	return {
-		entries: retained,
+		entries: boundSnapshotEntries(entries, host, sid, headerTimestamp),
 		firstUserText: projector.firstUserText,
 		titleChange: projector.titleChange,
 		model: projector.model,

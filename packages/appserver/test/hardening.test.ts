@@ -3,7 +3,15 @@ import { mkdtemp, stat, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type DurableEntry, decodeServerFrame, entryId, hostId, projectId, sessionId } from "@oh-my-pi/app-wire";
+import {
+	type DurableEntry,
+	decodeServerFrame,
+	entryId,
+	hostId,
+	parseBounded,
+	projectId,
+	sessionId,
+} from "@oh-my-pi/app-wire";
 import { FileSessionDiscovery, stableProjectId } from "../src/discovery.ts";
 import { IdempotencyStore } from "../src/idempotency.ts";
 import { createEpoch, createHostId, loadPersistentHostId, unixSocketActive } from "../src/identity.ts";
@@ -269,6 +277,62 @@ describe("projection, replay, and idempotency", () => {
 		expect(projection.value.entries.map(entry => String(entry.id))).toEqual(["a", "b"]);
 		expect(projection.value.cursor.seq).toBe(2);
 	});
+	test("keeps attach and gap snapshots within wire limits after live transcript growth", () => {
+		const projection = new SessionProjection(host, record("s"), "epoch-a", 3);
+		for (let i = 0; i < 1200; i++) {
+			projection.appendEntry({
+				id: entryId(`live-${i}`),
+				parentId: i === 0 ? null : entryId(`live-${i - 1}`),
+				hostId: host,
+				sessionId: sessionId("s"),
+				kind: "message",
+				timestamp: stamp,
+				data: { role: "assistant", text: `${"x".repeat(4096)} ${i}` },
+			});
+		}
+		projection.appendEntry({
+			id: entryId("snapshot-truncation-s"),
+			parentId: entryId("live-1199"),
+			hostId: host,
+			sessionId: sessionId("s"),
+			kind: "message",
+			timestamp: stamp,
+			data: { role: "assistant", text: "latest entry collides with the omission notice base id" },
+		});
+
+		expect(projection.value.entries).toHaveLength(1201);
+		const snapshots = [
+			projection.snapshot(),
+			projection.replay({ epoch: "old-epoch", seq: 0 }).at(-1),
+			projection.replay({ epoch: "epoch-a", seq: 0 }).at(-1),
+		];
+		for (const snapshot of snapshots) {
+			if (snapshot?.type !== "snapshot") throw new Error("expected bounded snapshot");
+			const serialized = JSON.stringify(snapshot);
+			expect(new TextEncoder().encode(serialized).byteLength).toBeLessThan(1_048_576);
+			expect(() => parseBounded(serialized)).not.toThrow();
+			expect(() => decodeServerFrame(serialized)).not.toThrow();
+			expect(snapshot.entries.length).toBeLessThanOrEqual(1000);
+			expect(snapshot.entries[0]?.kind).toBe("compaction");
+			expect(snapshot.entries.at(-1)?.id).toBe(entryId("snapshot-truncation-s"));
+			expect(snapshot.entries[0]?.id).not.toBe(snapshot.entries.at(-1)?.id);
+			expect(new Set(snapshot.entries.map(entry => entry.id)).size).toBe(snapshot.entries.length);
+			const ids = new Set(snapshot.entries.map(entry => entry.id));
+			expect(snapshot.entries.every(entry => entry.parentId === null || ids.has(entry.parentId))).toBe(true);
+		}
+
+		expect(
+			projection.appendEntry({
+				id: entryId("live-0"),
+				parentId: null,
+				hostId: host,
+				sessionId: sessionId("s"),
+				kind: "message",
+				timestamp: stamp,
+				data: { role: "assistant", text: `${"x".repeat(4096)} 0` },
+			}),
+		).toBeUndefined();
+	});
 	test("status deltas advance the advertised revision exactly once", () => {
 		const projection = new SessionProjection(host, record("s"), "epoch-a", 3);
 		const before = projection.value.revision;
@@ -295,6 +359,27 @@ describe("projection, replay, and idempotency", () => {
 		projection.appendEvent({ type: "one" });
 		projection.appendEvent({ type: "two" });
 		expect(projection.replay({ epoch: "epoch-a", seq: 0 }).map(frame => frame.type)).toEqual(["gap", "snapshot"]);
+	});
+	test("oversized contiguous replay falls back to a bounded gap snapshot", () => {
+		const projection = new SessionProjection(host, record("s"), "epoch-a", 256);
+		for (let i = 0; i < 80; i++) {
+			projection.appendEntry({
+				id: entryId(`replay-${i}`),
+				parentId: i === 0 ? null : entryId(`replay-${i - 1}`),
+				hostId: host,
+				sessionId: sessionId("s"),
+				kind: "message",
+				timestamp: stamp,
+				data: { role: "assistant", text: "x".repeat(8192) },
+			});
+		}
+
+		const replay = projection.replay({ epoch: "epoch-a", seq: 0 });
+		expect(replay.map(frame => frame.type)).toEqual(["gap", "snapshot"]);
+		expect(replay[0]).toMatchObject({ type: "gap", reason: "replay_budget_exceeded" });
+		const serialized = JSON.stringify(replay[1]);
+		expect(new TextEncoder().encode(serialized).byteLength).toBeLessThan(1_048_576);
+		expect(() => decodeServerFrame(serialized)).not.toThrow();
 	});
 	test("same command id pending waiters settle once and replay", async () => {
 		const store = new IdempotencyStore();

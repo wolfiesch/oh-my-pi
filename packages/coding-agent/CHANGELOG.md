@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- Fixed desktop and remote clients disconnecting while attaching or replaying large, actively growing sessions by bounding snapshot and aggregate replay payloads.
 - Fixed compiled appserver welcome frames reporting placeholder `local` identities instead of the owning OMP and appserver versions and build kinds.
 - Fixed active or locked sessions disappearing from observational session lists while keeping writable resume selection lock-safe.
 - Fixed one malformed or crash-truncated transcript entry hiding an otherwise valid session from appserver discovery.

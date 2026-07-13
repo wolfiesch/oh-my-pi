@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { decodeServerFrame, hostId, projectId, type ServerFrame, sessionId } from "@oh-my-pi/app-wire";
+import { decodeServerFrame, entryId, hostId, projectId, type ServerFrame, sessionId } from "@oh-my-pi/app-wire";
 import { createAppserver, type LocalAppserver } from "../src/server.ts";
 import type { ChildHandle, RpcChildFactory, SessionAuthority, SessionDiscovery, SessionRecord } from "../src/types.ts";
 import { frameBytes, RawUdsWebSocket } from "./raw-uds-client.ts";
@@ -284,6 +284,29 @@ describe("live Unix websocket protocol", () => {
 			expect(decodeServerFrame(new TextDecoder().decode(duplicate.payload)).type).toBe("error");
 		await promptClient.client.closed();
 		await closeClients([readOnly.client]);
+		await appserver.stop();
+	});
+	test("keeps the Unix websocket connected when attach bounds a multi-megabyte session", async () => {
+		const oversized = record("s1");
+		oversized.entries = Array.from({ length: 1200 }, (_, index) => ({
+			id: entryId(`large-${index}`),
+			parentId: index === 0 ? null : entryId(`large-${index - 1}`),
+			hostId: host,
+			sessionId: sid("s1"),
+			kind: "message",
+			timestamp: stamp,
+			data: { role: "assistant", text: `${"x".repeat(4096)} ${index}` },
+		}));
+		const { appserver, path } = await liveServer(new LiveFactory(), [oversized]);
+		const client = await readyClient(path, ["sessions.read"]);
+		client.client.sendJson(command("large-attach", "large-attach", "session.attach", "s1", {}));
+		const [response, snapshot] = await responseAndSnapshot(client.client, "large-attach");
+		expect(response.ok).toBe(true);
+		expect(snapshot.entries[0]?.kind).toBe("compaction");
+		expect(snapshot.entries.at(-1)?.id).toBe(entryId("large-1199"));
+		client.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "after-large-attach", timestamp: stamp });
+		expect((await client.client.nextServer()).type).toBe("pong");
+		await closeClients([client.client]);
 		await appserver.stop();
 	});
 

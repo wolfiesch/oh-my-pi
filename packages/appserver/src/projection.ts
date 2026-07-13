@@ -8,7 +8,15 @@ import {
 	type SessionRef,
 	type SessionStateResult,
 } from "@oh-my-pi/app-wire";
+import { boundSnapshotEntries } from "./snapshot-limits.ts";
 import type { Projection, SessionRecord } from "./types.ts";
+
+const MAX_REPLAY_BYTES = 512 * 1024;
+const encoder = new TextEncoder();
+
+function replayBytes(frames: readonly ServerFrame[]): number {
+	return frames.reduce((bytes, frame) => bytes + encoder.encode(JSON.stringify(frame)).byteLength, 0);
+}
 
 function frameCursor(frame: ServerFrame): { epoch: string; seq: number } | undefined {
 	if (!("cursor" in frame) || !frame.cursor || typeof frame.cursor !== "object") return undefined;
@@ -191,7 +199,12 @@ export class SessionProjection {
 			revision: this.value.revision,
 			hostId: this.value.hostId,
 			sessionId: this.value.sessionId,
-			entries: this.value.entries,
+			entries: boundSnapshotEntries(
+				this.value.entries,
+				this.value.hostId,
+				this.value.sessionId,
+				this.value.ref.updatedAt,
+			),
 		};
 	}
 	private nextCursor() {
@@ -232,6 +245,19 @@ export class SessionProjection {
 				},
 				this.snapshot(),
 			];
-		return this.value.ring.filter(frame => (frameCursor(frame)?.seq ?? 0) > cursor.seq);
+		const frames = this.value.ring.filter(frame => (frameCursor(frame)?.seq ?? 0) > cursor.seq);
+		if (replayBytes(frames) <= MAX_REPLAY_BYTES) return frames;
+		return [
+			{
+				v: "omp-app/1",
+				type: "gap",
+				hostId: this.value.hostId,
+				sessionId: this.value.sessionId,
+				from: { epoch: cursor.epoch, seq: cursor.seq + 1 },
+				to: this.value.cursor,
+				reason: "replay_budget_exceeded",
+			},
+			this.snapshot(),
+		];
 	}
 }
