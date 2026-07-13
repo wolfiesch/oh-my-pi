@@ -5,6 +5,7 @@
 ### Added
 
 - Added desktop appserver controls for session model, thinking level, and fast mode, with live settings, model-role, and task-agent catalog metadata.
+- Added desktop session archive, restore, and delete backed by private profile metadata and crash-recoverable same-filesystem tombstones.
 
 ### Changed
 
@@ -21,6 +22,8 @@
 - Fixed explicit session rewrites and stale-lock takeover failures retaining lock ownership after the write or cleanup failed.
 - Fixed appserver discovery counting nested advisor and subagent transcripts as main sessions.
 - Fixed remote fast-mode changes bypassing the controller-lease checks used by other session mutations.
+- Fixed desktop session lifecycle races by fencing mutations before asynchronous work, refusing active or queued sessions, closing owned terminals and RPC children before removal, and keeping host-wide session indexes in sync with external transcript changes.
+- Fixed remote frame transforms reordering lifecycle deltas and responses; each connection now preserves send order and fails closed when a transform stalls.
 
 ## [16.4.8] - 2026-07-12
 

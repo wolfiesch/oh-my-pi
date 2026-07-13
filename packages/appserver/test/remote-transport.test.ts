@@ -414,6 +414,84 @@ describe("remote appserver policy transport", () => {
 		}
 	});
 
+	test("a delayed remote transform cannot let a later response overtake an earlier session delta", async () => {
+		const harness = new FakeBunHarness();
+		harness.install();
+		const factory = new LeaseFactory();
+		const releaseActive = Promise.withResolvers<void>();
+		const transformOrder: string[] = [];
+		let holdActive = false;
+		try {
+			const appserver = createAppserver({
+				hostId: hostId("host"),
+				socketPath: join(mkdtempSync(join(tmpdir(), "omp-ordered-transform-")), "app.sock"),
+				discovery: { list: async () => [leaseSessionRecord()] },
+				childFactory: factory,
+				remoteEndpoint: { address: "100.64.0.1", port: 1 },
+				remoteResolver: { resolve: async () => peerIdentity("node") },
+				remotePolicy: {
+					authenticate: async () => ({
+						authenticated: true,
+						grantedCapabilities: ["sessions.read", "sessions.prompt"],
+					}),
+					authorize: async () => true,
+					transformOutbound: async (_connection, frame) => {
+						if (holdActive && frame.type === "session.delta" && frame.upsert?.status === "active") {
+							transformOrder.push("active:start");
+							await releaseActive.promise;
+							transformOrder.push("active:end");
+						} else if (holdActive && frame.type === "response") transformOrder.push("response");
+						return frame;
+					},
+				},
+			});
+			await appserver.start();
+			const remote = harness.remote();
+			const socket = await openRemote(remote);
+			await remote.config.websocket?.message?.(socket, hello());
+			await flush();
+			socket.sends.length = 0;
+			holdActive = true;
+
+			const promptDispatch = remote.config.websocket?.message?.(
+				socket,
+				JSON.stringify({
+					v: "omp-app/1",
+					type: "command",
+					requestId: "ordered-prompt-request",
+					commandId: "ordered-prompt-command",
+					hostId: "host",
+					sessionId: "session",
+					command: "session.prompt",
+					args: { message: "hello" },
+				}),
+			);
+			const child = await factory.child();
+			await child.waitForWrites(1);
+			const rpcPrompt = JSON.parse(child.writes[0] ?? "{}") as Record<string, unknown>;
+			if (typeof rpcPrompt.id !== "string") throw new Error("RPC prompt id missing");
+			child.push({
+				type: "response",
+				id: rpcPrompt.id,
+				command: "prompt",
+				success: true,
+				data: { agentInvoked: true },
+			});
+			await flush();
+			expect(transformOrder).toEqual(["active:start"]);
+			expect(socket.sends).toEqual([]);
+
+			releaseActive.resolve();
+			await promptDispatch;
+			await flush();
+			expect(transformOrder).toEqual(["active:start", "active:end", "response"]);
+			expect(sentFrames(socket).map(frame => frame.type)).toEqual(["session.delta", "response"]);
+			await appserver.stop();
+		} finally {
+			harness.restore();
+		}
+	});
+
 	test("paired prompt lease authorizes one remote prompt and release blocks the next", async () => {
 		const harness = new FakeBunHarness();
 		harness.install();

@@ -283,7 +283,7 @@ describe("app-wire authority", () => {
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
-		expect(APP_WIRE_VERSION).toBe("0.5.1");
+		expect(APP_WIRE_VERSION).toBe("0.5.2");
 	});
 	test("welcome identity requires every version and build field", async () => {
 		const welcome = (await fixture("welcome.json")) as Record<string, unknown>;
@@ -291,6 +291,69 @@ describe("app-wire authority", () => {
 			expect(() => decodeServerFrame({ ...welcome, [field]: undefined })).toThrow(AppWireError);
 			expect(() => decodeServerFrame({ ...welcome, [field]: "bad\nidentity" })).toThrow(AppWireError);
 		}
+	});
+	test("session lifecycle commands require revision, use empty args, and decode exact results", () => {
+		for (const name of ["session.archive", "session.restore"] as const) {
+			expect(COMMAND_DESCRIPTORS[name]).toEqual({
+				capability: "sessions.manage",
+				scope: "session",
+				revision: "required",
+				revisionOwner: "session",
+				confirmation: "none",
+			});
+		}
+		expect(COMMAND_DESCRIPTORS["session.delete"]).toEqual({
+			capability: "sessions.manage",
+			scope: "session",
+			revision: "required",
+			revisionOwner: "session",
+			confirmation: "challenge",
+		});
+		for (const name of ["session.archive", "session.restore", "session.delete"] as const) {
+			expect(decodeCommandArguments(name, {})).toEqual({});
+			expect(() => decodeCommandArguments(name, { leaseId: "lease" })).toThrow(AppWireError);
+		}
+		expect(decodeCommandResult("session.archive", { archived: true })).toEqual({ archived: true });
+		expect(decodeCommandResult("session.restore", { restored: true })).toEqual({ restored: true });
+		expect(decodeCommandResult("session.delete", { deleted: true })).toEqual({ deleted: true });
+		expect(() => decodeCommandResult("session.delete", { deleted: true, sessionId: "s" })).toThrow(AppWireError);
+		const base = {
+			v: "omp-app/1",
+			type: "command",
+			requestId: "r",
+			commandId: "c",
+			hostId: "h",
+			sessionId: "s",
+			args: {},
+		};
+		expect(() => decodeClientFrame({ ...base, command: "session.archive" })).toThrow(AppWireError);
+		expect(() =>
+			decodeClientFrame({ ...base, command: "session.archive", expectedRevision: "revision" }),
+		).not.toThrow();
+	});
+	test("archivedAt is canonical ISO metadata and sessions host identity remains additive", () => {
+		const session = {
+			hostId: "h",
+			sessionId: "s",
+			project: { projectId: "p" },
+			revision: "r",
+			title: "Archived",
+			status: "idle",
+			updatedAt: "now",
+			archivedAt: "2026-07-13T12:34:56.000Z",
+		};
+		const legacy = {
+			v: "omp-app/1",
+			type: "sessions",
+			cursor: { epoch: "e", seq: 0 },
+			sessions: [session],
+		};
+		expect(decodeServerFrame(legacy)).toMatchObject({ sessions: [{ archivedAt: session.archivedAt }] });
+		expect(decodeServerFrame({ ...legacy, hostId: "h" })).toMatchObject({ hostId: "h" });
+		expect(() => decodeServerFrame({ ...legacy, hostId: 1 })).toThrow(AppWireError);
+		expect(() => decodeServerFrame({ ...legacy, sessions: [{ ...session, archivedAt: "next Tuesday" }] })).toThrow(
+			AppWireError,
+		);
 	});
 	test("exported wire version matches package metadata", async () => {
 		const metadata = (await Bun.file(new URL("../package.json", import.meta.url)).json()) as { version: string };
@@ -456,6 +519,9 @@ describe("app-wire authority", () => {
 			"session.compact": "session",
 			"session.pause": "session",
 			"session.resume": "session",
+			"session.archive": "session",
+			"session.restore": "session",
+			"session.delete": "session",
 			"session.model.set": "session",
 			"session.thinking.set": "session",
 			"session.fast.set": "session",

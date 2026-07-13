@@ -59,6 +59,12 @@ export interface OperationCommandHandler {
 		connectionId: string,
 		context: Omit<OperationContext, "connectionId" | "sessionId"> & { sessionId: SessionId },
 	): Promise<void>;
+	disconnectConnection(
+		connectionId: string,
+		context: Omit<OperationContext, "connectionId" | "sessionId">,
+	): Promise<void>;
+	closeSessionTerminals(sessionId: SessionId, abortSignal: AbortSignal): Promise<void>;
+	hasOpenTerminals(sessionId: SessionId): boolean;
 	publishTerminalOutput(frame: unknown, owner: TerminalOwner): void;
 }
 
@@ -205,6 +211,9 @@ export class TerminalOwnerRegistry {
 	get(connectionId: string): TerminalOwner[] {
 		return [...this.#owners.values()].filter(owner => owner.connectionId === connectionId);
 	}
+	forSession(sessionId: SessionId): TerminalOwner[] {
+		return [...this.#owners.values()].filter(owner => owner.sessionId === sessionId);
+	}
 	isCurrent(owner: TerminalOwner): boolean {
 		const current = this.#owners.get(owner.terminalId);
 		return (
@@ -350,9 +359,41 @@ export class DesktopOperationDispatcher implements OperationCommandHandler {
 		connectionId: string,
 		context: Omit<OperationContext, "connectionId" | "sessionId"> & { sessionId: SessionId },
 	): Promise<void> {
+		return this.disconnectConnection(connectionId, {
+			hostId: context.hostId,
+			deviceId: context.deviceId,
+			capabilities: context.capabilities,
+			currentRevision: context.currentRevision,
+			expectedRevision: context.expectedRevision,
+			abortSignal: context.abortSignal,
+		});
+	}
+
+	async disconnectConnection(
+		connectionId: string,
+		context: Omit<OperationContext, "connectionId" | "sessionId">,
+	): Promise<void> {
 		const owners = this.terminalOwners.get(connectionId);
+		await this.closeOwners(owners, context.abortSignal, true, context.capabilities);
+	}
+
+	hasOpenTerminals(sessionId: SessionId): boolean {
+		return this.terminalOwners.forSession(sessionId).length > 0;
+	}
+
+	async closeSessionTerminals(sessionId: SessionId, abortSignal: AbortSignal): Promise<void> {
+		await this.closeOwners(this.terminalOwners.forSession(sessionId), abortSignal, false, new Set(["term.open"]));
+	}
+
+	private async closeOwners(
+		owners: readonly TerminalOwner[],
+		abortSignal: AbortSignal,
+		releaseOnFailure: boolean,
+		capabilities: ReadonlySet<DeviceCapability>,
+	): Promise<void> {
 		const failures: unknown[] = [];
 		for (const owner of owners) {
+			let closed = false;
 			try {
 				if (this.authority.terminalClose)
 					await this.authority.terminalClose(
@@ -363,12 +404,20 @@ export class DesktopOperationDispatcher implements OperationCommandHandler {
 							sessionId: owner.sessionId,
 							terminalId: owner.terminalId,
 						},
-						{ ...context, connectionId, sessionId: owner.sessionId },
+						{
+							hostId: owner.hostId,
+							sessionId: owner.sessionId,
+							deviceId: owner.deviceId,
+							connectionId: owner.connectionId,
+							capabilities,
+							abortSignal,
+						},
 					);
+				closed = true;
 			} catch (error) {
 				failures.push(error);
 			} finally {
-				this.terminalOwners.release(owner.terminalId);
+				if (closed || releaseOnFailure) this.terminalOwners.release(owner.terminalId);
 			}
 		}
 		if (failures.length)

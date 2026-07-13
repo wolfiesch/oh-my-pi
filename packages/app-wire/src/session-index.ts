@@ -37,6 +37,7 @@ export interface SessionRef {
 	title: string;
 	status: "active" | "idle" | "closed" | (string & {});
 	updatedAt: string;
+	archivedAt?: string;
 	liveState?: Record<string, unknown>;
 	model?: string;
 	thinking?: string;
@@ -54,6 +55,7 @@ export interface SessionListResult {
 export interface SessionsFrame {
 	v: typeof PROTOCOL_VERSION;
 	type: "sessions";
+	hostId?: HostId;
 	cursor: Cursor;
 	sessions: SessionRef[];
 	totalCount?: number;
@@ -83,6 +85,12 @@ export function decodeSessionRef(value: unknown, path: string): SessionRef {
 	controlFree(session.title, `${path}.title`, 512);
 	controlFree(session.status, `${path}.status`, 64);
 	controlFree(session.updatedAt, `${path}.updatedAt`, 128);
+	if (session.archivedAt !== undefined) {
+		const archivedAt = controlFree(session.archivedAt, `${path}.archivedAt`, 128);
+		const timestamp = Date.parse(archivedAt);
+		if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== archivedAt)
+			fail("INVALID_FRAME", "archivedAt must be a canonical ISO timestamp", `${path}.archivedAt`);
+	}
 	if (session.liveState !== undefined) boundedMetadata(session.liveState, `${path}.liveState`, isSecretLikeKey);
 	if (session.model !== undefined) controlFree(session.model, `${path}.model`, 256);
 	if (session.thinking !== undefined) controlFree(session.thinking, `${path}.thinking`, 256);
@@ -122,9 +130,16 @@ export function decodeSessions(input: unknown): SessionsFrame {
 	const frame = inputObject(input);
 	if (frame.v !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v");
 	if (frame.type !== "sessions") fail("INVALID_FRAME", "expected sessions frame", "type");
+	const decodedHostId = frame.hostId === undefined ? undefined : hostId(frame.hostId, "hostId");
 	const cursor = decodeCursor(frame.cursor);
 	const values = boundedArray(frame.sessions, "sessions");
 	const sessions = values.map((entry, index) => decodeSessionRef(entry, `sessions[${index}]`));
 	const metadata = decodeListMetadata(frame, "frame", sessions.length);
-	return { ...frame, cursor, sessions, ...metadata } as unknown as SessionsFrame;
+	return {
+		...frame,
+		...(decodedHostId ? { hostId: decodedHostId } : {}),
+		cursor,
+		sessions,
+		...metadata,
+	} as unknown as SessionsFrame;
 }

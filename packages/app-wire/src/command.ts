@@ -134,6 +134,27 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		revisionOwner: "session",
 		confirmation: "none",
 	},
+	"session.archive": {
+		capability: "sessions.manage",
+		scope: "session",
+		revision: "required",
+		revisionOwner: "session",
+		confirmation: "none",
+	},
+	"session.restore": {
+		capability: "sessions.manage",
+		scope: "session",
+		revision: "required",
+		revisionOwner: "session",
+		confirmation: "none",
+	},
+	"session.delete": {
+		capability: "sessions.manage",
+		scope: "session",
+		revision: "required",
+		revisionOwner: "session",
+		confirmation: "challenge",
+	},
 	"session.model.set": {
 		capability: "sessions.manage",
 		scope: "session",
@@ -635,6 +656,9 @@ export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown)
 	},
 	"session.pause": value => leasedArgs(value, []),
 	"session.resume": value => leasedArgs(value, []),
+	"session.archive": noArgs,
+	"session.restore": noArgs,
+	"session.delete": noArgs,
 	"session.model.set": value => {
 		const x = leasedArgs(value, ["selector", "role", "persistence"]);
 		const selector = x.selector === undefined ? undefined : controlFree(x.selector, "args.selector", 512);
@@ -811,6 +835,9 @@ export const COMMAND_RESULT_DECODERS: Readonly<Record<string, (value: unknown) =
 			fail("INVALID_FRAME", "invalid resume result", "result");
 		return { resumed: x.resumed, paused: x.paused };
 	},
+	"session.archive": value => decodeBooleanResult(value, "archived"),
+	"session.restore": value => decodeBooleanResult(value, "restored"),
+	"session.delete": value => decodeBooleanResult(value, "deleted"),
 	"session.model.set": decodeAcceptedResult,
 	"session.thinking.set": decodeAcceptedResult,
 	"session.fast.set": decodeAcceptedResult,

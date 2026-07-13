@@ -73,6 +73,41 @@ import type {
 } from "./types.ts";
 
 const clock: Clock = { now: () => new Date() };
+const ARCHIVED_SESSION_COMMANDS = new Set([
+	"session.attach",
+	"session.archive",
+	"session.restore",
+	"session.delete",
+	"files.read",
+	"files.list",
+	"files.diff",
+	"review.read",
+]);
+const SESSION_LIFECYCLE_COMMANDS = new Set(["session.archive", "session.restore", "session.delete"]);
+const REMOTE_OUTBOUND_TRANSFORM_TIMEOUT_MS = 10_000;
+
+async function boundedRemoteTransform<T>(operation: Promise<T> | T): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(
+			() => reject(new Error("remote outbound transform timed out")),
+			REMOTE_OUTBOUND_TRANSFORM_TIMEOUT_MS,
+		);
+	});
+	try {
+		return await Promise.race([Promise.resolve(operation), timeout]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+function queuedLifecycleWork(liveState: Record<string, unknown> | undefined): boolean {
+	if (!liveState) return false;
+	if (typeof liveState.queuedMessageCount === "number" && liveState.queuedMessageCount > 0) return true;
+	const queued = liveState.queuedMessages;
+	if (!queued || typeof queued !== "object" || Array.isArray(queued)) return false;
+	return Object.values(queued).some(value => Array.isArray(value) && value.length > 0);
+}
 function response(
 	hostId: HostId,
 	command: CommandFrame,
@@ -201,6 +236,11 @@ interface RunIdentity {
 	record: OwnerRecord;
 	marker: { device: number; inode: number };
 }
+interface SessionLifecycleFailure {
+	code: string;
+	message: string;
+	details?: Record<string, unknown>;
+}
 function isErrno(error: unknown, code: string): boolean {
 	return (error as NodeJS.ErrnoException).code === code;
 }
@@ -302,6 +342,7 @@ export class LocalAppserver implements AppserverHandle {
 	#factory: RpcChildFactory;
 	#lockCheck: LockCheckHook;
 	#ringSize: number;
+	#lifecycleQuiesceTimeoutMs: number;
 	#handlers = new AppserverCommandHandlers();
 	#challenges = new Map<string, { command: CommandFrame; ws: AppWs; expiresAt: number; hash: string }>();
 	#records = new Map<SessionId, SessionRecord>();
@@ -311,6 +352,8 @@ export class LocalAppserver implements AppserverHandle {
 	#transcripts = new Map<SessionId, TranscriptEventTranslator>();
 	#subagents = new Map<SessionId, SubagentProjection>();
 	#startPromises = new Map<SessionId, Promise<RpcChildSupervisor>>();
+	#lifecycleMutations = new Set<SessionId>();
+	#inflightSessionOperations = new Map<SessionId, number>();
 	#closedSessions = new Set<SessionId>();
 	#idempotency = new IdempotencyStore();
 	#server?: Bun.Server<ServerWebSocketData>;
@@ -320,6 +363,7 @@ export class LocalAppserver implements AppserverHandle {
 	#attached = new Map<AppWs, Set<SessionId>>();
 	#deviceIds = new Map<AppWs, string>();
 	#abortControllers = new Map<AppWs, Set<AbortController>>();
+	#outboundTails = new Map<AppWs, Promise<void>>();
 	#localTransports = new Map<LocalWs, AppWs>();
 	#remoteTransports = new Map<string, AppWs>();
 	#remoteConnections = new Map<AppWs, RemoteConnection>();
@@ -371,6 +415,13 @@ export class LocalAppserver implements AppserverHandle {
 		this.#factory = options.childFactory ?? new BunRpcChildFactory();
 		this.#lockCheck = options.lockCheck ?? (() => undefined);
 		this.#ringSize = options.ringSize ?? 256;
+		this.#lifecycleQuiesceTimeoutMs = options.lifecycleQuiesceTimeoutMs ?? 2_000;
+		if (
+			!Number.isSafeInteger(this.#lifecycleQuiesceTimeoutMs) ||
+			this.#lifecycleQuiesceTimeoutMs <= 0 ||
+			this.#lifecycleQuiesceTimeoutMs > 60_000
+		)
+			throw new Error("lifecycleQuiesceTimeoutMs must be between 1 and 60000");
 		this.#ompVersion = options.ompVersion ?? "local";
 		this.#ompBuild = options.ompBuild ?? "local";
 		this.#appserverVersion = options.appserverVersion ?? "0.1.0";
@@ -390,6 +441,9 @@ export class LocalAppserver implements AppserverHandle {
 		this.#supportedCapabilities = new Set(requested);
 		this.#handlers.register("session.create", command => this.handleCreate(command));
 		this.#handlers.register("session.close", command => this.handleClose(command));
+		this.#handlers.register("session.archive", command => this.handleArchive(command));
+		this.#handlers.register("session.restore", command => this.handleRestore(command));
+		this.#handlers.register("session.delete", command => this.handleDelete(command));
 	}
 	async start(): Promise<void> {
 		if (this.#started) return;
@@ -817,6 +871,25 @@ export class LocalAppserver implements AppserverHandle {
 					details: { expectedRevision: command.expectedRevision, actualRevision: projection.value.revision },
 				}),
 			});
+		if (
+			command.sessionId &&
+			this.sessionArchived(command.sessionId) &&
+			!ARCHIVED_SESSION_COMMANDS.has(command.command)
+		)
+			return this.finish(command, {
+				frame: response(this.hostId, command, false, undefined, {
+					code: "session_archived",
+					message: "archived sessions are read-only; restore the session to continue work",
+				}),
+			});
+		const trackSessionOperation = Boolean(command.sessionId && !SESSION_LIFECYCLE_COMMANDS.has(command.command));
+		if (trackSessionOperation && !this.beginSessionOperation(command.sessionId!))
+			return this.finish(command, {
+				frame: response(this.hostId, command, false, undefined, {
+					code: "session_busy",
+					message: "session lifecycle mutation is in progress",
+				}),
+			});
 		const controller = new AbortController();
 		if (ws) this.#abortControllers.get(ws)?.add(controller);
 		let outcome: CommandOutcome;
@@ -1043,6 +1116,7 @@ export class LocalAppserver implements AppserverHandle {
 			};
 		} finally {
 			if (ws) this.#abortControllers.get(ws)?.delete(controller);
+			if (trackSessionOperation) this.endSessionOperation(command.sessionId!);
 		}
 		return this.finish(command, outcome);
 	}
@@ -1075,9 +1149,11 @@ export class LocalAppserver implements AppserverHandle {
 	}
 	private async handleCreate(command: CommandFrame): Promise<CommandOutcome> {
 		const created = await this.createSession(command.args);
+		const projection = this.#projections.get(created.sessionId as SessionId)!;
+		await this.broadcastIndex(projection.indexUpsert());
 		return {
 			frame: response(this.hostId, command, true, {
-				session: this.#projections.get(created.sessionId as SessionId)!.value.ref,
+				session: projection.value.ref,
 			}),
 		};
 	}
@@ -1094,6 +1170,254 @@ export class LocalAppserver implements AppserverHandle {
 		this.updateStatus(sessionId, "closed");
 		this.broadcast(sessionId, projection.appendEvent({ type: "session_closed" }));
 		return { frame: response(this.hostId, command, true, { closed: true, sessionId }) };
+	}
+	private async deletePreflight(
+		command: CommandFrame,
+		ignoreLifecycleFence = false,
+	): Promise<SessionLifecycleFailure | undefined> {
+		const sessionId = command.sessionId;
+		if (!sessionId) return { code: "unknown_session", message: "session is not indexed" };
+		if (!this.#authority) return { code: "unsupported", message: "session lifecycle management is unavailable" };
+		const revisionFailure = this.lifecycleRevisionFailure(command);
+		if (revisionFailure) return revisionFailure;
+		const record = this.#records.get(sessionId);
+		if (!record) return { code: "unknown_session", message: "session is not indexed" };
+		if (this.sessionLifecycleBusy(sessionId, ignoreLifecycleFence))
+			return { code: "session_busy", message: "session has active or pending work" };
+		if (!this.#supervisors.has(sessionId)) {
+			try {
+				await this.#lockCheck(record);
+			} catch {
+				return { code: "session_locked", message: "session is locked by another process" };
+			}
+		}
+		return undefined;
+	}
+	private sessionArchived(sessionId: SessionId): boolean {
+		return Boolean(
+			this.#records.get(sessionId)?.archivedAt || this.#projections.get(sessionId)?.value.ref.archivedAt,
+		);
+	}
+	private beginSessionOperation(sessionId: SessionId): boolean {
+		if (this.#lifecycleMutations.has(sessionId)) return false;
+		this.#inflightSessionOperations.set(sessionId, (this.#inflightSessionOperations.get(sessionId) ?? 0) + 1);
+		return true;
+	}
+	private endSessionOperation(sessionId: SessionId): void {
+		const count = this.#inflightSessionOperations.get(sessionId) ?? 0;
+		if (count <= 1) this.#inflightSessionOperations.delete(sessionId);
+		else this.#inflightSessionOperations.set(sessionId, count - 1);
+	}
+	private sessionLifecycleBusy(sessionId: SessionId, ignoreLifecycleFence = false): boolean {
+		const ref = this.#projections.get(sessionId)?.value.ref;
+		const liveState = ref?.liveState;
+		return (
+			(!ignoreLifecycleFence && this.#lifecycleMutations.has(sessionId)) ||
+			(this.#inflightSessionOperations.get(sessionId) ?? 0) > 0 ||
+			this.#startPromises.has(sessionId) ||
+			this.#supervisors.get(sessionId)?.hasPendingCalls() === true ||
+			(this.#transcripts.get(sessionId)?.pendingUiRequests().length ?? 0) > 0 ||
+			ref?.status === "active" ||
+			ref?.pendingApproval === true ||
+			ref?.pendingUserInput === true ||
+			liveState?.isStreaming === true ||
+			liveState?.isCompacting === true ||
+			liveState?.pendingApproval === true ||
+			liveState?.pendingUserInput === true ||
+			queuedLifecycleWork(liveState)
+		);
+	}
+	private lifecycleRevisionFailure(command: CommandFrame): SessionLifecycleFailure | undefined {
+		const projection = command.sessionId ? this.#projections.get(command.sessionId) : undefined;
+		if (!projection) return { code: "unknown_session", message: "session is not indexed" };
+		if (command.expectedRevision === undefined)
+			return { code: "stale_revision", message: "expectedRevision is required" };
+		if (command.expectedRevision === projection.value.revision) return undefined;
+		return {
+			code: "stale_revision",
+			message: "session revision is stale",
+			details: { expectedRevision: command.expectedRevision, actualRevision: projection.value.revision },
+		};
+	}
+	private lifecycleBusyOutcome(command: CommandFrame, message: string): CommandOutcome {
+		return { frame: response(this.hostId, command, false, undefined, { code: "session_busy", message }) };
+	}
+	private lifecycleFailureOutcome(command: CommandFrame, failure: SessionLifecycleFailure): CommandOutcome {
+		return { frame: response(this.hostId, command, false, undefined, failure) };
+	}
+	private async childExitedWithinLifecycleTimeout(child: ChildHandle): Promise<boolean> {
+		return Promise.race([
+			child.exited.then(() => true).catch(() => false),
+			Bun.sleep(this.#lifecycleQuiesceTimeoutMs).then(() => false),
+		]);
+	}
+	private async quiesceSupervisor(sessionId: SessionId): Promise<boolean> {
+		const supervisor = this.#supervisors.get(sessionId);
+		if (!supervisor) return true;
+		const child = supervisor.child();
+		if (!child) return false;
+		supervisor.stop("SIGTERM");
+		if (!(await this.childExitedWithinLifecycleTimeout(child))) {
+			// A lifecycle mutation may proceed only after the process itself exits,
+			// not merely after the supervisor has rejected its pending RPC calls.
+			supervisor.stop("SIGKILL");
+			if (!(await this.childExitedWithinLifecycleTimeout(child))) return false;
+		}
+		if (this.#supervisors.get(sessionId) !== supervisor) return false;
+		this.#supervisors.delete(sessionId);
+		this.#transcripts.delete(sessionId);
+		this.#subagents.delete(sessionId);
+		return true;
+	}
+	private async quiesceSessionRuntime(sessionId: SessionId): Promise<boolean> {
+		if (this.#operations?.hasOpenTerminals(sessionId)) {
+			const controller = new AbortController();
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				const closed = await Promise.race([
+					this.#operations
+						.closeSessionTerminals(sessionId, controller.signal)
+						.then(() => true)
+						.catch(() => false),
+					new Promise<false>(resolve => {
+						timer = setTimeout(() => {
+							controller.abort();
+							resolve(false);
+						}, this.#lifecycleQuiesceTimeoutMs);
+					}),
+				]);
+				if (!closed) return false;
+			} finally {
+				if (timer) clearTimeout(timer);
+			}
+		}
+		return this.quiesceSupervisor(sessionId);
+	}
+	private async handleArchive(command: CommandFrame): Promise<CommandOutcome> {
+		const sessionId = command.sessionId!;
+		if (this.#lifecycleMutations.has(sessionId))
+			return this.lifecycleBusyOutcome(command, "session lifecycle mutation is already in progress");
+		this.#lifecycleMutations.add(sessionId);
+		try {
+			if (!this.#authority)
+				return this.lifecycleFailureOutcome(command, {
+					code: "unsupported",
+					message: "session lifecycle management is unavailable",
+				});
+			const revisionFailure = this.lifecycleRevisionFailure(command);
+			if (revisionFailure) return this.lifecycleFailureOutcome(command, revisionFailure);
+			const projection = this.#projections.get(sessionId)!;
+			const record = this.#records.get(sessionId)!;
+			if (record.archivedAt) return { frame: response(this.hostId, command, true, { archived: true }) };
+			if (this.sessionLifecycleBusy(sessionId, true))
+				return this.lifecycleBusyOutcome(command, "sessions with active or pending work cannot be archived");
+			if (!(await this.quiesceSessionRuntime(sessionId)))
+				return this.lifecycleBusyOutcome(command, "session runtime did not stop cleanly");
+			try {
+				await this.#lockCheck(record);
+			} catch {
+				return {
+					frame: response(this.hostId, command, false, undefined, {
+						code: "session_locked",
+						message: "session is locked by another process",
+					}),
+				};
+			}
+			const archivedAt = this.#clock.now().toISOString();
+			await this.#authority.archive(record, archivedAt);
+			record.archivedAt = archivedAt;
+			await this.broadcastAttachedOrdered(
+				sessionId,
+				projection.appendEvent({ type: "session_archived", archivedAt }),
+			);
+			const delta = projection.updateArchivedAt(archivedAt);
+			if (delta) await this.broadcastIndex(delta);
+			return { frame: response(this.hostId, command, true, { archived: true }) };
+		} catch {
+			return {
+				frame: response(this.hostId, command, false, undefined, {
+					code: "session_lifecycle_failed",
+					message: "session archive failed",
+				}),
+			};
+		} finally {
+			this.#lifecycleMutations.delete(sessionId);
+		}
+	}
+	private async handleRestore(command: CommandFrame): Promise<CommandOutcome> {
+		const sessionId = command.sessionId!;
+		if (this.#lifecycleMutations.has(sessionId))
+			return this.lifecycleBusyOutcome(command, "session lifecycle mutation is already in progress");
+		this.#lifecycleMutations.add(sessionId);
+		try {
+			if (!this.#authority)
+				return this.lifecycleFailureOutcome(command, {
+					code: "unsupported",
+					message: "session lifecycle management is unavailable",
+				});
+			const revisionFailure = this.lifecycleRevisionFailure(command);
+			if (revisionFailure) return this.lifecycleFailureOutcome(command, revisionFailure);
+			const projection = this.#projections.get(sessionId)!;
+			const record = this.#records.get(sessionId)!;
+			if (!record.archivedAt) return { frame: response(this.hostId, command, true, { restored: true }) };
+			await this.#authority.restore(record);
+			delete record.archivedAt;
+			await this.broadcastAttachedOrdered(sessionId, projection.appendEvent({ type: "session_restored" }));
+			const delta = projection.updateArchivedAt();
+			if (delta) await this.broadcastIndex(delta);
+			return { frame: response(this.hostId, command, true, { restored: true }) };
+		} catch {
+			return {
+				frame: response(this.hostId, command, false, undefined, {
+					code: "session_lifecycle_failed",
+					message: "session restore failed",
+				}),
+			};
+		} finally {
+			this.#lifecycleMutations.delete(sessionId);
+		}
+	}
+	private async handleDelete(command: CommandFrame): Promise<CommandOutcome> {
+		const sessionId = command.sessionId!;
+		if (this.#lifecycleMutations.has(sessionId))
+			return this.lifecycleBusyOutcome(command, "session lifecycle mutation is already in progress");
+		this.#lifecycleMutations.add(sessionId);
+		try {
+			const projection = this.#projections.get(sessionId);
+			const record = this.#records.get(sessionId);
+			if (!projection || !record)
+				return this.lifecycleFailureOutcome(command, {
+					code: "unknown_session",
+					message: "session is not indexed",
+				});
+			const guarded = await this.deletePreflight(command, true);
+			if (guarded && guarded.code !== "session_busy") return this.lifecycleFailureOutcome(command, guarded);
+			if (guarded)
+				return this.lifecycleBusyOutcome(command, "session became busy while deletion was being confirmed");
+			if (!(await this.quiesceSessionRuntime(sessionId)))
+				return this.lifecycleBusyOutcome(command, "session runtime did not stop cleanly");
+			const finalGuard = await this.deletePreflight(command, true);
+			if (finalGuard) return this.lifecycleFailureOutcome(command, finalGuard);
+			await this.#authority!.delete(record);
+			await this.broadcastAttachedOrdered(sessionId, projection.appendEvent({ type: "session_deleted" }));
+			await this.broadcastIndex(projection.remove());
+			this.#records.delete(sessionId);
+			this.#projections.delete(sessionId);
+			this.#closedSessions.delete(sessionId);
+			this.#transcripts.delete(sessionId);
+			this.#subagents.delete(sessionId);
+			for (const sessions of this.#attached.values()) sessions.delete(sessionId);
+			return { frame: response(this.hostId, command, true, { deleted: true }) };
+		} catch {
+			return {
+				frame: response(this.hostId, command, false, undefined, {
+					code: "session_lifecycle_failed",
+					message: "session deletion failed",
+				}),
+			};
+		} finally {
+			this.#lifecycleMutations.delete(sessionId);
+		}
 	}
 	private finish(command: CommandFrame, outcome: CommandOutcome): CommandOutcome {
 		this.#idempotency.complete(command.commandId, command, outcome);
@@ -1123,6 +1447,8 @@ export class LocalAppserver implements AppserverHandle {
 	private async ensureSupervisor(sessionId: SessionId): Promise<RpcChildSupervisor> {
 		if (this.#stopping) throw new Error("appserver is stopping");
 		if (this.#closedSessions.has(sessionId)) throw new Error("session is closed");
+		if (this.#lifecycleMutations.has(sessionId)) throw new Error("session lifecycle mutation is in progress");
+		if (this.sessionArchived(sessionId)) throw new Error("session is archived");
 		const existing = this.#supervisors.get(sessionId);
 		if (existing) return existing;
 		const pending = this.#startPromises.get(sessionId);
@@ -1139,10 +1465,14 @@ export class LocalAppserver implements AppserverHandle {
 		const existing = this.#supervisors.get(sessionId);
 		if (existing) return existing;
 		if (this.#stopping || this.#closedSessions.has(sessionId)) throw new Error("session is closed");
+		if (this.#lifecycleMutations.has(sessionId)) throw new Error("session lifecycle mutation is in progress");
 		const record = this.#records.get(sessionId);
 		if (!record) throw new Error("unknown session");
+		if (this.sessionArchived(sessionId)) throw new Error("session is archived");
 		await this.#lockCheck(record);
 		if (this.#stopping || this.#closedSessions.has(sessionId)) throw new Error("session is closed");
+		if (this.#lifecycleMutations.has(sessionId) || this.sessionArchived(sessionId))
+			throw new Error("session lifecycle changed while starting");
 		const projection = this.#projections.get(sessionId)!;
 		const transcript = new TranscriptEventTranslator();
 		transcript.observeKnownEntries(projection.value.entries);
@@ -1307,6 +1637,24 @@ export class LocalAppserver implements AppserverHandle {
 					return;
 				}
 				const session = this.#projections.get(frame.sessionId);
+				if (this.sessionArchived(frame.sessionId) && frame.type !== "terminal.close") {
+					await this.#sendFrame(ws, {
+						v: "omp-app/1",
+						type: "error",
+						code: "SESSION_ARCHIVED",
+						message: "archived sessions are read-only",
+					});
+					return;
+				}
+				if (!this.beginSessionOperation(frame.sessionId)) {
+					await this.#sendFrame(ws, {
+						v: "omp-app/1",
+						type: "error",
+						code: "SESSION_BUSY",
+						message: "session lifecycle mutation is in progress",
+					});
+					return;
+				}
 				const controller = new AbortController();
 				this.#abortControllers.get(ws)?.add(controller);
 				try {
@@ -1338,6 +1686,7 @@ export class LocalAppserver implements AppserverHandle {
 					await this.#sendFrame(ws, { v: "omp-app/1", type: "error", code, message: "terminal operation failed" });
 				} finally {
 					this.#abortControllers.get(ws)?.delete(controller);
+					this.endSessionOperation(frame.sessionId);
 				}
 				return;
 			}
@@ -1361,6 +1710,13 @@ export class LocalAppserver implements AppserverHandle {
 						}),
 					);
 					return;
+				}
+				if (frame.command === "session.delete") {
+					const failure = await this.deletePreflight(frame);
+					if (failure) {
+						await this.#sendFrame(ws, response(this.hostId, frame, false, undefined, failure));
+						return;
+					}
 				}
 				await this.#sendFrame(ws, this.challenge(ws, frame));
 				return;
@@ -1458,12 +1814,10 @@ export class LocalAppserver implements AppserverHandle {
 				capabilities: (this.#clientCapabilities.get(ws) ?? new Set()) as OperationContext["capabilities"],
 				abortSignal: AbortSignal.abort(),
 			};
-			for (const sessionId of this.#projections.keys()) {
-				try {
-					await this.#operations.disconnect(ws.connectionId, { ...contextBase, sessionId });
-				} catch {
-					/* owner cleanup is best effort; registry always releases */
-				}
+			try {
+				await this.#operations.disconnectConnection(ws.connectionId, contextBase);
+			} catch {
+				/* owner cleanup is best effort; registry always releases */
 			}
 		}
 		this.#clients.delete(ws);
@@ -1571,13 +1925,27 @@ export class LocalAppserver implements AppserverHandle {
 		if (this.#remotePolicy?.disconnected) await this.#remotePolicy.disconnected(connection);
 	}
 	async #sendFrame(transport: AppWs, frame: ServerFrame): Promise<boolean> {
+		const previous = this.#outboundTails.get(transport) ?? Promise.resolve();
+		const send = previous.then(() => this.#sendFrameNow(transport, frame));
+		const tail = send.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.#outboundTails.set(transport, tail);
+		try {
+			return await send;
+		} finally {
+			if (this.#outboundTails.get(transport) === tail) this.#outboundTails.delete(transport);
+		}
+	}
+	async #sendFrameNow(transport: AppWs, frame: ServerFrame): Promise<boolean> {
 		if (transport.remote) {
 			const connection = this.#remoteConnections.get(transport);
 			if (!connection || !this.#remotePolicy) return false;
 			let transformed: ServerFrame | string | undefined;
 			try {
 				transformed = this.#remotePolicy.transformOutbound
-					? await this.#remotePolicy.transformOutbound(connection, frame)
+					? await boundedRemoteTransform(this.#remotePolicy.transformOutbound(connection, frame))
 					: frame;
 			} catch {
 				connection.socket.close(1011, "remote policy failed");
@@ -1607,14 +1975,13 @@ export class LocalAppserver implements AppserverHandle {
 			this.#records.set(record.sessionId, record);
 			this.#createdPending.delete(record.sessionId);
 			const projection = this.#projections.get(record.sessionId);
-			if (!projection)
-				this.#projections.set(
-					record.sessionId,
-					new SessionProjection(this.hostId, record, this.epoch, this.#ringSize),
-				);
-			else {
+			if (!projection) {
+				const inserted = new SessionProjection(this.hostId, record, this.epoch, this.#ringSize);
+				this.#projections.set(record.sessionId, inserted);
+				await this.broadcastIndex(inserted.indexUpsert());
+			} else {
 				const output = projection.reconcileRecord(record);
-				if (output) this.broadcast(record.sessionId, output);
+				if (output) await this.broadcastIndex(output);
 			}
 		}
 		for (const [sessionId, pending] of this.#createdPending) {
@@ -1625,19 +1992,29 @@ export class LocalAppserver implements AppserverHandle {
 			if (pending.refreshesRemaining > 0) pending.refreshesRemaining -= 1;
 			else {
 				this.#createdPending.delete(sessionId);
+				const projection = this.#projections.get(sessionId);
+				if (projection) await this.broadcastIndex(projection.remove());
 				this.#records.delete(sessionId);
 				this.#projections.delete(sessionId);
 			}
 		}
 		for (const sessionId of [...this.#records.keys()]) {
 			if (discoveredIds.has(sessionId) || this.#createdPending.has(sessionId)) continue;
-			this.#records.delete(sessionId);
-			this.#projections.delete(sessionId);
-			this.#closedSessions.delete(sessionId);
-			this.#supervisors.get(sessionId)?.stop();
-			this.#supervisors.delete(sessionId);
-			this.#transcripts.delete(sessionId);
-			this.#subagents.delete(sessionId);
+			if (this.#lifecycleMutations.has(sessionId)) continue;
+			this.#lifecycleMutations.add(sessionId);
+			try {
+				if (!(await this.quiesceSessionRuntime(sessionId))) continue;
+				const projection = this.#projections.get(sessionId);
+				if (projection) await this.broadcastIndex(projection.remove());
+				this.#records.delete(sessionId);
+				this.#projections.delete(sessionId);
+				this.#closedSessions.delete(sessionId);
+				this.#transcripts.delete(sessionId);
+				this.#subagents.delete(sessionId);
+				for (const sessions of this.#attached.values()) sessions.delete(sessionId);
+			} finally {
+				this.#lifecycleMutations.delete(sessionId);
+			}
 		}
 	}
 	private sessionListResult(): { sessions: SessionRef[]; totalCount: number; truncated: boolean } {
@@ -1656,12 +2033,27 @@ export class LocalAppserver implements AppserverHandle {
 		return {
 			v: "omp-app/1",
 			type: "sessions",
+			hostId: this.hostId,
 			cursor: { epoch: this.epoch, seq: 0 },
 			...this.sessionListResult(),
 		};
 	}
 	private broadcast(sessionId: SessionId, frame: ServerFrame): void {
+		if (frame.type === "session.delta") {
+			void this.broadcastIndex(frame);
+			return;
+		}
 		for (const [client, sessions] of this.#attached) if (sessions.has(sessionId)) void this.#sendFrame(client, frame);
+	}
+	private async broadcastAttachedOrdered(sessionId: SessionId, frame: ServerFrame): Promise<void> {
+		for (const [client, sessions] of this.#attached)
+			if (sessions.has(sessionId)) await this.#sendFrame(client, frame);
+	}
+	private async broadcastIndex(frame: ServerFrame): Promise<void> {
+		for (const client of this.#clients) {
+			if (!this.#hello.has(client) || !this.#clientCapabilities.get(client)?.has("sessions.read")) continue;
+			await this.#sendFrame(client, frame);
+		}
 	}
 	private async fetch(request: Request, server: Bun.Server<ServerWebSocketData>): Promise<Response | undefined> {
 		const url = new URL(request.url);

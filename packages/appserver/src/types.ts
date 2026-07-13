@@ -95,6 +95,7 @@ export interface SessionRecord {
 	title: string;
 	updatedAt: string;
 	status: SessionRef["status"];
+	archivedAt?: string;
 	model?: string;
 	thinking?: string;
 	entries: DurableEntry[];
@@ -109,6 +110,9 @@ export interface SessionAuthoritySession {
 export interface SessionAuthority {
 	create(cwd: string, title?: string): Promise<SessionAuthoritySession>;
 	list(): Promise<SessionRecord[]>;
+	archive(session: SessionRecord, archivedAt: string): Promise<void>;
+	restore(session: SessionRecord): Promise<void>;
+	delete(session: SessionRecord): Promise<void>;
 }
 export interface SessionDiscovery {
 	list(): Promise<SessionRecord[]>;
@@ -160,6 +164,8 @@ export interface AppserverOptions {
 	supportedFeatures?: readonly string[];
 	supportedCapabilities?: readonly string[];
 	ringSize?: number;
+	/** Maximum time lifecycle mutations wait for terminal and child shutdown. */
+	lifecycleQuiesceTimeoutMs?: number;
 	now?: () => Date;
 	remoteEndpoint?: RemoteListenerConfig;
 	remotePolicy?: RemoteConnectionPolicy;
@@ -171,9 +177,13 @@ export interface Projection {
 	hostId: HostId;
 	sessionId: SessionId;
 	revision: Revision;
+	/** Cursor for attach replay of transcript entry/event frames. */
 	cursor: Cursor;
+	/** Independent cursor for host-wide session index deltas. */
+	indexCursor: Cursor;
 	entries: DurableEntry[];
 	ref: SessionRef;
+	/** Transcript entry/event replay ring; session.delta frames are never stored here. */
 	ring: ServerFrame[];
 }
 export interface CommandOutcome {

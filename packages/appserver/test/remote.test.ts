@@ -258,6 +258,7 @@ test("remote sessions inventory preserves protocol-sized arrays and rejects over
 		const frame = {
 			v: "omp-app/1",
 			type: "sessions",
+			hostId: "host",
 			cursor: { epoch: "epoch", seq: 0 },
 			sessions,
 		} as unknown as ServerFrame;

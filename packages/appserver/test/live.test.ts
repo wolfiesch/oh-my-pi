@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decodeServerFrame, entryId, hostId, projectId, type ServerFrame, sessionId } from "@oh-my-pi/app-wire";
+import type { DesktopOperationsAuthority } from "../src/operations/dispatcher.ts";
 import { createAppserver, type LocalAppserver } from "../src/server.ts";
 import type { ChildHandle, RpcChildFactory, SessionAuthority, SessionDiscovery, SessionRecord } from "../src/types.ts";
 import { frameBytes, RawUdsWebSocket } from "./raw-uds-client.ts";
@@ -98,6 +99,8 @@ class StaticDiscovery implements SessionDiscovery {
 }
 class FakeAuthority implements SessionAuthority {
 	readonly created = Promise.withResolvers<{ cwd: string; title?: string }>();
+	readonly lifecycle: string[] = [];
+	failLifecycle = false;
 	constructor(private readonly values: SessionRecord[] = []) {}
 	async list(): Promise<SessionRecord[]> {
 		return this.values;
@@ -105,6 +108,22 @@ class FakeAuthority implements SessionAuthority {
 	async create(cwd: string, title?: string) {
 		this.created.resolve({ cwd, title });
 		return { sessionId: sid("created"), path: "/tmp/created.jsonl", cwd, title, entries: [] };
+	}
+	async archive(session: SessionRecord, archivedAt: string): Promise<void> {
+		if (this.failLifecycle) throw new Error("lifecycle failure");
+		this.lifecycle.push(`archive:${session.sessionId}`);
+		session.archivedAt = archivedAt;
+	}
+	async restore(session: SessionRecord): Promise<void> {
+		if (this.failLifecycle) throw new Error("lifecycle failure");
+		this.lifecycle.push(`restore:${session.sessionId}`);
+		delete session.archivedAt;
+	}
+	async delete(session: SessionRecord): Promise<void> {
+		if (this.failLifecycle) throw new Error("lifecycle failure");
+		this.lifecycle.push(`delete:${session.sessionId}`);
+		const index = this.values.findIndex(value => value.sessionId === session.sessionId);
+		if (index >= 0) this.values.splice(index, 1);
 	}
 }
 class Gate {
@@ -117,9 +136,11 @@ class Gate {
 		await this.opened.promise;
 	}
 }
+type LiveChildExitMode = "graceful" | "forced" | "manual";
 class LiveChild implements ChildHandle {
 	readonly writes: string[] = [];
 	readonly killed = Promise.withResolvers<void>();
+	readonly killSignals: string[] = [];
 	readonly #exit = Promise.withResolvers<number>();
 	readonly exited = this.#exit.promise;
 	readonly #lines: string[] = [];
@@ -135,6 +156,7 @@ class LiveChild implements ChildHandle {
 	};
 	readonly stdout: AsyncIterable<string> = this.stream();
 	readonly stderr: AsyncIterable<string> = (async function* () {})();
+	constructor(readonly exitMode: LiveChildExitMode = "graceful") {}
 	async *stream(): AsyncGenerator<string> {
 		yield `${JSON.stringify({ type: "ready" })}\n`;
 		while (true) {
@@ -154,8 +176,13 @@ class LiveChild implements ChildHandle {
 		if (waiter) waiter.resolve(line);
 		else this.#lines.push(line);
 	}
-	kill(): void {
+	kill(signal = "SIGTERM"): void {
+		this.killSignals.push(signal);
 		this.killed.resolve();
+		if (this.exitMode === "manual" || (this.exitMode === "forced" && signal !== "SIGKILL")) return;
+		this.release();
+	}
+	release(): void {
 		const waiter = this.#waiters.shift();
 		waiter?.resolve(undefined);
 		this.#exit.resolve(0);
@@ -169,8 +196,9 @@ class LiveChild implements ChildHandle {
 }
 class LiveFactory implements RpcChildFactory {
 	readonly children: LiveChild[] = [];
+	constructor(readonly exitMode: LiveChildExitMode = "graceful") {}
 	spawn(): ChildHandle {
-		const child = new LiveChild();
+		const child = new LiveChild(this.exitMode);
 		this.children.push(child);
 		this.#spawned.resolve(child);
 		return child;
@@ -196,14 +224,20 @@ function responseFor(child: LiveChild, command: string, success = true): void {
 async function readyClient(
 	path: string,
 	capabilities?: string[],
-): Promise<{ client: RawUdsWebSocket; welcome: Extract<ServerFrame, { type: "welcome" }> }> {
+): Promise<{
+	client: RawUdsWebSocket;
+	welcome: Extract<ServerFrame, { type: "welcome" }>;
+	sessions: Extract<ServerFrame, { type: "sessions" }>;
+}> {
 	const client = await RawUdsWebSocket.connect(path);
 	client.sendJson(hello(capabilities));
 	const welcome = await client.nextServer();
 	expect(welcome.type).toBe("welcome");
 	const sessions = await client.nextServer();
 	expect(sessions.type).toBe("sessions");
-	return { client, welcome: welcome as Extract<ServerFrame, { type: "welcome" }> };
+	expect(sessions).toMatchObject({ hostId: host });
+	if (sessions.type !== "sessions") throw new Error("missing initial sessions inventory");
+	return { client, welcome: welcome as Extract<ServerFrame, { type: "welcome" }>, sessions };
 }
 async function responseAndSnapshot(
 	client: RawUdsWebSocket,
@@ -228,6 +262,35 @@ async function untilResponse(
 		frames.push(frame);
 		if (frame.type === "response" && frame.requestId === rid(requestId)) return { response: frame, frames };
 	}
+}
+async function startIdleSessionRuntime(
+	client: RawUdsWebSocket,
+	factory: LiveFactory,
+	requestId: string,
+): Promise<LiveChild> {
+	client.sendJson(command(requestId, requestId, "session.state.get", "s1", {}));
+	const child = await factory.child();
+	await child.waitForWrites(1);
+	const stateCall = JSON.parse(child.writes[0] ?? "{}") as { id?: string };
+	if (!stateCall.id) throw new Error("state RPC id missing");
+	child.push({
+		type: "response",
+		id: stateCall.id,
+		command: "get_state",
+		success: true,
+		data: {
+			isStreaming: false,
+			isCompacting: false,
+			isPaused: false,
+			messageCount: 0,
+			queuedMessageCount: 0,
+			steeringMode: "one-at-a-time",
+			followUpMode: "all",
+			interruptMode: "wait",
+		},
+	});
+	expect((await untilResponse(client, requestId)).response.ok).toBe(true);
+	return child;
 }
 async function closeClients(clients: RawUdsWebSocket[]): Promise<void> {
 	for (const client of clients) {
@@ -344,22 +407,12 @@ describe("live Unix websocket protocol", () => {
 			await replayClient.client.nextServer(),
 			await replayClient.client.nextServer(),
 			await replayClient.client.nextServer(),
-			await replayClient.client.nextServer(),
-			await replayClient.client.nextServer(),
 		];
 		expect(replayResponse.type).toBe("response");
-		expect(replayFrames.map(frame => frame.type)).toEqual([
-			"session.delta",
-			"entry",
-			"event",
-			"event",
-			"session.delta",
-		]);
+		expect(replayFrames.map(frame => frame.type)).toEqual(["entry", "event", "event"]);
 		expect(
-			replayFrames.map(frame =>
-				frame.type === "entry" || frame.type === "event" || frame.type === "session.delta" ? frame.cursor.seq : -1,
-			),
-		).toEqual([1, 2, 3, 4, 5]);
+			replayFrames.map(frame => (frame.type === "entry" || frame.type === "event" ? frame.cursor.seq : -1)),
+		).toEqual([1, 2, 3]);
 		await closeClients([first.client, replayClient.client]);
 		await appserver.stop();
 
@@ -426,7 +479,7 @@ describe("live Unix websocket protocol", () => {
 		await appserver.stop();
 	});
 
-	test("broadcasts only to attached session subscribers and removes a disconnected subscriber", async () => {
+	test("broadcasts index deltas host-wide while entry and subagent frames remain attached", async () => {
 		const factory = new LiveFactory();
 		const { appserver, path } = await liveServer(factory);
 		const s1 = await readyClient(path, ["sessions.read", "sessions.prompt"]);
@@ -449,6 +502,10 @@ describe("live Unix websocket protocol", () => {
 		expect(received.frames.map(frame => frame.type)).toEqual(["session.delta", "entry", "response"]);
 		s2.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "s2", timestamp: stamp });
 		unattached.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "none", timestamp: stamp });
+		const s2Delta = await s2.client.nextServer();
+		const unattachedDelta = await unattached.client.nextServer();
+		expect(s2Delta).toMatchObject({ type: "session.delta", sessionId: "s1", upsert: { status: "active" } });
+		expect(unattachedDelta).toMatchObject({ type: "session.delta", sessionId: "s1", upsert: { status: "active" } });
 		const s2Pong = await s2.client.nextServer();
 		const unattachedPong = await unattached.client.nextServer();
 		expect(s2Pong.type).toBe("pong");
@@ -1340,9 +1397,543 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		await appserver.stop();
 	});
 
+	test("lifecycle mutations converge host-wide while events remain attached and archived sessions stay read-only", async () => {
+		const values = [record("s1")];
+		const authority = new FakeAuthority(values);
+		const factory = new LiveFactory();
+		const root = await mkdtemp(join(tmpdir(), "omp-lifecycle-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			childFactory: factory,
+		});
+		await appserver.start();
+		const attached = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]);
+		const observer = await readyClient(appserver.socketPath, ["sessions.read"]);
+		attached.client.sendJson(command("attach-lifecycle", "attach-lifecycle", "session.attach", "s1", {}));
+		await responseAndSnapshot(attached.client, "attach-lifecycle");
+
+		const initialRevision = appserver.snapshot(sid("s1"))!.revision;
+		attached.client.sendJson({
+			...command("archive", "archive", "session.archive", "s1", {}),
+			expectedRevision: initialRevision,
+		});
+		const archived = await untilResponse(attached.client, "archive");
+		expect(archived.frames.map(frame => frame.type)).toEqual(["event", "session.delta", "response"]);
+		expect(archived.frames[0]).toMatchObject({ type: "event", event: { type: "session_archived" } });
+		expect(archived.frames[1]).toMatchObject({
+			type: "session.delta",
+			upsert: { archivedAt: expect.stringMatching(/Z$/) },
+		});
+		expect(archived.response).toMatchObject({ ok: true, result: { archived: true } });
+		const observerArchive = await observer.client.nextServer();
+		expect(observerArchive).toMatchObject({ type: "session.delta", upsert: { archivedAt: expect.any(String) } });
+		expect(authority.lifecycle).toEqual(["archive:s1"]);
+
+		attached.client.sendJson(
+			command("archived-prompt", "archived-prompt", "session.prompt", "s1", { message: "no" }),
+		);
+		const rejectedPrompt = await untilResponse(attached.client, "archived-prompt");
+		expect(rejectedPrompt.frames).toHaveLength(1);
+		expect(rejectedPrompt.response).toMatchObject({ ok: false, error: { code: "session_archived" } });
+		expect(factory.children).toHaveLength(0);
+
+		const archivedRevision = appserver.snapshot(sid("s1"))!.revision;
+		attached.client.sendJson({
+			...command("restore", "restore", "session.restore", "s1", {}),
+			expectedRevision: archivedRevision,
+		});
+		const restored = await untilResponse(attached.client, "restore");
+		expect(restored.frames.map(frame => frame.type)).toEqual(["event", "session.delta", "response"]);
+		expect(restored.frames[0]).toMatchObject({ type: "event", event: { type: "session_restored" } });
+		expect(restored.frames[1]).toMatchObject({ type: "session.delta", upsert: { sessionId: "s1" } });
+		const restoredDelta = restored.frames[1];
+		if (restoredDelta?.type !== "session.delta" || !restoredDelta.upsert)
+			throw new Error("missing restore index delta");
+		expect("archivedAt" in restoredDelta.upsert).toBe(false);
+		expect((await observer.client.nextServer()).type).toBe("session.delta");
+
+		attached.client.sendJson(command("state-before-delete", "state-before-delete", "session.state.get", "s1", {}));
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		const stateCommand = JSON.parse(child.writes[0]!) as { id: string };
+		child.push({
+			type: "response",
+			id: stateCommand.id,
+			command: "get_state",
+			success: true,
+			data: {
+				isStreaming: false,
+				isCompacting: false,
+				isPaused: false,
+				messageCount: 0,
+				queuedMessageCount: 0,
+				steeringMode: "one-at-a-time",
+				followUpMode: "all",
+				interruptMode: "wait",
+			},
+		});
+		const state = await untilResponse(attached.client, "state-before-delete");
+		expect(state.response.ok).toBe(true);
+		if (state.frames.some(frame => frame.type === "session.delta"))
+			expect((await observer.client.nextServer()).type).toBe("session.delta");
+
+		const deleteRevision = appserver.snapshot(sid("s1"))!.revision;
+		attached.client.sendJson({
+			...command("delete", "delete", "session.delete", "s1", {}),
+			expectedRevision: deleteRevision,
+		});
+		const challenge = await attached.client.nextServer();
+		expect(challenge.type).toBe("confirmation");
+		if (challenge.type !== "confirmation") throw new Error("missing delete confirmation");
+		attached.client.sendJson(
+			confirmFrame("delete-confirm", String(challenge.confirmationId), "delete", "approve", "s1"),
+		);
+		const deleted = await untilResponse(attached.client, "delete");
+		expect(deleted.frames.map(frame => frame.type)).toEqual(["event", "session.delta", "response"]);
+		expect(deleted.frames[0]).toMatchObject({ type: "event", event: { type: "session_deleted" } });
+		expect(deleted.frames[1]).toMatchObject({ type: "session.delta", remove: "s1" });
+		expect(deleted.response).toMatchObject({ ok: true, result: { deleted: true } });
+		expect(await child.killed.promise).toBeUndefined();
+		const observerDelete = await observer.client.nextServer();
+		expect(observerDelete).toMatchObject({ type: "session.delta", remove: "s1" });
+		expect(authority.lifecycle).toEqual(["archive:s1", "restore:s1", "delete:s1"]);
+
+		const reconnected = await readyClient(appserver.socketPath, ["sessions.read"]);
+		expect(reconnected.sessions).toMatchObject({
+			hostId: host,
+			sessions: [],
+			totalCount: 0,
+			truncated: false,
+		});
+		await closeClients([attached.client, observer.client, reconnected.client]);
+		await appserver.stop();
+	});
+
+	test("active deletion is refused before challenge and failed metadata mutation emits no lifecycle frames", async () => {
+		const values = [record("s1")];
+		const authority = new FakeAuthority(values);
+		const factory = new LiveFactory();
+		const root = await mkdtemp(join(tmpdir(), "omp-lifecycle-guard-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			childFactory: factory,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]);
+		client.client.sendJson(command("attach-guard", "attach-guard", "session.attach", "s1", {}));
+		await responseAndSnapshot(client.client, "attach-guard");
+		client.client.sendJson(command("prompt-guard", "prompt-guard", "session.prompt", "s1", { message: "work" }));
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		const active = await client.client.nextServer();
+		expect(active).toMatchObject({ type: "session.delta", upsert: { status: "active" } });
+		client.client.sendJson({
+			...command("delete-active", "delete-active", "session.delete", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const refused = await client.client.nextServer();
+		expect(refused).toMatchObject({ type: "response", ok: false, error: { code: "session_busy" } });
+		expect(authority.lifecycle).toEqual([]);
+
+		responseFor(child, "prompt");
+		await untilResponse(client.client, "prompt-guard");
+		await child.waitForWrites(2);
+		const refreshCall = JSON.parse(child.writes[1] ?? "{}") as { id?: string };
+		if (!refreshCall.id) throw new Error("scheduled state refresh RPC id missing");
+		child.push({
+			type: "response",
+			id: refreshCall.id,
+			command: "get_state",
+			success: true,
+			data: {
+				isStreaming: false,
+				isCompacting: false,
+				isPaused: false,
+				messageCount: 1,
+				queuedMessageCount: 0,
+				steeringMode: "one-at-a-time",
+				followUpMode: "all",
+				interruptMode: "wait",
+			},
+		});
+		child.push({ type: "turn_end" });
+		await client.client.nextServer();
+		await client.client.nextServer();
+		authority.failLifecycle = true;
+		client.client.sendJson({
+			...command("archive-fail", "archive-fail", "session.archive", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const failed = await untilResponse(client.client, "archive-fail");
+		expect(failed.frames).toHaveLength(1);
+		expect(failed.response).toMatchObject({ ok: false, error: { code: "session_lifecycle_failed" } });
+		expect(appserver.snapshot(sid("s1"))!.ref.archivedAt).toBeUndefined();
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
+	test("queued state and a pending non-streaming RPC both fail lifecycle operations closed", async () => {
+		const values = [record("s1")];
+		const authority = new FakeAuthority(values);
+		const factory = new LiveFactory();
+		const root = await mkdtemp(join(tmpdir(), "omp-lifecycle-pending-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			childFactory: factory,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage"]);
+		client.client.sendJson({
+			...command("rename-pending", "rename-pending", "session.rename", "s1", { name: "Renamed" }),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		client.client.sendJson({
+			...command("archive-during-rpc", "archive-during-rpc", "session.archive", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const rpcBusy = await untilResponse(client.client, "archive-during-rpc");
+		expect(rpcBusy.response).toMatchObject({ ok: false, error: { code: "session_busy" } });
+		expect(authority.lifecycle).toEqual([]);
+
+		const renameCall = JSON.parse(child.writes[0] ?? "{}") as { id?: string };
+		if (!renameCall.id) throw new Error("rename RPC id missing");
+		child.push({ type: "response", id: renameCall.id, command: "set_session_name", success: true, data: {} });
+		expect((await untilResponse(client.client, "rename-pending")).response.ok).toBe(true);
+		await child.waitForWrites(2);
+		const stateCall = JSON.parse(child.writes[1] ?? "{}") as { id?: string };
+		if (!stateCall.id) throw new Error("state RPC id missing");
+		child.push({
+			type: "response",
+			id: stateCall.id,
+			command: "get_state",
+			success: true,
+			data: {
+				isStreaming: false,
+				isCompacting: false,
+				isPaused: false,
+				messageCount: 1,
+				queuedMessageCount: 1,
+				queuedMessages: { steering: ["later"], followUp: [] },
+				steeringMode: "one-at-a-time",
+				followUpMode: "all",
+				interruptMode: "wait",
+			},
+		});
+		const queuedDelta = await client.client.nextServer();
+		expect(queuedDelta).toMatchObject({
+			type: "session.delta",
+			upsert: { liveState: { queuedMessageCount: 1, queuedMessages: { steering: ["later"] } } },
+		});
+		client.client.sendJson({
+			...command("archive-queued", "archive-queued", "session.archive", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const queuedBusy = await untilResponse(client.client, "archive-queued");
+		expect(queuedBusy.response).toMatchObject({ ok: false, error: { code: "session_busy" } });
+		expect(authority.lifecycle).toEqual([]);
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
+	test("a deferred desktop write blocks archive until the write has fully settled", async () => {
+		const values = [record("s1")];
+		const authority = new FakeAuthority(values);
+		const writeStarted = Promise.withResolvers<void>();
+		const releaseWrite = Promise.withResolvers<void>();
+		let writeFinished = false;
+		const operationsAuthority: DesktopOperationsAuthority = {
+			filesWrite: async () => {
+				writeStarted.resolve();
+				await releaseWrite.promise;
+				writeFinished = true;
+				return {};
+			},
+		};
+		const root = await mkdtemp(join(tmpdir(), "omp-lifecycle-write-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			operationsAuthority,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "files.write"]);
+		client.client.sendJson({
+			...command("write", "write", "files.write", "s1", { path: "file.txt", content: "new" }),
+			expectedRevision: "file-revision",
+		});
+		const writeChallenge = await client.client.nextServer();
+		if (writeChallenge.type !== "confirmation") throw new Error("missing write confirmation");
+		client.client.sendJson(
+			confirmFrame("write-confirm", String(writeChallenge.confirmationId), "write", "approve", "s1"),
+		);
+		await writeStarted.promise;
+		client.client.sendJson({
+			...command("archive-during-write", "archive-during-write", "session.archive", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const busy = await untilResponse(client.client, "archive-during-write");
+		expect(busy.response).toMatchObject({ ok: false, error: { code: "session_busy" } });
+		expect(writeFinished).toBe(false);
+		expect(authority.lifecycle).toEqual([]);
+
+		releaseWrite.resolve();
+		expect((await untilResponse(client.client, "write")).response.ok).toBe(true);
+		expect(writeFinished).toBe(true);
+		client.client.sendJson({
+			...command("archive-after-write", "archive-after-write", "session.archive", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const archived = await untilResponse(client.client, "archive-after-write");
+		expect(archived.response).toMatchObject({ ok: true, result: { archived: true } });
+		expect(authority.lifecycle).toEqual(["archive:s1"]);
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
+	test("deleting the last session closes its open terminal before removing the projection", async () => {
+		const values = [record("s1")];
+		const authority = new FakeAuthority(values);
+		let closes = 0;
+		const operationsAuthority: DesktopOperationsAuthority = {
+			termOpen: async () => ({ terminalId: "term-last" }),
+			terminalInput: async () => {},
+			terminalResize: async () => {},
+			terminalClose: async () => {
+				closes++;
+			},
+		};
+		const root = await mkdtemp(join(tmpdir(), "omp-lifecycle-terminal-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			operationsAuthority,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "term.open"]);
+		client.client.sendJson(command("term-open", "term-open", "term.open", "s1", {}));
+		const openChallenge = await client.client.nextServer();
+		if (openChallenge.type !== "confirmation") throw new Error("missing terminal confirmation");
+		client.client.sendJson(
+			confirmFrame("term-open-confirm", String(openChallenge.confirmationId), "term-open", "approve", "s1"),
+		);
+		expect((await untilResponse(client.client, "term-open")).response).toMatchObject({
+			ok: true,
+			result: { terminalId: "term-last" },
+		});
+
+		client.client.sendJson({
+			...command("delete-last", "delete-last", "session.delete", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const deleteChallenge = await client.client.nextServer();
+		if (deleteChallenge.type !== "confirmation") throw new Error("missing delete confirmation");
+		client.client.sendJson(
+			confirmFrame("delete-last-confirm", String(deleteChallenge.confirmationId), "delete-last", "approve", "s1"),
+		);
+		const deleted = await untilResponse(client.client, "delete-last");
+		expect(deleted.response).toMatchObject({ ok: true, result: { deleted: true } });
+		expect(appserver.snapshot(sid("s1"))).toBeUndefined();
+		expect(closes).toBe(1);
+		await closeClients([client.client]);
+		await appserver.stop();
+		expect(closes).toBe(1);
+	});
+
+	test("a hung terminal close times out and releases the lifecycle fence", async () => {
+		const values = [record("s1")];
+		const authority = new FakeAuthority(values);
+		const releaseClose = Promise.withResolvers<void>();
+		let closeCalls = 0;
+		const operationsAuthority: DesktopOperationsAuthority = {
+			termOpen: async () => ({ terminalId: "term-hung" }),
+			terminalInput: async () => {},
+			terminalResize: async () => {},
+			terminalClose: async () => {
+				closeCalls++;
+				await releaseClose.promise;
+			},
+		};
+		const root = await mkdtemp(join(tmpdir(), "omp-lifecycle-terminal-timeout-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			operationsAuthority,
+			lifecycleQuiesceTimeoutMs: 20,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "term.open"]);
+		client.client.sendJson(command("term-hung", "term-hung", "term.open", "s1", {}));
+		const challenge = await client.client.nextServer();
+		if (challenge.type !== "confirmation") throw new Error("missing terminal confirmation");
+		client.client.sendJson(
+			confirmFrame("term-hung-confirm", String(challenge.confirmationId), "term-hung", "approve", "s1"),
+		);
+		expect((await untilResponse(client.client, "term-hung")).response.ok).toBe(true);
+
+		client.client.sendJson({
+			...command("archive-hung-term", "archive-hung-term", "session.archive", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const refused = await untilResponse(client.client, "archive-hung-term");
+		expect(refused.response).toMatchObject({ ok: false, error: { code: "session_busy" } });
+		expect(closeCalls).toBe(1);
+		expect(authority.lifecycle).toEqual([]);
+
+		client.client.sendJson(command("attach-after-timeout", "attach-after-timeout", "session.attach", "s1", {}));
+		expect((await responseAndSnapshot(client.client, "attach-after-timeout"))[0].ok).toBe(true);
+		releaseClose.resolve();
+		await Bun.sleep(0);
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
+	test("lifecycle quiesce escalates a graceful-stop timeout before mutating metadata", async () => {
+		const values = [record("s1")];
+		const authority = new FakeAuthority(values);
+		const factory = new LiveFactory("forced");
+		const root = await mkdtemp(join(tmpdir(), "omp-lifecycle-supervisor-force-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			childFactory: factory,
+			lifecycleQuiesceTimeoutMs: 20,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]);
+		const child = await startIdleSessionRuntime(client.client, factory, "state-before-force");
+
+		client.client.sendJson({
+			...command("archive-force", "archive-force", "session.archive", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const archived = await untilResponse(client.client, "archive-force");
+		expect(archived.response).toMatchObject({ ok: true, result: { archived: true } });
+		expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(appserver.childFor(sid("s1"))).toBeUndefined();
+		expect(authority.lifecycle).toEqual(["archive:s1"]);
+
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
+	test("a child that survives forced termination stays owned and blocks lifecycle retries", async () => {
+		const values = [record("s1")];
+		const authority = new FakeAuthority(values);
+		const factory = new LiveFactory("manual");
+		const root = await mkdtemp(join(tmpdir(), "omp-lifecycle-supervisor-stuck-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			childFactory: factory,
+			lifecycleQuiesceTimeoutMs: 20,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]);
+		const child = await startIdleSessionRuntime(client.client, factory, "state-before-stuck");
+		const revision = appserver.snapshot(sid("s1"))!.revision;
+
+		for (const requestId of ["archive-stuck-first", "archive-stuck-retry"]) {
+			client.client.sendJson({
+				...command(requestId, requestId, "session.archive", "s1", {}),
+				expectedRevision: revision,
+			});
+			const refused = await untilResponse(client.client, requestId);
+			expect(refused.response).toMatchObject({ ok: false, error: { code: "session_busy" } });
+			expect(appserver.childFor(sid("s1"))).toBe(child);
+			expect(authority.lifecycle).toEqual([]);
+		}
+		expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL"]);
+
+		child.release();
+		client.client.sendJson({
+			...command("archive-after-exit", "archive-after-exit", "session.archive", "s1", {}),
+			expectedRevision: revision,
+		});
+		const archived = await untilResponse(client.client, "archive-after-exit");
+		expect(archived.response).toMatchObject({ ok: true, result: { archived: true } });
+		expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL", "SIGTERM"]);
+		expect(appserver.childFor(sid("s1"))).toBeUndefined();
+		expect(authority.lifecycle).toEqual(["archive:s1"]);
+
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
+	test("an opposite lifecycle request cannot report a no-op success while archive is in flight", async () => {
+		const values = [record("s1")];
+		const authority = new FakeAuthority(values);
+		const archiveStarted = Promise.withResolvers<void>();
+		const releaseArchive = Promise.withResolvers<void>();
+		authority.archive = async (session, archivedAt) => {
+			archiveStarted.resolve();
+			await releaseArchive.promise;
+			authority.lifecycle.push(`archive:${session.sessionId}`);
+			session.archivedAt = archivedAt;
+		};
+		const root = await mkdtemp(join(tmpdir(), "omp-lifecycle-opposite-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage"]);
+		const initialRevision = appserver.snapshot(sid("s1"))!.revision;
+		client.client.sendJson({
+			...command("archive-slow", "archive-slow", "session.archive", "s1", {}),
+			expectedRevision: initialRevision,
+		});
+		await archiveStarted.promise;
+		client.client.sendJson({
+			...command("restore-racing", "restore-racing", "session.restore", "s1", {}),
+			expectedRevision: initialRevision,
+		});
+		const refused = await untilResponse(client.client, "restore-racing");
+		expect(refused.response).toMatchObject({ ok: false, error: { code: "session_busy" } });
+		releaseArchive.resolve();
+		expect((await untilResponse(client.client, "archive-slow")).response).toMatchObject({
+			ok: true,
+			result: { archived: true },
+		});
+		expect(appserver.snapshot(sid("s1"))?.ref.archivedAt).toBeDefined();
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
 	test("session list reconciliation broadcasts newly discovered safe metadata", async () => {
 		const records: SessionRecord[] = [{ ...record("s1"), title: "Session" }];
 		const factory = new LiveFactory();
+		let terminalCloses = 0;
+		const operationsAuthority: DesktopOperationsAuthority = {
+			termOpen: async () => ({ terminalId: "term-external" }),
+			terminalInput: async () => {},
+			terminalResize: async () => {},
+			terminalClose: async () => {
+				terminalCloses++;
+			},
+		};
 		const root = await mkdtemp(join(tmpdir(), "omp-reconcile-live-"));
 		const appserver = createAppserver({
 			hostId: host,
@@ -1350,9 +1941,11 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 			socketPath: join(root, "app.sock"),
 			discovery: new StaticDiscovery(records),
 			childFactory: factory,
+			operationsAuthority,
 		});
 		await appserver.start();
-		const client = await readyClient(appserver.socketPath, ["sessions.read"]);
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.prompt", "term.open"]);
+		const observer = await readyClient(appserver.socketPath, ["sessions.read"]);
 		client.client.sendJson(command("attach-reconcile", "attach-reconcile", "session.attach", "s1", {}));
 		await responseAndSnapshot(client.client, "attach-reconcile");
 
@@ -1375,6 +1968,10 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 				sessions: [{ project: { projectId: "project-test", name: "tmp" }, title: "Discovered title" }],
 			},
 		});
+		expect(await observer.client.nextServer()).toMatchObject({
+			type: "session.delta",
+			upsert: { sessionId: sid("s1"), title: "Discovered title" },
+		});
 
 		records[0] = {
 			...records[0]!,
@@ -1389,7 +1986,60 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 			project: { projectId: "project-test", name: "tmp" },
 			title: "Discovered title",
 		});
-		await closeClients([client.client]);
+
+		records.push(record("s2"));
+		client.client.sendJson(hostCommand("list-added", "list-added", "session.list", {}));
+		const added = await untilResponse(client.client, "list-added");
+		expect(added.frames[0]).toMatchObject({
+			type: "session.delta",
+			upsert: { sessionId: sid("s2") },
+		});
+		expect(await observer.client.nextServer()).toMatchObject({
+			type: "session.delta",
+			upsert: { sessionId: sid("s2") },
+		});
+		client.client.sendJson(command("attach-added", "attach-added", "session.attach", "s2", {}));
+		await responseAndSnapshot(client.client, "attach-added");
+		client.client.sendJson(command("term-added", "term-added", "term.open", "s2", {}));
+		const terminalChallenge = await client.client.nextServer();
+		if (terminalChallenge.type !== "confirmation") throw new Error("missing external terminal confirmation");
+		client.client.sendJson(
+			confirmFrame("term-added-confirm", String(terminalChallenge.confirmationId), "term-added", "approve", "s2"),
+		);
+		expect((await untilResponse(client.client, "term-added")).response.ok).toBe(true);
+		client.client.sendJson(command("state-added", "state-added", "session.state.get", "s2", {}));
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		const stateCall = JSON.parse(child.writes[0] ?? "{}") as { id?: string };
+		if (!stateCall.id) throw new Error("external session state RPC id missing");
+		child.push({
+			type: "response",
+			id: stateCall.id,
+			command: "get_state",
+			success: true,
+			data: {
+				isStreaming: false,
+				isCompacting: false,
+				isPaused: false,
+				messageCount: 0,
+				queuedMessageCount: 0,
+				steeringMode: "one-at-a-time",
+				followUpMode: "all",
+				interruptMode: "wait",
+			},
+		});
+		const stateOutcome = await untilResponse(client.client, "state-added");
+		for (const frame of stateOutcome.frames)
+			if (frame.type === "session.delta") expect((await observer.client.nextServer()).type).toBe("session.delta");
+
+		records.pop();
+		client.client.sendJson(hostCommand("list-removed", "list-removed", "session.list", {}));
+		const removed = await untilResponse(client.client, "list-removed");
+		expect(removed.frames[0]).toMatchObject({ type: "session.delta", remove: sid("s2") });
+		expect(await observer.client.nextServer()).toMatchObject({ type: "session.delta", remove: sid("s2") });
+		expect(await child.killed.promise).toBeUndefined();
+		expect(terminalCloses).toBe(1);
+		await closeClients([client.client, observer.client]);
 		await appserver.stop();
 	});
 
@@ -1408,7 +2058,9 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		await appserver.start();
 		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]);
 		client.client.sendJson(hostCommand("create-live", "create-live", "session.create", { projectId: "requested" }));
-		const created = await client.client.nextServer();
+		const createdOutcome = await untilResponse(client.client, "create-live");
+		expect(createdOutcome.frames.map(frame => frame.type)).toEqual(["session.delta", "response"]);
+		const created = createdOutcome.response;
 		expect(created).toMatchObject({
 			type: "response",
 			ok: true,
@@ -1476,25 +2128,9 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 			}),
 		);
 		const replayResponse = await replayClient.client.nextServer();
-		const replay = [
-			await replayClient.client.nextServer(),
-			await replayClient.client.nextServer(),
-			await replayClient.client.nextServer(),
-			await replayClient.client.nextServer(),
-		];
+		const replay = [await replayClient.client.nextServer()];
 		expect(replayResponse.type).toBe("response");
-		expect(replay.map(frame => frame.type)).toEqual(["session.delta", "entry", "session.delta", "session.delta"]);
-		expect(
-			replay.flatMap(frame =>
-				frame.type === "session.delta" && frame.upsert
-					? [{ name: frame.upsert.project.name, title: frame.upsert.title }]
-					: [],
-			),
-		).toEqual([
-			{ name: "authority", title: "Session" },
-			{ name: "authority", title: "First live request" },
-			{ name: "authority", title: "Explicit title" },
-		]);
+		expect(replay.map(frame => frame.type)).toEqual(["entry"]);
 		await closeClients([client.client, replayClient.client]);
 		await appserver.stop();
 	});
@@ -1514,7 +2150,9 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		await appserver.start();
 		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]);
 		client.client.sendJson(hostCommand("create", "create", "session.create", { projectId: "project-authority" }));
-		const created = await client.client.nextServer();
+		const createdOutcome = await untilResponse(client.client, "create");
+		expect(createdOutcome.frames.map(frame => frame.type)).toEqual(["session.delta", "response"]);
+		const created = createdOutcome.response;
 		expect(created.type).toBe("response");
 		expect((await authority.created.promise).title).toBeUndefined();
 		if (created.type === "response") {
@@ -1544,8 +2182,9 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		await lockApp.start();
 		const lockClient = await readyClient(lockApp.socketPath, ["sessions.read", "sessions.prompt"]);
 		lockClient.client.sendJson(command("fail", "fail", "session.prompt", "s1", { message: "x" }));
-		const failure = await lockClient.client.nextServer();
-		expect(failure.type).toBe("response");
+		const failure = await untilResponse(lockClient.client, "fail");
+		expect(failure.frames.map(frame => frame.type)).toEqual(["session.delta", "session.delta", "response"]);
+		expect(failure.response.ok).toBe(false);
 		expect(lockApp.snapshot(sid("s1"))?.ref.status).toBe("idle");
 		fail = false;
 		lockClient.client.sendJson(command("retry", "retry", "session.prompt", "s1", { message: "x" }));

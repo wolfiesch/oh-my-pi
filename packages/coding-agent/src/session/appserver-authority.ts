@@ -1,4 +1,5 @@
 import { statSync } from "node:fs";
+import * as path from "node:path";
 import { type DurableEntry, hostId, type ProjectId, type SessionId } from "@oh-my-pi/app-wire";
 import type { LockCheckHook, SessionAuthority, SessionAuthoritySession, SessionRecord } from "@oh-my-pi/appserver";
 import {
@@ -8,10 +9,11 @@ import {
 	projectNameFromCwd,
 	stableProjectId,
 } from "@oh-my-pi/appserver";
-import { getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
+import { getAgentDir, getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import type { AgentRegistry } from "../registry/agent-registry";
+import { AppserverSessionLifecycleStore } from "./appserver-session-lifecycle";
 import {
 	createDesktopConfigAuthority,
 	type DesktopConfigAuthority,
@@ -36,6 +38,8 @@ export interface AppserverRuntimeAuthorities {
 }
 
 export interface AppserverAuthorityOptions {
+	sessionsDir?: string;
+	lifecycleMetadataPath?: string;
 	settings?: Settings;
 	modelRegistry?: Pick<ModelRegistry, "getAll" | "getAvailable">;
 	agentRegistry?: Pick<AgentRegistry, "list">;
@@ -65,11 +69,26 @@ function settingsPort(settings: Settings): DesktopSettingsPort {
 
 export function createAppserverRuntime(options: AppserverAuthorityOptions = {}): AppserverRuntimeAuthorities {
 	const records = new Map<SessionId, SessionRecord>();
-	const baseDiscovery = new FileSessionDiscovery(getSessionsDir(), undefined, hostId("appserver-authority"));
+	const sessionsDir = path.resolve(options.sessionsDir ?? getSessionsDir());
+	const lifecycle = new AppserverSessionLifecycleStore(
+		options.lifecycleMetadataPath ?? path.join(getAgentDir(), "appserver", "session-lifecycle.json"),
+		sessionsDir,
+	);
+	let recovery: Promise<void> | undefined;
+	const ensureRecovered = (): Promise<void> => {
+		recovery ??= lifecycle.recoverDeletes();
+		return recovery;
+	};
+	const baseDiscovery = new FileSessionDiscovery(sessionsDir, undefined, hostId("appserver-authority"));
 	const refresh = async (): Promise<SessionRecord[]> => {
+		await ensureRecovered();
+		const archived = await lifecycle.archivedSessions();
 		const discovered = await baseDiscovery.list();
 		records.clear();
-		for (const record of discovered) records.set(record.sessionId, record);
+		for (const record of discovered) {
+			const archivedAt = archived.get(record.sessionId);
+			records.set(record.sessionId, archivedAt ? { ...record, archivedAt } : record);
+		}
 		return [...records.values()];
 	};
 	const sessionAuthority: SessionAuthority = {
@@ -103,6 +122,33 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 		},
 		async list(): Promise<SessionRecord[]> {
 			return refresh();
+		},
+		async archive(session, archivedAt): Promise<void> {
+			await ensureRecovered();
+			const current = (await baseDiscovery.list()).find(candidate => candidate.sessionId === session.sessionId);
+			if (!current || path.resolve(current.path) !== path.resolve(session.path))
+				throw new Error("session archive target changed during authorization");
+			await lifecycle.archiveSession(session.sessionId, archivedAt, current.path);
+			const indexed = records.get(session.sessionId);
+			if (indexed) records.set(session.sessionId, { ...indexed, archivedAt });
+		},
+		async restore(session): Promise<void> {
+			await ensureRecovered();
+			await lifecycle.restore(session.sessionId);
+			const current = records.get(session.sessionId);
+			if (current) {
+				const next = { ...current };
+				delete next.archivedAt;
+				records.set(session.sessionId, next);
+			}
+		},
+		async delete(session): Promise<void> {
+			await ensureRecovered();
+			const current = (await baseDiscovery.list()).find(candidate => candidate.sessionId === session.sessionId);
+			if (!current || path.resolve(current.path) !== path.resolve(session.path))
+				throw new Error("session deletion target changed during authorization");
+			await lifecycle.deleteSession(session.sessionId, current.path);
+			records.delete(session.sessionId);
 		},
 	};
 	const discovery = { list: () => sessionAuthority.list() };

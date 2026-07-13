@@ -120,7 +120,21 @@ describe("projection and replay", () => {
 			project: { projectId: "project-test", name: "tmp" },
 			title: "Explicit title",
 		});
-		expect(projection.replay({ epoch: "epoch-a", seq: 0 })).toEqual([reconciled, titled]);
+		expect(projection.replay({ epoch: "epoch-a", seq: 0 })).toEqual([]);
+		expect(projection.value.cursor.seq).toBe(0);
+		expect(projection.value.indexCursor.seq).toBe(2);
+	});
+	test("keeps transcript replay contiguous across independent index deltas", () => {
+		const projection = new SessionProjection(host, record("s"), "epoch-a");
+		const first = projection.appendEvent({ type: "before_delta" });
+		const delta = projection.updateStatus("active");
+		const second = projection.appendEvent({ type: "after_delta" });
+		expect(first).toMatchObject({ type: "event", cursor: { epoch: "epoch-a", seq: 1 } });
+		expect(delta).toMatchObject({ type: "session.delta", cursor: { epoch: "epoch-a", seq: 1 } });
+		expect(second).toMatchObject({ type: "event", cursor: { epoch: "epoch-a", seq: 2 } });
+		expect(projection.value.cursor.seq).toBe(2);
+		expect(projection.value.indexCursor.seq).toBe(1);
+		expect(projection.replay({ epoch: "epoch-a", seq: 0 })).toEqual([first, second]);
 	});
 });
 describe("idempotency", () => {

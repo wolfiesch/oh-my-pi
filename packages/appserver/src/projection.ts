@@ -58,9 +58,11 @@ export class SessionProjection {
 				title: record.title,
 				status: record.status,
 				updatedAt: record.updatedAt,
+				...(record.archivedAt ? { archivedAt: record.archivedAt } : {}),
 				...(record.model ? { model: record.model } : {}),
 				...(record.thinking ? { thinking: record.thinking } : {}),
 			},
+			indexCursor: { epoch, seq: 0 },
 			ring: [],
 		};
 	}
@@ -70,15 +72,15 @@ export class SessionProjection {
 		const nextRevision = revision(`r-${this.#revisionHash.copy().digest("hex").slice(0, 24)}`);
 		this.value.revision = nextRevision;
 		this.value.ref = { ...this.value.ref, status, revision: nextRevision };
-		return this.appendFrame({
+		return {
 			v: "omp-app/1",
 			type: "session.delta",
-			cursor: this.nextCursor(),
+			cursor: this.nextIndexCursor(),
 			revision: nextRevision,
 			hostId: this.value.hostId,
 			sessionId: this.value.sessionId,
 			upsert: this.value.ref,
-		});
+		};
 	}
 	updateTitle(title: string): ServerFrame | undefined {
 		if (!title || this.value.ref.title === title) return undefined;
@@ -94,8 +96,44 @@ export class SessionProjection {
 				? { projectId: current.project.projectId, ...(projectName ? { name: projectName } : {}) }
 				: current.project;
 		const title = placeholderTitle(current.title) && !placeholderTitle(record.title) ? record.title : current.title;
-		if (project === current.project && title === current.title) return undefined;
-		return this.updateRef({ ...current, project, title }, `record:${record.updatedAt}`);
+		const archivedAt = record.archivedAt;
+		if (project === current.project && title === current.title && archivedAt === current.archivedAt) return undefined;
+		const next = { ...current, project, title };
+		if (archivedAt) next.archivedAt = archivedAt;
+		else delete next.archivedAt;
+		return this.updateRef(next, `record:${record.updatedAt}:${archivedAt ?? "restored"}`);
+	}
+	updateArchivedAt(archivedAt?: string): ServerFrame | undefined {
+		if (this.value.ref.archivedAt === archivedAt) return undefined;
+		const next = { ...this.value.ref };
+		if (archivedAt) next.archivedAt = archivedAt;
+		else delete next.archivedAt;
+		return this.updateRef(next, `archived:${archivedAt ?? "restored"}`);
+	}
+	indexUpsert(): ServerFrame {
+		return {
+			v: "omp-app/1",
+			type: "session.delta",
+			cursor: this.nextIndexCursor(),
+			revision: this.value.revision,
+			hostId: this.value.hostId,
+			sessionId: this.value.sessionId,
+			upsert: this.value.ref,
+		};
+	}
+	remove(): ServerFrame {
+		this.#revisionHash.update("deleted\n");
+		const nextRevision = revision(`r-${this.#revisionHash.copy().digest("hex").slice(0, 24)}`);
+		this.value.revision = nextRevision;
+		return {
+			v: "omp-app/1",
+			type: "session.delta",
+			cursor: this.nextIndexCursor(),
+			revision: nextRevision,
+			hostId: this.value.hostId,
+			sessionId: this.value.sessionId,
+			remove: this.value.sessionId,
+		};
 	}
 	appendEntry(entry: DurableEntry): ServerFrame | undefined {
 		const previous = this.#byId.get(entry.id);
@@ -155,15 +193,15 @@ export class SessionProjection {
 		next.revision = nextRevision;
 		this.value.revision = nextRevision;
 		this.value.ref = next;
-		return this.appendFrame({
+		return {
 			v: "omp-app/1",
 			type: "session.delta",
-			cursor: this.nextCursor(),
+			cursor: this.nextIndexCursor(),
 			revision: nextRevision,
 			hostId: this.value.hostId,
 			sessionId: this.value.sessionId,
 			upsert: next,
-		});
+		};
 	}
 	appendEvent(event: SessionEvent): ServerFrame {
 		return this.appendFrame({
@@ -181,15 +219,15 @@ export class SessionProjection {
 		next.revision = nextRevision;
 		this.value.revision = nextRevision;
 		this.value.ref = next;
-		return this.appendFrame({
+		return {
 			v: "omp-app/1",
 			type: "session.delta",
-			cursor: this.nextCursor(),
+			cursor: this.nextIndexCursor(),
 			revision: nextRevision,
 			hostId: this.value.hostId,
 			sessionId: this.value.sessionId,
 			upsert: next,
-		});
+		};
 	}
 	snapshot(): ServerFrame {
 		return {
@@ -210,6 +248,10 @@ export class SessionProjection {
 	private nextCursor() {
 		this.value.cursor = { epoch: this.value.cursor.epoch, seq: this.value.cursor.seq + 1 };
 		return this.value.cursor;
+	}
+	private nextIndexCursor() {
+		this.value.indexCursor = { epoch: this.value.indexCursor.epoch, seq: this.value.indexCursor.seq + 1 };
+		return this.value.indexCursor;
 	}
 	private appendFrame(frame: ServerFrame): ServerFrame {
 		this.value.ring.push(frame);

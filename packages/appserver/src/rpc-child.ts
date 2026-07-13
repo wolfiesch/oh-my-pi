@@ -138,6 +138,9 @@ export class RpcChildSupervisor {
 		private readonly callbacks: ChildCallbacks,
 		private readonly argv = ["omp", "--mode", "rpc"],
 	) {}
+	hasPendingCalls(): boolean {
+		return this.#pending.size > 0;
+	}
 	async start(): Promise<void> {
 		if (this.#child) throw new Error("child already started");
 		this.#child = this.factory.spawn({ session: this.session, argv: this.argv, cwd: this.session.cwd });
@@ -204,12 +207,13 @@ export class RpcChildSupervisor {
 		if (stringBytes(line) > MAX_LINE_BYTES) throw new Error("rpc command exceeds 1MiB");
 		await this.#child.stdin.write(line);
 	}
-	stop(): void {
+	stop(signal: "SIGTERM" | "SIGKILL" = "SIGTERM"): void {
 		const child = this.#child;
 		this.#closed = true;
-		child?.kill();
+		child?.kill(signal);
 		this.fail(new Error("rpc child stopped"));
-		this.#child = undefined;
+		// The owner must retain this handle until `exited` settles. Clearing it
+		// here would let lifecycle retries lose track of a signal-resistant child.
 	}
 	child(): ChildHandle | undefined {
 		return this.#child;
