@@ -347,6 +347,35 @@ describe("projection, replay, and idempotency", () => {
 		}
 		expect(projection.updateStatus("active")).toBeUndefined();
 	});
+	test("idle and closed status transitions clear projected streaming state", () => {
+		for (const status of ["idle", "closed"] as const) {
+			const projection = new SessionProjection(host, record(`streaming-${status}`), "epoch-a", 3);
+			projection.updateState({
+				isStreaming: true,
+				isCompacting: false,
+				isPaused: false,
+				messageCount: 1,
+				queuedMessageCount: 0,
+				steeringMode: "one-at-a-time",
+				followUpMode: "all",
+				interruptMode: "wait",
+			});
+			expect(projection.value.ref).toMatchObject({
+				status: "active",
+				liveState: { isStreaming: true },
+			});
+
+			const delta = projection.updateStatus(status);
+			expect(delta).toMatchObject({
+				type: "session.delta",
+				upsert: { status, liveState: { isStreaming: false } },
+			});
+			expect(projection.value.ref).toMatchObject({
+				status,
+				liveState: { isStreaming: false },
+			});
+		}
+	});
 	test("old epoch returns gap and snapshot", () => {
 		const projection = new SessionProjection(host, record("s"), "epoch-new", 3);
 		projection.appendEvent({ type: "live" });

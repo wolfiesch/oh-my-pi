@@ -353,6 +353,126 @@ describe("live Unix websocket protocol", () => {
 		await closeClients([readOnly.client]);
 		await appserver.stop();
 	});
+	test("a model change reaches a second client before its command response when the first client is delayed", async () => {
+		const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("reserved") });
+		const port = reserved.port;
+		reserved.stop(true);
+		if (!port) throw new Error("failed to reserve a remote listener port");
+
+		const factory = new LiveFactory();
+		const releaseDelta = Promise.withResolvers<void>();
+		const delayedDelta = Promise.withResolvers<void>();
+		let holdDelta = false;
+		const root = await mkdtemp(join(tmpdir(), "omp-index-order-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			discovery: new StaticDiscovery([record("s1")]),
+			childFactory: factory,
+			remoteEndpoint: {
+				address: "127.0.0.1",
+				port,
+				serveProxy: true,
+				trustedServeProxy: true,
+			},
+			remotePolicy: {
+				authenticate: async () => ({ authenticated: true, grantedCapabilities: ["sessions.read"] }),
+				authorize: async () => true,
+				transformOutbound: async (_connection, frame) => {
+					if (holdDelta && frame.type === "session.delta") {
+						delayedDelta.resolve();
+						await releaseDelta.promise;
+					}
+					return frame;
+				},
+			},
+		});
+		let observer: WebSocket | undefined;
+		let owner: RawUdsWebSocket | undefined;
+		try {
+			await appserver.start();
+			const observerReady = Promise.withResolvers<void>();
+			let observerFrames = 0;
+			observer = new WebSocket(`ws://127.0.0.1:${port}/v1/ws`, {
+				headers: {
+					"Tailscale-Node-ID": "observer-node",
+					"Tailscale-Node-Name": "observer",
+					"Tailscale-User-Login": "observer@example.com",
+					"Tailscale-Client-IP": "100.64.0.2",
+				},
+				perMessageDeflate: false,
+			});
+			observer.addEventListener("open", () => observer?.send(JSON.stringify(hello(["sessions.read"]))));
+			observer.addEventListener("error", () => observerReady.reject(new Error("remote observer failed")));
+			observer.addEventListener("message", () => {
+				observerFrames++;
+				if (observerFrames === 2) observerReady.resolve();
+			});
+			await observerReady.promise;
+
+			const readyOwner = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage"]);
+			owner = readyOwner.client;
+			owner.sendJson(command("attach-model-owner", "attach-model-owner", "session.attach", "s1", {}));
+			const [, snapshot] = await responseAndSnapshot(owner, "attach-model-owner");
+			holdDelta = true;
+			owner.sendJson({
+				...command("set-model", "set-model", "session.model.set", "s1", {
+					selector: "xai-oauth/grok-4.5",
+					persistence: "session",
+				}),
+				expectedRevision: snapshot.revision,
+			});
+
+			const child = await factory.child();
+			await child.waitForWrites(1);
+			const setModel = JSON.parse(child.writes[0] ?? "{}") as { id?: string; type?: string };
+			expect(setModel.type).toBe("set_model");
+			if (!setModel.id) throw new Error("set_model RPC id missing");
+			child.push({ type: "response", id: setModel.id, command: "set_model", success: true, data: {} });
+			await child.waitForWrites(2);
+			const getState = JSON.parse(child.writes[1] ?? "{}") as { id?: string; type?: string };
+			expect(getState.type).toBe("get_state");
+			if (!getState.id) throw new Error("get_state RPC id missing");
+			child.push({
+				type: "response",
+				id: getState.id,
+				command: "get_state",
+				success: true,
+				data: {
+					isStreaming: false,
+					isCompacting: false,
+					isPaused: false,
+					messageCount: 0,
+					queuedMessageCount: 0,
+					steeringMode: "one-at-a-time",
+					followUpMode: "all",
+					interruptMode: "wait",
+					model: {
+						id: "grok-4.5",
+						provider: "xai-oauth",
+						name: "Grok 4.5",
+						selector: "xai-oauth/grok-4.5",
+					},
+				},
+			});
+			await delayedDelta.promise;
+			releaseDelta.resolve();
+
+			const changed = await untilResponse(owner, "set-model");
+			expect(changed.frames.map(frame => frame.type)).toEqual(["session.delta", "response"]);
+			expect(changed.frames[0]).toMatchObject({
+				type: "session.delta",
+				upsert: { model: "xai-oauth/grok-4.5" },
+			});
+			expect(changed.response).toMatchObject({ ok: true, result: { accepted: true } });
+		} finally {
+			releaseDelta.resolve();
+			owner?.destroy();
+			observer?.close();
+			await appserver.stop();
+		}
+	});
 	test("builds attach output before acknowledging success", async () => {
 		const normal = record("normal");
 		const fragile = record("fragile");
@@ -1999,6 +2119,94 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
 		});
 		const archived = await untilResponse(client.client, "archive-after-stale-state");
+		expect(archived.response).toMatchObject({ ok: true, result: { archived: true } });
+		expect(authority.lifecycle).toEqual(["archive:s1"]);
+
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
+	test("agent end clears streaming state that a scheduled refresh already projected", async () => {
+		const values = [record("s1")];
+		const authority = new FakeAuthority(values);
+		const factory = new LiveFactory();
+		const root = await mkdtemp(join(tmpdir(), "omp-lifecycle-terminal-state-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			childFactory: factory,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]);
+		client.client.sendJson(command("attach-terminal-state", "attach-terminal-state", "session.attach", "s1", {}));
+		await responseAndSnapshot(client.client, "attach-terminal-state");
+
+		client.client.sendJson(
+			command("prompt-terminal-state", "prompt-terminal-state", "session.prompt", "s1", { message: "work" }),
+		);
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		const promptCall = JSON.parse(child.writes[0]!) as { id: string; type: string };
+		expect(promptCall.type).toBe("prompt");
+		child.push({
+			type: "response",
+			id: promptCall.id,
+			command: "prompt",
+			success: true,
+			data: { agentInvoked: true },
+		});
+		expect((await untilResponse(client.client, "prompt-terminal-state")).response.ok).toBe(true);
+		await child.waitForWrites(2);
+		const refreshCall = child.writes
+			.map(value => JSON.parse(value) as { id?: string; type?: string })
+			.find(value => value.type === "get_state");
+		if (!refreshCall?.id) throw new Error("scheduled state refresh RPC id missing");
+
+		child.push({
+			type: "response",
+			id: refreshCall.id,
+			command: "get_state",
+			success: true,
+			data: {
+				isStreaming: true,
+				isCompacting: false,
+				isPaused: false,
+				messageCount: 1,
+				queuedMessageCount: 0,
+				steeringMode: "one-at-a-time",
+				followUpMode: "all",
+				interruptMode: "wait",
+			},
+		});
+		expect(await client.client.nextServer()).toMatchObject({
+			type: "session.delta",
+			upsert: expect.objectContaining({
+				status: "active",
+				liveState: expect.objectContaining({ isStreaming: true }),
+			}),
+		});
+
+		child.push({ type: "agent_end", messages: [] });
+		expect(await client.client.nextServer()).toMatchObject({ type: "event", event: { type: "agent.end" } });
+		expect(await client.client.nextServer()).toMatchObject({
+			type: "session.delta",
+			upsert: expect.objectContaining({
+				status: "idle",
+				liveState: expect.objectContaining({ isStreaming: false }),
+			}),
+		});
+		expect(appserver.snapshot(sid("s1"))?.ref).toMatchObject({
+			status: "idle",
+			liveState: { isStreaming: false },
+		});
+
+		client.client.sendJson({
+			...command("archive-terminal-state", "archive-terminal-state", "session.archive", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const archived = await untilResponse(client.client, "archive-terminal-state");
 		expect(archived.response).toMatchObject({ ok: true, result: { archived: true } });
 		expect(authority.lifecycle).toEqual(["archive:s1"]);
 

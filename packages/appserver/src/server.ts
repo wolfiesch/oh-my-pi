@@ -1530,7 +1530,7 @@ export class LocalAppserver implements AppserverHandle {
 				? "active"
 				: undefined;
 		const frame = projection.updateState(state, statusOverride);
-		if (frame) this.broadcast(sessionId, frame);
+		if (frame) await this.broadcastIndex(frame);
 		return state;
 	}
 	private scheduleStateRefresh(

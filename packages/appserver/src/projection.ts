@@ -67,11 +67,18 @@ export class SessionProjection {
 		};
 	}
 	updateStatus(status: SessionRef["status"]): ServerFrame | undefined {
-		if (this.value.ref.status === status) return undefined;
-		this.#revisionHash.update(`status:${status}\n`);
+		const clearsStreaming =
+			(status === "idle" || status === "closed") && this.value.ref.liveState?.isStreaming === true;
+		if (this.value.ref.status === status && !clearsStreaming) return undefined;
+		this.#revisionHash.update(`status:${status}${clearsStreaming ? ":non-streaming" : ""}\n`);
 		const nextRevision = revision(`r-${this.#revisionHash.copy().digest("hex").slice(0, 24)}`);
 		this.value.revision = nextRevision;
-		this.value.ref = { ...this.value.ref, status, revision: nextRevision };
+		this.value.ref = {
+			...this.value.ref,
+			status,
+			revision: nextRevision,
+			...(clearsStreaming ? { liveState: { ...this.value.ref.liveState, isStreaming: false } } : {}),
+		};
 		return {
 			v: "omp-app/1",
 			type: "session.delta",
