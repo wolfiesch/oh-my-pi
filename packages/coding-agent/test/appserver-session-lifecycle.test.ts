@@ -2,7 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { sessionId } from "@oh-my-pi/app-wire";
+import { decodeServerFrame, hostId, projectId, sessionId } from "@oh-my-pi/app-wire";
+import { SessionProjection } from "@oh-my-pi/appserver";
 import { createAppserverRuntime } from "../src/session/appserver-authority";
 import { AppserverSessionLifecycleStore } from "../src/session/appserver-session-lifecycle";
 import { acquireSessionLock } from "../src/session/session-lock";
@@ -44,6 +45,38 @@ async function writeSession(sessionsDir: string, id: string): Promise<string> {
 }
 
 describe("appserver session lifecycle authority", () => {
+	test("new-session authority projects raw manager metadata before attach snapshots", async () => {
+		const { root, sessionsDir, metadataPath } = await fixture();
+		const cwd = path.join(root, "workspace");
+		await fs.mkdir(cwd);
+		const runtime = createAppserverRuntime({ sessionsDir, lifecycleMetadataPath: metadataPath });
+		const created = await runtime.sessionAuthority.create(cwd, "Fresh remote session");
+		const transcript = (await fs.readFile(created.path, "utf8"))
+			.split(/\r?\n/u)
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+
+		expect(transcript.some(entry => entry.type === "title_change")).toBe(true);
+		expect(transcript.some(entry => entry.type === "title_change" && entry.data === undefined)).toBe(true);
+		expect(created.entries).toEqual([]);
+
+		const projection = new SessionProjection(
+			hostId("new-session-projection-test"),
+			{
+				...created,
+				projectId: projectId("new-session-project"),
+				projectName: "workspace",
+				title: created.title ?? "Session",
+				updatedAt: "2026-07-13T12:00:00.000Z",
+				status: "idle",
+			},
+			"new-session-epoch",
+		);
+		const snapshot = projection.snapshot();
+		expect(snapshot).toMatchObject({ type: "snapshot", entries: [] });
+		expect(decodeServerFrame(snapshot)).toMatchObject({ type: "snapshot", entries: [] });
+	});
+
 	test("archive and restore survive runtime restart with private atomic metadata", async () => {
 		const { sessionsDir, metadataPath } = await fixture();
 		await writeSession(sessionsDir, "session-durable");

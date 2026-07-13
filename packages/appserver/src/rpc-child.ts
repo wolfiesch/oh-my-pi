@@ -162,8 +162,16 @@ export class RpcChildSupervisor {
 			this.#readyReject = undefined;
 		}
 	}
-	async call(command: Record<string, unknown>, requestId: string, signal?: AbortSignal): Promise<RpcResponse> {
+	async call(
+		command: Record<string, unknown>,
+		requestId: string,
+		signal?: AbortSignal,
+		onDispatched?: (internalId: string) => void,
+	): Promise<RpcResponse> {
 		if (!this.#child || this.#closed || !this.#ready) throw new Error("rpc child unavailable");
+		// A caller can disconnect while the supervisor is still starting. Do not
+		// enqueue a cancel followed by the original command once that wait ends.
+		if (signal?.aborted) throw new Error("rpc call aborted");
 		const internalId = `${requestId}:${++this.#counter}`;
 		const promise = Promise.withResolvers<RpcResponse>();
 		this.#pending.set(internalId, promise);
@@ -180,6 +188,10 @@ export class RpcChildSupervisor {
 		try {
 			const line = `${JSON.stringify({ ...command, id: internalId })}\n`;
 			if (stringBytes(line) > MAX_LINE_BYTES) throw new Error("rpc command exceeds 1MiB");
+			onDispatched?.(internalId);
+			// onDispatched is synchronous, so this also closes the only gap before
+			// the write where user code could abort the signal.
+			if (signal?.aborted) return await promise.promise;
 			await this.#child.stdin.write(line);
 			const response = await promise.promise;
 			if (response.type !== "response" || response.command !== command.type || typeof response.success !== "boolean")
@@ -192,8 +204,13 @@ export class RpcChildSupervisor {
 			signal?.removeEventListener("abort", onAbort);
 		}
 	}
-	async prompt(id: string, message: string, signal?: AbortSignal): Promise<RpcResponse> {
-		return this.call({ type: "prompt", message }, id, signal);
+	async prompt(
+		id: string,
+		message: string,
+		signal?: AbortSignal,
+		onDispatched?: (internalId: string) => void,
+	): Promise<RpcResponse> {
+		return this.call({ type: "prompt", message }, id, signal, onDispatched);
 	}
 	async cancel(id: string): Promise<RpcResponse> {
 		return this.call({ type: "abort" }, id);
@@ -261,6 +278,9 @@ export class RpcChildSupervisor {
 		} catch {}
 	}
 	private dispatch(value: Record<string, unknown>): void {
+		// stop() deliberately keeps draining the process handle until exit, but
+		// buffered stdout from that stopped child no longer owns session state.
+		if (this.#closed) return;
 		if (value.type === "response") {
 			if (typeof value.id !== "string" || typeof value.command !== "string" || typeof value.success !== "boolean")
 				throw new Error("malformed rpc response");

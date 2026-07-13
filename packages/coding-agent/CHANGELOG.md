@@ -9,12 +9,16 @@
 
 ### Changed
 
+- Appserver now admits one unresolved `session.prompt` per session and returns `session_busy` before a second prompt reaches the RPC child; active clients can use `session.steer` or `session.followUp` to add work to the running agent.
+- Bounded completed appserver command outcomes to a five-minute replay window and a 1,024-entry least-recently-used cache. Replays do not extend expiry, and pending commands are never evicted.
 - Appserver remote listener mode, bind address, port, and browser origins now persist in host-local `agent/local/config.yml` instead of synchronized profile config.
 - Session-scoped Bash and Python execution now read output limits from the active session settings instead of process-global defaults.
 
 ### Fixed
 
-- Fixed desktop and remote clients disconnecting while attaching or replaying large, actively growing sessions by bounding snapshot and aggregate replay payloads.
+- Fixed appserver sessions briefly returning to idle at intermediate turn boundaries during tool-driven runs; the active prompt now remains owned until final `agent.end`, a correlated local-only result or failure, successful cancellation, closure, or child termination.
+- Fixed RPC prompt failures emitting a second response with an already-settled request id, which caused strict child supervisors to terminate otherwise healthy sessions. Late failures now use an exact-ID asynchronous `prompt_result` frame, which appserver surfaces as a sanitized `turn.error` without allowing stale results to settle newer work.
+- Fixed `session.attach` acknowledgement and replay races by preparing output before success, catching up from its baseline, rebuilding cached delivery after revalidating session existence, and bounding large snapshots and replays so desktop and remote clients remain connected.
 - Fixed compiled appserver welcome frames reporting placeholder `local` identities instead of the owning OMP and appserver versions and build kinds.
 - Fixed active or locked sessions disappearing from observational session lists while keeping writable resume selection lock-safe.
 - Fixed one malformed or crash-truncated transcript entry hiding an otherwise valid session from appserver discovery.

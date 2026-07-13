@@ -251,8 +251,18 @@ export const RPC_OUT_OF_BAND_DISPOSITIONS = {
 /** RPC metadata acknowledgements are intentionally omitted from durable session history. */
 export const RPC_INTERNAL_FRAME_DISPOSITIONS = {
 	available_commands_update: "intentionally-internal",
-	prompt_result: "intentionally-internal",
 } as const satisfies Record<string, Extract<AppserverRpcFrameDisposition, "intentionally-internal">>;
+
+/** Prompt results are conditional: local-only hints stay internal while late failures are visible. */
+export const RPC_PROMPT_RESULT_DISPOSITIONS = {
+	agentInvoked: "intentionally-internal",
+	error: "translated",
+} as const satisfies Record<"agentInvoked" | "error", AppserverRpcFrameDisposition>;
+
+export interface TranscriptFrameContext {
+	/** Whether this prompt result belongs to the prompt lifecycle currently owned by the session. */
+	currentPromptResult?: boolean;
+}
 
 const TEXT_BLOCK = "text";
 const THINKING_BLOCK = "thinking";
@@ -632,15 +642,29 @@ export class TranscriptEventTranslator {
 			? { type: "ask.resolved", askId: id, at }
 			: { type: "approval.resolved", approvalId: id, at };
 	}
-	translate(frame: Record<string, unknown>): AppserverEvent[] {
+	translate(frame: Record<string, unknown>, context: TranscriptFrameContext = {}): AppserverEvent[] {
 		const type = asString(frame.type);
 		if (!type) return [];
 		if (isAgentSessionEventType(type)) return this.#translateAgentSessionEvent(frame as unknown as AgentSessionEvent);
 		if (type === "subagent_event") return this.#translateSubagentEvent(frame as unknown as RpcSubagentEventFrame);
 		if (type === "extension_ui_request") return this.extensionUi(frame);
+		if (type === "prompt_result") return this.#translatePromptResult(frame, context.currentPromptResult !== false);
 		if (Object.hasOwn(RPC_OUT_OF_BAND_DISPOSITIONS, type)) return [];
 		if (Object.hasOwn(RPC_INTERNAL_FRAME_DISPOSITIONS, type)) return [];
 		return [];
+	}
+	#translatePromptResult(frame: Record<string, unknown>, current: boolean): AppserverEvent[] {
+		if (typeof frame.error !== "string") return [];
+		const at = this.#nowIso();
+		const error: Extract<TranscriptEvent, { type: "turn.error" }> = {
+			type: "turn.error",
+			message: safeOptionalDisplay(frame.error, 1_024) ?? "The prompt stopped with an error.",
+			at,
+		};
+		if (!current || this.#turnAt === undefined) return [error];
+		this.#turnAt = undefined;
+		this.#activeAssistant = this.#activeAssistant?.ended ? undefined : this.#activeAssistant;
+		return [error, { type: "turn.end", at }];
 	}
 	#translateAgentSessionEvent(event: AgentSessionEvent): AppserverEvent[] {
 		const frame = asFrame(event);

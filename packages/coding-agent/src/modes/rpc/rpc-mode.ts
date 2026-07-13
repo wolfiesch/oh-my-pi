@@ -48,6 +48,7 @@ import type {
 	RpcHostUriCancelRequest,
 	RpcHostUriRequest,
 	RpcHostUriResult,
+	RpcPromptResultFrame,
 	RpcResponse,
 	RpcSessionEntryFrame,
 	RpcSessionState,
@@ -184,8 +185,7 @@ export async function tryRunRpcSkillCommand(
 export function reportLocalOnlyPromptResult(input: {
 	id: string | undefined;
 	prompt: Promise<boolean>;
-	output: (obj: object) => void;
-	onError: (error: Error) => void;
+	output: (obj: RpcPromptResultFrame) => void;
 	hasExtensionAgentMessageTask?: () => boolean;
 	waitForExtensionAgentMessageTasks?: () => Promise<void>;
 }): void {
@@ -198,7 +198,11 @@ export function reportLocalOnlyPromptResult(input: {
 			}
 		})
 		.catch(error => {
-			input.onError(error instanceof Error ? error : new Error(String(error)));
+			input.output({
+				type: "prompt_result",
+				id: input.id,
+				error: error instanceof Error ? error.message : String(error),
+			});
 		});
 }
 
@@ -277,8 +281,7 @@ export class RpcExtensionUserMessageTracker {
 export function watchAndReportLocalOnlyPromptResult(input: {
 	id: string | undefined;
 	startPrompt: () => Promise<boolean>;
-	output: (obj: object) => void;
-	onError: (error: Error) => void;
+	output: (obj: RpcPromptResultFrame) => void;
 	extensionUserMessageTracker: RpcExtensionUserMessageTracker;
 }): void {
 	const trackedPrompt = input.extensionUserMessageTracker.watchPrompt(input.startPrompt);
@@ -286,7 +289,6 @@ export function watchAndReportLocalOnlyPromptResult(input: {
 		id: input.id,
 		prompt: trackedPrompt.prompt,
 		output: input.output,
-		onError: input.onError,
 		hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
 		waitForExtensionAgentMessageTasks: trackedPrompt.waitForAgentMessageTasks,
 	});
@@ -960,7 +962,6 @@ export async function runRpcMode(
 							id,
 							startPrompt: () => session.prompt(builtinResult.prompt, { images: command.images }),
 							output,
-							onError: promptError => output(error(id, "prompt", promptError.message)),
 							extensionUserMessageTracker,
 						});
 						return success(id, "prompt");
@@ -979,7 +980,6 @@ export async function runRpcMode(
 							streamingBehavior: command.streamingBehavior,
 						}),
 					output,
-					onError: promptError => output(error(id, "prompt", promptError.message)),
 					extensionUserMessageTracker,
 				});
 				return success(id, "prompt");
@@ -1016,9 +1016,13 @@ export async function runRpcMode(
 
 			case "abort_and_prompt": {
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
-				session
-					.prompt(command.message, { images: command.images })
-					.catch(e => output(error(id, "abort_and_prompt", e.message)));
+				session.prompt(command.message, { images: command.images }).catch(promptError =>
+					output({
+						type: "prompt_result",
+						id,
+						error: promptError instanceof Error ? promptError.message : String(promptError),
+					}),
+				);
 				return success(id, "abort_and_prompt");
 			}
 

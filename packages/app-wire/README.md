@@ -11,6 +11,14 @@ import { decodeServerFrame } from "@oh-my-pi/app-wire";
 const frame = decodeServerFrame(line); // AppWireError on malformed input
 ```
 
+Appserver command idempotency is a bounded retry contract. Reusing a pending `commandId` with the same semantic payload waits for its original outcome; a different payload conflicts. For a completed command, the same payload, ignoring only the envelope `requestId`, replays the retained outcome. Completed outcomes expire five minutes after completion. Replay updates the outcome's least-recently-used position without extending that deadline. The default host cache retains at most 1,024 completed outcomes and never evicts pending commands. Once a completed outcome expires or is displaced, the ID is new again and the command may execute again.
+
+`session.attach` prepares its snapshot or requested replay before acknowledging success. It then delivers the acknowledgement, prepared frames, catch-up replay from the acknowledged baseline, and current subagent state in order. Cached attach delivery rebuilds this connection-scoped output and revalidates session existence, so an old success cannot resurrect a deleted session. Preparation failure does not mark the connection attached.
+
+Appserver accepts one unresolved `session.prompt` per session. A second normal prompt receives `session_busy` before another prompt is written to the RPC child; use `session.steer` or `session.followUp` to add work to an active run. The session remains `active` across intermediate `turn.end` events, including tool-driven multi-turn runs, and returns to `idle` on the final `agent.end`.
+
+The appserver consumes child-RPC `prompt_result` frames internally instead of forwarding them as `omp-app/1` frames. A matching local-only result returns the session to `idle`; a matching late failure emits a sanitized `turn.error` and then returns it to `idle`. A stale result may still produce diagnostic output, but it cannot release newer work. A rejected or non-invoking child response, a dispatch failure, or a successful cancel also releases the prompt lifecycle. Runtime closure or child termination releases ownership and marks the session `closed`.
+
 The exact device capability set and command mapping are exported. Destructive confirmation is separate from one-time `pair.start`/`pair.ok` pairing. File and review paths, plus known file-command arguments, must be safe relative POSIX paths. Remote-only transport supervision and terminal scraping remain outside this wire package.
 
 ## Revision ownership

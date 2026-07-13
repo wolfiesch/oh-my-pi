@@ -3,9 +3,11 @@ import { mkdtemp, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type DurableEntry, hostId, projectId, sessionId } from "@oh-my-pi/app-wire";
+import { completeAttachOutput, prepareAttachOutput } from "../src/attach-output.ts";
 import { IdempotencyStore } from "../src/idempotency.ts";
 import { SessionProjection } from "../src/projection.ts";
 import { createAppserver } from "../src/server.ts";
+import { SubagentProjection } from "../src/subagent-projection.ts";
 import type { ChildHandle, RpcChildFactory, SessionDiscovery, SessionRecord } from "../src/types.ts";
 
 const host = hostId("host-test");
@@ -74,6 +76,30 @@ function entry(id: string, parentId: string | null = null): DurableEntry {
 }
 
 describe("projection and replay", () => {
+	test("completes attach output across the pre-subscription transcript and subagent gap", () => {
+		const projection = new SessionProjection(host, record("s"), "epoch-a");
+		const subagents = new SubagentProjection(host, sessionId("s"), () => 100);
+		const prepared = prepareAttachOutput(projection);
+		const appended = projection.appendEntry(entry("during-attach"));
+		const agent = subagents.applyFrame({
+			type: "subagent_lifecycle",
+			payload: {
+				id: "AttachWorker",
+				index: 0,
+				agent: "task",
+				description: "Attach race worker",
+				status: "started",
+				lastUpdate: 100,
+			},
+		});
+		if (!appended || !agent) throw new Error("expected attach-gap projection frames");
+		const frames = completeAttachOutput(prepared, projection, subagents);
+
+		expect(frames.map(frame => frame.type)).toEqual(["snapshot", "entry", "agent"]);
+		expect(frames[0]).toMatchObject({ type: "snapshot", entries: [] });
+		expect(frames[1]).toEqual(appended);
+		expect(frames[2]).toMatchObject({ type: "agent", agentId: "AttachWorker", state: "started" });
+	});
 	test("deduplicates durable IDs and emits gap on ring eviction", () => {
 		const projection = new SessionProjection(host, record("s"), "epoch-a", 1);
 		expect(projection.appendEntry(entry("a"))).toBeDefined();

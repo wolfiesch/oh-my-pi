@@ -33,9 +33,6 @@ describe("reportLocalOnlyPromptResult", () => {
 			id: "req_1",
 			prompt: trackedPrompt.prompt,
 			output: frame => output.push(frame),
-			onError: error => {
-				throw error;
-			},
 			hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
 		});
 		await waitForPromptHandlers(trackedPrompt.prompt);
@@ -55,9 +52,6 @@ describe("reportLocalOnlyPromptResult", () => {
 			id: "req_1",
 			prompt: trackedPrompt.prompt,
 			output: frame => output.push(frame),
-			onError: error => {
-				throw error;
-			},
 			hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
 		});
 		await waitForPromptHandlers(trackedPrompt.prompt);
@@ -77,9 +71,6 @@ describe("reportLocalOnlyPromptResult", () => {
 			id: "req_1",
 			prompt: trackedPrompt.prompt,
 			output: frame => output.push(frame),
-			onError: error => {
-				throw error;
-			},
 			hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
 		});
 		await waitForPromptHandlers(trackedPrompt.prompt);
@@ -97,9 +88,6 @@ describe("reportLocalOnlyPromptResult", () => {
 			id: "req_1",
 			prompt: trackedPrompt.prompt,
 			output: frame => output.push(frame),
-			onError: error => {
-				throw error;
-			},
 			hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
 		});
 		await waitForPromptHandlers(trackedPrompt.prompt);
@@ -189,9 +177,6 @@ describe("reportLocalOnlyPromptResult", () => {
 			id: "req_success",
 			prompt: trackedPrompt.prompt,
 			output: frame => output.push(frame),
-			onError: error => {
-				throw error;
-			},
 			hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
 			waitForExtensionAgentMessageTasks: trackedPrompt.waitForAgentMessageTasks,
 		});
@@ -241,9 +226,6 @@ describe("reportLocalOnlyPromptResult", () => {
 			id: "req_rejected",
 			prompt: trackedPrompt.prompt,
 			output: frame => output.push(frame),
-			onError: error => {
-				throw error;
-			},
 			hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
 			waitForExtensionAgentMessageTasks: trackedPrompt.waitForAgentMessageTasks,
 		});
@@ -261,33 +243,26 @@ describe("reportLocalOnlyPromptResult", () => {
 			id: "req_1",
 			prompt,
 			output: frame => output.push(frame),
-			onError: error => {
-				throw error;
-			},
 		});
 		await waitForPromptHandlers(prompt);
 
 		expect(output).toEqual([]);
 	});
 
-	test("reports prompt rejection without emitting output", async () => {
+	test("represents a late prompt rejection without emitting a second response", async () => {
 		const output: object[] = [];
 		const thrown = new Error("boom");
 		const prompt = Promise.reject(thrown);
-		let reported: Error | undefined;
 
 		reportLocalOnlyPromptResult({
 			id: "req_1",
 			prompt,
 			output: frame => output.push(frame),
-			onError: error => {
-				reported = error;
-			},
 		});
 		await waitForPromptHandlers(prompt);
 
-		expect(reported).toBe(thrown);
-		expect(output).toEqual([]);
+		expect(output).toEqual([{ type: "prompt_result", id: "req_1", error: "boom" }]);
+		expect(output.some(frame => "type" in frame && frame.type === "response")).toBe(false);
 	});
 });
 
@@ -301,9 +276,6 @@ describe("watchAndReportLocalOnlyPromptResult", () => {
 			id: "req_1",
 			startPrompt: () => prompt,
 			output: frame => output.push(frame),
-			onError: error => {
-				throw error;
-			},
 			extensionUserMessageTracker: extensionUserMessages,
 		});
 		await waitForPromptHandlers(prompt);
@@ -320,9 +292,6 @@ describe("watchAndReportLocalOnlyPromptResult", () => {
 			id: "req_1",
 			startPrompt: () => prompt,
 			output: frame => output.push(frame),
-			onError: error => {
-				throw error;
-			},
 			extensionUserMessageTracker: extensionUserMessages,
 		});
 		await waitForPromptHandlers(prompt);

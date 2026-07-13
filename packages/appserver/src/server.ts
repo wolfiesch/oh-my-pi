@@ -23,6 +23,7 @@ import {
 	type SessionStateResult,
 	utf8ByteLength,
 } from "@oh-my-pi/app-wire";
+import { completeAttachOutput, prepareAttachOutput } from "./attach-output.ts";
 import { AppserverCommandHandlers } from "./command-handler.ts";
 import {
 	compareSessionRecords,
@@ -229,6 +230,15 @@ function childBoolean(value: unknown, key: string): boolean {
 	if (!record || typeof record[key] !== "boolean") throw new Error("rpc child result is malformed");
 	return record[key] as boolean;
 }
+function childAgentInvoked(value: unknown): boolean | undefined {
+	const record =
+		value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+	const data =
+		record?.data && typeof record.data === "object" && !Array.isArray(record.data)
+			? (record.data as Record<string, unknown>)
+			: undefined;
+	return typeof data?.agentInvoked === "boolean" ? data.agentInvoked : undefined;
+}
 type AppWs = ConnectionTransport;
 type LocalWs = Bun.ServerWebSocket<ServerWebSocketData>;
 interface RunIdentity {
@@ -240,6 +250,10 @@ interface SessionLifecycleFailure {
 	code: string;
 	message: string;
 	details?: Record<string, unknown>;
+}
+interface PromptLifecycle {
+	requestId: string;
+	internalId?: string;
 }
 function isErrno(error: unknown, code: string): boolean {
 	return (error as NodeJS.ErrnoException).code === code;
@@ -349,6 +363,8 @@ export class LocalAppserver implements AppserverHandle {
 	#createdPending = new Map<SessionId, { record: SessionRecord; refreshesRemaining: number }>();
 	#projections = new Map<SessionId, SessionProjection>();
 	#supervisors = new Map<SessionId, RpcChildSupervisor>();
+	#promptLifecycles = new Map<SessionId, PromptLifecycle>();
+	#stateRefreshGenerations = new Map<SessionId, number>();
 	#transcripts = new Map<SessionId, TranscriptEventTranslator>();
 	#subagents = new Map<SessionId, SubagentProjection>();
 	#startPromises = new Map<SessionId, Promise<RpcChildSupervisor>>();
@@ -599,6 +615,8 @@ export class LocalAppserver implements AppserverHandle {
 		}
 		for (const supervisor of this.#supervisors.values()) supervisor.stop();
 		this.#supervisors.clear();
+		this.#promptLifecycles.clear();
+		this.#stateRefreshGenerations.clear();
 		this.#transcripts.clear();
 		this.#subagents.clear();
 		await Promise.allSettled([...this.#startPromises.values()]);
@@ -814,6 +832,16 @@ export class LocalAppserver implements AppserverHandle {
 				}),
 			};
 		if (command.command === "host.list" || command.command === "session.list") await this.refreshSessions();
+		const projection = command.sessionId ? this.#projections.get(command.sessionId) : undefined;
+		// Attach output is connection-scoped and rebuilt on every delivery. A
+		// cached success cannot attach a session that has since been deleted.
+		if (command.command === "session.attach" && !projection)
+			return {
+				frame: response(this.hostId, command, false, undefined, {
+					code: "unknown_session",
+					message: "session is not indexed",
+				}),
+			};
 		const check = this.#idempotency.begin(command.commandId, command);
 		if (check.kind === "replay")
 			return {
@@ -850,7 +878,6 @@ export class LocalAppserver implements AppserverHandle {
 					message: "expectedRevision is forbidden",
 				}),
 			});
-		const projection = command.sessionId ? this.#projections.get(command.sessionId) : undefined;
 		if (descriptor.scope === "session" && !projection)
 			return this.finish(command, {
 				frame: response(this.hostId, command, false, undefined, {
@@ -893,6 +920,7 @@ export class LocalAppserver implements AppserverHandle {
 		const controller = new AbortController();
 		if (ws) this.#abortControllers.get(ws)?.add(controller);
 		let outcome: CommandOutcome;
+		let promptLifecycle: PromptLifecycle | undefined;
 		try {
 			const registered = await this.#handlers.dispatch(command);
 			if (registered) outcome = registered;
@@ -903,11 +931,17 @@ export class LocalAppserver implements AppserverHandle {
 						...this.sessionListResult(),
 					}),
 				};
-			else if (command.command === "session.attach")
+			else if (command.command === "session.attach") {
+				const cursor = command.args.cursor;
+				const attachOutput = prepareAttachOutput(
+					projection!,
+					cursor === undefined ? undefined : decodeCursor(cursor),
+				);
 				outcome = {
-					frame: response(this.hostId, command, true, { attached: true, cursor: projection!.value.cursor }),
+					frame: response(this.hostId, command, true, { attached: true, cursor: attachOutput.baseline }),
+					attachOutput,
 				};
-			else if (command.command === "session.state.get") {
+			} else if (command.command === "session.state.get") {
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
 				const result = await supervisor.call({ type: "get_state" }, command.requestId, controller.signal);
 				if (!result.success || !("data" in result)) throw new Error("rpc state query failed");
@@ -1030,27 +1064,49 @@ export class LocalAppserver implements AppserverHandle {
 					this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId);
 			} else if (command.command === "session.prompt") {
 				if (this.#closedSessions.has(command.sessionId!)) throw new Error("session is closed");
-				this.updateStatus(command.sessionId!, "active");
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
-				const result = await supervisor.prompt(
-					command.requestId,
-					decodeSessionPromptArguments(command.args).message,
-					controller.signal,
-				);
-				if (!result.success) this.updateStatus(command.sessionId!, "closed");
-				outcome = {
-					frame: response(
-						this.hostId,
-						command,
-						result.success,
-						{ accepted: result.success },
-						result.success ? undefined : { code: "child_error", message: "session command failed" },
-					),
-				};
-				this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId);
+				if (this.#promptLifecycles.has(command.sessionId!)) {
+					outcome = {
+						frame: response(this.hostId, command, false, undefined, {
+							code: "session_busy",
+							message: "another prompt is still running; use steer or follow-up",
+						}),
+					};
+				} else {
+					const lifecycle: PromptLifecycle = { requestId: command.requestId };
+					promptLifecycle = lifecycle;
+					this.#promptLifecycles.set(command.sessionId!, lifecycle);
+					this.updateStatus(command.sessionId!, "active");
+					const result = await supervisor.prompt(
+						command.requestId,
+						decodeSessionPromptArguments(command.args).message,
+						controller.signal,
+						internalId => {
+							if (this.#promptLifecycles.get(command.sessionId!) === lifecycle)
+								lifecycle.internalId = internalId;
+						},
+					);
+					if (!result.success || childAgentInvoked(result) === false) {
+						if (this.releasePromptLifecycle(command.sessionId!, lifecycle))
+							this.updateStatus(command.sessionId!, "idle");
+					}
+					outcome = {
+						frame: response(
+							this.hostId,
+							command,
+							result.success,
+							{ accepted: result.success },
+							result.success ? undefined : { code: "child_error", message: "session command failed" },
+						),
+					};
+					this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId, true);
+				}
 			} else if (command.command === "session.cancel") {
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
+				const cancelledLifecycle = this.#promptLifecycles.get(command.sessionId!);
 				const result = await supervisor.cancel(command.requestId);
+				if (result.success && this.releasePromptLifecycle(command.sessionId!, cancelledLifecycle))
+					this.updateStatus(command.sessionId!, "idle");
 				outcome = {
 					frame: response(
 						this.hostId,
@@ -1081,11 +1137,9 @@ export class LocalAppserver implements AppserverHandle {
 					}),
 				};
 		} catch (error) {
-			const failedProjection =
-				command.command === "session.prompt" ? this.#projections.get(command.sessionId!) : undefined;
 			if (
-				failedProjection &&
-				failedProjection.value.ref.status === "active" &&
+				command.command === "session.prompt" &&
+				this.releasePromptLifecycle(command.sessionId!, promptLifecycle) &&
 				!this.#closedSessions.has(command.sessionId!)
 			)
 				this.updateStatus(command.sessionId!, "idle");
@@ -1165,6 +1219,8 @@ export class LocalAppserver implements AppserverHandle {
 		if (pending) await pending.catch(() => undefined);
 		this.#supervisors.get(sessionId)?.stop();
 		this.#supervisors.delete(sessionId);
+		this.#promptLifecycles.delete(sessionId);
+		this.#stateRefreshGenerations.delete(sessionId);
 		this.#transcripts.delete(sessionId);
 		this.#subagents.delete(sessionId);
 		this.updateStatus(sessionId, "closed");
@@ -1216,6 +1272,7 @@ export class LocalAppserver implements AppserverHandle {
 			(this.#inflightSessionOperations.get(sessionId) ?? 0) > 0 ||
 			this.#startPromises.has(sessionId) ||
 			this.#supervisors.get(sessionId)?.hasPendingCalls() === true ||
+			this.#promptLifecycles.has(sessionId) ||
 			(this.#transcripts.get(sessionId)?.pendingUiRequests().length ?? 0) > 0 ||
 			ref?.status === "active" ||
 			ref?.pendingApproval === true ||
@@ -1253,7 +1310,10 @@ export class LocalAppserver implements AppserverHandle {
 	}
 	private async quiesceSupervisor(sessionId: SessionId): Promise<boolean> {
 		const supervisor = this.#supervisors.get(sessionId);
-		if (!supervisor) return true;
+		if (!supervisor) {
+			this.#stateRefreshGenerations.delete(sessionId);
+			return true;
+		}
 		const child = supervisor.child();
 		if (!child) return false;
 		supervisor.stop("SIGTERM");
@@ -1265,6 +1325,8 @@ export class LocalAppserver implements AppserverHandle {
 		}
 		if (this.#supervisors.get(sessionId) !== supervisor) return false;
 		this.#supervisors.delete(sessionId);
+		this.#promptLifecycles.delete(sessionId);
+		this.#stateRefreshGenerations.delete(sessionId);
 		this.#transcripts.delete(sessionId);
 		this.#subagents.delete(sessionId);
 		return true;
@@ -1404,6 +1466,8 @@ export class LocalAppserver implements AppserverHandle {
 			this.#records.delete(sessionId);
 			this.#projections.delete(sessionId);
 			this.#closedSessions.delete(sessionId);
+			this.#promptLifecycles.delete(sessionId);
+			this.#stateRefreshGenerations.delete(sessionId);
 			this.#transcripts.delete(sessionId);
 			this.#subagents.delete(sessionId);
 			for (const sessions of this.#attached.values()) sessions.delete(sessionId);
@@ -1420,8 +1484,21 @@ export class LocalAppserver implements AppserverHandle {
 		}
 	}
 	private finish(command: CommandFrame, outcome: CommandOutcome): CommandOutcome {
-		this.#idempotency.complete(command.commandId, command, outcome);
+		const cached: CommandOutcome = { ...outcome };
+		delete cached.attachOutput;
+		this.#idempotency.complete(command.commandId, command, cached);
 		return outcome;
+	}
+	private releasePromptLifecycle(sessionId: SessionId, lifecycle?: PromptLifecycle): boolean {
+		if (!lifecycle || this.#promptLifecycles.get(sessionId) !== lifecycle) return false;
+		this.#promptLifecycles.delete(sessionId);
+		this.advanceStateRefreshGeneration(sessionId);
+		return true;
+	}
+	private advanceStateRefreshGeneration(sessionId: SessionId): number {
+		const generation = (this.#stateRefreshGenerations.get(sessionId) ?? 0) + 1;
+		this.#stateRefreshGenerations.set(sessionId, generation);
+		return generation;
 	}
 	private updateStatus(sessionId: SessionId, status: SessionRef["status"]): void {
 		const frame = this.#projections.get(sessionId)?.updateStatus(status);
@@ -1431,18 +1508,31 @@ export class LocalAppserver implements AppserverHandle {
 		sessionId: SessionId,
 		supervisor: RpcChildSupervisor,
 		requestId: string,
+		preserveProjectedStatus = false,
 	): Promise<SessionStateResult> {
+		const generation = this.advanceStateRefreshGeneration(sessionId);
 		const result = await supervisor.call({ type: "get_state" }, `${requestId}:state`);
 		if (!result.success || !("data" in result)) throw new Error("rpc state query failed");
 		const state = safeSessionState(result.data);
 		const projection = this.#projections.get(sessionId);
 		if (!projection) throw new Error("unknown session");
-		const frame = projection.updateState(state);
+		if (this.#stateRefreshGenerations.get(sessionId) !== generation) return state;
+		const statusOverride = preserveProjectedStatus
+			? projection.value.ref.status
+			: this.#promptLifecycles.has(sessionId)
+				? "active"
+				: undefined;
+		const frame = projection.updateState(state, statusOverride);
 		if (frame) this.broadcast(sessionId, frame);
 		return state;
 	}
-	private scheduleStateRefresh(sessionId: SessionId, supervisor: RpcChildSupervisor, requestId: string): void {
-		void this.refreshState(sessionId, supervisor, requestId).catch(() => undefined);
+	private scheduleStateRefresh(
+		sessionId: SessionId,
+		supervisor: RpcChildSupervisor,
+		requestId: string,
+		preserveProjectedStatus = false,
+	): void {
+		void this.refreshState(sessionId, supervisor, requestId, preserveProjectedStatus).catch(() => undefined);
 	}
 	private async ensureSupervisor(sessionId: SessionId): Promise<RpcChildSupervisor> {
 		if (this.#stopping) throw new Error("appserver is stopping");
@@ -1513,17 +1603,31 @@ export class LocalAppserver implements AppserverHandle {
 				event: frame => {
 					const agentFrame = subagents.applyFrame(frame);
 					if (agentFrame) this.broadcast(sessionId, agentFrame);
-					for (const event of transcript.translate(frame)) {
+					if (frame.type === "agent_end") this.advanceStateRefreshGeneration(sessionId);
+					const promptLifecycle = this.#promptLifecycles.get(sessionId);
+					const terminalPromptResult =
+						frame.type === "prompt_result" && (frame.agentInvoked === false || typeof frame.error === "string");
+					const currentPromptResult =
+						terminalPromptResult && typeof frame.id === "string" && promptLifecycle?.internalId === frame.id;
+					for (const event of transcript.translate(frame, { currentPromptResult })) {
 						this.broadcast(sessionId, projection.appendEvent(asAppWireEvent(event)));
 						if (event.type === "turn.start" || event.type === "agent.start")
 							this.updateStatus(sessionId, "active");
-						else if (event.type === "turn.end" || event.type === "agent.end")
+						else if (event.type === "agent.end") {
+							this.releasePromptLifecycle(sessionId, this.#promptLifecycles.get(sessionId));
 							this.updateStatus(sessionId, "idle");
+						}
+					}
+					if (currentPromptResult) {
+						if (this.releasePromptLifecycle(sessionId, promptLifecycle)) this.updateStatus(sessionId, "idle");
 					}
 				},
 				crashed: () => {
+					this.advanceStateRefreshGeneration(sessionId);
+					this.#promptLifecycles.delete(sessionId);
 					this.updateStatus(sessionId, "closed");
 					this.#supervisors.delete(sessionId);
+					this.#stateRefreshGenerations.delete(sessionId);
 					this.#transcripts.delete(sessionId);
 					this.#subagents.delete(sessionId);
 				},
@@ -1536,6 +1640,7 @@ export class LocalAppserver implements AppserverHandle {
 			return supervisor;
 		} catch (error) {
 			this.#supervisors.delete(sessionId);
+			this.#promptLifecycles.delete(sessionId);
 			this.#transcripts.delete(sessionId);
 			this.#subagents.delete(sessionId);
 			supervisor.stop();
@@ -1722,22 +1827,37 @@ export class LocalAppserver implements AppserverHandle {
 				return;
 			}
 			const outcome = await this.#command(frame, ws);
-			await this.#sendFrame(ws, outcome.frame);
+			const outputFrames = [outcome.frame];
 			if (
 				frame.command === "session.attach" &&
 				frame.sessionId &&
 				outcome.frame.type === "response" &&
 				outcome.frame.ok
 			) {
-				this.#attached.get(ws)?.add(frame.sessionId);
+				const attached = this.#attached.get(ws);
+				const projection = this.#projections.get(frame.sessionId);
+				if (!attached || !projection) throw new Error("attach output is incomplete");
 				const cursor = frame.args.cursor;
-				const outputs = cursor
-					? this.replay(frame.sessionId, cursor as { epoch: string; seq: number })
-					: [this.#projections.get(frame.sessionId)!.snapshot()];
-				for (const output of outputs) await this.#sendFrame(ws, output);
-				for (const agentFrame of this.#subagents.get(frame.sessionId)?.frames() ?? [])
-					await this.#sendFrame(ws, agentFrame);
+				const prepared =
+					outcome.attachOutput ??
+					prepareAttachOutput(projection, cursor === undefined ? undefined : decodeCursor(cursor));
+				// A replayed command outcome carries the baseline from its first
+				// delivery, while its bulk attach output is deliberately rebuilt.
+				// Keep the acknowledgement cursor aligned with the freshly prepared
+				// snapshot/replay that immediately follows it.
+				outputFrames[0] = response(this.hostId, frame, true, {
+					attached: true,
+					cursor: prepared.baseline,
+				});
+				attached.add(frame.sessionId);
+				try {
+					outputFrames.push(...completeAttachOutput(prepared, projection, this.#subagents.get(frame.sessionId)));
+				} catch (error) {
+					attached.delete(frame.sessionId);
+					throw error;
+				}
 			}
+			await Promise.all(outputFrames.map(output => this.#sendFrame(ws, output)));
 		} catch {
 			if (ws.remote) {
 				ws.close(1008, "invalid frame");
@@ -1996,6 +2116,7 @@ export class LocalAppserver implements AppserverHandle {
 				if (projection) await this.broadcastIndex(projection.remove());
 				this.#records.delete(sessionId);
 				this.#projections.delete(sessionId);
+				this.#stateRefreshGenerations.delete(sessionId);
 			}
 		}
 		for (const sessionId of [...this.#records.keys()]) {
@@ -2009,6 +2130,8 @@ export class LocalAppserver implements AppserverHandle {
 				this.#records.delete(sessionId);
 				this.#projections.delete(sessionId);
 				this.#closedSessions.delete(sessionId);
+				this.#promptLifecycles.delete(sessionId);
+				this.#stateRefreshGenerations.delete(sessionId);
 				this.#transcripts.delete(sessionId);
 				this.#subagents.delete(sessionId);
 				for (const sessions of this.#attached.values()) sessions.delete(sessionId);

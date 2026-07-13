@@ -156,7 +156,7 @@ export class SessionProjection {
 			entry,
 		});
 	}
-	updateState(state: SessionStateResult): ServerFrame | undefined {
+	updateState(state: SessionStateResult, statusOverride?: SessionRef["status"]): ServerFrame | undefined {
 		const next: SessionRef = { ...this.value.ref };
 		const liveState = { ...(next.liveState ?? {}) };
 		delete liveState.modelId;
@@ -175,7 +175,7 @@ export class SessionProjection {
 		else delete next.thinking;
 		if (state.contextUsage !== undefined) next.contextUsage = state.contextUsage;
 		else delete next.contextUsage;
-		if (next.status !== "closed") next.status = state.isStreaming ? "active" : "idle";
+		if (next.status !== "closed") next.status = statusOverride ?? (state.isStreaming ? "active" : "idle");
 		next.liveState = {
 			...liveState,
 			isStreaming: state.isStreaming,

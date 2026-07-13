@@ -542,6 +542,154 @@ describe("child supervision", () => {
 		supervisor.stop();
 		expect(crashed).toHaveLength(0);
 	});
+	test("an already-aborted call never writes the original command or a compensating abort", async () => {
+		const finish = Promise.withResolvers<void>();
+		const exited = Promise.withResolvers<number>();
+		const writes: Record<string, unknown>[] = [];
+		const child: ChildHandle = {
+			stdin: {
+				write: data => {
+					writes.push(JSON.parse(data) as Record<string, unknown>);
+				},
+			},
+			stdout: (async function* () {
+				yield `${JSON.stringify({ type: "ready" })}\n`;
+				await finish.promise;
+			})(),
+			stderr: (async function* () {})(),
+			exited: exited.promise,
+			kill: () => {
+				finish.resolve();
+				exited.resolve(0);
+			},
+		};
+		const supervisor = new RpcChildSupervisor(
+			{ spawn: () => child, argv: path => ["omp", "--mode", "rpc", "--session", path] },
+			record("s"),
+			{ entry: () => {}, event: () => {}, crashed: () => {} },
+		);
+
+		await supervisor.start();
+		const controller = new AbortController();
+		controller.abort();
+		await expect(supervisor.prompt("outer", "never run", controller.signal)).rejects.toThrow("rpc call aborted");
+		expect(writes).toEqual([]);
+		supervisor.stop();
+	});
+	test("buffered child frames are discarded after an explicit stop", async () => {
+		const releaseBuffered = Promise.withResolvers<void>();
+		const bufferedDrained = Promise.withResolvers<void>();
+		const exited = Promise.withResolvers<number>();
+		const entries: unknown[] = [];
+		const events: unknown[] = [];
+		const crashed: Error[] = [];
+		const child: ChildHandle = {
+			stdin: { write: () => {} },
+			stdout: (async function* () {
+				yield `${JSON.stringify({ type: "ready" })}\n`;
+				await releaseBuffered.promise;
+				yield `${JSON.stringify({ type: "session_entry", entry: { id: "late" } })}\n`;
+				yield `${JSON.stringify({ type: "agent_end", messages: [] })}\n`;
+				bufferedDrained.resolve();
+			})(),
+			stderr: (async function* () {})(),
+			exited: exited.promise,
+			kill: () => {
+				releaseBuffered.resolve();
+				exited.resolve(0);
+			},
+		};
+		const supervisor = new RpcChildSupervisor(
+			{ spawn: () => child, argv: path => ["omp", "--mode", "rpc", "--session", path] },
+			record("s"),
+			{
+				entry: frame => entries.push(frame),
+				event: frame => events.push(frame),
+				crashed: error => crashed.push(error),
+			},
+		);
+
+		await supervisor.start();
+		supervisor.stop();
+		await bufferedDrained.promise;
+		expect(entries).toEqual([]);
+		expect(events).toEqual([]);
+		expect(crashed).toEqual([]);
+	});
+	test("late prompt failures remain events after the acceptance response settles", async () => {
+		const firstWrite = Promise.withResolvers<void>();
+		const secondWrite = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		const exited = Promise.withResolvers<number>();
+		const lateFailureSeen = Promise.withResolvers<void>();
+		const writes: Record<string, unknown>[] = [];
+		const events: Record<string, unknown>[] = [];
+		const crashed: Error[] = [];
+		const child: ChildHandle = {
+			stdin: {
+				write: data => {
+					writes.push(JSON.parse(data) as Record<string, unknown>);
+					if (writes.length === 1) firstWrite.resolve();
+					else secondWrite.resolve();
+				},
+			},
+			stdout: (async function* () {
+				yield `${JSON.stringify({ type: "ready" })}\n`;
+				await firstWrite.promise;
+				yield `${JSON.stringify({
+					type: "response",
+					id: writes[0]?.id,
+					command: "prompt",
+					success: true,
+				})}\n`;
+				yield `${JSON.stringify({ type: "prompt_result", id: writes[0]?.id, error: "missing auth" })}\n`;
+				await secondWrite.promise;
+				yield `${JSON.stringify({
+					type: "response",
+					id: writes[1]?.id,
+					command: "get_state",
+					success: true,
+					data: {},
+				})}\n`;
+				await finish.promise;
+			})(),
+			stderr: (async function* () {})(),
+			exited: exited.promise,
+			kill: () => {
+				finish.resolve();
+				exited.resolve(0);
+			},
+		};
+		const supervisor = new RpcChildSupervisor(
+			{ spawn: () => child, argv: path => ["omp", "--mode", "rpc", "--session", path] },
+			record("s"),
+			{
+				entry: () => {},
+				event: frame => {
+					events.push(frame);
+					if (frame.type === "prompt_result") lateFailureSeen.resolve();
+				},
+				crashed: error => crashed.push(error),
+			},
+		);
+
+		await supervisor.start();
+		expect(await supervisor.prompt("outer", "hello")).toMatchObject({
+			type: "response",
+			command: "prompt",
+			success: true,
+		});
+		await lateFailureSeen.promise;
+		expect(events).toEqual([{ type: "prompt_result", id: "outer:1", error: "missing auth" }]);
+		expect(crashed).toHaveLength(0);
+		expect(await supervisor.call({ type: "get_state" }, "state")).toMatchObject({
+			type: "response",
+			command: "get_state",
+			success: true,
+		});
+		expect(crashed).toHaveLength(0);
+		supervisor.stop();
+	});
 	test("real Unix WebSocket upgrades on the local socket", async () => {
 		const root = await mkdtemp(join(tmpdir(), "omp-ws-"));
 		const path = join(root, "app.sock");

@@ -45,7 +45,7 @@ There is no envelope beyond the object shape itself.
 6. Host URI requests/cancellations (`host_uri_request`, `host_uri_cancel`)
 7. Extension errors (`{ type: "extension_error", extensionPath, event, error }`)
 8. Available-commands updates (`{ type: "available_commands_update", commands }`), emitted at startup and whenever command metadata changes
-9. Prompt lifecycle hints (`{ type: "prompt_result", id?, agentInvoked }`) for scheduled prompts that later resolve without invoking the agent
+9. Prompt lifecycle hints for accepted prompts that later resolve locally (`{ type: "prompt_result", id?, agentInvoked }`) or fail (`{ type: "prompt_result", id?, error }`)
 10. Subagent frames (`subagent_lifecycle`, `subagent_progress`, `subagent_event`), gated by `set_subagent_subscription`
 11. Builtin slash-command side channels (`command_output`, `session_info_update`, `config_update`)
 
@@ -90,9 +90,9 @@ Important edge behavior from runtime:
 
 - Unknown command responses are emitted with `id: undefined` (even if the request had an `id`).
 - Parse/handler exceptions in the input loop emit `command: "parse"` with `id: undefined`.
-- `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails.
+- Every command emits at most one `response` for its id. A `prompt` or `abort_and_prompt` failure before acceptance uses that response. After a success acknowledgement, an asynchronous failure is emitted as `prompt_result` with the original id and an `error` string, never as a second response.
 - `prompt` success responses may include `data.agentInvoked`. `false` means the prompt completed locally without an agent turn; `true` means the prompt produced agent lifecycle events; omitted means the host must rely on session events for completion.
-- `abort_and_prompt` does not currently emit `data.agentInvoked` or `prompt_result`; hosts should treat it as the legacy abort-then-schedule path and rely on session events or same-id scheduling errors.
+- `abort_and_prompt` does not emit `data.agentInvoked`; hosts should treat it as the legacy abort-then-schedule path and rely on session events or a `prompt_result` error.
 
 ## Command Schema (canonical)
 
@@ -207,6 +207,14 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 ```json
 { "type": "prompt_result", "id": "req_1", "agentInvoked": false }
 ```
+
+If that accepted prompt later rejects, the same asynchronous channel carries the failure. It is not a second command response:
+
+```json
+{ "type": "prompt_result", "id": "req_1", "error": "No API key found for provider" }
+```
+
+Hosts that track prompt lifecycles must assign a unique `id` to each prompt and settle only the unresolved lifecycle whose ID exactly matches `prompt_result.id`. A missing, unmatched, or stale ID may still be shown as non-terminal diagnostic output, but it must not settle another prompt or close its active turn.
 
 Local-only slash commands may emit `command_output` frames before completing via `data.agentInvoked: false` or a later `prompt_result`. They do not emit `agent_end`.
 
@@ -392,7 +400,7 @@ This is the most important operational behavior.
 
 ### Immediate ack vs completion
 
-`prompt` and `abort_and_prompt` are **acknowledged immediately**:
+`prompt` and `abort_and_prompt` acknowledge accepted work without waiting for run completion. A failure before acceptance uses the command's single failure response. A successful acknowledgement has this shape:
 
 ```json
 { "id": "req_1", "type": "response", "command": "prompt", "success": true }
@@ -401,8 +409,10 @@ This is the most important operational behavior.
 That means:
 
 - command acceptance != run completion
-- agent turns complete via `agent_end`
+- `turn_end` closes one agent-loop iteration and may be followed by another `turn_start`; it is not prompt completion or an idle boundary
+- agent-backed prompts complete via the final `agent_end`
 - local-only prompts complete via `data.agentInvoked: false` on the response or via a later `prompt_result`
+- late prompt failures complete via `prompt_result.error`, never a second `response` with the settled command id
 
 ### While streaming
 

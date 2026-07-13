@@ -381,8 +381,8 @@ export class SessionEntryProjector {
 	}
 }
 
-function normalizeEntries(
-	values: Record<string, unknown>[],
+export function projectSessionEntries(
+	values: readonly unknown[],
 	host: HostId,
 	sid: SessionId,
 	headerTimestamp: string,
@@ -394,7 +394,9 @@ function normalizeEntries(
 	thinking?: string;
 } {
 	const projector = new SessionEntryProjector(host, sid, "batch");
-	for (const raw of values) {
+	for (const value of values) {
+		const raw = asObject(value);
+		if (!raw) continue;
 		if (!validRawEntry(raw)) continue;
 		try {
 			entryId(String(raw.id));
@@ -496,7 +498,7 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
 			// only the bad entry so one partial write cannot hide the whole session.
 		}
 	}
-	const normalized = normalizeEntries(values, host, sid, header.timestamp);
+	const normalized = projectSessionEntries(values, host, sid, header.timestamp);
 	const sessionTitle = typeof header.title === "string" ? cleanText(header.title, 512, true) : undefined;
 	const title =
 		fixedTitle ||

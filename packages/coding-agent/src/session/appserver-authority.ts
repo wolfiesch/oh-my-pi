@@ -1,12 +1,13 @@
 import { statSync } from "node:fs";
 import * as path from "node:path";
-import { type DurableEntry, hostId, type ProjectId, type SessionId } from "@oh-my-pi/app-wire";
+import { hostId, type ProjectId, type SessionId, sessionId } from "@oh-my-pi/app-wire";
 import type { LockCheckHook, SessionAuthority, SessionAuthoritySession, SessionRecord } from "@oh-my-pi/appserver";
 import {
 	type DesktopOperationsAuthority,
 	FileSessionDiscovery,
 	type OperationContext,
 	projectNameFromCwd,
+	projectSessionEntries,
 	stableProjectId,
 } from "@oh-my-pi/appserver";
 import { getAgentDir, getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
@@ -79,7 +80,8 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 		recovery ??= lifecycle.recoverDeletes();
 		return recovery;
 	};
-	const baseDiscovery = new FileSessionDiscovery(sessionsDir, undefined, hostId("appserver-authority"));
+	const authorityHost = hostId("appserver-authority");
+	const baseDiscovery = new FileSessionDiscovery(sessionsDir, undefined, authorityHost);
 	const refresh = async (): Promise<SessionRecord[]> => {
 		await ensureRecovered();
 		const archived = await lifecycle.archivedSessions();
@@ -97,14 +99,22 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 			try {
 				if (title !== undefined) await manager.setSessionName(title, "user");
 				await manager.ensureOnDisk();
-				const path = manager.getSessionFile();
-				if (!path) throw new Error("session file was not created");
+				const sessionPath = manager.getSessionFile();
+				if (!sessionPath) throw new Error("session file was not created");
+				const createdSessionId = sessionId(manager.getSessionId());
+				const headerTimestamp = manager.getHeader()?.timestamp ?? new Date().toISOString();
+				const projected = projectSessionEntries(
+					manager.getEntries(),
+					authorityHost,
+					createdSessionId,
+					headerTimestamp,
+				);
 				const created = {
-					sessionId: manager.getSessionId() as SessionAuthoritySession["sessionId"],
-					path,
+					sessionId: createdSessionId,
+					path: sessionPath,
 					cwd: manager.getCwd(),
 					title: manager.getSessionName(),
-					entries: manager.getEntries() as unknown as DurableEntry[],
+					entries: projected.entries,
 				};
 				records.set(created.sessionId, {
 					...created,
@@ -113,6 +123,8 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 					title: created.title ?? "Session",
 					updatedAt: new Date().toISOString(),
 					status: "idle",
+					...(projected.model ? { model: projected.model } : {}),
+					...(projected.thinking ? { thinking: projected.thinking } : {}),
 					entries: created.entries,
 				});
 				return created;

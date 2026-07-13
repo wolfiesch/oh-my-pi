@@ -4,6 +4,7 @@ import {
 	type AppserverEvent,
 	RPC_INTERNAL_FRAME_DISPOSITIONS,
 	RPC_OUT_OF_BAND_DISPOSITIONS,
+	RPC_PROMPT_RESULT_DISPOSITIONS,
 	TranscriptEventTranslator,
 } from "../src/transcript-events.ts";
 
@@ -671,6 +672,40 @@ describe("appserver transcript event translator", () => {
 		expect(serialized).not.toContain("plaintext");
 	});
 
+	test("keeps local prompt results internal and closes only a real open turn on late failure", () => {
+		const translator = new TranscriptEventTranslator(() => 99);
+		expect(RPC_PROMPT_RESULT_DISPOSITIONS).toEqual({
+			agentInvoked: "intentionally-internal",
+			error: "translated",
+		});
+		expect(translator.translate({ type: "prompt_result", id: "local", agentInvoked: false })).toEqual([]);
+
+		const earlyFailure = translator.translate({
+			type: "prompt_result",
+			id: "early",
+			error: "Bearer abcdefghijklmnop failed at /home/tester/private token=plaintext",
+		});
+		expect(earlyFailure).toEqual([
+			{
+				type: "turn.error",
+				message: "Bearer [redacted] failed at [path] token=[redacted]",
+				at: new Date(99).toISOString(),
+			},
+		]);
+
+		expect(translator.translate({ type: "turn_start" }).map(event => event.type)).toEqual(["turn.start"]);
+		const staleFailure = translator.translate(
+			{ type: "prompt_result", id: "stale", error: "stale provider rejection" },
+			{ currentPromptResult: false },
+		);
+		expect(staleFailure.map(event => event.type)).toEqual(["turn.error"]);
+		const inTurnFailure = translator.translate(
+			{ type: "prompt_result", id: "open", error: "provider rejected" },
+			{ currentPromptResult: true },
+		);
+		expect(inTurnFailure.map(event => event.type)).toEqual(["turn.error", "turn.end"]);
+	});
+
 	test("surfaces subagent event summaries while adjacent frames remain separately projected", () => {
 		const translator = new TranscriptEventTranslator(() => 99);
 		expect(RPC_OUT_OF_BAND_DISPOSITIONS).toEqual({
@@ -681,7 +716,6 @@ describe("appserver transcript event translator", () => {
 		});
 		expect(RPC_INTERNAL_FRAME_DISPOSITIONS).toEqual({
 			available_commands_update: "intentionally-internal",
-			prompt_result: "intentionally-internal",
 		});
 		expect(translator.translate({ type: "subagent_lifecycle", payload: {} })).toEqual([]);
 		expect(translator.translate({ type: "subagent_progress", payload: {} })).toEqual([]);

@@ -186,8 +186,16 @@ export interface Projection {
 	/** Transcript entry/event replay ring; session.delta frames are never stored here. */
 	ring: ServerFrame[];
 }
+export interface PreparedAttachOutput {
+	/** Snapshot or replay frames built before a successful attach response can be emitted. */
+	initialFrames: readonly ServerFrame[];
+	/** Transcript cursor covered by the initial frames. */
+	baseline: Cursor;
+}
 export interface CommandOutcome {
 	frame: ServerFrame;
+	/** Per-delivery attach output. finish() strips this bulk data before idempotency caching. */
+	attachOutput?: PreparedAttachOutput;
 	unknown?: boolean;
 }
 export interface AppserverHandle {
