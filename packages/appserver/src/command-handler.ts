@@ -12,6 +12,10 @@ export class AppserverCommandHandlers {
 		this.#handlers.set(command, handler);
 	}
 
+	has(command: string): boolean {
+		return this.#handlers.has(command);
+	}
+
 	async dispatch(command: CommandFrame): Promise<CommandOutcome | undefined> {
 		const handler = this.#handlers.get(command.command);
 		return handler ? await handler(command) : undefined;

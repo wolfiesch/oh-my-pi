@@ -5,6 +5,7 @@ import {
 	type CatalogItem,
 	COMMAND_DESCRIPTORS,
 	catalogId,
+	DESKTOP_CATALOG_COMMANDS,
 	decodeCatalog,
 	hostId,
 	type SettingsFrame,
@@ -26,12 +27,6 @@ const MAX_STRING = 8192;
 const SECRET_KEY = /(?:password|passwd|secret|token|credential|api[_-]?key|private[_-]?key|access[_-]?key|auth)/iu;
 const SETTING_TYPES = new Set(["boolean", "number", "string", "enum", "array", "record"]);
 const CATALOG_KINDS = new Set(["tool", "model", "command", "setting", "skill", "agent", "provider", "mode"]);
-const SESSION_CONTROL_COMMANDS = [
-	"session.cancel",
-	"session.model.set",
-	"session.thinking.set",
-	"session.fast.set",
-] as const;
 type SettingControlType = "boolean" | "number" | "string" | "enum" | "array" | "record";
 type SettingScope = "global" | "session" | "project" | "cli" | "read-only";
 
@@ -635,7 +630,7 @@ export class DesktopConfigAuthority {
 					inlineHint: command.inlineHint,
 				}) as Record<string, unknown>,
 			});
-		for (const name of SESSION_CONTROL_COMMANDS) {
+		for (const name of DESKTOP_CATALOG_COMMANDS) {
 			const descriptor = COMMAND_DESCRIPTORS[name];
 			items.push({
 				id: catalogId(`command:${name}`),

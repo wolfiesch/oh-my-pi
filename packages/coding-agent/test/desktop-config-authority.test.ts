@@ -111,12 +111,24 @@ describe("DesktopConfigAuthority", () => {
 		expect(decodeCatalog(frame).type).toBe("catalog");
 		expect(frame.items.some(item => item.id === "availability:skills" && item.supported === false)).toBe(true);
 		expect(frame.items.some(item => item.id === "model:provider-a/model-a")).toBe(true);
-		for (const [name, capability] of [
+		const expectedCommands = [
+			["session.create", "sessions.manage"],
+			["session.rename", "sessions.manage"],
+			["session.archive", "sessions.manage"],
+			["session.restore", "sessions.manage"],
+			["session.delete", "sessions.manage"],
 			["session.cancel", "sessions.control"],
 			["session.model.set", "sessions.manage"],
 			["session.thinking.set", "sessions.manage"],
 			["session.fast.set", "sessions.manage"],
-		] as const) {
+		] as const;
+		expect(
+			frame.items
+				.filter(item => item.kind === "command" && item.name.startsWith("session."))
+				.map(item => item.name)
+				.sort(),
+		).toEqual(expectedCommands.map(([name]) => name).sort());
+		for (const [name, capability] of expectedCommands) {
 			const command = frame.items.find(item => item.kind === "command" && item.name === name);
 			expect(command?.supported).toBe(true);
 			expect(command?.capabilities).toEqual([capability]);

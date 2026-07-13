@@ -41,6 +41,7 @@ export interface CommandDescriptor {
 	revision: "none" | "optional" | "required";
 	revisionOwner: RevisionOwner;
 	confirmation: "none" | "challenge";
+	desktopCatalog?: true;
 }
 export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = {
 	"host.list": {
@@ -63,6 +64,7 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		revision: "none",
 		revisionOwner: "none",
 		confirmation: "none",
+		desktopCatalog: true,
 	},
 	"session.attach": {
 		capability: "sessions.read",
@@ -105,6 +107,7 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		revision: "required",
 		revisionOwner: "session",
 		confirmation: "none",
+		desktopCatalog: true,
 	},
 	"session.retry": {
 		capability: "sessions.control",
@@ -140,6 +143,7 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		revision: "required",
 		revisionOwner: "session",
 		confirmation: "none",
+		desktopCatalog: true,
 	},
 	"session.restore": {
 		capability: "sessions.manage",
@@ -147,6 +151,7 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		revision: "required",
 		revisionOwner: "session",
 		confirmation: "none",
+		desktopCatalog: true,
 	},
 	"session.delete": {
 		capability: "sessions.manage",
@@ -154,6 +159,7 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		revision: "required",
 		revisionOwner: "session",
 		confirmation: "challenge",
+		desktopCatalog: true,
 	},
 	"session.model.set": {
 		capability: "sessions.manage",
@@ -161,6 +167,7 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		revision: "required",
 		revisionOwner: "session",
 		confirmation: "none",
+		desktopCatalog: true,
 	},
 	"session.thinking.set": {
 		capability: "sessions.manage",
@@ -168,6 +175,7 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		revision: "required",
 		revisionOwner: "session",
 		confirmation: "none",
+		desktopCatalog: true,
 	},
 	"session.fast.set": {
 		capability: "sessions.manage",
@@ -175,6 +183,7 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		revision: "required",
 		revisionOwner: "session",
 		confirmation: "none",
+		desktopCatalog: true,
 	},
 	"session.ui.respond": {
 		capability: "sessions.prompt",
@@ -189,6 +198,7 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		revision: "optional",
 		revisionOwner: "session",
 		confirmation: "challenge",
+		desktopCatalog: true,
 	},
 	"session.close": {
 		capability: "sessions.manage",
@@ -394,6 +404,11 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		confirmation: "none",
 	},
 };
+export const DESKTOP_CATALOG_COMMANDS: readonly string[] = Object.freeze(
+	Object.entries(COMMAND_DESCRIPTORS)
+		.filter(([, descriptor]) => descriptor.desktopCatalog === true)
+		.map(([name]) => name),
+);
 export const COMMAND_CAPABILITIES: Readonly<Record<string, DeviceCapability>> = Object.fromEntries(
 	Object.entries(COMMAND_DESCRIPTORS).map(([name, descriptor]) => [name, descriptor.capability]),
 );

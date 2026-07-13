@@ -85,6 +85,17 @@ const ARCHIVED_SESSION_COMMANDS = new Set([
 	"review.read",
 ]);
 const SESSION_LIFECYCLE_COMMANDS = new Set(["session.archive", "session.restore", "session.delete"]);
+const DIRECT_SESSION_RPC_COMMANDS: ReadonlySet<string> = new Set([
+	"session.retry",
+	"session.pause",
+	"session.resume",
+	"session.compact",
+	"session.rename",
+	"session.model.set",
+	"session.thinking.set",
+	"session.fast.set",
+]);
+const SESSION_CANCEL_COMMAND = "session.cancel";
 const REMOTE_OUTBOUND_TRANSFORM_TIMEOUT_MS = 10_000;
 
 async function boundedRemoteTransform<T>(operation: Promise<T> | T): Promise<T> {
@@ -460,6 +471,11 @@ export class LocalAppserver implements AppserverHandle {
 		this.#handlers.register("session.archive", command => this.handleArchive(command));
 		this.#handlers.register("session.restore", command => this.handleRestore(command));
 		this.#handlers.register("session.delete", command => this.handleDelete(command));
+	}
+	hasDesktopSessionCommandHandler(command: string): boolean {
+		return (
+			this.#handlers.has(command) || DIRECT_SESSION_RPC_COMMANDS.has(command) || command === SESSION_CANCEL_COMMAND
+		);
 	}
 	async start(): Promise<void> {
 		if (this.#started) return;
@@ -983,16 +999,7 @@ export class LocalAppserver implements AppserverHandle {
 				const resolved = transcript.resolveUiRequest(requestId);
 				if (resolved) this.broadcast(command.sessionId!, projection!.appendEvent(asAppWireEvent(resolved)));
 				outcome = { frame: response(this.hostId, command, true, { accepted: true }) };
-			} else if (
-				command.command === "session.retry" ||
-				command.command === "session.pause" ||
-				command.command === "session.resume" ||
-				command.command === "session.compact" ||
-				command.command === "session.rename" ||
-				command.command === "session.model.set" ||
-				command.command === "session.thinking.set" ||
-				command.command === "session.fast.set"
-			) {
+			} else if (DIRECT_SESSION_RPC_COMMANDS.has(command.command)) {
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
 				const type =
 					command.command === "session.retry"
@@ -1101,7 +1108,7 @@ export class LocalAppserver implements AppserverHandle {
 					};
 					this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId, true);
 				}
-			} else if (command.command === "session.cancel") {
+			} else if (command.command === SESSION_CANCEL_COMMAND) {
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
 				const cancelledLifecycle = this.#promptLifecycles.get(command.sessionId!);
 				const result = await supervisor.cancel(command.requestId);

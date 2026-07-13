@@ -5,6 +5,7 @@ import {
 	COMMAND_ARGUMENT_DECODERS,
 	COMMAND_DESCRIPTORS,
 	COMMAND_RESULT_DECODERS,
+	DESKTOP_CATALOG_COMMANDS,
 	decodeAdditiveServerFrame,
 	decodeClientFrame,
 	decodeCommandArguments,
@@ -271,6 +272,7 @@ describe("app-wire authority", () => {
 			revision: "none",
 			revisionOwner: "none",
 			confirmation: "none",
+			desktopCatalog: true,
 		});
 		expect(COMMAND_DESCRIPTORS["session.attach"]).toEqual({
 			capability: "sessions.read",
@@ -300,6 +302,7 @@ describe("app-wire authority", () => {
 				revision: "required",
 				revisionOwner: "session",
 				confirmation: "none",
+				desktopCatalog: true,
 			});
 		}
 		expect(COMMAND_DESCRIPTORS["session.delete"]).toEqual({
@@ -308,6 +311,7 @@ describe("app-wire authority", () => {
 			revision: "required",
 			revisionOwner: "session",
 			confirmation: "challenge",
+			desktopCatalog: true,
 		});
 		for (const name of ["session.archive", "session.restore", "session.delete"] as const) {
 			expect(decodeCommandArguments(name, {})).toEqual({});
@@ -561,6 +565,21 @@ describe("app-wire authority", () => {
 			expect(descriptor.revisionOwner).toBe(expected[command]);
 			expect(descriptor.revision === "none").toBe(descriptor.revisionOwner === "none");
 		}
+	});
+	test("desktop catalog commands are an explicit canonical descriptor subset", () => {
+		const expected = [
+			"session.create",
+			"session.rename",
+			"session.archive",
+			"session.restore",
+			"session.delete",
+			"session.model.set",
+			"session.thinking.set",
+			"session.fast.set",
+			"session.cancel",
+		];
+		expect([...DESKTOP_CATALOG_COMMANDS].sort()).toEqual(expected.sort());
+		for (const command of DESKTOP_CATALOG_COMMANDS) expect(COMMAND_DESCRIPTORS[command].desktopCatalog).toBe(true);
 	});
 	test("descriptor validator rejects mismatched revision policy and owner", () => {
 		expect(() =>
