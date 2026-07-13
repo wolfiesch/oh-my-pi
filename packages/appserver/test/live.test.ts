@@ -3,7 +3,10 @@ import { mkdir, mkdtemp, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decodeServerFrame, entryId, hostId, projectId, type ServerFrame, sessionId } from "@oh-my-pi/app-wire";
+import { appserverLockCheck } from "../../coding-agent/src/session/appserver-authority";
+import { inspectSessionLock } from "../../coding-agent/src/session/session-lock";
 import type { DesktopOperationsAuthority } from "../src/operations/dispatcher.ts";
+import { BunRpcChildFactory } from "../src/rpc-child.ts";
 import { createAppserver, type LocalAppserver } from "../src/server.ts";
 import type { ChildHandle, RpcChildFactory, SessionAuthority, SessionDiscovery, SessionRecord } from "../src/types.ts";
 import { frameBytes, RawUdsWebSocket } from "./raw-uds-client.ts";
@@ -11,6 +14,7 @@ import { frameBytes, RawUdsWebSocket } from "./raw-uds-client.ts";
 const host = hostId("live-test-host");
 const epoch = "live-test-epoch";
 const stamp = "2026-01-01T00:00:00.000Z";
+const RPC_LOCK_CHILD = join(import.meta.dir, "fixtures", "rpc-lock-child.ts");
 const sid = (value: string) => sessionId(value);
 const rid = (value: string) => value as never;
 function record(id: string): SessionRecord {
@@ -2257,6 +2261,79 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 
 		await closeClients([client.client]);
 		await appserver.stop();
+	});
+
+	test("archive observes a real RPC child's lock release after lifecycle quiesce", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-lifecycle-real-lock-live-"));
+		const sessionPath = join(root, "session.jsonl");
+		await writeFile(sessionPath, `${JSON.stringify({ type: "session", id: "s1", cwd: root })}\n`);
+		const session = record("s1");
+		session.path = sessionPath;
+		session.cwd = root;
+		const authority = new FakeAuthority([session]);
+		const factory = new BunRpcChildFactory({ executable: process.execPath, prefixArgv: [RPC_LOCK_CHILD] });
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			childFactory: factory,
+			lockCheck: appserverLockCheck,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]);
+
+		client.client.sendJson(
+			command("real-lock-prompt", "real-lock-prompt", "session.prompt", "s1", { message: "done" }),
+		);
+		const prompted = await untilResponse(client.client, "real-lock-prompt");
+		expect(prompted.response).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
+
+		// Drain the prompt's scheduled state refresh through a correlated state
+		// request before asking lifecycle management to quiesce the idle child.
+		client.client.sendJson(command("real-lock-state", "real-lock-state", "session.state.get", "s1", {}));
+		expect((await untilResponse(client.client, "real-lock-state")).response.ok).toBe(true);
+		expect(inspectSessionLock(sessionPath)).toMatchObject({ status: "live", processAlive: true });
+
+		client.client.sendJson({
+			...command("real-lock-archive", "real-lock-archive", "session.archive", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const archived = await untilResponse(client.client, "real-lock-archive");
+		expect(archived.response).toMatchObject({ ok: true, result: { archived: true } });
+		expect(inspectSessionLock(sessionPath).status).toBe("missing");
+		expect(appserver.childFor(sid("s1"))).toBeUndefined();
+		expect(authority.lifecycle).toEqual(["archive:s1"]);
+
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
+	test("a real RPC child releases its session lock when stdin reaches EOF", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-rpc-eof-lock-live-"));
+		const sessionPath = join(root, "session.jsonl");
+		await writeFile(sessionPath, `${JSON.stringify({ type: "session", id: "s1", cwd: root })}\n`);
+		const child = Bun.spawn([process.execPath, RPC_LOCK_CHILD, "--session", sessionPath], {
+			cwd: root,
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const reader = child.stdout.getReader();
+		let ready = "";
+		while (!ready.includes("\n")) {
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			ready += new TextDecoder().decode(chunk.value);
+		}
+		reader.releaseLock();
+		expect(JSON.parse(ready.trim())).toEqual({ type: "ready" });
+		expect(inspectSessionLock(sessionPath)).toMatchObject({ status: "live", processAlive: true });
+
+		await child.stdin.end();
+		expect(await child.exited).toBe(0);
+		expect(inspectSessionLock(sessionPath).status).toBe("missing");
 	});
 
 	test("a child that survives forced termination stays owned and blocks lifecycle retries", async () => {

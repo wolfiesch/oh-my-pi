@@ -14,7 +14,7 @@
 import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { $env, isRecord, readJsonl, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, postmortem, readJsonl, Snowflake } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -35,6 +35,7 @@ import type { EventBus } from "../../utils/event-bus";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
+import { registerRpcSessionTeardown } from "./rpc-session-teardown";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
 	RpcCommand,
@@ -602,7 +603,6 @@ export async function runRpcMode(
 	// may write there.
 	process.env.PI_NOTIFICATIONS = "off";
 
-	process.stdout.write(`${JSON.stringify({ type: "ready" })}\n`);
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
 		process.stdout.write(`${JSON.stringify(obj)}\n`);
 	};
@@ -637,6 +637,19 @@ export async function runRpcMode(
 	const subagentRegistry = eventBus
 		? new RpcSubagentRegistry(eventBus, output, initialSubagentSubscription)
 		: undefined;
+	const sessionTeardown = registerRpcSessionTeardown({
+		beginDispose: () => session.beginDispose(),
+		cleanupProtocol: () => {
+			sessionEntrySubscription.dispose();
+			hostToolBridge.rejectAllPending("RPC session shut down before host tool execution completed");
+			hostUriBridge.clear("RPC session shut down before host URI request completed");
+			subagentRegistry?.dispose();
+		},
+		disposeSession: reason => session.dispose(reason === undefined ? {} : { reason }),
+	});
+	// Readiness guarantees the parent can safely terminate this child: the
+	// postmortem callback that releases the session lock is already armed.
+	output({ type: "ready" });
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
@@ -1400,10 +1413,8 @@ export async function runRpcMode(
 	const shutdownCoordinator = new RpcShutdownCoordinator({
 		isShutdownRequested: () => shutdownState.requested,
 		performShutdown: async () => {
-			if (session.extensionRunner?.hasHandlers("session_shutdown")) {
-				await session.extensionRunner.emit({ type: "session_shutdown" });
-			}
-			process.exit(0);
+			await sessionTeardown.shutdown();
+			await postmortem.quit(0);
 		},
 	});
 
@@ -1443,10 +1454,8 @@ export async function runRpcMode(
 	// Background bash tasks may still owe response frames; drain them before
 	// tearing down (stdin EOF ends the frame stream, not in-flight work).
 	await shutdownCoordinator.drain();
-	sessionEntrySubscription.dispose();
-	// stdin closed — RPC client is gone, exit cleanly
-	hostToolBridge.rejectAllPending("RPC client disconnected before host tool execution completed");
-	hostUriBridge.clear("RPC client disconnected before host URI request completed");
-	subagentRegistry?.dispose();
+	// stdin closed — release the session lock before the RPC process exits.
+	await sessionTeardown.shutdown();
+	await postmortem.quit(0);
 	process.exit(0);
 }

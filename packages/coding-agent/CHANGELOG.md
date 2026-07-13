@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Fixed RPC mode exiting on process termination, extension shutdown, or stdin EOF without disposing its session, which left a fresh writer lock behind and caused appserver lifecycle operations to report `session_locked` after quiescing an idle child.
 - Fixed appserver sessions briefly returning to idle at intermediate turn boundaries during tool-driven runs; the active prompt now remains owned until final `agent.end`, a correlated local-only result or failure, successful cancellation, closure, or child termination.
 - Fixed RPC prompt failures emitting a second response with an already-settled request id, which caused strict child supervisors to terminate otherwise healthy sessions. Late failures now use an exact-ID asynchronous `prompt_result` frame, which appserver surfaces as a sanitized `turn.error` without allowing stale results to settle newer work.
 - Fixed `session.attach` acknowledgement and replay races by preparing output before success, catching up from its baseline, rebuilding cached delivery after revalidating session existence, and bounding large snapshots and replays so desktop and remote clients remain connected.
