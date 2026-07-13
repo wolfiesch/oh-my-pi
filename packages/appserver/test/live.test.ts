@@ -1317,6 +1317,165 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		await appserver.stop();
 	});
 
+	test("session list reconciliation broadcasts newly discovered safe metadata", async () => {
+		const records: SessionRecord[] = [{ ...record("s1"), title: "Session" }];
+		const factory = new LiveFactory();
+		const root = await mkdtemp(join(tmpdir(), "omp-reconcile-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			discovery: new StaticDiscovery(records),
+			childFactory: factory,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read"]);
+		client.client.sendJson(command("attach-reconcile", "attach-reconcile", "session.attach", "s1", {}));
+		await responseAndSnapshot(client.client, "attach-reconcile");
+
+		records[0] = {
+			...records[0]!,
+			projectName: "tmp",
+			title: "Discovered title",
+			updatedAt: "2026-01-01T00:00:01.000Z",
+		};
+		client.client.sendJson(hostCommand("list-reconcile", "list-reconcile", "session.list", {}));
+		const reconciled = await untilResponse(client.client, "list-reconcile");
+		expect(reconciled.frames).toHaveLength(2);
+		expect(reconciled.frames[0]).toMatchObject({
+			type: "session.delta",
+			upsert: { project: { projectId: "project-test", name: "tmp" }, title: "Discovered title" },
+		});
+		expect(reconciled.response).toMatchObject({
+			ok: true,
+			result: {
+				sessions: [{ project: { projectId: "project-test", name: "tmp" }, title: "Discovered title" }],
+			},
+		});
+
+		records[0] = {
+			...records[0]!,
+			projectName: "stale-project-name",
+			title: "Stale discovered title",
+			updatedAt: "2026-01-01T00:00:02.000Z",
+		};
+		client.client.sendJson(hostCommand("list-stale", "list-stale", "session.list", {}));
+		const stale = await untilResponse(client.client, "list-stale");
+		expect(stale.frames.map(frame => frame.type)).toEqual(["response"]);
+		expect(appserver.snapshot(sid("s1"))?.ref).toMatchObject({
+			project: { projectId: "project-test", name: "tmp" },
+			title: "Discovered title",
+		});
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
+	test("created sessions publish project names and live fallback and explicit titles", async () => {
+		const authority = new FakeAuthority();
+		const factory = new LiveFactory();
+		const root = await mkdtemp(join(tmpdir(), "omp-created-title-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			projectRootForProject: () => "/tmp/authority",
+			childFactory: factory,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]);
+		client.client.sendJson(hostCommand("create-live", "create-live", "session.create", { projectId: "requested" }));
+		const created = await client.client.nextServer();
+		expect(created).toMatchObject({
+			type: "response",
+			ok: true,
+			result: {
+				session: {
+					sessionId: "created",
+					project: { projectId: expect.any(String), name: "authority" },
+					title: "Session",
+				},
+			},
+		});
+
+		client.client.sendJson(command("attach-created", "attach-created", "session.attach", "created", {}));
+		await responseAndSnapshot(client.client, "attach-created");
+		client.client.sendJson(
+			command("prompt-created", "prompt-created", "session.prompt", "created", { message: "First live request" }),
+		);
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		const active = await client.client.nextServer();
+		expect(active).toMatchObject({
+			type: "session.delta",
+			upsert: { project: { name: "authority" }, title: "Session", status: "active" },
+		});
+		child.push({
+			type: "session_entry",
+			entry: {
+				id: "user-live",
+				parentId: null,
+				type: "message",
+				timestamp: stamp,
+				message: { role: "user", content: "First live request" },
+			},
+		});
+		const userEntry = await client.client.nextServer();
+		const fallbackTitle = await client.client.nextServer();
+		expect(userEntry.type).toBe("entry");
+		expect(fallbackTitle).toMatchObject({
+			type: "session.delta",
+			upsert: { project: { name: "authority" }, title: "First live request" },
+		});
+		child.push({
+			type: "session_entry",
+			entry: {
+				id: "title-live",
+				parentId: "user-live",
+				type: "title_change",
+				timestamp: stamp,
+				title: "Explicit title",
+			},
+		});
+		const explicitTitle = await client.client.nextServer();
+		expect(explicitTitle).toMatchObject({
+			type: "session.delta",
+			upsert: { project: { name: "authority" }, title: "Explicit title" },
+		});
+		responseFor(child, "prompt");
+		const prompted = await untilResponse(client.client, "prompt-created");
+		expect(prompted.frames.map(frame => frame.type)).toEqual(["response"]);
+
+		const replayClient = await readyClient(appserver.socketPath, ["sessions.read"]);
+		replayClient.client.sendJson(
+			command("attach-created-replay", "attach-created-replay", "session.attach", "created", {
+				cursor: { epoch, seq: 0 },
+			}),
+		);
+		const replayResponse = await replayClient.client.nextServer();
+		const replay = [
+			await replayClient.client.nextServer(),
+			await replayClient.client.nextServer(),
+			await replayClient.client.nextServer(),
+			await replayClient.client.nextServer(),
+		];
+		expect(replayResponse.type).toBe("response");
+		expect(replay.map(frame => frame.type)).toEqual(["session.delta", "entry", "session.delta", "session.delta"]);
+		expect(
+			replay.flatMap(frame =>
+				frame.type === "session.delta" && frame.upsert
+					? [{ name: frame.upsert.project.name, title: frame.upsert.title }]
+					: [],
+			),
+		).toEqual([
+			{ name: "authority", title: "Session" },
+			{ name: "authority", title: "First live request" },
+			{ name: "authority", title: "Explicit title" },
+		]);
+		await closeClients([client.client, replayClient.client]);
+		await appserver.stop();
+	});
+
 	test("create without title uses authority, and prompt lock failure recovers status for retry", async () => {
 		const authority = new FakeAuthority();
 		const factory = new LiveFactory();
@@ -1337,7 +1496,11 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		expect((await authority.created.promise).title).toBeUndefined();
 		if (created.type === "response") {
 			expect(created.result).toMatchObject({
-				session: { sessionId: "created", project: { projectId: expect.any(String) } },
+				session: {
+					sessionId: "created",
+					project: { projectId: expect.any(String), name: "authority" },
+					title: "Session",
+				},
 			});
 			expect(JSON.stringify(created.result)).not.toContain("/tmp/authority");
 		}

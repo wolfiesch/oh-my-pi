@@ -17,6 +17,11 @@ function frameCursor(frame: ServerFrame): { epoch: string; seq: number } | undef
 		return undefined;
 	return { epoch: cursor.epoch, seq: cursor.seq };
 }
+
+function placeholderTitle(title: string): boolean {
+	return title === "Session" || title === "Untitled" || title.trim() === "";
+}
+
 export class SessionProjection {
 	readonly value: Projection;
 	#byId = new Map<string, DurableEntry>();
@@ -66,6 +71,23 @@ export class SessionProjection {
 			sessionId: this.value.sessionId,
 			upsert: this.value.ref,
 		});
+	}
+	updateTitle(title: string): ServerFrame | undefined {
+		if (!title || this.value.ref.title === title) return undefined;
+		return this.updateRef({ ...this.value.ref, title }, `title:${title}`);
+	}
+	reconcileRecord(record: SessionRecord): ServerFrame | undefined {
+		const current = this.value.ref;
+		const sameProject = current.project.projectId === record.projectId;
+		const projectName =
+			sameProject && !current.project.name && record.projectName ? record.projectName : current.project.name;
+		const project =
+			sameProject && projectName !== current.project.name
+				? { projectId: current.project.projectId, ...(projectName ? { name: projectName } : {}) }
+				: current.project;
+		const title = placeholderTitle(current.title) && !placeholderTitle(record.title) ? record.title : current.title;
+		if (project === current.project && title === current.title) return undefined;
+		return this.updateRef({ ...current, project, title }, `record:${record.updatedAt}`);
 	}
 	appendEntry(entry: DurableEntry): ServerFrame | undefined {
 		const previous = this.#byId.get(entry.id);
@@ -143,6 +165,22 @@ export class SessionProjection {
 			hostId: this.value.hostId,
 			sessionId: this.value.sessionId,
 			event,
+		});
+	}
+	private updateRef(next: SessionRef, marker: string): ServerFrame {
+		this.#revisionHash.update(`${marker}:${JSON.stringify(next)}\n`);
+		const nextRevision = revision(`r-${this.#revisionHash.copy().digest("hex").slice(0, 24)}`);
+		next.revision = nextRevision;
+		this.value.revision = nextRevision;
+		this.value.ref = next;
+		return this.appendFrame({
+			v: "omp-app/1",
+			type: "session.delta",
+			cursor: this.nextCursor(),
+			revision: nextRevision,
+			hostId: this.value.hostId,
+			sessionId: this.value.sessionId,
+			upsert: next,
 		});
 	}
 	snapshot(): ServerFrame {

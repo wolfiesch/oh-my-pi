@@ -83,6 +83,45 @@ describe("projection and replay", () => {
 		expect(replay[0]?.type).toBe("gap");
 		expect(projection.value.entries.map(value => String(value.id))).toEqual(["a"]);
 	});
+	test("publishes title changes and safely fills discovery metadata", () => {
+		const source = { ...record("s"), title: "Session" };
+		const projection = new SessionProjection(host, source, "epoch-a");
+		const discovered = {
+			...source,
+			projectName: "tmp",
+			title: "First substantive request",
+			updatedAt: new Date(1).toISOString(),
+		};
+		const reconciled = projection.reconcileRecord(discovered);
+		expect(reconciled).toMatchObject({
+			type: "session.delta",
+			cursor: { epoch: "epoch-a", seq: 1 },
+			upsert: { project: { projectId: "project-test", name: "tmp" }, title: "First substantive request" },
+		});
+		if (!reconciled) throw new Error("expected discovery metadata delta");
+		expect(projection.reconcileRecord(discovered)).toBeUndefined();
+
+		const titled = projection.updateTitle("Explicit title");
+		expect(titled).toMatchObject({
+			type: "session.delta",
+			cursor: { epoch: "epoch-a", seq: 2 },
+			upsert: { title: "Explicit title" },
+		});
+		if (!titled) throw new Error("expected explicit title delta");
+		expect(projection.updateTitle("Explicit title")).toBeUndefined();
+		expect(
+			projection.reconcileRecord({
+				...discovered,
+				projectName: "stale-project-name",
+				title: "Stale discovered title",
+			}),
+		).toBeUndefined();
+		expect(projection.value.ref).toMatchObject({
+			project: { projectId: "project-test", name: "tmp" },
+			title: "Explicit title",
+		});
+		expect(projection.replay({ epoch: "epoch-a", seq: 0 })).toEqual([reconciled, titled]);
+	});
 });
 describe("idempotency", () => {
 	test("same payload replays and changed payload conflicts", () => {

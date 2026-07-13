@@ -5,6 +5,7 @@ import {
 	type DesktopOperationsAuthority,
 	FileSessionDiscovery,
 	type OperationContext,
+	projectNameFromCwd,
 	stableProjectId,
 } from "@oh-my-pi/appserver";
 import { getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
@@ -89,6 +90,7 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 				records.set(created.sessionId, {
 					...created,
 					projectId: stableProjectId(created.cwd),
+					projectName: projectNameFromCwd(created.cwd),
 					title: created.title ?? "Session",
 					updatedAt: new Date().toISOString(),
 					status: "idle",

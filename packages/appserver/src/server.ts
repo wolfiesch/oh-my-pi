@@ -24,7 +24,13 @@ import {
 	utf8ByteLength,
 } from "@oh-my-pi/app-wire";
 import { AppserverCommandHandlers } from "./command-handler.ts";
-import { compareSessionRecords, SessionEntryProjector, stableProjectId } from "./discovery.ts";
+import {
+	compareSessionRecords,
+	fallbackSessionTitle,
+	projectNameFromCwd,
+	SessionEntryProjector,
+	stableProjectId,
+} from "./discovery.ts";
 import { IdempotencyStore } from "./idempotency.ts";
 import { createEpoch, createHostId, defaultSocketPath, loadPersistentHostId, unixSocketActive } from "./identity.ts";
 import {
@@ -1056,6 +1062,7 @@ export class LocalAppserver implements AppserverHandle {
 			path: created.path,
 			cwd: created.cwd,
 			projectId: stableProjectId(created.cwd),
+			projectName: projectNameFromCwd(created.cwd),
 			title: created.title ?? "Session",
 			updatedAt: timestamp,
 			status: "idle",
@@ -1158,6 +1165,16 @@ export class LocalAppserver implements AppserverHandle {
 					const settlementEvents = transcript.observeSessionEntry(raw, entries);
 					for (const entry of entries) {
 						const output = projection.appendEntry(entry);
+						if (output) this.broadcast(sessionId, output);
+					}
+					const projectedTitle =
+						projector.titleChange ??
+						(projection.value.ref.title === "Session" || projection.value.ref.title === "Untitled"
+							? fallbackSessionTitle(projector.firstUserText)
+							: undefined);
+					if (projectedTitle) {
+						record.title = projectedTitle;
+						const output = projection.updateTitle(projectedTitle);
 						if (output) this.broadcast(sessionId, output);
 					}
 					for (const event of settlementEvents)
@@ -1589,11 +1606,16 @@ export class LocalAppserver implements AppserverHandle {
 		for (const record of discovered) {
 			this.#records.set(record.sessionId, record);
 			this.#createdPending.delete(record.sessionId);
-			if (!this.#projections.has(record.sessionId))
+			const projection = this.#projections.get(record.sessionId);
+			if (!projection)
 				this.#projections.set(
 					record.sessionId,
 					new SessionProjection(this.hostId, record, this.epoch, this.#ringSize),
 				);
+			else {
+				const output = projection.reconcileRecord(record);
+				if (output) this.broadcast(record.sessionId, output);
+			}
 		}
 		for (const [sessionId, pending] of this.#createdPending) {
 			if (discoveredIds.has(sessionId)) {

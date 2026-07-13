@@ -114,7 +114,7 @@ function contentText(content: unknown): string {
 	return cleanText(parts.join(""), MAX_TEXT_BYTES);
 }
 
-function basename(cwd: string): string {
+export function projectNameFromCwd(cwd: string): string {
 	const pieces = cwd.replace(/[\\/]+$/u, "").split(/[\\/]/u);
 	return cleanText(pieces.at(-1) ?? "", 256, true);
 }
@@ -481,7 +481,7 @@ export function stableProjectId(cwd: string): ProjectId {
 	return projectId(`project-${createHash("sha256").update(canonical).digest("hex").slice(0, 24)}`);
 }
 
-function fallbackTitle(firstUserText: string | undefined): string | undefined {
+export function fallbackSessionTitle(firstUserText: string | undefined): string | undefined {
 	if (!firstUserText) return undefined;
 	const lines = firstUserText.split(/\r?\n/u);
 	const wrapper = /^Complete the assignment below,\s*thoroughly:\s*$/iu.test(lines[0]?.trim() ?? "");
@@ -558,13 +558,17 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
 	const normalized = normalizeEntries(values, host, sid, header.timestamp);
 	const sessionTitle = typeof header.title === "string" ? cleanText(header.title, 512, true) : undefined;
 	const title =
-		fixedTitle || normalized.titleChange || sessionTitle || fallbackTitle(normalized.firstUserText) || "Untitled";
+		fixedTitle ||
+		normalized.titleChange ||
+		sessionTitle ||
+		fallbackSessionTitle(normalized.firstUserText) ||
+		"Untitled";
 	return {
 		sessionId: sid,
 		path,
 		cwd,
 		projectId: stableProjectId(cwd),
-		projectName: basename(cwd),
+		projectName: projectNameFromCwd(cwd),
 		title: cleanText(title, 512, true) || "Untitled",
 		updatedAt: "",
 		status: "idle",
@@ -613,7 +617,7 @@ function parseTranscriptMetadata(input: string | Uint8Array, path: string): Sess
 		path,
 		cwd,
 		projectId: stableProjectId(cwd),
-		projectName: basename(cwd),
+		projectName: projectNameFromCwd(cwd),
 		title:
 			cleanText(
 				fixedTitle || (typeof header.title === "string" ? header.title : undefined) || "Untitled",
