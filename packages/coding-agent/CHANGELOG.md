@@ -15,6 +15,30 @@
 - Fixed appserver discovery counting nested advisor and subagent transcripts as main sessions.
 - Fixed remote fast-mode changes bypassing the controller-lease checks used by other session mutations.
 
+## [16.4.8] - 2026-07-12
+
+### Fixed
+
+- Improved search reliability for Perplexity provider by forcing retrieval for all queries
+- Fixed JS eval cells losing top-level `function` and `var` declarations across cells when the defining cell contained top-level `await` — the async wrapper scoped them to the cell's IIFE instead of publishing them to the worker global
+
+## [16.4.7] - 2026-07-12
+
+### Added
+
+- Enabled Home and End keyboard navigation in the model browser
+- Added a `c` hotkey in the plan-review overlay that copies the current reviewed plan markdown to the system clipboard, including in-overlay edits.
+
+### Changed
+
+- Streamlined list view styling by removing inline model role chips from row entries
+- Reworked /models hub selection visuals: the background highlight band is reserved for mouse hover, the keyboard position is a cursor glyph drawn only in the pane that owns the arrow keys, and the sidebar's active scope renders as a bold accent label
+- Removed the redundant "login" label from inactive (locked) provider entries in the Model Hub sidebar
+
+### Fixed
+
+- Fixed PageUp/PageDown in the model browser wrapping past the list edges instead of clamping
+- Fixed the hover highlight sticking to the last hovered model row when the pointer moved into the provider sidebar
 
 ## [16.4.6] - 2026-07-12
 
