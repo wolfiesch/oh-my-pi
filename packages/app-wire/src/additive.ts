@@ -1,98 +1,918 @@
+import { type Cursor, decodeCursor } from "./cursor.ts";
+import { type DurableEntry, decodeEntry } from "./entry.ts";
 import { fail } from "./errors.ts";
-import { boundedArray, boundedMap, boundedMetadata, boundedText, controlFree, finiteNumber, inputObject, isSecretLikeKey, safeRelativePath, safeSeq } from "./guards.ts";
-import { PROTOCOL_VERSION, MAX_FILE_BYTES, MAX_TERMINAL_OUTPUT_BYTES } from "./limits.ts";
-import { agentId, catalogId, deviceId, hostId, leaseId, operationId, previewId, revision, sessionId, terminalId, watchId, type AgentId, type CatalogId, type DeviceId, type HostId, type LeaseId, type OperationId, type PreviewId, type Revision, type SessionId, type TerminalId, type WatchId } from "./ids.ts";
-import { decodeCursor, type Cursor } from "./cursor.ts";
-import { decodeEntry, type DurableEntry } from "./entry.ts";
+import {
+	boundedArray,
+	boundedMap,
+	boundedMetadata,
+	boundedSettings,
+	boundedText,
+	controlFree,
+	finiteNumber,
+	inputObject,
+	isSecretLikeKey,
+	safeRelativePath,
+	safeSeq,
+} from "./guards.ts";
+import {
+	type AgentId,
+	agentId,
+	type CatalogId,
+	catalogId,
+	type DeviceId,
+	deviceId,
+	type HostId,
+	hostId,
+	type LeaseId,
+	leaseId,
+	type OperationId,
+	operationId,
+	type PreviewId,
+	previewId,
+	type Revision,
+	revision,
+	type SessionId,
+	sessionId,
+	type TerminalId,
+	terminalId,
+	type WatchId,
+	watchId,
+} from "./ids.ts";
+import { MAX_FILE_BYTES, MAX_TERMINAL_OUTPUT_BYTES, PROTOCOL_VERSION } from "./limits.ts";
 import { decodeSessionRef, type SessionRef } from "./session-index.ts";
 
-export const ADDITIVE_FEATURES = ["host.watch","session.watch","session.state","session.delta","controller.lease","prompt.lease","agent.lifecycle","agent.progress","agent.event","agent.transcript","terminal.io","files.list","files.diff","audit.tail","catalog.metadata","settings.metadata","preview.control"] as const;
+export const ADDITIVE_FEATURES = [
+	"host.watch",
+	"session.watch",
+	"session.state",
+	"session.delta",
+	"controller.lease",
+	"prompt.lease",
+	"agent.lifecycle",
+	"agent.progress",
+	"agent.event",
+	"agent.transcript",
+	"terminal.io",
+	"files.list",
+	"files.diff",
+	"audit.tail",
+	"catalog.metadata",
+	"settings.metadata",
+	"preview.control",
+] as const;
 export type AdditiveFeature = (typeof ADDITIVE_FEATURES)[number];
 export type WireFeature = AdditiveFeature | "resume";
-function frame(input: unknown, expected: readonly string[]): Record<string, unknown> { const x = inputObject(input); if (x.v !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v"); if (typeof x.type !== "string" || !expected.includes(x.type)) fail("UNKNOWN_FRAME", "unknown discriminant", "type"); if (x.metadata !== undefined) boundedMetadata(x.metadata, "metadata", isSecretLikeKey); return x; }
-function own(x: Record<string, unknown>): { hostId: HostId; sessionId: SessionId } { return { hostId: hostId(x.hostId), sessionId: sessionId(x.sessionId) }; }
-function cur(x: unknown): Cursor { return decodeCursor(x); }
-function known(value: unknown, path: string, values: readonly string[]): string { const result = controlFree(value, path, 128); if (!values.includes(result)) fail("UNKNOWN_FRAME", `unknown discriminant ${result}`, path); return result; }
-function base64(value: unknown, path: string, max: number): string { const text = boundedText(value, path, Math.ceil(max * 4 / 3) + 4); if (text.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(text)) fail("BOUNDS", "invalid base64 payload", path); try { if (atob(text).length > max) fail("BOUNDS", "decoded payload exceeds protocol limit", path); } catch { fail("BOUNDS", "invalid base64 payload", path); } return text; }
-function httpUrl(value: unknown, path: string): string { const text = controlFree(value, path, 4096); let parsed: URL; try { parsed = new URL(text); } catch { fail("INVALID_FRAME", "invalid preview URL", path); } if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.username !== "" || parsed.password !== "") fail("INVALID_FRAME", "preview URL must be http(s) without credentials", path); return text; }
-function object(value: unknown, path: string): Record<string, unknown> { return boundedMap(value, path); }
-
-export interface HostWatchFrame { v: typeof PROTOCOL_VERSION; type: "host.watch"; watchId: WatchId; hostId: HostId; cursor: Cursor; state: "started"|"stopped"|"ready"; revision: Revision; [key:string]: unknown; }
-export interface SessionWatchFrame { v: typeof PROTOCOL_VERSION; type: "session.watch"; watchId: WatchId; hostId: HostId; sessionId: SessionId; cursor: Cursor; state: "started"|"stopped"|"ready"; revision: Revision; [key:string]: unknown; }
-export interface SessionStateFrame { v: typeof PROTOCOL_VERSION; type: "session.state"; hostId: HostId; sessionId: SessionId; cursor: Cursor; revision: Revision; state: string; [key:string]: unknown; }
-export interface SessionDeltaFrame { v: typeof PROTOCOL_VERSION; type: "session.delta"; hostId: HostId; sessionId: SessionId; cursor: Cursor; revision: Revision; upsert?: SessionRef; remove?: SessionId; [key:string]: unknown; }
-export type WatchFrame = HostWatchFrame|SessionWatchFrame|SessionStateFrame|SessionDeltaFrame;
-export function decodeWatch(input: unknown): WatchFrame {
-  const x=frame(input,["host.watch","session.watch","session.state","session.delta"]); const type=x.type as string;
-  if(type==="host.watch") return {...x,type,watchId:watchId(x.watchId),hostId:hostId(x.hostId),cursor:cur(x.cursor),state:known(x.state,"state",["started","stopped","ready"]) as HostWatchFrame["state"],revision:revision(x.revision)} as HostWatchFrame;
-  const ids=own(x), cursor=cur(x.cursor), rev=revision(x.revision);
-  if(type==="session.watch") return {...x,type,watchId:watchId(x.watchId),...ids,cursor,state:known(x.state,"state",["started","stopped","ready"]) as SessionWatchFrame["state"],revision:rev} as SessionWatchFrame;
-  if(type==="session.state") return {...x,type,...ids,cursor,revision:rev,state:controlFree(x.state,"state",128)} as SessionStateFrame;
-  const result:Record<string,unknown>={...x,type,...ids,cursor,revision:rev};
-  if(x.upsert!==undefined) result.upsert=decodeSessionRef(x.upsert,"upsert"); if(x.remove!==undefined) result.remove=sessionId(x.remove,"remove");
-  if(result.upsert===undefined&&result.remove===undefined) fail("INVALID_FRAME","session delta requires upsert or remove","delta");
-  if(result.upsert!==undefined&&result.remove!==undefined) fail("INVALID_FRAME","session delta cannot upsert and remove","delta");
-  if(result.upsert!==undefined){const upsert=result.upsert as SessionRef;if(upsert.hostId!==ids.hostId||upsert.sessionId!==ids.sessionId) fail("INVALID_FRAME","upsert belongs to another session","upsert");}
-  return result as unknown as SessionDeltaFrame;
+function frame(input: unknown, expected: readonly string[]): Record<string, unknown> {
+	const x = inputObject(input);
+	if (x.v !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v");
+	if (typeof x.type !== "string" || !expected.includes(x.type)) fail("UNKNOWN_FRAME", "unknown discriminant", "type");
+	if (x.metadata !== undefined) boundedMetadata(x.metadata, "metadata", isSecretLikeKey);
+	return x;
+}
+function own(x: Record<string, unknown>): { hostId: HostId; sessionId: SessionId } {
+	return { hostId: hostId(x.hostId), sessionId: sessionId(x.sessionId) };
+}
+function cur(x: unknown): Cursor {
+	return decodeCursor(x);
+}
+function known(value: unknown, path: string, values: readonly string[]): string {
+	const result = controlFree(value, path, 128);
+	if (!values.includes(result)) fail("UNKNOWN_FRAME", `unknown discriminant ${result}`, path);
+	return result;
+}
+function base64(value: unknown, path: string, max: number): string {
+	const text = boundedText(value, path, Math.ceil((max * 4) / 3) + 4);
+	if (text.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(text))
+		fail("BOUNDS", "invalid base64 payload", path);
+	try {
+		if (atob(text).length > max) fail("BOUNDS", "decoded payload exceeds protocol limit", path);
+	} catch {
+		fail("BOUNDS", "invalid base64 payload", path);
+	}
+	return text;
+}
+function httpUrl(value: unknown, path: string): string {
+	const text = controlFree(value, path, 4096);
+	let parsed: URL;
+	try {
+		parsed = new URL(text);
+	} catch {
+		fail("INVALID_FRAME", "invalid preview URL", path);
+	}
+	if (
+		(parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+		parsed.username !== "" ||
+		parsed.password !== ""
+	)
+		fail("INVALID_FRAME", "preview URL must be http(s) without credentials", path);
+	return text;
+}
+function object(value: unknown, path: string): Record<string, unknown> {
+	return boundedMap(value, path);
 }
 
-export type LeaseKind="controller"|"prompt"; export type LeaseState="acquired"|"renewed"|"released"|"expired";
-export interface LeaseFrame { v:typeof PROTOCOL_VERSION; type:"lease"|"prompt.lease"; hostId:HostId; sessionId:SessionId; leaseId:LeaseId; cursor:Cursor; kind:LeaseKind; state:LeaseState; owner:DeviceId; expiresAt:string; revision?:Revision; [key:string]:unknown; }
-export interface PromptLeaseFrame extends LeaseFrame { type:"prompt.lease"; kind:"prompt"; }
-export function decodeLease(input: unknown): LeaseFrame|PromptLeaseFrame { const x=frame(input,["lease","prompt.lease"]); const type=x.type as "lease"|"prompt.lease", ids=own(x), expected=type === "lease" ? "controller" : "prompt"; if (x.kind !== expected) fail("INVALID_FRAME","lease kind does not match type","kind"); const result={...x,type,...ids,leaseId:leaseId(x.leaseId),cursor:cur(x.cursor),kind:expected,state:known(x.state,"state",["acquired","renewed","released","expired"]) as LeaseState,owner:deviceId(x.owner),expiresAt:controlFree(x.expiresAt,"expiresAt",128)} as LeaseFrame; if (x.revision !== undefined) result.revision=revision(x.revision); return type === "prompt.lease" ? result as PromptLeaseFrame : result; }
+export interface HostWatchFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "host.watch";
+	watchId: WatchId;
+	hostId: HostId;
+	cursor: Cursor;
+	state: "started" | "stopped" | "ready";
+	revision: Revision;
+	[key: string]: unknown;
+}
+export interface SessionWatchFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "session.watch";
+	watchId: WatchId;
+	hostId: HostId;
+	sessionId: SessionId;
+	cursor: Cursor;
+	state: "started" | "stopped" | "ready";
+	revision: Revision;
+	[key: string]: unknown;
+}
+export interface SessionStateFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "session.state";
+	hostId: HostId;
+	sessionId: SessionId;
+	cursor: Cursor;
+	revision: Revision;
+	state: string;
+	[key: string]: unknown;
+}
+export interface SessionDeltaFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "session.delta";
+	hostId: HostId;
+	sessionId: SessionId;
+	cursor: Cursor;
+	revision: Revision;
+	upsert?: SessionRef;
+	remove?: SessionId;
+	[key: string]: unknown;
+}
+export type WatchFrame = HostWatchFrame | SessionWatchFrame | SessionStateFrame | SessionDeltaFrame;
+export function decodeWatch(input: unknown): WatchFrame {
+	const x = frame(input, ["host.watch", "session.watch", "session.state", "session.delta"]);
+	const type = x.type as string;
+	if (type === "host.watch")
+		return {
+			...x,
+			type,
+			watchId: watchId(x.watchId),
+			hostId: hostId(x.hostId),
+			cursor: cur(x.cursor),
+			state: known(x.state, "state", ["started", "stopped", "ready"]) as HostWatchFrame["state"],
+			revision: revision(x.revision),
+		} as HostWatchFrame;
+	const ids = own(x),
+		cursor = cur(x.cursor),
+		rev = revision(x.revision);
+	if (type === "session.watch")
+		return {
+			...x,
+			type,
+			watchId: watchId(x.watchId),
+			...ids,
+			cursor,
+			state: known(x.state, "state", ["started", "stopped", "ready"]) as SessionWatchFrame["state"],
+			revision: rev,
+		} as SessionWatchFrame;
+	if (type === "session.state")
+		return {
+			...x,
+			type,
+			...ids,
+			cursor,
+			revision: rev,
+			state: controlFree(x.state, "state", 128),
+		} as SessionStateFrame;
+	const result: Record<string, unknown> = { ...x, type, ...ids, cursor, revision: rev };
+	if (x.upsert !== undefined) result.upsert = decodeSessionRef(x.upsert, "upsert");
+	if (x.remove !== undefined) result.remove = sessionId(x.remove, "remove");
+	if (result.upsert === undefined && result.remove === undefined)
+		fail("INVALID_FRAME", "session delta requires upsert or remove", "delta");
+	if (result.upsert !== undefined && result.remove !== undefined)
+		fail("INVALID_FRAME", "session delta cannot upsert and remove", "delta");
+	if (result.upsert !== undefined) {
+		const upsert = result.upsert as SessionRef;
+		if (upsert.hostId !== ids.hostId || upsert.sessionId !== ids.sessionId)
+			fail("INVALID_FRAME", "upsert belongs to another session", "upsert");
+	}
+	return result as unknown as SessionDeltaFrame;
+}
 
-export type AgentLifecycle="created"|"started"|"running"|"completed"|"failed"|"cancelled";
-export interface AgentStateFrame { v:typeof PROTOCOL_VERSION; type:"agent.state"; hostId:HostId; sessionId:SessionId; agentId:AgentId; cursor:Cursor; state:AgentLifecycle; revision:Revision; [key:string]:unknown; }
-export interface AgentLifecycleFrame { v:typeof PROTOCOL_VERSION; type:"agent.lifecycle"; hostId:HostId; sessionId:SessionId; agentId:AgentId; cursor:Cursor; lifecycle:AgentLifecycle; revision:Revision; [key:string]:unknown; }
-export interface AgentProgressFrame { v:typeof PROTOCOL_VERSION; type:"agent.progress"; hostId:HostId; sessionId:SessionId; agentId:AgentId; cursor:Cursor; progress:number; revision:Revision; detail?:Record<string,unknown>; [key:string]:unknown; }
-export interface AgentEventFrame { v:typeof PROTOCOL_VERSION; type:"agent.event"; hostId:HostId; sessionId:SessionId; agentId:AgentId; cursor:Cursor; event:string; revision:Revision; data?:Record<string,unknown>; [key:string]:unknown; }
-export interface AgentTranscriptFrame { v:typeof PROTOCOL_VERSION; type:"agent.transcript"; hostId:HostId; sessionId:SessionId; agentId:AgentId; cursor:Cursor; entries:DurableEntry[]; revision:Revision; [key:string]:unknown; }
-export type AgentAdditiveFrame=AgentStateFrame|AgentLifecycleFrame|AgentProgressFrame|AgentEventFrame|AgentTranscriptFrame;
-export function decodeAgentAdditive(input: unknown): AgentAdditiveFrame { const x=frame(input,["agent.state","agent.lifecycle","agent.progress","agent.event","agent.transcript"]), type=x.type as string, ids=own(x), aid=agentId(x.agentId), cursor=cur(x.cursor), rev=revision(x.revision), states=["created","started","running","completed","failed","cancelled"] as const; if (type === "agent.state") return {...x,type,...ids,agentId:aid,cursor,state:known(x.state,"state",states) as AgentLifecycle,revision:rev} as AgentStateFrame; if (type === "agent.lifecycle") return {...x,type,...ids,agentId:aid,cursor,lifecycle:known(x.lifecycle,"lifecycle",states) as AgentLifecycle,revision:rev} as AgentLifecycleFrame; if (type === "agent.progress") { const progress=finiteNumber(x.progress,"progress"); if(progress<0||progress>1) fail("BOUNDS","progress must be between zero and one","progress"); const result={...x,type,...ids,agentId:aid,cursor,progress,revision:rev} as AgentProgressFrame; if(x.detail!==undefined) result.detail=boundedMetadata(x.detail,"detail",isSecretLikeKey); return result; } if(type === "agent.event") { const result={...x,type,...ids,agentId:aid,cursor,event:controlFree(x.event,"event",128),revision:rev} as AgentEventFrame; if(x.data!==undefined) result.data=object(x.data,"data"); return result; } const entries=boundedArray(x.entries,"entries").map((value,i)=>decodeEntry(value,`entries[${i}]`)); for(const entry of entries) if(entry.hostId!==ids.hostId||entry.sessionId!==ids.sessionId) fail("INVALID_FRAME","transcript entry belongs to another session","entries"); return {...x,type,...ids,agentId:aid,cursor,entries,revision:rev} as AgentTranscriptFrame; }
+export type LeaseKind = "controller" | "prompt";
+export type LeaseState = "acquired" | "renewed" | "released" | "expired";
+export interface LeaseFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "lease" | "prompt.lease";
+	hostId: HostId;
+	sessionId: SessionId;
+	leaseId: LeaseId;
+	cursor: Cursor;
+	kind: LeaseKind;
+	state: LeaseState;
+	owner: DeviceId;
+	expiresAt: string;
+	revision?: Revision;
+	[key: string]: unknown;
+}
+export interface PromptLeaseFrame extends LeaseFrame {
+	type: "prompt.lease";
+	kind: "prompt";
+}
+export function decodeLease(input: unknown): LeaseFrame | PromptLeaseFrame {
+	const x = frame(input, ["lease", "prompt.lease"]);
+	const type = x.type as "lease" | "prompt.lease",
+		ids = own(x),
+		expected = type === "lease" ? "controller" : "prompt";
+	if (x.kind !== expected) fail("INVALID_FRAME", "lease kind does not match type", "kind");
+	const result = {
+		...x,
+		type,
+		...ids,
+		leaseId: leaseId(x.leaseId),
+		cursor: cur(x.cursor),
+		kind: expected,
+		state: known(x.state, "state", ["acquired", "renewed", "released", "expired"]) as LeaseState,
+		owner: deviceId(x.owner),
+		expiresAt: controlFree(x.expiresAt, "expiresAt", 128),
+	} as LeaseFrame;
+	if (x.revision !== undefined) result.revision = revision(x.revision);
+	return type === "prompt.lease" ? (result as PromptLeaseFrame) : result;
+}
 
-export interface TerminalInputFrame { v:typeof PROTOCOL_VERSION; type:"terminal.input"; hostId:HostId; sessionId:SessionId; terminalId:TerminalId; data:string; encoding?:"utf8"|"base64"; [key:string]:unknown; }
-export interface TerminalOutputFrame { v:typeof PROTOCOL_VERSION; type:"terminal.output"; hostId:HostId; sessionId:SessionId; terminalId:TerminalId; cursor:Cursor; stream:"stdout"|"stderr"; data:string; encoding?:"utf8"|"base64"; [key:string]:unknown; }
-export interface TerminalResizeFrame { v:typeof PROTOCOL_VERSION; type:"terminal.resize"; hostId:HostId; sessionId:SessionId; terminalId:TerminalId; cols:number; rows:number; [key:string]:unknown; }
-export interface TerminalCloseFrame { v:typeof PROTOCOL_VERSION; type:"terminal.close"; hostId:HostId; sessionId:SessionId; terminalId:TerminalId; reason?:string; [key:string]:unknown; }
-export interface TerminalExitFrame { v:typeof PROTOCOL_VERSION; type:"terminal.exit"; hostId:HostId; sessionId:SessionId; terminalId:TerminalId; cursor:Cursor; exitCode:number; signal?:string; [key:string]:unknown; }
-export type TerminalClientFrame=TerminalInputFrame|TerminalResizeFrame|TerminalCloseFrame; export type TerminalServerFrame=TerminalOutputFrame|TerminalExitFrame;
-function dimension(value:unknown,path:string):number { const n=safeSeq(value,path), max=path.endsWith("cols")?1000:500; if(n===0||n>max) fail("BOUNDS","terminal dimension out of range",path); return n; }
-export function decodeTerminalClient(input:unknown):TerminalClientFrame { const x=frame(input,["terminal.input","terminal.resize","terminal.close"]), type=x.type as string, ids=own(x), tid=terminalId(x.terminalId); if(type === "terminal.input") { const encoding=x.encoding===undefined?undefined:known(x.encoding,"encoding",["utf8","base64"]) as "utf8"|"base64", data=encoding === "base64"?base64(x.data,"data",MAX_TERMINAL_OUTPUT_BYTES):boundedText(x.data,"data",MAX_TERMINAL_OUTPUT_BYTES), result={...x,type,...ids,terminalId:tid,data} as TerminalInputFrame; if(encoding!==undefined) result.encoding=encoding; return result; } if(type === "terminal.resize") return {...x,type,...ids,terminalId:tid,cols:dimension(x.cols,"cols"),rows:dimension(x.rows,"rows")} as TerminalResizeFrame; const result={...x,type,...ids,terminalId:tid} as TerminalCloseFrame; if(x.reason!==undefined) result.reason=controlFree(x.reason,"reason",256); return result; }
-export function decodeTerminalAdditive(input:unknown):TerminalServerFrame { const x=frame(input,["terminal.output","terminal.exit"]), type=x.type as string, ids=own(x), tid=terminalId(x.terminalId), cursor=cur(x.cursor); if(type === "terminal.output") { const encoding=x.encoding===undefined?undefined:known(x.encoding,"encoding",["utf8","base64"]) as "utf8"|"base64", data=encoding === "base64"?base64(x.data,"data",MAX_TERMINAL_OUTPUT_BYTES):boundedText(x.data,"data",MAX_TERMINAL_OUTPUT_BYTES), result={...x,type,...ids,terminalId:tid,cursor,stream:known(x.stream,"stream",["stdout","stderr"]) as "stdout"|"stderr",data} as TerminalOutputFrame; if(encoding!==undefined) result.encoding=encoding; return result; } const code=x.exitCode; if(typeof code!=="number"||!Number.isSafeInteger(code)) fail("INVALID_FRAME","exitCode must be safe integer","exitCode"); const result={...x,type,...ids,terminalId:tid,cursor,exitCode:code} as TerminalExitFrame; if(x.signal!==undefined) result.signal=controlFree(x.signal,"signal",128); return result; }
+export type AgentLifecycle = "created" | "started" | "running" | "completed" | "failed" | "cancelled";
+export interface AgentStateFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "agent.state";
+	hostId: HostId;
+	sessionId: SessionId;
+	agentId: AgentId;
+	cursor: Cursor;
+	state: AgentLifecycle;
+	revision: Revision;
+	[key: string]: unknown;
+}
+export interface AgentLifecycleFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "agent.lifecycle";
+	hostId: HostId;
+	sessionId: SessionId;
+	agentId: AgentId;
+	cursor: Cursor;
+	lifecycle: AgentLifecycle;
+	revision: Revision;
+	[key: string]: unknown;
+}
+export interface AgentProgressFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "agent.progress";
+	hostId: HostId;
+	sessionId: SessionId;
+	agentId: AgentId;
+	cursor: Cursor;
+	progress: number;
+	revision: Revision;
+	detail?: Record<string, unknown>;
+	[key: string]: unknown;
+}
+export interface AgentEventFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "agent.event";
+	hostId: HostId;
+	sessionId: SessionId;
+	agentId: AgentId;
+	cursor: Cursor;
+	event: string;
+	revision: Revision;
+	data?: Record<string, unknown>;
+	[key: string]: unknown;
+}
+export interface AgentTranscriptFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "agent.transcript";
+	hostId: HostId;
+	sessionId: SessionId;
+	agentId: AgentId;
+	cursor: Cursor;
+	entries: DurableEntry[];
+	revision: Revision;
+	[key: string]: unknown;
+}
+export type AgentAdditiveFrame =
+	| AgentStateFrame
+	| AgentLifecycleFrame
+	| AgentProgressFrame
+	| AgentEventFrame
+	| AgentTranscriptFrame;
+export function decodeAgentAdditive(input: unknown): AgentAdditiveFrame {
+	const x = frame(input, ["agent.state", "agent.lifecycle", "agent.progress", "agent.event", "agent.transcript"]),
+		type = x.type as string,
+		ids = own(x),
+		aid = agentId(x.agentId),
+		cursor = cur(x.cursor),
+		rev = revision(x.revision),
+		states = ["created", "started", "running", "completed", "failed", "cancelled"] as const;
+	if (type === "agent.state")
+		return {
+			...x,
+			type,
+			...ids,
+			agentId: aid,
+			cursor,
+			state: known(x.state, "state", states) as AgentLifecycle,
+			revision: rev,
+		} as AgentStateFrame;
+	if (type === "agent.lifecycle")
+		return {
+			...x,
+			type,
+			...ids,
+			agentId: aid,
+			cursor,
+			lifecycle: known(x.lifecycle, "lifecycle", states) as AgentLifecycle,
+			revision: rev,
+		} as AgentLifecycleFrame;
+	if (type === "agent.progress") {
+		const progress = finiteNumber(x.progress, "progress");
+		if (progress < 0 || progress > 1) fail("BOUNDS", "progress must be between zero and one", "progress");
+		const result = { ...x, type, ...ids, agentId: aid, cursor, progress, revision: rev } as AgentProgressFrame;
+		if (x.detail !== undefined) result.detail = boundedMetadata(x.detail, "detail", isSecretLikeKey);
+		return result;
+	}
+	if (type === "agent.event") {
+		const result = {
+			...x,
+			type,
+			...ids,
+			agentId: aid,
+			cursor,
+			event: controlFree(x.event, "event", 128),
+			revision: rev,
+		} as AgentEventFrame;
+		if (x.data !== undefined) result.data = object(x.data, "data");
+		return result;
+	}
+	const entries = boundedArray(x.entries, "entries").map((value, i) => decodeEntry(value, `entries[${i}]`));
+	for (const entry of entries)
+		if (entry.hostId !== ids.hostId || entry.sessionId !== ids.sessionId)
+			fail("INVALID_FRAME", "transcript entry belongs to another session", "entries");
+	return { ...x, type, ...ids, agentId: aid, cursor, entries, revision: rev } as AgentTranscriptFrame;
+}
 
-export interface FileListEntry { path:string; kind:"file"|"directory"|"symlink"; size?:number; revision?:Revision; [key:string]:unknown; }
-export interface FilesListFrame { v:typeof PROTOCOL_VERSION; type:"files.list"; hostId:HostId; sessionId:SessionId; path:string; entries:FileListEntry[]; cursor?:Cursor; revision?:Revision; [key:string]:unknown; }
-export interface FilesReadFrame { v:typeof PROTOCOL_VERSION; type:"files.read"; hostId:HostId; sessionId:SessionId; path:string; content:string; encoding?:"utf8"|"base64"; revision?:Revision; [key:string]:unknown; }
-export interface FilesWriteFrame { v:typeof PROTOCOL_VERSION; type:"files.write"; hostId:HostId; sessionId:SessionId; path:string; content:string; encoding?:"utf8"|"base64"; revision:Revision; [key:string]:unknown; }
-export interface FilesPatchFrame { v:typeof PROTOCOL_VERSION; type:"files.patch"; hostId:HostId; sessionId:SessionId; path:string; patch:string; revision:Revision; [key:string]:unknown; }
-export interface FilesDiffFrame { v:typeof PROTOCOL_VERSION; type:"files.diff"; hostId:HostId; sessionId:SessionId; path:string; diff:string; fromRevision?:Revision; toRevision?:Revision; [key:string]:unknown; }
-export type FilesAdditiveFrame=FilesListFrame|FilesReadFrame|FilesWriteFrame|FilesPatchFrame|FilesDiffFrame;
-function fileEntry(value:unknown,path:string):FileListEntry { const x=boundedMap(value,path), result={...x,path:safeRelativePath(x.path,`${path}.path`),kind:known(x.kind,`${path}.kind`,["file","directory","symlink"]) as FileListEntry["kind"]} as FileListEntry; if(x.size!==undefined) { const size=safeSeq(x.size,`${path}.size`); if(size>MAX_FILE_BYTES*1024) fail("BOUNDS","file size exceeds limit",`${path}.size`); result.size=size; } if(x.revision!==undefined) result.revision=revision(x.revision); return result; }
-export function decodeFilesAdditive(input:unknown):FilesAdditiveFrame { const x=frame(input,["files.list","files.read","files.write","files.patch","files.diff"]), type=x.type as string, ids=own(x), path=safeRelativePath(x.path); if(type === "files.list") { const result={...x,type,...ids,path,entries:boundedArray(x.entries,"entries").map((v,i)=>fileEntry(v,`entries[${i}]`))} as FilesListFrame; if(x.cursor!==undefined) result.cursor=cur(x.cursor); if(x.revision!==undefined) result.revision=revision(x.revision); return result; } if(type === "files.read") { const encoding=x.encoding===undefined?undefined:known(x.encoding,"encoding",["utf8","base64"]) as "utf8"|"base64", result={...x,type,...ids,path,content:encoding === "base64"?base64(x.content,"content",MAX_FILE_BYTES):boundedText(x.content,"content",MAX_FILE_BYTES)} as FilesReadFrame; if(encoding!==undefined) result.encoding=encoding; if(x.revision!==undefined) result.revision=revision(x.revision); return result; } if(type === "files.write") { const encoding=x.encoding===undefined?undefined:known(x.encoding,"encoding",["utf8","base64"]) as "utf8"|"base64", result={...x,type,...ids,path,content:encoding === "base64"?base64(x.content,"content",MAX_FILE_BYTES):boundedText(x.content,"content",MAX_FILE_BYTES),revision:revision(x.revision)} as FilesWriteFrame; if(encoding!==undefined) result.encoding=encoding; return result; } if(type === "files.patch") return {...x,type,...ids,path,patch:boundedText(x.patch,"patch",MAX_FILE_BYTES),revision:revision(x.revision)} as FilesPatchFrame; const result={...x,type,...ids,path,diff:boundedText(x.diff,"diff",MAX_FILE_BYTES)} as FilesDiffFrame; if(x.fromRevision!==undefined) result.fromRevision=revision(x.fromRevision); if(x.toRevision!==undefined) result.toRevision=revision(x.toRevision); return result; }
+export interface TerminalInputFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "terminal.input";
+	hostId: HostId;
+	sessionId: SessionId;
+	terminalId: TerminalId;
+	data: string;
+	encoding?: "utf8" | "base64";
+	[key: string]: unknown;
+}
+export interface TerminalOutputFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "terminal.output";
+	hostId: HostId;
+	sessionId: SessionId;
+	terminalId: TerminalId;
+	cursor: Cursor;
+	stream: "stdout" | "stderr";
+	data: string;
+	encoding?: "utf8" | "base64";
+	[key: string]: unknown;
+}
+export interface TerminalResizeFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "terminal.resize";
+	hostId: HostId;
+	sessionId: SessionId;
+	terminalId: TerminalId;
+	cols: number;
+	rows: number;
+	[key: string]: unknown;
+}
+export interface TerminalCloseFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "terminal.close";
+	hostId: HostId;
+	sessionId: SessionId;
+	terminalId: TerminalId;
+	reason?: string;
+	[key: string]: unknown;
+}
+export interface TerminalExitFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "terminal.exit";
+	hostId: HostId;
+	sessionId: SessionId;
+	terminalId: TerminalId;
+	cursor: Cursor;
+	exitCode: number;
+	signal?: string;
+	[key: string]: unknown;
+}
+export type TerminalClientFrame = TerminalInputFrame | TerminalResizeFrame | TerminalCloseFrame;
+export type TerminalServerFrame = TerminalOutputFrame | TerminalExitFrame;
+function dimension(value: unknown, path: string): number {
+	const n = safeSeq(value, path),
+		max = path.endsWith("cols") ? 1000 : 500;
+	if (n === 0 || n > max) fail("BOUNDS", "terminal dimension out of range", path);
+	return n;
+}
+export function decodeTerminalClient(input: unknown): TerminalClientFrame {
+	const x = frame(input, ["terminal.input", "terminal.resize", "terminal.close"]),
+		type = x.type as string,
+		ids = own(x),
+		tid = terminalId(x.terminalId);
+	if (type === "terminal.input") {
+		const encoding =
+				x.encoding === undefined
+					? undefined
+					: (known(x.encoding, "encoding", ["utf8", "base64"]) as "utf8" | "base64"),
+			data =
+				encoding === "base64"
+					? base64(x.data, "data", MAX_TERMINAL_OUTPUT_BYTES)
+					: boundedText(x.data, "data", MAX_TERMINAL_OUTPUT_BYTES),
+			result = { ...x, type, ...ids, terminalId: tid, data } as TerminalInputFrame;
+		if (encoding !== undefined) result.encoding = encoding;
+		return result;
+	}
+	if (type === "terminal.resize")
+		return {
+			...x,
+			type,
+			...ids,
+			terminalId: tid,
+			cols: dimension(x.cols, "cols"),
+			rows: dimension(x.rows, "rows"),
+		} as TerminalResizeFrame;
+	const result = { ...x, type, ...ids, terminalId: tid } as TerminalCloseFrame;
+	if (x.reason !== undefined) result.reason = controlFree(x.reason, "reason", 256);
+	return result;
+}
+export function decodeTerminalAdditive(input: unknown): TerminalServerFrame {
+	const x = frame(input, ["terminal.output", "terminal.exit"]),
+		type = x.type as string,
+		ids = own(x),
+		tid = terminalId(x.terminalId),
+		cursor = cur(x.cursor);
+	if (type === "terminal.output") {
+		const encoding =
+				x.encoding === undefined
+					? undefined
+					: (known(x.encoding, "encoding", ["utf8", "base64"]) as "utf8" | "base64"),
+			data =
+				encoding === "base64"
+					? base64(x.data, "data", MAX_TERMINAL_OUTPUT_BYTES)
+					: boundedText(x.data, "data", MAX_TERMINAL_OUTPUT_BYTES),
+			result = {
+				...x,
+				type,
+				...ids,
+				terminalId: tid,
+				cursor,
+				stream: known(x.stream, "stream", ["stdout", "stderr"]) as "stdout" | "stderr",
+				data,
+			} as TerminalOutputFrame;
+		if (encoding !== undefined) result.encoding = encoding;
+		return result;
+	}
+	const code = x.exitCode;
+	if (typeof code !== "number" || !Number.isSafeInteger(code))
+		fail("INVALID_FRAME", "exitCode must be safe integer", "exitCode");
+	const result = { ...x, type, ...ids, terminalId: tid, cursor, exitCode: code } as TerminalExitFrame;
+	if (x.signal !== undefined) result.signal = controlFree(x.signal, "signal", 128);
+	return result;
+}
 
-export interface AuditEvent { eventId:OperationId; hostId:HostId; sessionId?:SessionId; action:string; actor:string; timestamp:string; detail?:Record<string,unknown>; [key:string]:unknown; }
-export interface AuditTailFrame { v:typeof PROTOCOL_VERSION; type:"audit.tail"; hostId:HostId; cursor:Cursor; events:AuditEvent[]; [key:string]:unknown; }
-export interface AuditEventFrame { v:typeof PROTOCOL_VERSION; type:"audit.event"; hostId:HostId; event:AuditEvent; cursor:Cursor; [key:string]:unknown; }
-function auditEvent(value:unknown,path:string):AuditEvent { const x=boundedMap(value,path), result={...x,eventId:operationId(x.eventId),hostId:hostId(x.hostId),action:controlFree(x.action,`${path}.action`,128),actor:controlFree(x.actor,`${path}.actor`,256),timestamp:controlFree(x.timestamp,`${path}.timestamp`,128)} as AuditEvent; if(x.sessionId!==undefined) result.sessionId=sessionId(x.sessionId); if(x.detail!==undefined) result.detail=boundedMetadata(x.detail,`${path}.detail`,isSecretLikeKey); return result; }
-export function decodeAuditAdditive(input:unknown):AuditTailFrame|AuditEventFrame { const x=frame(input,["audit.tail","audit.event"]), type=x.type as string; if(type === "audit.tail") { const host=hostId(x.hostId), events=boundedArray(x.events,"events").map((v,i)=>auditEvent(v,`events[${i}]`)); for(const event of events) if(event.hostId!==host) fail("INVALID_FRAME","audit event belongs to another host","events"); return {...x,type,hostId:host,cursor:cur(x.cursor),events} as AuditTailFrame; } const host=hostId(x.hostId), event=auditEvent(x.event,"event"); if(event.hostId!==host) fail("INVALID_FRAME","audit event belongs to another host","event.hostId"); return {...x,type,hostId:host,event,cursor:cur(x.cursor)} as AuditEventFrame; }
+export interface FileListEntry {
+	path: string;
+	kind: "file" | "directory" | "symlink";
+	size?: number;
+	revision?: Revision;
+	[key: string]: unknown;
+}
+export interface FilesListFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "files.list";
+	hostId: HostId;
+	sessionId: SessionId;
+	path: string;
+	entries: FileListEntry[];
+	cursor?: Cursor;
+	revision?: Revision;
+	[key: string]: unknown;
+}
+export interface FilesReadFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "files.read";
+	hostId: HostId;
+	sessionId: SessionId;
+	path: string;
+	content: string;
+	encoding?: "utf8" | "base64";
+	revision?: Revision;
+	[key: string]: unknown;
+}
+export interface FilesWriteFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "files.write";
+	hostId: HostId;
+	sessionId: SessionId;
+	path: string;
+	content: string;
+	encoding?: "utf8" | "base64";
+	revision: Revision;
+	[key: string]: unknown;
+}
+export interface FilesPatchFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "files.patch";
+	hostId: HostId;
+	sessionId: SessionId;
+	path: string;
+	patch: string;
+	revision: Revision;
+	[key: string]: unknown;
+}
+export interface FilesDiffFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "files.diff";
+	hostId: HostId;
+	sessionId: SessionId;
+	path: string;
+	diff: string;
+	fromRevision?: Revision;
+	toRevision?: Revision;
+	[key: string]: unknown;
+}
+export type FilesAdditiveFrame = FilesListFrame | FilesReadFrame | FilesWriteFrame | FilesPatchFrame | FilesDiffFrame;
+function fileEntry(value: unknown, path: string): FileListEntry {
+	const x = boundedMap(value, path),
+		result = {
+			...x,
+			path: safeRelativePath(x.path, `${path}.path`),
+			kind: known(x.kind, `${path}.kind`, ["file", "directory", "symlink"]) as FileListEntry["kind"],
+		} as FileListEntry;
+	if (x.size !== undefined) {
+		const size = safeSeq(x.size, `${path}.size`);
+		if (size > MAX_FILE_BYTES * 1024) fail("BOUNDS", "file size exceeds limit", `${path}.size`);
+		result.size = size;
+	}
+	if (x.revision !== undefined) result.revision = revision(x.revision);
+	return result;
+}
+export function decodeFilesAdditive(input: unknown): FilesAdditiveFrame {
+	const x = frame(input, ["files.list", "files.read", "files.write", "files.patch", "files.diff"]),
+		type = x.type as string,
+		ids = own(x),
+		path = safeRelativePath(x.path);
+	if (type === "files.list") {
+		const result = {
+			...x,
+			type,
+			...ids,
+			path,
+			entries: boundedArray(x.entries, "entries").map((v, i) => fileEntry(v, `entries[${i}]`)),
+		} as FilesListFrame;
+		if (x.cursor !== undefined) result.cursor = cur(x.cursor);
+		if (x.revision !== undefined) result.revision = revision(x.revision);
+		return result;
+	}
+	if (type === "files.read") {
+		const encoding =
+				x.encoding === undefined
+					? undefined
+					: (known(x.encoding, "encoding", ["utf8", "base64"]) as "utf8" | "base64"),
+			result = {
+				...x,
+				type,
+				...ids,
+				path,
+				content:
+					encoding === "base64"
+						? base64(x.content, "content", MAX_FILE_BYTES)
+						: boundedText(x.content, "content", MAX_FILE_BYTES),
+			} as FilesReadFrame;
+		if (encoding !== undefined) result.encoding = encoding;
+		if (x.revision !== undefined) result.revision = revision(x.revision);
+		return result;
+	}
+	if (type === "files.write") {
+		const encoding =
+				x.encoding === undefined
+					? undefined
+					: (known(x.encoding, "encoding", ["utf8", "base64"]) as "utf8" | "base64"),
+			result = {
+				...x,
+				type,
+				...ids,
+				path,
+				content:
+					encoding === "base64"
+						? base64(x.content, "content", MAX_FILE_BYTES)
+						: boundedText(x.content, "content", MAX_FILE_BYTES),
+				revision: revision(x.revision),
+			} as FilesWriteFrame;
+		if (encoding !== undefined) result.encoding = encoding;
+		return result;
+	}
+	if (type === "files.patch")
+		return {
+			...x,
+			type,
+			...ids,
+			path,
+			patch: boundedText(x.patch, "patch", MAX_FILE_BYTES),
+			revision: revision(x.revision),
+		} as FilesPatchFrame;
+	const result = { ...x, type, ...ids, path, diff: boundedText(x.diff, "diff", MAX_FILE_BYTES) } as FilesDiffFrame;
+	if (x.fromRevision !== undefined) result.fromRevision = revision(x.fromRevision);
+	if (x.toRevision !== undefined) result.toRevision = revision(x.toRevision);
+	return result;
+}
 
-export type CatalogKind="tool"|"model"|"command"|"setting"|"skill"|"agent"|"provider"|"mode";
-export interface CatalogItem { id:CatalogId; kind:CatalogKind; name:string; description?:string; capabilities?:string[]; supported?:boolean; reason?:string; metadata?:Record<string,unknown>; [key:string]:unknown; }
-export interface CatalogFrame { v:typeof PROTOCOL_VERSION; type:"catalog"; hostId:HostId; revision:Revision; items:CatalogItem[]; [key:string]:unknown; }
-export interface SettingsFrame { v:typeof PROTOCOL_VERSION; type:"settings"; hostId:HostId; revision:Revision; settings:Record<string,unknown>; [key:string]:unknown; }
-function metadata(value:unknown,path:string):Record<string,unknown> { return boundedMetadata(value,path,isSecretLikeKey); }
-function catalogItem(value:unknown,path:string):CatalogItem { const x=boundedMap(value,path), result={...x,id:catalogId(x.id),kind:known(x.kind,`${path}.kind`,["tool","model","command","setting","skill","agent","provider","mode"]) as CatalogKind,name:controlFree(x.name,`${path}.name`,256)} as CatalogItem; if(x.description!==undefined) result.description=boundedText(x.description,`${path}.description`,4096); if(x.capabilities!==undefined) result.capabilities=boundedArray(x.capabilities,`${path}.capabilities`,128).map((v,i)=>controlFree(v,`${path}.capabilities[${i}]`,128)); if(x.supported!==undefined){if(typeof x.supported!=="boolean") fail("INVALID_FRAME","supported must be boolean",`${path}.supported`); result.supported=x.supported;} if(x.reason!==undefined) result.reason=boundedText(x.reason,`${path}.reason`,2048); if(x.metadata!==undefined) result.metadata=metadata(x.metadata,`${path}.metadata`); return result; }
-export function decodeCatalog(input:unknown):CatalogFrame|SettingsFrame { const x=frame(input,["catalog","settings"]), type=x.type as string, host=hostId(x.hostId), rev=revision(x.revision); if(type === "catalog") return {...x,type,hostId:host,revision:rev,items:boundedArray(x.items,"items").map((v,i)=>catalogItem(v,`items[${i}]`))} as CatalogFrame; return {...x,type,hostId:host,revision:rev,settings:metadata(x.settings,"settings")} as SettingsFrame; }
+export interface AuditEvent {
+	eventId: OperationId;
+	hostId: HostId;
+	sessionId?: SessionId;
+	action: string;
+	actor: string;
+	timestamp: string;
+	detail?: Record<string, unknown>;
+	[key: string]: unknown;
+}
+export interface AuditTailFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "audit.tail";
+	hostId: HostId;
+	cursor: Cursor;
+	events: AuditEvent[];
+	[key: string]: unknown;
+}
+export interface AuditEventFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "audit.event";
+	hostId: HostId;
+	event: AuditEvent;
+	cursor: Cursor;
+	[key: string]: unknown;
+}
+function auditEvent(value: unknown, path: string): AuditEvent {
+	const x = boundedMap(value, path),
+		result = {
+			...x,
+			eventId: operationId(x.eventId),
+			hostId: hostId(x.hostId),
+			action: controlFree(x.action, `${path}.action`, 128),
+			actor: controlFree(x.actor, `${path}.actor`, 256),
+			timestamp: controlFree(x.timestamp, `${path}.timestamp`, 128),
+		} as AuditEvent;
+	if (x.sessionId !== undefined) result.sessionId = sessionId(x.sessionId);
+	if (x.detail !== undefined) result.detail = boundedMetadata(x.detail, `${path}.detail`, isSecretLikeKey);
+	return result;
+}
+export function decodeAuditAdditive(input: unknown): AuditTailFrame | AuditEventFrame {
+	const x = frame(input, ["audit.tail", "audit.event"]),
+		type = x.type as string;
+	if (type === "audit.tail") {
+		const host = hostId(x.hostId),
+			events = boundedArray(x.events, "events").map((v, i) => auditEvent(v, `events[${i}]`));
+		for (const event of events)
+			if (event.hostId !== host) fail("INVALID_FRAME", "audit event belongs to another host", "events");
+		return { ...x, type, hostId: host, cursor: cur(x.cursor), events } as AuditTailFrame;
+	}
+	const host = hostId(x.hostId),
+		event = auditEvent(x.event, "event");
+	if (event.hostId !== host) fail("INVALID_FRAME", "audit event belongs to another host", "event.hostId");
+	return { ...x, type, hostId: host, event, cursor: cur(x.cursor) } as AuditEventFrame;
+}
 
-export type PreviewState="launching"|"ready"|"running"|"stopped"|"failed";
-export interface PreviewLaunchFrame { v:typeof PROTOCOL_VERSION; type:"preview.launch"; hostId:HostId; sessionId:SessionId; previewId:PreviewId; url:string; revision:Revision; [key:string]:unknown; }
-export interface PreviewStateFrame { v:typeof PROTOCOL_VERSION; type:"preview.state"; hostId:HostId; sessionId:SessionId; previewId:PreviewId; state:PreviewState; revision:Revision; error?:string; [key:string]:unknown; }
-export interface PreviewNavigationFrame { v:typeof PROTOCOL_VERSION; type:"preview.navigation"; hostId:HostId; sessionId:SessionId; previewId:PreviewId; url:string; [key:string]:unknown; }
-export interface PreviewCaptureFrame { v:typeof PROTOCOL_VERSION; type:"preview.capture"; hostId:HostId; sessionId:SessionId; previewId:PreviewId; content:string; encoding:"base64"; mimeType:string; [key:string]:unknown; }
-export interface PreviewErrorFrame { v:typeof PROTOCOL_VERSION; type:"preview.error"; hostId:HostId; sessionId:SessionId; previewId:PreviewId; code:string; message:string; [key:string]:unknown; }
-export type PreviewFrame=PreviewLaunchFrame|PreviewStateFrame|PreviewNavigationFrame|PreviewCaptureFrame|PreviewErrorFrame;
-export function decodePreview(input:unknown):PreviewFrame { const x=frame(input,["preview.launch","preview.state","preview.navigation","preview.capture","preview.error"]), type=x.type as string, ids=own(x), pid=previewId(x.previewId); if(type === "preview.launch") return {...x,type,...ids,previewId:pid,url:httpUrl(x.url,"url"),revision:revision(x.revision)} as PreviewLaunchFrame; if(type === "preview.state"){const result={...x,type,...ids,previewId:pid,state:known(x.state,"state",["launching","ready","running","stopped","failed"]) as PreviewState,revision:revision(x.revision)} as PreviewStateFrame; if(x.error!==undefined) result.error=boundedText(x.error,"error",2048); return result;} if(type === "preview.navigation") return {...x,type,...ids,previewId:pid,url:httpUrl(x.url,"url")} as PreviewNavigationFrame; if(type === "preview.capture") return {...x,type,...ids,previewId:pid,content:base64(x.content,"content",MAX_FILE_BYTES),encoding:"base64",mimeType:controlFree(x.mimeType,"mimeType",128)} as PreviewCaptureFrame; return {...x,type,...ids,previewId:pid,code:controlFree(x.code,"code",128),message:boundedText(x.message,"message",2048)} as PreviewErrorFrame; }
+export type CatalogKind = "tool" | "model" | "command" | "setting" | "skill" | "agent" | "provider" | "mode";
+export interface CatalogItem {
+	id: CatalogId;
+	kind: CatalogKind;
+	name: string;
+	description?: string;
+	capabilities?: string[];
+	supported?: boolean;
+	reason?: string;
+	metadata?: Record<string, unknown>;
+	[key: string]: unknown;
+}
+export interface CatalogFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "catalog";
+	hostId: HostId;
+	revision: Revision;
+	items: CatalogItem[];
+	[key: string]: unknown;
+}
+export interface SettingsFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "settings";
+	hostId: HostId;
+	revision: Revision;
+	settings: Record<string, unknown>;
+	[key: string]: unknown;
+}
+function metadata(value: unknown, path: string): Record<string, unknown> {
+	return boundedMetadata(value, path, isSecretLikeKey);
+}
+function catalogItem(value: unknown, path: string): CatalogItem {
+	const x = boundedMap(value, path),
+		result = {
+			...x,
+			id: catalogId(x.id),
+			kind: known(x.kind, `${path}.kind`, [
+				"tool",
+				"model",
+				"command",
+				"setting",
+				"skill",
+				"agent",
+				"provider",
+				"mode",
+			]) as CatalogKind,
+			name: controlFree(x.name, `${path}.name`, 256),
+		} as CatalogItem;
+	if (x.description !== undefined) result.description = boundedText(x.description, `${path}.description`, 4096);
+	if (x.capabilities !== undefined)
+		result.capabilities = boundedArray(x.capabilities, `${path}.capabilities`, 128).map((v, i) =>
+			controlFree(v, `${path}.capabilities[${i}]`, 128),
+		);
+	if (x.supported !== undefined) {
+		if (typeof x.supported !== "boolean") fail("INVALID_FRAME", "supported must be boolean", `${path}.supported`);
+		result.supported = x.supported;
+	}
+	if (x.reason !== undefined) result.reason = boundedText(x.reason, `${path}.reason`, 2048);
+	if (x.metadata !== undefined) result.metadata = metadata(x.metadata, `${path}.metadata`);
+	return result;
+}
+export function decodeCatalog(input: unknown): CatalogFrame | SettingsFrame {
+	const x = frame(input, ["catalog", "settings"]),
+		type = x.type as string,
+		host = hostId(x.hostId),
+		rev = revision(x.revision);
+	if (type === "catalog")
+		return {
+			...x,
+			type,
+			hostId: host,
+			revision: rev,
+			items: boundedArray(x.items, "items").map((v, i) => catalogItem(v, `items[${i}]`)),
+		} as CatalogFrame;
+	return {
+		...x,
+		type,
+		hostId: host,
+		revision: rev,
+		settings: boundedSettings(x.settings, "settings"),
+	} as SettingsFrame;
+}
 
-export type AdditiveServerFrame=WatchFrame|LeaseFrame|PromptLeaseFrame|AgentAdditiveFrame|TerminalServerFrame|FilesAdditiveFrame|AuditTailFrame|AuditEventFrame|CatalogFrame|SettingsFrame|PreviewFrame;
-export function decodeAdditiveServerFrame(input:unknown):AdditiveServerFrame { const type=inputObject(input).type; if(typeof type!=="string") fail("INVALID_FRAME","frame type must be string","type"); if(["host.watch","session.watch","session.state","session.delta"].includes(type)) return decodeWatch(input); if(type === "lease"||type === "prompt.lease") return decodeLease(input); if(type.startsWith("agent.")) return decodeAgentAdditive(input); if(type === "terminal.output"||type === "terminal.exit") return decodeTerminalAdditive(input); if(type.startsWith("files.")) return decodeFilesAdditive(input); if(type === "audit.tail"||type === "audit.event") return decodeAuditAdditive(input); if(type === "catalog"||type === "settings") return decodeCatalog(input); if(type.startsWith("preview.")) return decodePreview(input); fail("UNKNOWN_FRAME","unknown additive server frame family","type"); }
-export function isNegotiatedFeature(feature:string, granted:readonly string[]):boolean { return granted.includes(feature); }
+export type PreviewState = "launching" | "ready" | "running" | "stopped" | "failed";
+export interface PreviewLaunchFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "preview.launch";
+	hostId: HostId;
+	sessionId: SessionId;
+	previewId: PreviewId;
+	url: string;
+	revision: Revision;
+	[key: string]: unknown;
+}
+export interface PreviewStateFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "preview.state";
+	hostId: HostId;
+	sessionId: SessionId;
+	previewId: PreviewId;
+	state: PreviewState;
+	revision: Revision;
+	error?: string;
+	[key: string]: unknown;
+}
+export interface PreviewNavigationFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "preview.navigation";
+	hostId: HostId;
+	sessionId: SessionId;
+	previewId: PreviewId;
+	url: string;
+	[key: string]: unknown;
+}
+export interface PreviewCaptureFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "preview.capture";
+	hostId: HostId;
+	sessionId: SessionId;
+	previewId: PreviewId;
+	content: string;
+	encoding: "base64";
+	mimeType: string;
+	[key: string]: unknown;
+}
+export interface PreviewErrorFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "preview.error";
+	hostId: HostId;
+	sessionId: SessionId;
+	previewId: PreviewId;
+	code: string;
+	message: string;
+	[key: string]: unknown;
+}
+export type PreviewFrame =
+	| PreviewLaunchFrame
+	| PreviewStateFrame
+	| PreviewNavigationFrame
+	| PreviewCaptureFrame
+	| PreviewErrorFrame;
+export function decodePreview(input: unknown): PreviewFrame {
+	const x = frame(input, [
+			"preview.launch",
+			"preview.state",
+			"preview.navigation",
+			"preview.capture",
+			"preview.error",
+		]),
+		type = x.type as string,
+		ids = own(x),
+		pid = previewId(x.previewId);
+	if (type === "preview.launch")
+		return {
+			...x,
+			type,
+			...ids,
+			previewId: pid,
+			url: httpUrl(x.url, "url"),
+			revision: revision(x.revision),
+		} as PreviewLaunchFrame;
+	if (type === "preview.state") {
+		const result = {
+			...x,
+			type,
+			...ids,
+			previewId: pid,
+			state: known(x.state, "state", ["launching", "ready", "running", "stopped", "failed"]) as PreviewState,
+			revision: revision(x.revision),
+		} as PreviewStateFrame;
+		if (x.error !== undefined) result.error = boundedText(x.error, "error", 2048);
+		return result;
+	}
+	if (type === "preview.navigation")
+		return { ...x, type, ...ids, previewId: pid, url: httpUrl(x.url, "url") } as PreviewNavigationFrame;
+	if (type === "preview.capture")
+		return {
+			...x,
+			type,
+			...ids,
+			previewId: pid,
+			content: base64(x.content, "content", MAX_FILE_BYTES),
+			encoding: "base64",
+			mimeType: controlFree(x.mimeType, "mimeType", 128),
+		} as PreviewCaptureFrame;
+	return {
+		...x,
+		type,
+		...ids,
+		previewId: pid,
+		code: controlFree(x.code, "code", 128),
+		message: boundedText(x.message, "message", 2048),
+	} as PreviewErrorFrame;
+}
+
+export type AdditiveServerFrame =
+	| WatchFrame
+	| LeaseFrame
+	| PromptLeaseFrame
+	| AgentAdditiveFrame
+	| TerminalServerFrame
+	| FilesAdditiveFrame
+	| AuditTailFrame
+	| AuditEventFrame
+	| CatalogFrame
+	| SettingsFrame
+	| PreviewFrame;
+export function decodeAdditiveServerFrame(input: unknown): AdditiveServerFrame {
+	const type = inputObject(input).type;
+	if (typeof type !== "string") fail("INVALID_FRAME", "frame type must be string", "type");
+	if (["host.watch", "session.watch", "session.state", "session.delta"].includes(type)) return decodeWatch(input);
+	if (type === "lease" || type === "prompt.lease") return decodeLease(input);
+	if (type.startsWith("agent.")) return decodeAgentAdditive(input);
+	if (type === "terminal.output" || type === "terminal.exit") return decodeTerminalAdditive(input);
+	if (type.startsWith("files.")) return decodeFilesAdditive(input);
+	if (type === "audit.tail" || type === "audit.event") return decodeAuditAdditive(input);
+	if (type === "catalog" || type === "settings") return decodeCatalog(input);
+	if (type.startsWith("preview.")) return decodePreview(input);
+	fail("UNKNOWN_FRAME", "unknown additive server frame family", "type");
+}
+export function isNegotiatedFeature(feature: string, granted: readonly string[]): boolean {
+	return granted.includes(feature);
+}

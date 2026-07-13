@@ -45,15 +45,22 @@ export type RpcCommand =
 	| { id?: string; type: "set_subagent_subscription"; level: RpcSubagentSubscriptionLevel }
 	| { id?: string; type: "get_subagents" }
 	| { id?: string; type: "get_subagent_messages"; subagentId?: string; sessionFile?: string; fromByte?: number }
-
-	// Model
-	| { id?: string; type: "set_model"; provider: string; modelId: string }
+	| {
+			id?: string;
+			type: "set_model";
+			selector?: string;
+			role?: string;
+			provider?: string;
+			modelId?: string;
+			persist?: boolean;
+	  }
 	| { id?: string; type: "cycle_model" }
 	| { id?: string; type: "get_available_models" }
 
 	// Thinking
-	| { id?: string; type: "set_thinking_level"; level: ThinkingLevel }
+	| { id?: string; type: "set_thinking_level"; level: ThinkingLevel | "auto" }
 	| { id?: string; type: "cycle_thinking_level" }
+	| { id?: string; type: "set_fast"; enabled: boolean }
 
 	// Queue modes
 	| { id?: string; type: "set_steering_mode"; mode: "all" | "one-at-a-time" }
@@ -92,11 +99,11 @@ export type RpcCommand =
 // ============================================================================
 // RPC State
 // ============================================================================
-
 export interface RpcSessionState {
 	model?: Model;
-	thinkingLevel: ThinkingLevel | undefined;
 	isStreaming: boolean;
+	thinkingLevel: ThinkingLevel | "auto" | undefined;
+	fast: boolean;
 	isCompacting: boolean;
 	steeringMode: "all" | "one-at-a-time";
 	isPaused?: boolean;
@@ -254,6 +261,7 @@ export type RpcResponse =
 
 	// Thinking
 	| { id?: string; type: "response"; command: "set_thinking_level"; success: true }
+	| { id?: string; type: "response"; command: "set_fast"; success: true; data: { enabled: boolean } }
 	| {
 			id?: string;
 			type: "response";

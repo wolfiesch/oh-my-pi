@@ -8,9 +8,9 @@ import {
 	type ConfirmationChallenge,
 	type ConfirmFrame,
 	decodeClientFrame,
-	decodeSessionStateResult,
 	decodeCursor,
 	decodeSessionPromptArguments,
+	decodeSessionStateResult,
 	type HelloFrame,
 	type HostId,
 	parseBounded,
@@ -18,18 +18,18 @@ import {
 	type ResultFrame,
 	requiredCapability,
 	type ServerFrame,
-	type SessionStateResult,
-	type SessionRef,
 	type SessionId,
+	type SessionRef,
+	type SessionStateResult,
 	utf8ByteLength,
 } from "@oh-my-pi/app-wire";
 import { AppserverCommandHandlers } from "./command-handler.ts";
+import { compareSessionRecords, SessionEntryProjector, stableProjectId } from "./discovery.ts";
 import { IdempotencyStore } from "./idempotency.ts";
-import { SessionEntryProjector, compareSessionRecords, stableProjectId } from "./discovery.ts";
 import { createEpoch, createHostId, defaultSocketPath, loadPersistentHostId, unixSocketActive } from "./identity.ts";
 import {
-	DesktopOperationDispatcher,
 	commandFeature,
+	DesktopOperationDispatcher,
 	type OperationContext,
 	operationCapabilities,
 } from "./operations/dispatcher.ts";
@@ -45,9 +45,11 @@ import {
 	unlinkIfExists,
 } from "./ownership.ts";
 import { SessionProjection } from "./projection.ts";
+import { BunRemoteListener, createListenerPlan, createServeProxyPlan } from "./remote/listener.ts";
+import type { RemoteConnection, RemoteListenerConfig } from "./remote/types.ts";
 import { BunRpcChildFactory, RpcChildSupervisor } from "./rpc-child.ts";
-import { TranscriptEventTranslator, asAppWireEvent } from "./transcript-events.ts";
 import { SubagentProjection } from "./subagent-projection.ts";
+import { asAppWireEvent, TranscriptEventTranslator } from "./transcript-events.ts";
 import type {
 	AppserverHandle,
 	AppserverOptions,
@@ -56,7 +58,6 @@ import type {
 	CommandOutcome,
 	ConnectionTransport,
 	LockCheckHook,
-	RemoteAuthorizationContext,
 	RemoteConnectionPolicy,
 	RemoteHelloDecision,
 	RpcChildFactory,
@@ -64,8 +65,6 @@ import type {
 	SessionDiscovery,
 	SessionRecord,
 } from "./types.ts";
-import { BunRemoteListener, createListenerPlan, createServeProxyPlan } from "./remote/listener.ts";
-import type { RemoteConnection, RemoteListenerConfig } from "./remote/types.ts";
 
 const clock: Clock = { now: () => new Date() };
 function response(
@@ -160,10 +159,21 @@ function safeSessionState(value: unknown): SessionStateResult {
 						id: model.id,
 						provider: model.provider,
 						...(typeof model.name === "string" ? { displayName: model.name } : {}),
+						...(typeof model.selector === "string"
+							? { selector: model.selector }
+							: typeof raw.modelSelector === "string"
+								? { selector: raw.modelSelector }
+								: {}),
+						...(typeof model.role === "string"
+							? { role: model.role }
+							: typeof raw.modelRole === "string"
+								? { role: raw.modelRole }
+								: {}),
 					},
 				}
 			: {}),
 		...(raw.thinkingLevel === undefined ? {} : { thinking: raw.thinkingLevel }),
+		...(typeof raw.fast === "boolean" ? { fast: raw.fast } : {}),
 		...(raw.sessionName === undefined ? {} : { sessionName: raw.sessionName }),
 		...(context
 			? { contextUsage: { used: context.used ?? context.tokens, limit: context.limit ?? context.contextWindow } }
@@ -867,7 +877,8 @@ export class LocalAppserver implements AppserverHandle {
 				command.command === "session.compact" ||
 				command.command === "session.rename" ||
 				command.command === "session.model.set" ||
-				command.command === "session.thinking.set"
+				command.command === "session.thinking.set" ||
+				command.command === "session.fast.set"
 			) {
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
 				const type =
@@ -883,17 +894,25 @@ export class LocalAppserver implements AppserverHandle {
 										? "set_session_name"
 										: command.command === "session.model.set"
 											? "set_model"
-											: "set_thinking_level";
+											: command.command === "session.thinking.set"
+												? "set_thinking_level"
+												: "set_fast";
 				const args =
 					command.command === "session.compact"
 						? { customInstructions: command.args.instructions }
 						: command.command === "session.rename"
 							? { name: command.args.name }
 							: command.command === "session.model.set"
-								? { provider: command.args.provider, modelId: command.args.modelId }
+								? {
+										selector: command.args.selector,
+										role: command.args.role,
+										persist: command.args.persistence === "settings",
+									}
 								: command.command === "session.thinking.set"
 									? { level: command.args.level }
-									: {};
+									: command.command === "session.fast.set"
+										? { enabled: command.args.enabled }
+										: {};
 				const result = await supervisor.call({ type, ...args }, command.requestId, controller.signal);
 				if (!result.success)
 					outcome = {
@@ -916,9 +935,20 @@ export class LocalAppserver implements AppserverHandle {
 										: command.command === "session.rename"
 											? { renamed: true }
 											: { accepted: true };
+					if (
+						command.command === "session.model.set" ||
+						command.command === "session.thinking.set" ||
+						command.command === "session.fast.set"
+					)
+						await this.refreshState(command.sessionId!, supervisor, command.requestId);
 					outcome = { frame: response(this.hostId, command, true, data) };
 				}
-				this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId);
+				if (
+					command.command !== "session.model.set" &&
+					command.command !== "session.thinking.set" &&
+					command.command !== "session.fast.set"
+				)
+					this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId);
 			} else if (command.command === "session.prompt") {
 				if (this.#closedSessions.has(command.sessionId!)) throw new Error("session is closed");
 				this.updateStatus(command.sessionId!, "active");
@@ -1108,6 +1138,7 @@ export class LocalAppserver implements AppserverHandle {
 		if (this.#stopping || this.#closedSessions.has(sessionId)) throw new Error("session is closed");
 		const projection = this.#projections.get(sessionId)!;
 		const transcript = new TranscriptEventTranslator();
+		transcript.observeKnownEntries(projection.value.entries);
 		this.#transcripts.set(sessionId, transcript);
 		const subagents = new SubagentProjection(this.hostId, sessionId);
 		this.#subagents.set(sessionId, subagents);
@@ -1123,19 +1154,24 @@ export class LocalAppserver implements AppserverHandle {
 							? (value as Record<string, unknown>)
 							: undefined;
 					if (!raw) return;
-					transcript.observeSessionEntry(raw);
-					for (const entry of projector.project(raw)) {
+					const entries = projector.project(raw);
+					const settlementEvents = transcript.observeSessionEntry(raw, entries);
+					for (const entry of entries) {
 						const output = projection.appendEntry(entry);
 						if (output) this.broadcast(sessionId, output);
 					}
+					for (const event of settlementEvents)
+						this.broadcast(sessionId, projection.appendEvent(asAppWireEvent(event)));
 				},
 				event: frame => {
 					const agentFrame = subagents.applyFrame(frame);
 					if (agentFrame) this.broadcast(sessionId, agentFrame);
 					for (const event of transcript.translate(frame)) {
 						this.broadcast(sessionId, projection.appendEvent(asAppWireEvent(event)));
-						if (event.type === "turn.start") this.updateStatus(sessionId, "active");
-						else if (event.type === "turn.end") this.updateStatus(sessionId, "idle");
+						if (event.type === "turn.start" || event.type === "agent.start")
+							this.updateStatus(sessionId, "active");
+						else if (event.type === "turn.end" || event.type === "agent.end")
+							this.updateStatus(sessionId, "idle");
 					}
 				},
 				crashed: () => {

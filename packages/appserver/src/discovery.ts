@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readdir, readFile, stat, unlink } from "node:fs/promises";
 import { realpathSync } from "node:fs";
+import { chmod, mkdir, open, readdir, readFile, stat, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { entryId, hostId, parseBounded, projectId, sessionId } from "@oh-my-pi/app-wire";
 import type { DurableEntry, EntryId, HostId, ProjectId, SessionId } from "@oh-my-pi/app-wire";
+import { entryId, hostId, parseBounded, projectId, sessionId } from "@oh-my-pi/app-wire";
 import type { FileSystem, SessionDiscovery, SessionRecord } from "./types.ts";
 
 const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
+const MAX_METADATA_BYTES = 128 * 1024;
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_SNAPSHOT_ENTRIES = 1000;
 const MAX_SNAPSHOT_BYTES = 512 * 1024;
@@ -16,7 +17,10 @@ const MAX_ARGUMENT_BYTES = 128 * 1024;
 const MAX_SNAPSHOT_NODES = 16_000;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-const realFs: FileSystem = {
+type DiscoveryFileSystem = FileSystem & {
+	readFileSlice?: (path: string, maxBytes: number) => Promise<string | Uint8Array>;
+};
+const realFs: DiscoveryFileSystem = {
 	mkdir: async (path, options) => {
 		await mkdir(path, options);
 	},
@@ -31,6 +35,16 @@ const realFs: FileSystem = {
 	stat: async path => await stat(path),
 	readdir: async path => (await readdir(path, { withFileTypes: true })).map(entry => join(path, entry.name)),
 	readFile: async path => await readFile(path),
+	readFileSlice: async (path, maxBytes) => {
+		const handle = await open(path, "r");
+		try {
+			const buffer = Buffer.allocUnsafe(maxBytes);
+			const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+			return buffer.subarray(0, bytesRead);
+		} finally {
+			await handle.close();
+		}
+	},
 };
 
 function boundUtf8(value: string, maxBytes: number): string {
@@ -512,8 +526,7 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
 	}
 	const header = values[headerIndex];
 	if (
-		!header ||
-		header.type !== "session" ||
+		header?.type !== "session" ||
 		typeof header.id !== "string" ||
 		!header.id ||
 		typeof header.cwd !== "string" ||
@@ -542,6 +555,58 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
 		entries: normalized.entries,
 	};
 }
+/** Build a metadata-only record for oversized transcripts; entries stay empty because SessionRecord has no truncation flag. */
+function parseTranscriptMetadata(input: string | Uint8Array, path: string): SessionRecord {
+	const bytes = typeof input === "string" ? encoder.encode(input).byteLength : input.byteLength;
+	if (bytes > MAX_METADATA_BYTES) throw new Error("metadata prefix exceeds limit");
+	const text = typeof input === "string" ? input : new TextDecoder("utf-8", { fatal: true }).decode(input);
+	let fixedTitle: string | undefined;
+	let header: Record<string, unknown> | undefined;
+	for (const line of text.split(/\r?\n/u)) {
+		if (!line) continue;
+		if (encoder.encode(line).byteLength > MAX_LINE_BYTES) throw new Error("transcript line exceeds limit");
+		const value = parseBounded(line);
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid transcript entry");
+		const entry = value as Record<string, unknown>;
+		if (!header && entry.type === "title") {
+			if (entry.v !== 1 || typeof entry.title !== "string") throw new Error("invalid transcript prelude");
+			fixedTitle = cleanText(entry.title, 512, true) || undefined;
+			continue;
+		}
+		if (entry.type === "session") {
+			header = entry;
+			break;
+		}
+		if (!header) throw new Error("invalid transcript header");
+	}
+	if (
+		!header ||
+		typeof header.id !== "string" ||
+		!header.id ||
+		typeof header.cwd !== "string" ||
+		!header.cwd ||
+		typeof header.timestamp !== "string" ||
+		!Number.isFinite(Date.parse(header.timestamp))
+	)
+		throw new Error("invalid transcript header");
+	const cwd = resolve(header.cwd);
+	return {
+		sessionId: sessionId(header.id),
+		path,
+		cwd,
+		projectId: stableProjectId(cwd),
+		projectName: basename(cwd),
+		title:
+			cleanText(
+				fixedTitle || (typeof header.title === "string" ? header.title : undefined) || "Untitled",
+				512,
+				true,
+			) || "Untitled",
+		updatedAt: "",
+		status: "idle",
+		entries: [],
+	};
+}
 
 interface FileIndexEntry {
 	readonly signature: string;
@@ -556,15 +621,28 @@ export function compareSessionRecords(a: SessionRecord, b: SessionRecord): numbe
 	return 0;
 }
 
+function isEncodedProjectDirectory(path: string): boolean {
+	const name = path.slice(path.lastIndexOf("/") + 1);
+	return name === "-" || name.startsWith("-");
+}
+
 export class FileSessionDiscovery implements SessionDiscovery {
 	private readonly index = new Map<string, FileIndexEntry>();
 
 	constructor(
 		private readonly root: string,
-		private readonly fs: FileSystem = realFs,
+		private readonly fs: DiscoveryFileSystem = realFs,
 		private readonly host: HostId = hostId("discovery"),
 	) {}
-	private async files(path: string): Promise<string[]> {
+	private async isSessionArtifactDirectory(path: string): Promise<boolean> {
+		try {
+			const sibling = await this.fs.stat(`${path}.jsonl`);
+			return sibling.isFile();
+		} catch {
+			return false;
+		}
+	}
+	private async files(path: string, depth = 0): Promise<string[]> {
 		const children = await this.fs.readdir(path);
 		const output: string[] = [];
 		for (const child of children.sort()) {
@@ -574,8 +652,16 @@ export class FileSessionDiscovery implements SessionDiscovery {
 			} catch {
 				continue;
 			}
-			if (info.isDirectory()) output.push(...(await this.files(child)));
-			else if (info.isFile() && child.endsWith(".jsonl")) output.push(child);
+			if (info.isFile() && child.endsWith(".jsonl")) {
+				if (depth <= 1) output.push(child);
+			} else if (
+				depth === 0 &&
+				info.isDirectory() &&
+				isEncodedProjectDirectory(child) &&
+				!(await this.isSessionArtifactDirectory(child))
+			) {
+				output.push(...(await this.files(child, 1)));
+			}
 		}
 		return output;
 	}
@@ -600,15 +686,16 @@ export class FileSessionDiscovery implements SessionDiscovery {
 			seen.add(identity);
 			try {
 				const fileStat = await this.fs.stat(path);
-				if (fileStat.size > MAX_TRANSCRIPT_BYTES) {
-					this.index.delete(identity);
-					continue;
-				}
 				const signature = `${fileStat.size}:${fileStat.mtimeMs}:${fileStat.ctimeMs ?? ""}:${fileStat.dev ?? ""}:${fileStat.ino ?? ""}`;
 				const cached = this.index.get(identity);
 				let record = cached?.signature === signature ? cached.record : undefined;
 				if (!record) {
-					record = parseTranscript(await this.fs.readFile(path), path, this.host);
+					if (fileStat.size > MAX_TRANSCRIPT_BYTES) {
+						if (!this.fs.readFileSlice) throw new Error("oversized transcript has no bounded reader");
+						record = parseTranscriptMetadata(await this.fs.readFileSlice(path, MAX_METADATA_BYTES), path);
+					} else {
+						record = parseTranscript(await this.fs.readFile(path), path, this.host);
+					}
 					record.updatedAt = new Date(fileStat.mtimeMs).toISOString();
 					this.index.set(identity, { signature, record });
 				} else if (record.path !== path) {

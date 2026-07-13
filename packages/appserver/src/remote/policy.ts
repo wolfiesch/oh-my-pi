@@ -1,27 +1,22 @@
 import { randomUUID } from "node:crypto";
 import {
-	COMMAND_DESCRIPTORS,
-	DEVICE_CAPABILITIES,
-	isSecretLikeKey,
-	leaseId as wireLeaseId,
-	MAX_ARRAY_ITEMS,
-	MAX_MAP_KEYS,
-	pairingId,
-	REMOTE_DEFAULT_CAPABILITIES,
 	type ClientFrame,
+	COMMAND_DESCRIPTORS,
 	type CommandFrame,
 	type ConfirmFrame,
+	DEVICE_CAPABILITIES,
 	type HelloFrame,
+	isSecretLikeKey,
+	MAX_ARRAY_ITEMS,
+	MAX_MAP_KEYS,
 	type PairOkFrame,
 	type PairStartFrame,
+	pairingId,
+	REMOTE_DEFAULT_CAPABILITIES,
 	type ServerFrame,
+	leaseId as wireLeaseId,
 } from "@oh-my-pi/app-wire";
 import {
-	LocalPairingTicketIssuer,
-	LeaseRegistry,
-	SecureConfirmationStore,
-	SqliteDeviceRegistry,
-	TokenBucketLimiter,
 	type AuthenticatedPrincipal,
 	type AuthorizationGuard,
 	type Capability,
@@ -29,12 +24,17 @@ import {
 	type DeviceMetadata,
 	type DeviceRegistry,
 	type Lease,
+	LeaseRegistry,
+	LocalPairingTicketIssuer,
 	type PairingService,
 	type Random,
+	type SecureConfirmationStore,
 	type RemotePeerIdentity as SecurityPeerIdentity,
+	SqliteDeviceRegistry,
+	type TokenBucketLimiter,
 } from "../security/index.ts";
 import type { RemoteAuthorizationContext, RemoteConnectionPolicy, RemoteHelloDecision } from "../types.ts";
-import type { ListenerPeerContext, RemoteConnection, RemotePeerIdentity } from "./types.ts";
+import type { RemoteConnection, RemotePeerIdentity } from "./types.ts";
 
 interface CachedCommand {
 	readonly fingerprint: string;
@@ -139,6 +139,7 @@ function mutation(command: string): boolean {
 		"session.resume",
 		"session.model.set",
 		"session.thinking.set",
+		"session.fast.set",
 		"session.close",
 		"session.cancel",
 		"files.write",
@@ -738,10 +739,7 @@ function sanitizeRemoteFrame(frame: ServerFrame): ServerFrame | undefined {
 		if (entries.length > MAX_MAP_KEYS) throw new Error("outbound object exceeded");
 		for (const [childKey, child] of entries) {
 			const childIsSettingsMap =
-				frame.type === "response" &&
-				frame.command === "settings.read" &&
-				depth === 1 &&
-				childKey === "settings";
+				frame.type === "response" && frame.command === "settings.read" && depth === 1 && childKey === "settings";
 			if (
 				(frame.type === "welcome" && depth === 0 && childKey === "authentication") ||
 				(frame.type === "response" && depth === 0 && childKey === "command")

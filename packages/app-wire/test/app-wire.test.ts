@@ -2,26 +2,27 @@ import { describe, expect, test } from "bun:test";
 import {
 	APP_WIRE_VERSION,
 	AppWireError,
-	MAX_FILE_BYTES,
-	MAX_INPUT_BYTES,
-	MAX_MAP_KEYS,
-	COMMAND_DESCRIPTORS,
 	COMMAND_ARGUMENT_DECODERS,
+	COMMAND_DESCRIPTORS,
 	COMMAND_RESULT_DECODERS,
-	validateCommandDescriptor,
+	decodeAdditiveServerFrame,
 	decodeClientFrame,
 	decodeCommandArguments,
 	decodeCommandResult,
 	decodeDurableEntryFrame,
 	decodeEntry,
 	decodeServerFrame,
-	decodeAdditiveServerFrame,
-	inputObject,
-	safeRelativePath,
 	decodeSessionListResult,
-	sameSession,
+	inputObject,
 	isServerFrame,
+	MAX_FILE_BYTES,
+	MAX_INPUT_BYTES,
+	MAX_MAP_KEYS,
+	safeRelativePath,
+	sameSession,
+	validateCommandDescriptor,
 } from "../src/index.ts";
+
 const root = new URL("../fixtures/v1/", import.meta.url);
 async function fixture(name: string): Promise<unknown> {
 	return JSON.parse(await Bun.file(new URL(name, root)).text()) as unknown;
@@ -37,7 +38,9 @@ describe("app-wire authority", () => {
 		savedCursors: [{ hostId: "h", sessionId: "s", cursor: { epoch: "e1", seq: 1 } }],
 	};
 	test("every canonical golden decodes through public guards", async () => {
-		const files = (await Array.fromAsync(new Bun.Glob("*.json").scan({ cwd: new URL(".", root).pathname }))).filter(name => !name.endsWith(".invalid.json")).sort();
+		const files = (await Array.fromAsync(new Bun.Glob("*.json").scan({ cwd: new URL(".", root).pathname })))
+			.filter(name => !name.endsWith(".invalid.json"))
+			.sort();
 		const client = new Set([
 			"hello.json",
 			"hello-auth.json",
@@ -134,7 +137,7 @@ describe("app-wire authority", () => {
 			expect(() => safeRelativePath(path)).toThrow(AppWireError);
 	});
 	test("input byte limit and additive fields", () => {
-		expect(() => decodeServerFrame("{" + "x".repeat(MAX_INPUT_BYTES))).toThrow(AppWireError);
+		expect(() => decodeServerFrame(`{${"x".repeat(MAX_INPUT_BYTES)}`)).toThrow(AppWireError);
 		const raw = {
 			v: "omp-app/1",
 			type: "event",
@@ -235,10 +238,25 @@ describe("app-wire authority", () => {
 				args: {},
 			}),
 		).toThrow(AppWireError);
-		expect(() => decodeClientFrame({ v: "omp-app/1", type: "command", requestId: "r", commandId: "c", hostId: "h", sessionId: "s", command: "files.write", args: { path: "a", content: "x" } })).toThrow(AppWireError);
+		expect(() =>
+			decodeClientFrame({
+				v: "omp-app/1",
+				type: "command",
+				requestId: "r",
+				commandId: "c",
+				hostId: "h",
+				sessionId: "s",
+				command: "files.write",
+				args: { path: "a", content: "x" },
+			}),
+		).toThrow(AppWireError);
 		const base = { v: "omp-app/1", type: "command", requestId: "r", commandId: "c", hostId: "h", args: {} } as const;
-		expect(() => decodeClientFrame({ ...base, command: "session.create", args: { projectId: "project-1" } })).not.toThrow();
-		expect(() => decodeClientFrame({ ...base, command: "session.create", args: { cwd: "/tmp/project" } })).toThrow(AppWireError);
+		expect(() =>
+			decodeClientFrame({ ...base, command: "session.create", args: { projectId: "project-1" } }),
+		).not.toThrow();
+		expect(() => decodeClientFrame({ ...base, command: "session.create", args: { cwd: "/tmp/project" } })).toThrow(
+			AppWireError,
+		);
 		expect(() => decodeCommandArguments("term.open", { cwd: "/tmp/project" })).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("term.open", { cwd: "../project" })).toThrow(AppWireError);
 		expect(decodeCommandArguments("term.open", { cwd: "src/project" }).cwd).toBe("src/project");
@@ -265,20 +283,35 @@ describe("app-wire authority", () => {
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
-		expect(APP_WIRE_VERSION).toBe("0.4.4");
+		expect(APP_WIRE_VERSION).toBe("0.5.0");
 	});
 	test("exported wire version matches package metadata", async () => {
 		const metadata = (await Bun.file(new URL("../package.json", import.meta.url)).json()) as { version: string };
 		expect(APP_WIRE_VERSION).toBe(metadata.version);
 	});
 	test("session project wire data is opaque and live state is secret-free", () => {
-		const session = { hostId: "h", sessionId: "s", project: { projectId: "p", name: "Demo" }, revision: "r", title: "Demo", status: "idle", updatedAt: "now", liveState: { phase: "work", phaseLabel: "human" } };
+		const session = {
+			hostId: "h",
+			sessionId: "s",
+			project: { projectId: "p", name: "Demo" },
+			revision: "r",
+			title: "Demo",
+			status: "idle",
+			updatedAt: "now",
+			liveState: { phase: "work", phaseLabel: "human" },
+		};
 		const frame = { v: "omp-app/1", type: "sessions", cursor: { epoch: "e", seq: 1 }, sessions: [session] };
 		const decoded = decodeServerFrame(frame);
 		expect(JSON.stringify(decoded)).not.toContain("canonicalCwd");
-		expect(JSON.stringify(decodeCommandResult("session.list", { cursor: { epoch: "e", seq: 1 }, sessions: [session] }))).not.toContain("/workspace");
-		expect(() => decodeServerFrame({ ...frame, sessions: [{ ...session, liveState: { deviceToken: "x" } }] })).toThrow(AppWireError);
-		expect(() => decodeServerFrame({ ...frame, sessions: [{ ...session, liveState: { nested: { session_key: "x" } } }] })).toThrow(AppWireError);
+		expect(
+			JSON.stringify(decodeCommandResult("session.list", { cursor: { epoch: "e", seq: 1 }, sessions: [session] })),
+		).not.toContain("/workspace");
+		expect(() =>
+			decodeServerFrame({ ...frame, sessions: [{ ...session, liveState: { deviceToken: "x" } }] }),
+		).toThrow(AppWireError);
+		expect(() =>
+			decodeServerFrame({ ...frame, sessions: [{ ...session, liveState: { nested: { session_key: "x" } } }] }),
+		).toThrow(AppWireError);
 	});
 	test("malicious secret metadata fixture is rejected", async () => {
 		const malicious = await fixture("session-secret.invalid.json");
@@ -289,28 +322,108 @@ describe("app-wire authority", () => {
 		const bad = await fixture("hello-auth-bad.invalid.json");
 		expect(() => decodeClientFrame(partial)).toThrow(AppWireError);
 		let caught: unknown;
-		try { decodeClientFrame(bad); } catch (error) { caught = error; }
+		try {
+			decodeClientFrame(bad);
+		} catch (error) {
+			caught = error;
+		}
 		expect(caught).toBeInstanceOf(AppWireError);
 		expect(String(caught)).not.toContain("not-a-token");
 	});
 	test("additive watch, lease, PTY, files, audit, catalog, preview discriminants are bounded", () => {
 		const frames = [
-			{ v: "omp-app/1", type: "host.watch", watchId: "w", hostId: "h", cursor: { epoch: "e", seq: 1 }, state: "ready", revision: "r" },
-			{ v: "omp-app/1", type: "session.delta", hostId: "h", sessionId: "s", cursor: { epoch: "e", seq: 2 }, revision: "r", upsert: { hostId: "h", sessionId: "s", project: { projectId: "p" }, revision: "r", title: "Demo", status: "idle", updatedAt: "now" } },
-			{ v: "omp-app/1", type: "prompt.lease", hostId: "h", sessionId: "s", leaseId: "l", cursor: { epoch: "e", seq: 3 }, kind: "prompt", state: "acquired", owner: "desktop", expiresAt: "now" },
-			{ v: "omp-app/1", type: "agent.progress", hostId: "h", sessionId: "s", agentId: "a", cursor: { epoch: "e", seq: 4 }, progress: 0.5, revision: "r" },
-			{ v: "omp-app/1", type: "terminal.output", hostId: "h", sessionId: "s", terminalId: "t", cursor: { epoch: "e", seq: 5 }, stream: "stdout", data: "ok" },
+			{
+				v: "omp-app/1",
+				type: "host.watch",
+				watchId: "w",
+				hostId: "h",
+				cursor: { epoch: "e", seq: 1 },
+				state: "ready",
+				revision: "r",
+			},
+			{
+				v: "omp-app/1",
+				type: "session.delta",
+				hostId: "h",
+				sessionId: "s",
+				cursor: { epoch: "e", seq: 2 },
+				revision: "r",
+				upsert: {
+					hostId: "h",
+					sessionId: "s",
+					project: { projectId: "p" },
+					revision: "r",
+					title: "Demo",
+					status: "idle",
+					updatedAt: "now",
+				},
+			},
+			{
+				v: "omp-app/1",
+				type: "prompt.lease",
+				hostId: "h",
+				sessionId: "s",
+				leaseId: "l",
+				cursor: { epoch: "e", seq: 3 },
+				kind: "prompt",
+				state: "acquired",
+				owner: "desktop",
+				expiresAt: "now",
+			},
+			{
+				v: "omp-app/1",
+				type: "agent.progress",
+				hostId: "h",
+				sessionId: "s",
+				agentId: "a",
+				cursor: { epoch: "e", seq: 4 },
+				progress: 0.5,
+				revision: "r",
+			},
+			{
+				v: "omp-app/1",
+				type: "terminal.output",
+				hostId: "h",
+				sessionId: "s",
+				terminalId: "t",
+				cursor: { epoch: "e", seq: 5 },
+				stream: "stdout",
+				data: "ok",
+			},
 			{ v: "omp-app/1", type: "files.diff", hostId: "h", sessionId: "s", path: "src/a.ts", diff: "@@\\n" },
-			{ v: "omp-app/1", type: "audit.event", hostId: "h", cursor: { epoch: "e", seq: 1 }, event: { eventId: "op", hostId: "h", action: "read", actor: "desktop", timestamp: "now" } },
-			{ v: "omp-app/1", type: "catalog", hostId: "h", revision: "r", items: [{ id: "tool", kind: "tool", name: "shell" }] },
-			{ v: "omp-app/1", type: "preview.capture", hostId: "h", sessionId: "s", previewId: "p", content: "YQ==", encoding: "base64", mimeType: "image/png" },
+			{
+				v: "omp-app/1",
+				type: "audit.event",
+				hostId: "h",
+				cursor: { epoch: "e", seq: 1 },
+				event: { eventId: "op", hostId: "h", action: "read", actor: "desktop", timestamp: "now" },
+			},
+			{
+				v: "omp-app/1",
+				type: "catalog",
+				hostId: "h",
+				revision: "r",
+				items: [{ id: "tool", kind: "tool", name: "shell" }],
+			},
+			{
+				v: "omp-app/1",
+				type: "preview.capture",
+				hostId: "h",
+				sessionId: "s",
+				previewId: "p",
+				content: "YQ==",
+				encoding: "base64",
+				mimeType: "image/png",
+			},
 		] as const;
 		for (const value of frames) expect(decodeServerFrame(value).type).toBe(value.type);
 		expect(() => decodeAdditiveServerFrame({ ...frames[0], state: "future" })).toThrow(AppWireError);
 		expect(() => decodeAdditiveServerFrame({ ...frames[2], kind: "controller" })).toThrow(AppWireError);
 		expect(() => decodeAdditiveServerFrame({ ...frames[4], data: "x", stream: "future" })).toThrow(AppWireError);
 		expect(() => decodeAdditiveServerFrame({ ...frames[5], path: "../secret" })).toThrow(AppWireError);
-		expect(() => decodeAdditiveServerFrame({ ...frames[6], event: { ...frames[6].event, hostId: "other" } })).toThrow(AppWireError);
+		expect(() => decodeAdditiveServerFrame({ ...frames[6], event: { ...frames[6].event, hostId: "other" } })).toThrow(
+			AppWireError,
+		);
 	});
 	test("every command has typed bounded argument and result decoders", () => {
 		for (const command of Object.keys(COMMAND_DESCRIPTORS)) {
@@ -322,12 +435,53 @@ describe("app-wire authority", () => {
 	});
 	test("every descriptor declares an exhaustive revision owner", () => {
 		const expected: Record<string, string> = {
-			"session.prompt": "session", "session.cancel": "session", "session.close": "session", "agent.cancel": "session", "bash.run": "session", "term.open": "session",
-			"session.state.get": "none", "session.steer": "session", "session.followUp": "session", "session.rename": "session", "session.retry": "session", "session.compact": "session", "session.pause": "session", "session.resume": "session", "session.model.set": "session", "session.thinking.set": "session", "session.ui.respond": "session",
-			"controller.lease.acquire": "session", "controller.lease.renew": "session", "controller.lease.release": "session", "prompt.lease.acquire": "session", "prompt.lease.renew": "session", "prompt.lease.release": "session",
-			"preview.launch": "session", "preview.state": "session", "preview.navigate": "session", "preview.capture": "session",
-			"files.read": "authority", "files.write": "authority", "files.patch": "authority", "files.list": "authority", "files.diff": "authority", "review.read": "authority", "review.apply": "authority", "config.write": "authority", "settings.write": "authority",
-			"host.list": "none", "session.list": "none", "session.create": "none", "session.attach": "none", "audit.read": "none", "audit.tail": "none", "settings.read": "none", "catalog.get": "none", "host.watch": "none", "session.watch": "none",
+			"session.prompt": "session",
+			"session.cancel": "session",
+			"session.close": "session",
+			"agent.cancel": "session",
+			"bash.run": "session",
+			"term.open": "session",
+			"session.state.get": "none",
+			"session.steer": "session",
+			"session.followUp": "session",
+			"session.rename": "session",
+			"session.retry": "session",
+			"session.compact": "session",
+			"session.pause": "session",
+			"session.resume": "session",
+			"session.model.set": "session",
+			"session.thinking.set": "session",
+			"session.fast.set": "session",
+			"session.ui.respond": "session",
+			"controller.lease.acquire": "session",
+			"controller.lease.renew": "session",
+			"controller.lease.release": "session",
+			"prompt.lease.acquire": "session",
+			"prompt.lease.renew": "session",
+			"prompt.lease.release": "session",
+			"preview.launch": "session",
+			"preview.state": "session",
+			"preview.navigate": "session",
+			"preview.capture": "session",
+			"files.read": "authority",
+			"files.write": "authority",
+			"files.patch": "authority",
+			"files.list": "authority",
+			"files.diff": "authority",
+			"review.read": "authority",
+			"review.apply": "authority",
+			"config.write": "authority",
+			"settings.write": "authority",
+			"host.list": "none",
+			"session.list": "none",
+			"session.create": "none",
+			"session.attach": "none",
+			"audit.read": "none",
+			"audit.tail": "none",
+			"settings.read": "none",
+			"catalog.get": "none",
+			"host.watch": "none",
+			"session.watch": "none",
 		};
 		expect(Object.keys(COMMAND_DESCRIPTORS).sort()).toEqual(Object.keys(expected).sort());
 		for (const [command, descriptor] of Object.entries(COMMAND_DESCRIPTORS)) {
@@ -336,29 +490,132 @@ describe("app-wire authority", () => {
 		}
 	});
 	test("descriptor validator rejects mismatched revision policy and owner", () => {
-		expect(() => validateCommandDescriptor("invalid", { capability: "files.read", scope: "host", revision: "none", revisionOwner: "authority", confirmation: "none" })).toThrow(AppWireError);
-		expect(() => validateCommandDescriptor("invalid", { capability: "files.read", scope: "host", revision: "required", revisionOwner: "none", confirmation: "none" })).toThrow(AppWireError);
+		expect(() =>
+			validateCommandDescriptor("invalid", {
+				capability: "files.read",
+				scope: "host",
+				revision: "none",
+				revisionOwner: "authority",
+				confirmation: "none",
+			}),
+		).toThrow(AppWireError);
+		expect(() =>
+			validateCommandDescriptor("invalid", {
+				capability: "files.read",
+				scope: "host",
+				revision: "required",
+				revisionOwner: "none",
+				confirmation: "none",
+			}),
+		).toThrow(AppWireError);
 	});
 	test("terminal direction and command payload/result contracts are explicit", () => {
 		const base = { v: "omp-app/1", hostId: "h", sessionId: "s", terminalId: "t" };
 		expect(decodeClientFrame({ ...base, type: "terminal.input", data: "x" }).type).toBe("terminal.input");
 		expect(decodeClientFrame({ ...base, type: "terminal.resize", cols: 80, rows: 24 }).type).toBe("terminal.resize");
 		expect(() => decodeServerFrame({ ...base, type: "terminal.input", data: "x" })).toThrow(AppWireError);
-		expect(decodeServerFrame({ ...base, type: "terminal.output", cursor: { epoch: "e", seq: 1 }, stream: "stdout", data: "x" }).type).toBe("terminal.output");
-		expect(() => decodeClientFrame({ ...base, type: "terminal.output", cursor: { epoch: "e", seq: 1 }, stream: "stdout", data: "x" })).toThrow(AppWireError);
+		expect(
+			decodeServerFrame({
+				...base,
+				type: "terminal.output",
+				cursor: { epoch: "e", seq: 1 },
+				stream: "stdout",
+				data: "x",
+			}).type,
+		).toBe("terminal.output");
+		expect(() =>
+			decodeClientFrame({
+				...base,
+				type: "terminal.output",
+				cursor: { epoch: "e", seq: 1 },
+				stream: "stdout",
+				data: "x",
+			}),
+		).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("session.prompt", { prompt: "wrong" })).toThrow(AppWireError);
 		expect(decodeCommandArguments("session.prompt", { message: "hello" }).message).toBe("hello");
-		expect(decodeCommandArguments("session.prompt", { message: "hello", leaseId: "lease-1" })).toMatchObject({ message: "hello", leaseId: "lease-1" });
-		expect(() => decodeCommandArguments("session.prompt", { message: "hello", unexpected: true })).toThrow(AppWireError);
+		expect(decodeCommandArguments("session.prompt", { message: "hello", leaseId: "lease-1" })).toMatchObject({
+			message: "hello",
+			leaseId: "lease-1",
+		});
+		expect(() => decodeCommandArguments("session.prompt", { message: "hello", unexpected: true })).toThrow(
+			AppWireError,
+		);
 		expect(() => decodeCommandArguments("session.prompt", { message: "" })).toThrow(AppWireError);
-		expect(() => decodeCommandArguments("session.prompt", { message: "hello", leaseId: "bad\u0000lease" })).toThrow(AppWireError);
+		expect(() => decodeCommandArguments("session.prompt", { message: "hello", leaseId: "bad\u0000lease" })).toThrow(
+			AppWireError,
+		);
 		expect(() => decodeCommandArguments("preview.launch", { url: "javascript:alert(1)" })).toThrow(AppWireError);
+		expect(
+			decodeCommandArguments("session.model.set", { selector: "openai/gpt-5.5", persistence: "session" }),
+		).toMatchObject({ selector: "openai/gpt-5.5", persistence: "session" });
+		expect(decodeCommandArguments("session.model.set", { role: "slow", persistence: "settings" })).toMatchObject({
+			role: "slow",
+			persistence: "settings",
+		});
+		expect(() =>
+			decodeCommandArguments("session.model.set", {
+				selector: "openai/gpt-5.5",
+				role: "slow",
+				persistence: "session",
+			}),
+		).toThrow(AppWireError);
+		expect(() =>
+			decodeCommandArguments("session.model.set", { selector: "openai/gpt-5.5", persistence: "bad" }),
+		).toThrow(AppWireError);
+		expect(() => decodeCommandArguments("session.thinking.set", { level: "auto" })).not.toThrow();
+		expect(() => decodeCommandArguments("session.thinking.set", { level: "unsupported" })).toThrow(AppWireError);
+		expect(decodeCommandArguments("session.fast.set", { enabled: true })).toMatchObject({ enabled: true });
+		expect(() => decodeCommandArguments("session.fast.set", { enabled: "yes" })).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("settings.write", { apiKey: "secret" })).toThrow(AppWireError);
-		expect(() => decodeClientFrame({ v: "omp-app/1", type: "command", requestId: "r", commandId: "c", hostId: "h", sessionId: "s", command: "session.prompt", args: { prompt: "wrong" } })).toThrow(AppWireError);
-		expect(() => decodeClientFrame({ v: "omp-app/1", type: "command", requestId: "r", commandId: "c", hostId: "h", sessionId: "s", command: "files.list", args: { path: "../secret" } })).toThrow(AppWireError);
-		expect(decodeCommandResult("session.list", { cursor: { epoch: "e", seq: 1 }, sessions: [] }).sessions).toEqual([]);
+		const state = {
+			isStreaming: false,
+			isCompacting: false,
+			isPaused: false,
+			messageCount: 0,
+			queuedMessageCount: 0,
+			steeringMode: "all",
+			followUpMode: "all",
+			interruptMode: "immediate",
+		};
+		expect(() => decodeCommandResult("session.state.get", { ...state, thinking: "bogus" })).toThrow(AppWireError);
+		for (const level of ["inherit", "off", "auto", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+			expect(() => decodeCommandResult("session.state.get", { ...state, thinking: level })).not.toThrow();
+		}
+		for (const level of ["invalid", "ultra", "extreme"]) {
+			expect(() => decodeCommandResult("session.state.get", { ...state, thinking: level })).toThrow(AppWireError);
+		}
+		expect(() =>
+			decodeClientFrame({
+				v: "omp-app/1",
+				type: "command",
+				requestId: "r",
+				commandId: "c",
+				hostId: "h",
+				sessionId: "s",
+				command: "session.prompt",
+				args: { prompt: "wrong" },
+			}),
+		).toThrow(AppWireError);
+		expect(() =>
+			decodeClientFrame({
+				v: "omp-app/1",
+				type: "command",
+				requestId: "r",
+				commandId: "c",
+				hostId: "h",
+				sessionId: "s",
+				command: "files.list",
+				args: { path: "../secret" },
+			}),
+		).toThrow(AppWireError);
+		expect(decodeCommandResult("session.list", { cursor: { epoch: "e", seq: 1 }, sessions: [] }).sessions).toEqual(
+			[],
+		);
 		expect(() => decodeCommandResult("session.list", { sessions: [] })).toThrow(AppWireError);
-		expect(decodeCommandResult("session.attach", { attached: true, cursor: { epoch: "e", seq: 1 } }).attached).toBe(true);
+		expect(decodeCommandResult("session.attach", { attached: true, cursor: { epoch: "e", seq: 1 } }).attached).toBe(
+			true,
+		);
 		expect(() => decodeCommandResult("session.create", { session: {} })).toThrow(AppWireError);
 		expect(decodeCommandResult("session.cancel", { cancelled: true }).cancelled).toBe(true);
 		expect(() => decodeCommandResult("session.cancel", { ok: true })).toThrow(AppWireError);
@@ -366,7 +623,9 @@ describe("app-wire authority", () => {
 		expect(decodeCommandResult("term.open", { terminalId: "t" }).terminalId).toBe("t");
 		expect(() => decodeCommandResult("term.open", { terminalId: 1 })).toThrow(AppWireError);
 		expect(() => decodeCommandResult("preview.capture", { content: "not-base64" })).toThrow(AppWireError);
-		expect(decodeCommandResult("controller.lease.renew", { leaseId: "l", cursor: { epoch: "e", seq: 1 } }).leaseId).toBe("l");
+		expect(
+			decodeCommandResult("controller.lease.renew", { leaseId: "l", cursor: { epoch: "e", seq: 1 } }).leaseId,
+		).toBe("l");
 		expect(() => decodeCommandResult("host.watch", { watchId: "w" })).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("settings.write", { values: { nested: [{ ok: true }] } })).not.toThrow();
 		const supportedSettings = Object.fromEntries(
@@ -388,6 +647,39 @@ describe("app-wire authority", () => {
 				},
 			}),
 		).not.toThrow();
+		const settingsFrame = decodeAdditiveServerFrame({
+			v: "omp-app/1",
+			type: "settings",
+			hostId: "real-host",
+			revision: "revision-1",
+			settings: {
+				...supportedSettings,
+				"auth.broker.token": { configured: true, sensitive: true },
+			},
+		});
+		expect(settingsFrame).toMatchObject({
+			type: "settings",
+			hostId: "real-host",
+			settings: { "auth.broker.token": { configured: true, sensitive: true } },
+		});
+		expect(() =>
+			decodeAdditiveServerFrame({
+				v: "omp-app/1",
+				type: "settings",
+				hostId: "real-host",
+				revision: "revision-1",
+				settings: { "auth.broker.token": { sensitive: true, default: "must-not-cross" } },
+			}),
+		).toThrow(AppWireError);
+		expect(() =>
+			decodeAdditiveServerFrame({
+				v: "omp-app/1",
+				type: "settings",
+				hostId: "real-host",
+				revision: "revision-1",
+				settings: { "visible.setting": { metadata: { token: "must-not-cross" } } },
+			}),
+		).toThrow(AppWireError);
 		expect(() =>
 			decodeCommandResult("settings.read", {
 				revision: "revision-1",
@@ -416,10 +708,24 @@ describe("app-wire authority", () => {
 			node = next;
 		}
 		expect(() => decodeCommandArguments("settings.write", deep)).toThrow(AppWireError);
-		expect(() => decodeCommandArguments("settings.write", { values: Array.from({ length: 1001 }, () => true) })).toThrow(AppWireError);
+		expect(() =>
+			decodeCommandArguments("settings.write", { values: Array.from({ length: 1001 }, () => true) }),
+		).toThrow(AppWireError);
 	});
 	test("session identity remains host scoped", () => {
-		expect((decodeServerFrame({ v: "omp-app/1", type: "response", requestId: "r", hostId: "h", command: "session.cancel", ok: true, result: { cancelled: true } }) as Record<string, unknown>).result).toEqual({ cancelled: true });
+		expect(
+			(
+				decodeServerFrame({
+					v: "omp-app/1",
+					type: "response",
+					requestId: "r",
+					hostId: "h",
+					command: "session.cancel",
+					ok: true,
+					result: { cancelled: true },
+				}) as Record<string, unknown>
+			).result,
+		).toEqual({ cancelled: true });
 		expect(sameSession({ hostId: "h", sessionId: "s" }, { hostId: "other", sessionId: "s" })).toBe(false);
 	});
 });

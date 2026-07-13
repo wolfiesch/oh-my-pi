@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { TranscriptEventTranslator } from "../src/transcript-events.ts";
+import {
+	AGENT_SESSION_EVENT_DISPOSITIONS,
+	type AppserverEvent,
+	RPC_INTERNAL_FRAME_DISPOSITIONS,
+	RPC_OUT_OF_BAND_DISPOSITIONS,
+	TranscriptEventTranslator,
+} from "../src/transcript-events.ts";
 
 describe("appserver transcript event translator", () => {
 	test("maps one assistant/tool turn into stable dot events", () => {
@@ -89,31 +95,224 @@ describe("appserver transcript event translator", () => {
 		expect(events.filter(event => event.type === "tool.result")).toHaveLength(1);
 	});
 
-	test("drops meta and future frames and does not let durable entries duplicate final state", () => {
+	test("settles a correlated assistant stream onto the authoritative durable entry exactly once", () => {
 		const translator = new TranscriptEventTranslator(() => 99);
 		translator.translate({ type: "turn_start" });
-		translator.translate({ type: "message_start", message: { role: "assistant", content: [] } });
+		translator.translate({
+			type: "message_start",
+			streamId: "stream-1",
+			message: { role: "assistant", content: [] },
+		});
 		translator.translate({
 			type: "message_update",
+			streamId: "stream-1",
 			message: { role: "assistant", timestamp: 10, content: [{ type: "text", text: "done" }] },
 		});
 		translator.translate({
 			type: "message_end",
-			message: { role: "assistant", timestamp: 10, content: [{ type: "text", text: "done" }] },
-		});
-		translator.observeSessionEntry({
-			type: "message",
-			id: "durable-1",
+			streamId: "stream-1",
 			message: { role: "assistant", timestamp: 10, content: [{ type: "text", text: "done" }] },
 		});
 		expect(
 			translator.translate({
-				type: "message_end",
-				message: { role: "assistant", timestamp: 10, content: [{ type: "text", text: "done" }] },
+				type: "message_update",
+				streamId: "stream-1",
+				message: { role: "assistant", timestamp: 10, content: [{ type: "text", text: "late partial" }] },
 			}),
+		).toEqual([]);
+		expect(
+			translator.observeSessionEntry(
+				{
+					type: "message",
+					id: "raw-durable-1",
+					message: { role: "assistant", timestamp: 10, content: [{ type: "text", text: "done" }] },
+				},
+				[
+					{
+						id: "durable-1" as never,
+						parentId: null,
+						hostId: "host" as never,
+						sessionId: "session" as never,
+						kind: "message",
+						timestamp: "1970-01-01T00:00:00.010Z",
+						data: { role: "assistant", text: "done" },
+					},
+				],
+			),
+		).toEqual([]);
+		expect(
+			translator.translate({
+				type: "message_persisted",
+				streamId: "stream-1",
+				entryId: "raw-durable-1",
+			}),
+		).toEqual([
+			{
+				type: "message.settled",
+				transientEntryId: "assistant:stream-1",
+				entryId: "durable-1",
+				at: "1970-01-01T00:00:00.010Z",
+			},
+		]);
+		expect(
+			translator.translate({
+				type: "message_persisted",
+				streamId: "stream-1",
+				entryId: "raw-durable-1",
+			}),
+		).toEqual([]);
+		expect(
+			translator.translate({
+				type: "message_update",
+				streamId: "stream-1",
+				message: { role: "assistant", timestamp: 10, content: [{ type: "text", text: "late partial" }] },
+			}),
+		).toEqual([]);
+		expect(
+			translator.observeSessionEntry(
+				{
+					type: "message",
+					id: "raw-durable-1",
+					message: { role: "assistant", timestamp: 10, content: [{ type: "text", text: "done" }] },
+				},
+				[],
+			),
 		).toEqual([]);
 		expect(translator.translate({ type: "prompt_result", agentInvoked: true })).toEqual([]);
 		expect(translator.translate({ type: "future_frame", payload: "ignored" })).toEqual([]);
+	});
+
+	test("keeps exact same-millisecond assistant streams correlated across turn-end interleaving", () => {
+		const translator = new TranscriptEventTranslator(() => 99);
+		const assistant = { role: "assistant", timestamp: 10, content: [{ type: "text", text: "identical" }] };
+		const durable = (id: string) => ({
+			id: id as never,
+			parentId: null,
+			hostId: "host" as never,
+			sessionId: "session" as never,
+			kind: "message" as const,
+			timestamp: "1970-01-01T00:00:00.010Z",
+			data: { role: "assistant", text: "identical" },
+		});
+
+		for (const streamId of ["stream-a", "stream-b"]) {
+			translator.translate({ type: "turn_start" });
+			translator.translate({ type: "message_start", streamId, message: { ...assistant, content: [] } });
+			translator.translate({ type: "message_end", streamId, message: assistant });
+			translator.translate({ type: "turn_end" });
+		}
+
+		expect(
+			translator.observeSessionEntry(
+				{ type: "message", id: "raw-a", message: { ...assistant, content: [{ type: "text", text: "redacted" }] } },
+				[durable("durable-a")],
+			),
+		).toEqual([]);
+		expect(
+			translator.observeSessionEntry(
+				{ type: "message", id: "raw-b", message: { ...assistant, content: [{ type: "text", text: "redacted" }] } },
+				[durable("durable-b")],
+			),
+		).toEqual([]);
+
+		expect(translator.translate({ type: "message_persisted", streamId: "stream-b", entryId: "raw-b" })).toEqual([
+			{
+				type: "message.settled",
+				transientEntryId: "assistant:stream-b",
+				entryId: "durable-b",
+				at: "1970-01-01T00:00:00.010Z",
+			},
+		]);
+		expect(translator.translate({ type: "message_persisted", streamId: "stream-a", entryId: "raw-a" })).toEqual([
+			{
+				type: "message.settled",
+				transientEntryId: "assistant:stream-a",
+				entryId: "durable-a",
+				at: "1970-01-01T00:00:00.010Z",
+			},
+		]);
+	});
+
+	test("waits for the exact entry when persistence mapping arrives first and ignores skipped streams", () => {
+		const translator = new TranscriptEventTranslator(() => 99);
+		const message = { role: "assistant", timestamp: 10, content: [{ type: "text", text: "done" }] };
+		translator.translate({ type: "message_start", streamId: "pending", message: { ...message, content: [] } });
+		translator.translate({ type: "message_end", streamId: "pending", message });
+		expect(translator.translate({ type: "message_persisted", streamId: "pending", entryId: "raw-pending" })).toEqual(
+			[],
+		);
+		expect(
+			translator.observeSessionEntry({ type: "message", id: "raw-other", message }, [
+				{
+					id: "durable-other" as never,
+					parentId: null,
+					hostId: "host" as never,
+					sessionId: "session" as never,
+					kind: "message",
+					timestamp: "1970-01-01T00:00:00.010Z",
+					data: { role: "assistant", text: "done" },
+				},
+			]),
+		).toEqual([]);
+		expect(
+			translator.observeSessionEntry({ type: "message", id: "raw-pending", message }, [
+				{
+					id: "durable-pending" as never,
+					parentId: null,
+					hostId: "host" as never,
+					sessionId: "session" as never,
+					kind: "message",
+					timestamp: "1970-01-01T00:00:00.010Z",
+					data: { role: "assistant", text: "done" },
+				},
+			]),
+		).toEqual([
+			{
+				type: "message.settled",
+				transientEntryId: "assistant:pending",
+				entryId: "durable-pending",
+				at: "1970-01-01T00:00:00.010Z",
+			},
+		]);
+
+		translator.translate({ type: "message_start", streamId: "skipped", message: { ...message, content: [] } });
+		translator.translate({ type: "message_end", streamId: "skipped", message });
+		expect(translator.translate({ type: "message_persisted", streamId: "skipped", entryId: null })).toEqual([]);
+		expect(translator.translate({ type: "message_persisted", streamId: "skipped", entryId: "raw-other" })).toEqual(
+			[],
+		);
+	});
+
+	test("settles directly onto an already-projected persisted entry", () => {
+		const translator = new TranscriptEventTranslator(() => 99);
+		translator.observeKnownEntries([
+			{
+				id: "existing-entry" as never,
+				parentId: null,
+				hostId: "host" as never,
+				sessionId: "session" as never,
+				kind: "message",
+				timestamp: "1970-01-01T00:00:00.010Z",
+				data: { role: "assistant", text: "already there" },
+			},
+		]);
+		const message = {
+			role: "assistant",
+			timestamp: 10,
+			content: [{ type: "text", text: "already there" }],
+		};
+		translator.translate({ type: "message_start", streamId: "replayed", message: { ...message, content: [] } });
+		translator.translate({ type: "message_end", streamId: "replayed", message });
+		expect(
+			translator.translate({ type: "message_persisted", streamId: "replayed", entryId: "existing-entry" }),
+		).toEqual([
+			{
+				type: "message.settled",
+				transientEntryId: "assistant:replayed",
+				entryId: "existing-entry",
+				at: "1970-01-01T00:00:00.010Z",
+			},
+		]);
 	});
 	test("maps RPC extension UI requests and resolves the matching pending kind", () => {
 		const translator = new TranscriptEventTranslator(() => 99);
@@ -218,5 +417,303 @@ describe("appserver transcript event translator", () => {
 		});
 		expect(first[0]).toMatchObject({ at: "1970-01-01T00:00:00.100Z" });
 		expect(duplicate).toEqual([]);
+	});
+
+	test("translates every authoritative AgentSessionEvent type through an exhaustive corpus", () => {
+		interface CorpusCase {
+			raw: Record<string, unknown>;
+			expected: Array<AppserverEvent["type"]>;
+			prepare?: (translator: TranscriptEventTranslator) => void;
+		}
+		const assistant = (text: string, stopReason = "stop") => ({
+			role: "assistant",
+			content: [{ type: "text", text }],
+			stopReason,
+			timestamp: 10,
+		});
+		const cases: CorpusCase[] = [
+			{ raw: { type: "agent_start" }, expected: ["agent.start"] },
+			{ raw: { type: "agent_end", messages: [assistant("done")] }, expected: ["agent.end"] },
+			{ raw: { type: "turn_start" }, expected: ["turn.start"] },
+			{ raw: { type: "turn_end", message: assistant("done"), toolResults: [] }, expected: ["turn.end"] },
+			{ raw: { type: "message_start", message: assistant("start") }, expected: ["message.update"] },
+			{ raw: { type: "message_update", message: assistant("update") }, expected: ["message.update"] },
+			{
+				raw: { type: "message_end", message: assistant("end") },
+				expected: ["message.update"],
+				prepare: translator => {
+					translator.translate({ type: "message_start", message: assistant("") });
+				},
+			},
+			{
+				raw: { type: "message_persisted", streamId: "contract-stream", entryId: "contract-raw" },
+				expected: ["message.settled"],
+				prepare: translator => {
+					translator.translate({
+						type: "message_start",
+						streamId: "contract-stream",
+						message: assistant(""),
+					});
+					translator.translate({
+						type: "message_end",
+						streamId: "contract-stream",
+						message: assistant("done"),
+					});
+					translator.observeSessionEntry({ type: "message", id: "contract-raw", message: assistant("done") }, [
+						{
+							id: "contract-durable" as never,
+							parentId: null,
+							hostId: "host" as never,
+							sessionId: "session" as never,
+							kind: "message",
+							timestamp: "1970-01-01T00:00:00.010Z",
+							data: { role: "assistant", text: "done" },
+						},
+					]);
+				},
+			},
+			{
+				raw: { type: "tool_execution_start", toolCallId: "call-start", toolName: "read", args: {} },
+				expected: ["tool.start"],
+			},
+			{
+				raw: { type: "tool_execution_update", toolCallId: "call-update", toolName: "read", partialResult: "work" },
+				expected: ["tool.progress"],
+				prepare: translator => {
+					translator.translate({
+						type: "tool_execution_start",
+						toolCallId: "call-update",
+						toolName: "read",
+						args: {},
+					});
+				},
+			},
+			{
+				raw: { type: "tool_execution_end", toolCallId: "call-end", toolName: "read", result: {}, isError: false },
+				expected: ["tool.result"],
+				prepare: translator => {
+					translator.translate({
+						type: "tool_execution_start",
+						toolCallId: "call-end",
+						toolName: "read",
+						args: {},
+					});
+				},
+			},
+			{
+				raw: { type: "auto_compaction_start", reason: "threshold", action: "context-full" },
+				expected: ["compaction.start"],
+			},
+			{
+				raw: {
+					type: "auto_compaction_end",
+					action: "context-full",
+					result: { summary: "folded", firstKeptEntryId: "entry-1", tokensBefore: 100 },
+					aborted: false,
+					willRetry: false,
+				},
+				expected: ["compaction.end"],
+			},
+			{
+				raw: { type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 100, errorMessage: "busy" },
+				expected: ["turn.retry"],
+			},
+			{ raw: { type: "auto_retry_end", success: true, attempt: 1 }, expected: ["turn.retry.result"] },
+			{
+				raw: { type: "retry_fallback_applied", from: "model-a", to: "model-b", role: "default" },
+				expected: ["model.fallback"],
+			},
+			{
+				raw: { type: "retry_fallback_succeeded", model: "model-b", role: "default" },
+				expected: ["model.fallback.result"],
+			},
+			{
+				raw: { type: "ttsr_triggered", rules: [{ name: "scope", description: "Use it" }] },
+				expected: ["ttsr.triggered"],
+			},
+			{
+				raw: {
+					type: "todo_reminder",
+					todos: [{ content: "finish", status: "in_progress" }],
+					attempt: 1,
+					maxAttempts: 2,
+				},
+				expected: ["todo.reminder"],
+			},
+			{ raw: { type: "todo_auto_clear" }, expected: ["todo.cleared"] },
+			{
+				raw: {
+					type: "irc_message",
+					message: {
+						role: "custom",
+						customType: "irc:incoming",
+						content: "hello",
+						details: { from: "WorkerA" },
+						timestamp: 10,
+					},
+				},
+				expected: ["irc.message"],
+			},
+			{ raw: { type: "notice", level: "warning", message: "heads up" }, expected: ["notice"] },
+			{
+				raw: { type: "thinking_level_changed", thinkingLevel: "high", configured: "auto", resolved: "high" },
+				expected: ["thinking.level.changed"],
+			},
+			{
+				raw: {
+					type: "goal_updated",
+					goal: {
+						id: "goal-1",
+						objective: "ship",
+						status: "active",
+						tokensUsed: 10,
+						timeUsedSeconds: 2,
+						createdAt: 1,
+						updatedAt: 2,
+					},
+				},
+				expected: ["goal.updated"],
+			},
+		];
+
+		expect(cases.map(item => String(item.raw.type)).sort()).toEqual(
+			Object.keys(AGENT_SESSION_EVENT_DISPOSITIONS).sort(),
+		);
+		for (const item of cases) {
+			const translator = new TranscriptEventTranslator(() => 99);
+			item.prepare?.(translator);
+			expect(translator.translate(item.raw).map(event => event.type)).toEqual(item.expected);
+		}
+	});
+
+	test("projects a normal live sequence with lifecycle boundaries and an end-time timestamp", () => {
+		let now = 1;
+		const translator = new TranscriptEventTranslator(() => now++);
+		const assistant = {
+			role: "assistant",
+			content: [{ type: "text", text: "done" }],
+			stopReason: "stop",
+			timestamp: 10,
+		};
+		const events = [
+			...translator.translate({ type: "agent_start" }),
+			...translator.translate({ type: "turn_start" }),
+			...translator.translate({ type: "message_start", message: { ...assistant, content: [] } }),
+			...translator.translate({ type: "message_update", message: assistant }),
+			...translator.translate({ type: "message_end", message: assistant }),
+			...translator.translate({ type: "turn_end", message: assistant, toolResults: [] }),
+			...translator.translate({ type: "agent_end", messages: [assistant] }),
+		];
+		expect(events.map(event => event.type)).toEqual([
+			"agent.start",
+			"turn.start",
+			"message.update",
+			"turn.end",
+			"agent.end",
+		]);
+		const start = events.find(event => event.type === "turn.start");
+		const end = events.find(event => event.type === "turn.end");
+		expect(Date.parse(end?.at ?? "")).toBeGreaterThan(Date.parse(start?.at ?? ""));
+	});
+
+	test("derives turn.error only from an authoritative assistant error and redacts diagnostic text", () => {
+		const translator = new TranscriptEventTranslator(() => 99);
+		const error = translator.translate({
+			type: "turn_end",
+			message: {
+				role: "assistant",
+				stopReason: "error",
+				errorMessage: "Bearer abcdefghijklmnop failed at /home/lycaon/private token=plaintext",
+				errorStatus: 503,
+				errorId: 12,
+			},
+			toolResults: [],
+		});
+		expect(error).toMatchObject([{ type: "turn.error", errorStatus: 503, errorId: 12 }, { type: "turn.end" }]);
+		expect(JSON.stringify(error)).not.toContain("abcdefghijklmnop");
+		expect(JSON.stringify(error)).not.toContain("/home/lycaon");
+		expect(JSON.stringify(error)).not.toContain("plaintext");
+
+		const nonAuthoritative = translator.translate({
+			type: "turn_end",
+			message: { role: "assistant", stopReason: "stop", errorMessage: "not an error outcome" },
+			toolResults: [],
+		});
+		expect(nonAuthoritative.map(event => event.type)).toEqual(["turn.end"]);
+	});
+
+	test("bounds new event payloads to safe summaries instead of forwarding raw objects", () => {
+		const translator = new TranscriptEventTranslator(() => 99);
+		const compaction = translator.translate({
+			type: "auto_compaction_end",
+			action: "context-full",
+			result: {
+				summary: "Kept /home/lycaon/private token=plaintext",
+				firstKeptEntryId: "entry-1",
+				tokensBefore: 10,
+				details: { authorization: "Bearer abcdefghijklmnop" },
+				preserveData: { secret: "plaintext" },
+			},
+			aborted: false,
+			willRetry: false,
+		});
+		expect(compaction[0]).toMatchObject({
+			type: "compaction.end",
+			status: "completed",
+			summary: "Kept [path] token=[redacted]",
+			tokensBefore: 10,
+			firstKeptEntryId: "entry-1",
+		});
+		const serialized = JSON.stringify(compaction);
+		expect(serialized).not.toContain("details");
+		expect(serialized).not.toContain("preserveData");
+		expect(serialized).not.toContain("abcdefghijklmnop");
+		expect(serialized).not.toContain("plaintext");
+	});
+
+	test("surfaces subagent event summaries while adjacent frames remain separately projected", () => {
+		const translator = new TranscriptEventTranslator(() => 99);
+		expect(RPC_OUT_OF_BAND_DISPOSITIONS).toEqual({
+			session_entry: "separately-projected",
+			subagent_lifecycle: "separately-projected",
+			subagent_progress: "separately-projected",
+			subagent_event: "translated",
+		});
+		expect(RPC_INTERNAL_FRAME_DISPOSITIONS).toEqual({
+			available_commands_update: "intentionally-internal",
+			prompt_result: "intentionally-internal",
+		});
+		expect(translator.translate({ type: "subagent_lifecycle", payload: {} })).toEqual([]);
+		expect(translator.translate({ type: "subagent_progress", payload: {} })).toEqual([]);
+
+		const known = translator.translate({
+			type: "subagent_event",
+			payload: {
+				id: "WorkerA",
+				event: {
+					type: "notice",
+					level: "error",
+					message: "Bearer abcdefghijklmnop failed at /home/lycaon/private",
+				},
+			},
+		});
+		expect(known).toMatchObject([
+			{
+				type: "agent.event",
+				agentId: "WorkerA",
+				event: "notice",
+				detail: { level: "error", message: "Bearer [redacted] failed at [path]" },
+			},
+		]);
+		expect(JSON.stringify(known)).not.toContain("abcdefghijklmnop");
+
+		expect(
+			translator.translate({
+				type: "subagent_event",
+				payload: { id: "WorkerA", event: { type: "future_subagent_event", secret: "do-not-forward" } },
+			}),
+		).toMatchObject([
+			{ type: "agent.event", agentId: "WorkerA", event: "unknown", detail: { rawType: "future_subagent_event" } },
+		]);
 	});
 });

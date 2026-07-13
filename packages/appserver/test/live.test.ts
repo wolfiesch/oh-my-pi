@@ -1,17 +1,9 @@
+import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
-import {
-	decodeServerFrame,
-	entryId,
-	hostId,
-	projectId,
-	sessionId,
-	type DurableEntry,
-	type ServerFrame,
-} from "@oh-my-pi/app-wire";
-import { LocalAppserver, createAppserver } from "../src/server.ts";
+import { decodeServerFrame, hostId, projectId, type ServerFrame, sessionId } from "@oh-my-pi/app-wire";
+import { createAppserver, type LocalAppserver } from "../src/server.ts";
 import type { ChildHandle, RpcChildFactory, SessionAuthority, SessionDiscovery, SessionRecord } from "../src/types.ts";
 import { frameBytes, RawUdsWebSocket } from "./raw-uds-client.ts";
 
@@ -580,9 +572,14 @@ describe("live Unix websocket protocol", () => {
 		const child = await factory.child();
 		await child.waitForWrites(1);
 		child.push({ type: "turn_start" });
-		child.push({ type: "message_start", message: { role: "assistant", content: [] } });
+		child.push({
+			type: "message_start",
+			streamId: "assistant-stream-1",
+			message: { role: "assistant", content: [] },
+		});
 		child.push({
 			type: "message_update",
+			streamId: "assistant-stream-1",
 			message: {
 				role: "assistant",
 				timestamp: 10,
@@ -602,6 +599,7 @@ describe("live Unix websocket protocol", () => {
 		});
 		child.push({
 			type: "message_end",
+			streamId: "assistant-stream-1",
 			message: {
 				role: "assistant",
 				timestamp: 10,
@@ -628,6 +626,7 @@ describe("live Unix websocket protocol", () => {
 				},
 			},
 		});
+		child.push({ type: "message_persisted", streamId: "assistant-stream-1", entryId: "assistant-1" });
 		child.push({ type: "prompt_result", agentInvoked: true });
 		child.push({ type: "future_frame", payload: "ignored" });
 		child.push({ type: "turn_end" });
@@ -640,8 +639,30 @@ describe("live Unix websocket protocol", () => {
 			"tool.start",
 			"tool.progress",
 			"tool.result",
+			"message.settled",
 			"turn.end",
 		]);
+		const messageUpdateIndex = output.frames.findIndex(
+			frame => frame.type === "event" && frame.event.type === "message.update",
+		);
+		const settledIndex = output.frames.findIndex(
+			frame => frame.type === "event" && frame.event.type === "message.settled",
+		);
+		const durableIndex = output.frames.findIndex(frame => frame.type === "entry" && frame.entry.id === "assistant-1");
+		expect(messageUpdateIndex).toBeGreaterThanOrEqual(0);
+		expect(settledIndex).toBeGreaterThan(messageUpdateIndex);
+		expect(durableIndex).toBeGreaterThan(messageUpdateIndex);
+		expect(settledIndex).toBeGreaterThan(durableIndex);
+		const messageUpdate = output.frames[messageUpdateIndex];
+		const settled = output.frames[settledIndex];
+		const durable = output.frames[durableIndex];
+		if (messageUpdate?.type !== "event" || settled?.type !== "event" || durable?.type !== "entry")
+			throw new Error("expected correlated streaming, settlement, and durable frames");
+		expect(settled.event).toMatchObject({
+			type: "message.settled",
+			transientEntryId: messageUpdate.event.entryId,
+			entryId: durable.entry.id,
+		});
 		expect(output.frames).toContainEqual(
 			expect.objectContaining({
 				type: "session.delta",
@@ -692,6 +713,13 @@ describe("live Unix websocket protocol", () => {
 		expect(queuedActive.type).toBe("session.delta");
 		if (queuedActive.type === "session.delta") expect(queuedActive.upsert?.status).toBe("active");
 		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("active");
+		child.push({ type: "agent_end", messages: [] });
+		const agentEnd = await client.client.nextServer();
+		const agentIdle = await client.client.nextServer();
+		expect(agentEnd.type === "event" ? agentEnd.event.type : agentEnd.type).toBe("agent.end");
+		expect(agentIdle.type).toBe("session.delta");
+		if (agentIdle.type === "session.delta") expect(agentIdle.upsert?.status).toBe("idle");
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
 		await closeClients([client.client]);
 		await appserver.stop();
 	});
@@ -1187,6 +1215,105 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 			Date.now = originalNow;
 		}
 		await closeClients([owner.client, other.client]);
+		await appserver.stop();
+	});
+
+	test("streaming revision drift stales a revisioned cancel, while revisionless cancel reaches RPC and returns idle", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory, [record("s1")]);
+		const client = await readyClient(path, ["sessions.read", "sessions.prompt", "sessions.control"]);
+		client.client.sendJson(command("attach-cancel", "attach-cancel", "session.attach", "s1", {}));
+		await responseAndSnapshot(client.client, "attach-cancel");
+
+		client.client.sendJson(command("state-before-cancel", "state-before-cancel", "session.state.get", "s1", {}));
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		const state = JSON.parse(child.writes[0]!) as { id: string; type: string };
+		expect(state.type).toBe("get_state");
+		child.push({
+			id: state.id,
+			type: "response",
+			command: "get_state",
+			success: true,
+			data: {
+				isStreaming: false,
+				isCompacting: false,
+				isPaused: false,
+				steeringMode: "one-at-a-time",
+				followUpMode: "all",
+				interruptMode: "wait",
+				messageCount: 0,
+				queuedMessageCount: 0,
+			},
+		});
+		expect((await untilResponse(client.client, "state-before-cancel")).response.ok).toBe(true);
+
+		child.push({ type: "agent_start" });
+		const agentStart = await client.client.nextServer();
+		const active = await client.client.nextServer();
+		expect(agentStart.type === "event" ? agentStart.event.type : agentStart.type).toBe("agent.start");
+		expect(active).toMatchObject({ type: "session.delta", upsert: expect.objectContaining({ status: "active" }) });
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("active");
+
+		const revisionedCancel = command("cancel-stale", "cancel-stale", "session.cancel", "s1", {});
+		(revisionedCancel as Record<string, unknown>).expectedRevision = appserver.snapshot(sid("s1"))?.revision;
+		client.client.sendJson(revisionedCancel);
+		const staleChallenge = await client.client.nextServer();
+		expect(staleChallenge.type).toBe("confirmation");
+		if (staleChallenge.type !== "confirmation") throw new Error("missing revisioned cancel challenge");
+		child.push({
+			type: "session_entry",
+			entry: { id: "entry-before-stale-approval", parentId: null, type: "message", timestamp: stamp, text: "first" },
+		});
+		expect((await client.client.nextServer()).type).toBe("entry");
+		client.client.sendJson(
+			confirmFrame("approve-stale-cancel", String(staleChallenge.confirmationId), "cancel-stale", "approve", "s1"),
+		);
+		const staleCancel = await untilResponse(client.client, "cancel-stale");
+		expect(staleCancel.response).toMatchObject({ ok: false, error: { code: "stale_revision" } });
+		expect(child.writes).toHaveLength(1);
+
+		// Cancel intentionally carries no expectedRevision. A streaming session's
+		// projection can advance between challenge and approval, but the approved
+		// stop intent must still reach the RPC child.
+		client.client.sendJson(command("cancel", "cancel", "session.cancel", "s1", {}));
+		const challenge = await client.client.nextServer();
+		expect(challenge.type).toBe("confirmation");
+		if (challenge.type !== "confirmation") throw new Error("missing cancel challenge");
+		const revisionAtChallenge = appserver.snapshot(sid("s1"))?.revision;
+
+		child.push({
+			type: "session_entry",
+			entry: { id: "entry-during-cancel", parentId: null, type: "message", timestamp: stamp, text: "second" },
+		});
+		const streamedEntry = await client.client.nextServer();
+		expect(streamedEntry.type).toBe("entry");
+		expect(appserver.snapshot(sid("s1"))?.revision).not.toBe(revisionAtChallenge);
+
+		client.client.sendJson(
+			confirmFrame("approve-cancel", String(challenge.confirmationId), "cancel", "approve", "s1"),
+		);
+		await child.waitForWrites(2);
+		const abort = JSON.parse(child.writes[1]!) as { id: string; type: string };
+		expect(abort.type).toBe("abort");
+
+		// AgentSession emits these before its abort response settles. Appserver must
+		// translate both and project the terminal status for every attached client.
+		child.push({ type: "turn_end" });
+		child.push({ type: "agent_end", messages: [] });
+		child.push({ id: abort.id, type: "response", command: "abort", success: true });
+		const cancelled = await untilResponse(client.client, "cancel");
+		expect(cancelled.response).toMatchObject({ ok: true, result: { cancelled: true } });
+		expect(cancelled.frames.flatMap(frame => (frame.type === "event" ? [frame.event.type] : []))).toEqual([
+			"turn.end",
+			"agent.end",
+		]);
+		expect(cancelled.frames).toContainEqual(
+			expect.objectContaining({ type: "session.delta", upsert: expect.objectContaining({ status: "idle" }) }),
+		);
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
+
+		await closeClients([client.client]);
 		await appserver.stop();
 	});
 

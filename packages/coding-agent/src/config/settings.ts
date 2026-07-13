@@ -40,6 +40,8 @@ import {
 	type GroupPrefix,
 	type GroupTypeMap,
 	getDefault,
+	HOST_LOCAL_PATHS,
+	isHostLocal,
 	SETTINGS_SCHEMA,
 	type SettingPath,
 	type SettingValue,
@@ -104,8 +106,9 @@ function getByPath(obj: RawSettings, segments: readonly string[]): unknown {
 	return current;
 }
 
+const settingPaths = Object.keys(SETTINGS_SCHEMA) as SettingPath[];
 const SETTING_PATH_SEGMENTS: Record<SettingPath, readonly string[]> = Object.fromEntries(
-	(Object.keys(SETTINGS_SCHEMA) as SettingPath[]).map(settingPath => [settingPath, settingPath.split(".")]),
+	settingPaths.map(settingPath => [settingPath, settingPath.split(".")]),
 ) as unknown as Record<SettingPath, readonly string[]>;
 
 /**
@@ -252,6 +255,7 @@ function resolvePathScopedStringArray(settingPath: SettingPath, value: unknown, 
 
 export class Settings {
 	#configPath: string | null;
+	#localConfigPath: string | null;
 	#cwd: string;
 	#agentDir: string;
 	#storage: AgentStorage | null = null;
@@ -259,6 +263,8 @@ export class Settings {
 	#configFiles: string[] = [];
 	/** Global settings from config.yml/config.yaml */
 	#global: RawSettings = {};
+	/** Local settings from local/config.yml */
+	#local: RawSettings = {};
 	/** Project settings from .claude/settings.yml etc */
 	#project: RawSettings = {};
 	/** Extra config.yml-style overlays passed by CLI */
@@ -273,7 +279,8 @@ export class Settings {
 
 	/** Paths modified during this session (for partial save) */
 	#modified = new Set<string>();
-
+	/** Paths modified in the local layer during this session */
+	#localModified = new Set<SettingPath>();
 	/** Legacy `lastChangelogVersion` captured from config.yml during migration (now a marker file). */
 	#legacyLastChangelogVersion?: string;
 
@@ -288,6 +295,7 @@ export class Settings {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
 		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
+		this.#localConfigPath = options.inMemory ? null : path.join(this.#agentDir, "local", "config.yml");
 		this.#configFiles = options.configFiles?.map(file => path.resolve(this.#cwd, expandTilde(file))) ?? [];
 		this.#persist = !options.inMemory && options.readOnly !== true;
 
@@ -382,8 +390,9 @@ export class Settings {
 			const value = getByPath(raw, segments);
 			return value === undefined ? { present: false } : { present: true, value: structuredClone(value) };
 		};
-		const global = layer(this.#global);
-		const project = layer(this.#project);
+		const hostLocal = isHostLocal(path);
+		const global = hostLocal ? layer(this.#local) : layer(this.#global);
+		const project = hostLocal ? { present: false } : layer(this.#project);
 		const configOverlay = layer(this.#configOverlay);
 		const override = layer(this.#overrides);
 		let source: SettingsDesktopSnapshot["source"] = "default";
@@ -399,8 +408,13 @@ export class Settings {
 	 */
 	clearGlobal(path: SettingPath): void {
 		const prev = this.get(path);
-		deleteByPath(this.#global, SETTING_PATH_SEGMENTS[path]);
-		this.#modified.add(path);
+		if (isHostLocal(path)) {
+			deleteByPath(this.#local, SETTING_PATH_SEGMENTS[path]);
+			this.#localModified.add(path);
+		} else {
+			deleteByPath(this.#global, SETTING_PATH_SEGMENTS[path]);
+			this.#modified.add(path);
+		}
 		this.#rebuildMerged();
 		this.#queueSave();
 		const hook = SETTING_HOOKS[path];
@@ -416,11 +430,16 @@ export class Settings {
 			if (layer.present) setByPath(target, [...segments], structuredClone(layer.value));
 			else deleteByPath(target, segments);
 		};
-		restore(this.#global, snapshot.global);
+		if (isHostLocal(snapshot.path)) {
+			restore(this.#local, snapshot.global);
+			this.#localModified.add(snapshot.path);
+		} else {
+			restore(this.#global, snapshot.global);
+			this.#modified.add(snapshot.path);
+		}
 		restore(this.#project, snapshot.project);
 		restore(this.#configOverlay, snapshot.configOverlay);
 		restore(this.#overrides, snapshot.override);
-		this.#modified.add(snapshot.path);
 		this.#rebuildMerged();
 		const next = this.get(snapshot.path);
 		this.#queueSave();
@@ -460,8 +479,13 @@ export class Settings {
 	set<P extends SettingPath>(path: P, value: SettingValue<P>): void {
 		const prev = this.get(path);
 		const segments = path.split(".");
-		setByPath(this.#global, segments, value);
-		this.#modified.add(path);
+		if (isHostLocal(path)) {
+			setByPath(this.#local, segments, value);
+			this.#localModified.add(path);
+		} else {
+			setByPath(this.#global, segments, value);
+			this.#modified.add(path);
+		}
 		this.#rebuildMerged();
 		const next = this.get(path);
 		this.#queueSave();
@@ -524,7 +548,7 @@ export class Settings {
 		if (this.#savePromise) {
 			await this.#savePromise;
 		}
-		if (this.#modified.size > 0) {
+		if (this.#modified.size > 0 || this.#localModified.size > 0) {
 			await this.#saveNow();
 		}
 	}
@@ -537,7 +561,9 @@ export class Settings {
 		});
 		cloned.#storage = this.#storage;
 		cloned.#configPath = this.#configPath;
+		cloned.#localConfigPath = this.#localConfigPath;
 		cloned.#global = structuredClone(this.#global);
+		cloned.#local = structuredClone(this.#local);
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
 		cloned.#configFiles = [...this.#configFiles];
 		cloned.#configOverlay = structuredClone(this.#configOverlay);
@@ -781,6 +807,10 @@ export class Settings {
 				this.#global = await this.#loadYaml(this.#configPath!);
 			}
 			await this.#seedLastChangelogVersionMarker();
+
+			if (this.#localConfigPath) {
+				this.#local = await this.#loadYaml(this.#localConfigPath);
+			}
 		}
 
 		this.#project = await projectPromise;
@@ -798,6 +828,10 @@ export class Settings {
 		const existingConfig = await this.#loadExistingMainYaml();
 		if (existingConfig) {
 			this.#global = existingConfig;
+		}
+
+		if (this.#localConfigPath) {
+			this.#local = await this.#loadYaml(this.#localConfigPath);
 		}
 
 		this.#project = await projectPromise;
@@ -955,10 +989,10 @@ export class Settings {
 		delete raw.lastChangelogVersion;
 
 		// ask.timeout: ms -> seconds (if value > 1000, it's old ms format)
-		if (raw.ask && typeof (raw.ask as Record<string, unknown>).timeout === "number") {
-			const oldValue = (raw.ask as Record<string, unknown>).timeout as number;
+		if (isRecord(raw.ask) && typeof raw.ask.timeout === "number") {
+			const oldValue = raw.ask.timeout;
 			if (oldValue > 1000) {
-				(raw.ask as Record<string, unknown>).timeout = Math.round(oldValue / 1000);
+				raw.ask.timeout = Math.round(oldValue / 1000);
 			}
 		}
 
@@ -1397,7 +1431,7 @@ export class Settings {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	#queueSave(): void {
-		if (!this.#persist || !this.#configPath) return;
+		if (!this.#persist || (!this.#configPath && !this.#localConfigPath)) return;
 
 		// Debounce: wait 100ms for more changes
 		if (this.#saveTimer) {
@@ -1412,33 +1446,75 @@ export class Settings {
 	}
 
 	async #saveNow(): Promise<void> {
-		if (!this.#persist || !this.#configPath || this.#modified.size === 0) return;
+		if (!this.#persist) return;
 
-		const configPath = this.#configPath;
-		const modifiedPaths = [...this.#modified];
+		const globalModified = this.#modified.size > 0 && this.#configPath;
+		const localModified = this.#localModified.size > 0 && this.#localConfigPath;
+
+		if (!globalModified && !localModified) return;
+
+		const globalModifiedPaths = [...this.#modified];
 		this.#modified.clear();
 
-		try {
-			await withFileLock(configPath, async () => {
-				// Re-read to preserve external changes
-				const current = await this.#loadYaml(configPath);
+		const localModifiedPaths = [...this.#localModified];
+		this.#localModified.clear();
 
-				// Apply only our modified paths
-				for (const modPath of modifiedPaths) {
-					const segments = modPath.split(".");
-					const value = getByPath(this.#global, segments);
-					setByPath(current, segments, value);
+		if (globalModified) {
+			const configPath = this.#configPath!;
+			try {
+				await withFileLock(configPath, async () => {
+					// Re-read to preserve external changes
+					const current = await this.#loadYaml(configPath);
+
+					// Apply only our modified paths
+					for (const modPath of globalModifiedPaths) {
+						const segments = modPath.split(".");
+						const value = getByPath(this.#global, segments);
+						setByPath(current, segments, value);
+					}
+
+					// Update our global with any external changes we preserved
+					this.#global = current;
+					await Bun.write(configPath, YAML.stringify(this.#global, null, 2));
+				});
+			} catch (error) {
+				logger.warn("Settings: save failed", { error: String(error) });
+				// Re-add failed paths for retry
+				for (const p of globalModifiedPaths) {
+					this.#modified.add(p);
+				}
+			}
+		}
+
+		if (localModified) {
+			const localConfigPath = this.#localConfigPath!;
+			try {
+				const localDir = path.dirname(localConfigPath);
+				if (!fs.existsSync(localDir)) {
+					fs.mkdirSync(localDir, { recursive: true });
 				}
 
-				// Update our global with any external changes we preserved
-				this.#global = current;
-				await Bun.write(configPath, YAML.stringify(this.#global, null, 2));
-			});
-		} catch (error) {
-			logger.warn("Settings: save failed", { error: String(error) });
-			// Re-add failed paths for retry
-			for (const p of modifiedPaths) {
-				this.#modified.add(p);
+				await withFileLock(localConfigPath, async () => {
+					// Re-read to preserve external changes
+					const current = await this.#loadYaml(localConfigPath);
+
+					// Apply only our modified paths
+					for (const modPath of localModifiedPaths) {
+						const segments = modPath.split(".");
+						const value = getByPath(this.#local, segments);
+						setByPath(current, segments, value);
+					}
+
+					// Update our local with any external changes we preserved
+					this.#local = current;
+					await Bun.write(localConfigPath, YAML.stringify(this.#local, null, 2));
+				});
+			} catch (error) {
+				logger.warn("Settings: local save failed", { error: String(error) });
+				// Re-add failed paths for retry
+				for (const p of localModifiedPaths) {
+					this.#localModified.add(p);
+				}
 			}
 		}
 
@@ -1450,9 +1526,23 @@ export class Settings {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	#rebuildMerged(): void {
-		this.#merged = this.#deepMerge(this.#deepMerge({}, this.#global), this.#project);
-		this.#merged = this.#deepMerge(this.#merged, this.#configOverlay);
-		this.#merged = this.#deepMerge(this.#merged, this.#overrides);
+		let merged = this.#deepMerge(this.#deepMerge({}, this.#global), this.#project);
+
+		for (const path of HOST_LOCAL_PATHS) {
+			deleteByPath(merged, SETTING_PATH_SEGMENTS[path]);
+		}
+
+		for (const path of HOST_LOCAL_PATHS) {
+			const value = getByPath(this.#local, SETTING_PATH_SEGMENTS[path]);
+			if (value !== undefined) {
+				setByPath(merged, [...SETTING_PATH_SEGMENTS[path]], structuredClone(value));
+			}
+		}
+
+		merged = this.#deepMerge(merged, this.#configOverlay);
+		merged = this.#deepMerge(merged, this.#overrides);
+
+		this.#merged = merged;
 		this.#resolvedCache.clear();
 		this.#editVariantCache = undefined;
 	}

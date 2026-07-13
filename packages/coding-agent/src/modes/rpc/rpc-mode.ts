@@ -10,10 +10,11 @@
  * - Events: AgentSessionEvent objects streamed as they occur
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
+
+import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isRecord, readJsonl, Snowflake } from "@oh-my-pi/pi-utils";
-import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -1042,8 +1043,15 @@ export async function runRpcMode(
 			case "get_state": {
 				const queued = session.getQueuedMessages();
 				const state: RpcSessionState = {
-					model: session.model,
-					thinkingLevel: session.thinkingLevel,
+					model: session.model
+						? {
+								...session.model,
+								...(session.configuredModelSelector() ? { selector: session.configuredModelSelector() } : {}),
+								...(session.configuredModelRole() ? { role: session.configuredModelRole() } : {}),
+							}
+						: undefined,
+					thinkingLevel: session.configuredThinkingLevel(),
+					fast: session.isFastModeEnabled(),
 					isStreaming: session.isStreaming,
 					isCompacting: session.isCompacting,
 					isPaused: agentPauseGate.paused,
@@ -1121,13 +1129,10 @@ export async function runRpcMode(
 			}
 
 			case "get_subagent_messages": {
-				if (!subagentRegistry) {
-					return error(id, "get_subagent_messages", "Subagent event bus is unavailable");
-				}
+				if (!subagentRegistry) return error(id, "get_subagent_messages", "Subagent event bus is unavailable");
 				try {
-					if (command.fromByte !== undefined && !Number.isFinite(command.fromByte)) {
+					if (command.fromByte !== undefined && !Number.isFinite(command.fromByte))
 						return error(id, "get_subagent_messages", "fromByte must be a finite number");
-					}
 					const sessionFile = subagentRegistry.resolveSessionFile(command);
 					const transcript = await readRpcSubagentTranscript(sessionFile, command.fromByte);
 					return success(id, "get_subagent_messages", transcript);
@@ -1136,18 +1141,28 @@ export async function runRpcMode(
 				}
 			}
 
-			// =================================================================
-			// Model
-			// =================================================================
-
 			case "set_model": {
-				const models = session.getAvailableModels();
-				const model = models.find(m => m.provider === command.provider && m.id === command.modelId);
-				if (!model) {
-					return error(id, "set_model", `Model not found: ${command.provider}/${command.modelId}`);
+				try {
+					const hasSelector =
+						command.selector !== undefined || (command.provider !== undefined && command.modelId !== undefined);
+					const hasRole = command.role !== undefined;
+					if (hasSelector === hasRole) throw new Error("provide exactly one selector or role");
+					if (command.selector === undefined && !hasRole) {
+						await session.setModelSelector({
+							selector: `${command.provider}/${command.modelId}`,
+							persist: command.persist,
+						});
+					} else {
+						await session.setModelSelector({
+							selector: command.selector,
+							role: command.role,
+							persist: command.persist,
+						});
+					}
+					return success(id, "set_model", session.model);
+				} catch (caught) {
+					return error(id, "set_model", caught instanceof Error ? caught.message : String(caught));
 				}
-				await session.setModel(model);
-				return success(id, "set_model", model);
 			}
 
 			case "cycle_model": {
@@ -1168,8 +1183,18 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "set_thinking_level": {
-				session.setThinkingLevel(command.level);
-				return success(id, "set_thinking_level");
+				try {
+					session.setThinkingLevelValidated(command.level);
+					return success(id, "set_thinking_level");
+				} catch (caught) {
+					return error(id, "set_thinking_level", caught instanceof Error ? caught.message : String(caught));
+				}
+			}
+
+			case "set_fast": {
+				if (!session.setFastMode(command.enabled))
+					return error(id, "set_fast", "Fast mode is unsupported for the current model");
+				return success(id, "set_fast", { enabled: session.isFastModeEnabled() });
 			}
 
 			case "cycle_thinking_level": {

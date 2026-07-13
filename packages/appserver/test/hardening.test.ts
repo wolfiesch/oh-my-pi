@@ -1,16 +1,17 @@
-import { chmod, mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
+import { describe, expect, test } from "bun:test";
+import { mkdtemp, stat, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
-import { decodeServerFrame, entryId, hostId, projectId, sessionId, type DurableEntry } from "@oh-my-pi/app-wire";
+import { type DurableEntry, decodeServerFrame, entryId, hostId, projectId, sessionId } from "@oh-my-pi/app-wire";
 import { FileSessionDiscovery, stableProjectId } from "../src/discovery.ts";
-import { createEpoch, createHostId, loadPersistentHostId, unixSocketActive } from "../src/identity.ts";
 import { IdempotencyStore } from "../src/idempotency.ts";
+import { createEpoch, createHostId, loadPersistentHostId, unixSocketActive } from "../src/identity.ts";
 import { SessionProjection } from "../src/projection.ts";
-import { resolveRpcChildInvocation, RpcChildSupervisor } from "../src/rpc-child.ts";
+import { RpcChildSupervisor, resolveRpcChildInvocation } from "../src/rpc-child.ts";
 import { createAppserver } from "../src/server.ts";
 import type { ChildHandle, FileSystem, RpcChildFactory, SessionDiscovery, SessionRecord } from "../src/types.ts";
+
 function wsFrame(text: string): Uint8Array {
 	const payload = new TextEncoder().encode(text);
 	const extended = payload.length >= 126;
@@ -114,7 +115,7 @@ function fakeFs(files: Record<string, string | Uint8Array>, directories: string[
 						"/root/-tmp-project/invalid-utf8.jsonl",
 					],
 		stat: async path => ({
-			isFile: () => !directories.includes(path),
+			isFile: () => path in files,
 			isDirectory: () => directories.includes(path),
 			mode: 0o644,
 			mtimeMs: path.endsWith("ok.jsonl") ? 20 : 10,
@@ -133,7 +134,7 @@ const validTranscript = `${JSON.stringify({ type: "session", id: "ok", cwd: "/tm
 const currentTranscript = `${JSON.stringify({ type: "title", v: 1, title: "Mutable title" })}\n${JSON.stringify({ type: "session", version: 3, id: "current", timestamp: stamp, cwd: "/tmp/current", title: "Stale title" })}\n${JSON.stringify({ type: "message", id: "entry", parentId: null, timestamp: stamp, message: "hello" })}\n`;
 
 describe("discovery hardening", () => {
-	test("recurses encoded cwd directories and sorts newest first", async () => {
+	test("lists encoded project-directory mains and sorts newest first", async () => {
 		const discovery = new FileSessionDiscovery(
 			"/root",
 			fakeFs(

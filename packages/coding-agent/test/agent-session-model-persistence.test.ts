@@ -174,6 +174,26 @@ describe("AgentSession model persistence", () => {
 		expect(created.session.model?.id).toBe(nextModel.id);
 		expect(created.settings.getModelRole("default")).toBe(defaultRoleValue);
 	});
+	it("resolves concrete selectors and configured roles without false temporary/default state", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const nextModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const created = await createSession({
+			initialModel: defaultModel,
+			modelRoles: { slow: modelValue(nextModel), default: modelValue(defaultModel) },
+		});
+
+		await created.session.setModelSelector({ selector: modelValue(nextModel), persist: false });
+		expect(created.session.model?.id).toBe(nextModel.id);
+		expect(created.session.configuredModelRole()).toBeUndefined();
+		expect(created.session.configuredModelSelector()).toBe(modelValue(nextModel));
+		expect(created.settings.getModelRole("default")).toBe(modelValue(defaultModel));
+
+		await created.session.setModelSelector({ role: "slow", persist: false });
+		expect(created.session.model?.id).toBe(nextModel.id);
+		expect(created.session.configuredModelRole()).toBe("slow");
+		expect(created.session.configuredModelSelector()).toBe(modelValue(nextModel));
+		expect(created.settings.getModelRole("slow")).toBe(modelValue(nextModel));
+	});
 
 	it("persists the default role when explicitly requested", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");

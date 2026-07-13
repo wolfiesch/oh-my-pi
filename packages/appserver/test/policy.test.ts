@@ -1,15 +1,16 @@
 import { expect, test } from "bun:test";
 import type { ClientFrame, CommandFrame, HelloFrame, Revision } from "@oh-my-pi/app-wire";
 import { TailscaleRemotePolicy } from "../src/remote/policy.ts";
+import type { RemoteConnection } from "../src/remote/types.ts";
 import {
-	DefaultAuthorizationGuard,
-	LeaseRegistry,
 	type AuthenticatedPrincipal,
+	DefaultAuthorizationGuard,
 	type DeviceRecord,
 	type DeviceRegistry,
+	LeaseRegistry,
 	type RemotePeerIdentity,
 } from "../src/security/index.ts";
-import type { RemoteConnection } from "../src/remote/types.ts";
+
 const revisionValue = "r" as Revision;
 
 const identity: RemotePeerIdentity = { nodeId: "node", login: "user@example", hostId: "host", tailnetIp: "100.64.0.2" };
@@ -85,7 +86,7 @@ function connection(connectionId: string, closeCalls: { count: number }): Remote
 		},
 	};
 }
-function hello(connectionId: string, capabilities?: string[], requestedFeatures: string[] = []): HelloFrame {
+function hello(_connectionId: string, capabilities?: string[], requestedFeatures: string[] = []): HelloFrame {
 	return {
 		v: "omp-app/1",
 		type: "hello",
@@ -202,7 +203,6 @@ test("stale lease acquire is typed and does not allocate before a fresh acquire"
 	policy.close();
 });
 
-
 test("registry invalidation closes once and clears authorization state", () => {
 	const registry = new Registry();
 	const calls = { count: 0 };
@@ -235,13 +235,17 @@ test("registry invalidation closes once and clears authorization state", () => {
 test("controller lease gates session mutations for the owning connection and expires", () => {
 	let now = 1_000;
 	const registry = new Registry();
+	registry.current = { ...record, capabilities: [...record.capabilities, "sessions.manage"] };
 	const policy = new TailscaleRemotePolicy({
 		registry,
 		clock: { now: () => now },
 		supportedFeatures: ["controller.lease"],
 	});
 	const owner = connection("mutation-owner", { count: 0 });
-	policy.authenticate(owner, hello("mutation-owner", ["sessions.control", "files.write"], ["controller.lease"]));
+	policy.authenticate(
+		owner,
+		hello("mutation-owner", ["sessions.control", "sessions.manage", "files.write"], ["controller.lease"]),
+	);
 	const acquire = {
 		...command("mutation-lease", "controller.lease.acquire", "session"),
 		expectedRevision: "r",
@@ -260,6 +264,28 @@ test("controller lease gates session mutations for the owning connection and exp
 	expect(policy.authorize(owner, write, { connectionId: owner.connectionId, peer: owner.peer })).toBe(true);
 	const review = command("review", "review.apply", "session", { leaseId, reviewId: "review" });
 	expect(policy.authorize(owner, review, { connectionId: owner.connectionId, peer: owner.peer })).toBe(true);
+	const fastWithoutLease = {
+		...command("fast-without-lease", "session.fast.set", "session", { enabled: true }),
+		expectedRevision: "r",
+	} as CommandFrame;
+	expect(
+		policy.authorize(owner, fastWithoutLease, {
+			connectionId: owner.connectionId,
+			peer: owner.peer,
+			sessionRevision: revisionValue,
+		}),
+	).toBe(false);
+	const fast = {
+		...command("fast", "session.fast.set", "session", { leaseId, enabled: true }),
+		expectedRevision: "r",
+	} as CommandFrame;
+	expect(
+		policy.authorize(owner, fast, {
+			connectionId: owner.connectionId,
+			peer: owner.peer,
+			sessionRevision: revisionValue,
+		}),
+	).toBe(true);
 	const wrongConnection = connection("mutation-other", { count: 0 });
 	policy.authenticate(
 		wrongConnection,

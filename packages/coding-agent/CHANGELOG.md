@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added desktop appserver controls for session model, thinking level, and fast mode, with live settings, model-role, and task-agent catalog metadata.
+
+### Changed
+
+- Appserver remote listener mode, bind address, port, and browser origins now persist in host-local `agent/local/config.yml` instead of synchronized profile config.
+
+### Fixed
+
+- Fixed appserver discovery counting nested advisor and subagent transcripts as main sessions.
+- Fixed remote fast-mode changes bypassing the controller-lease checks used by other session mutations.
+
+
 ## [16.4.6] - 2026-07-12
 
 ### Added

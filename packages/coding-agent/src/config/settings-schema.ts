@@ -143,6 +143,7 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 		"Execution",
 		"Discovery & MCP",
 		"Developer",
+		"Appserver / Remote access",
 	],
 	tasks: ["Modes", "Subagents", "Isolation", "Commands & Skills"],
 	providers: ["Services", "Fireworks", "Tiny Model", "Protocol", "Timeouts", "Privacy"],
@@ -219,38 +220,47 @@ export type AnyUiMetadata = UiBase & {
 	options?: ReadonlyArray<SubmenuOption> | "runtime";
 };
 
-interface BooleanDef {
+interface SettingMeta {
+	restartRequired?: boolean;
+	min?: number;
+	max?: number;
+	maxItems?: number;
+	maxEntries?: number;
+	hostLocal?: boolean;
+}
+
+interface BooleanDef extends SettingMeta {
 	type: "boolean";
 	default: boolean | undefined;
 	ui?: UiBoolean;
 }
 
-interface StringDef {
+interface StringDef extends SettingMeta {
 	type: "string";
 	default: string | undefined;
 	ui?: UiString;
 }
 
-interface NumberDef {
+interface NumberDef extends SettingMeta {
 	type: "number";
 	default: number | undefined;
 	ui?: UiNumber;
 }
 
-interface EnumDef<T extends readonly string[]> {
+interface EnumDef<T extends readonly string[]> extends SettingMeta {
 	type: "enum";
 	values: T;
 	default: T[number];
 	ui?: UiEnum<T>;
 }
 
-interface ArrayDef<T> {
+interface ArrayDef<T> extends SettingMeta {
 	type: "array";
 	default: T[];
 	ui?: UiBase;
 }
 
-interface RecordDef<T> {
+interface RecordDef<T> extends SettingMeta {
 	type: "record";
 	default: Record<string, T>;
 	ui?: UiBase;
@@ -345,6 +355,67 @@ export const SETTINGS_SCHEMA = {
 	// per-machine overrides remain trivial.
 	"auth.broker.url": { type: "string", default: undefined },
 	"auth.broker.token": { type: "string", default: undefined },
+
+	// Appserver remote listener settings. These are host-local settings and
+	"appserver.remoteMode": {
+		type: "enum",
+		values: ["local", "direct"] as const,
+		default: "local" as const,
+		restartRequired: true,
+		hostLocal: true,
+		ui: {
+			tab: "tools",
+			group: "Appserver / Remote access",
+			label: "Remote access",
+			description:
+				"Local only by default. Direct accepts paired connections on one selected IP address. Applies after an appserver restart.",
+			options: [
+				{ value: "local", label: "Local only", description: "Listen on the local Unix socket only." },
+				{ value: "direct", label: "Direct", description: "Accept paired connections on the selected IP address." },
+			],
+		},
+	},
+	"appserver.remoteAddress": {
+		type: "string",
+		default: "",
+		restartRequired: true,
+		hostLocal: true,
+		ui: {
+			tab: "tools",
+			group: "Appserver / Remote access",
+			label: "Bind address",
+			description:
+				"IP address the appserver binds in Direct mode. Choose one concrete address; wildcards such as 0.0.0.0 are not allowed. Applies after an appserver restart.",
+		},
+	},
+	"appserver.remotePort": {
+		type: "number",
+		default: 8787,
+		min: 1,
+		max: 65_535,
+		restartRequired: true,
+		hostLocal: true,
+		ui: {
+			tab: "tools",
+			group: "Appserver / Remote access",
+			label: "Port",
+			description: "TCP port the appserver listens on in Direct mode (1–65535). Applies after an appserver restart.",
+		},
+	},
+	"appserver.remoteOrigins": {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		maxItems: 64,
+		restartRequired: true,
+		hostLocal: true,
+		ui: {
+			tab: "tools",
+			group: "Appserver / Remote access",
+			label: "Allowed browser origins",
+			description:
+				"Browser origins allowed to open WebSocket connections. Each entry must match the Origin exactly, e.g. https://app.example.com. Applies after an appserver restart.",
+		},
+	},
 
 	autoResume: {
 		type: "boolean",
@@ -5060,6 +5131,23 @@ export function hasUi(path: SettingPath): boolean {
 	return "ui" in SETTINGS_SCHEMA[path];
 }
 
+const SETTING_PATHS = Object.keys(SETTINGS_SCHEMA) as SettingPath[];
+
+/** Precomputed list of host-local setting paths */
+export const HOST_LOCAL_PATHS: readonly SettingPath[] = Object.freeze(
+	SETTING_PATHS.filter(path => {
+		const definition = SETTINGS_SCHEMA[path];
+		return "hostLocal" in definition && definition.hostLocal === true;
+	}),
+);
+
+const HOST_LOCAL_PATHS_SET = new Set<SettingPath>(HOST_LOCAL_PATHS);
+
+/** Check if a setting path is host local */
+export function isHostLocal(path: SettingPath): boolean {
+	return HOST_LOCAL_PATHS_SET.has(path);
+}
+
 /** Get UI metadata for a path (undefined if no UI) */
 export function getUi(path: SettingPath): AnyUiMetadata | undefined {
 	const def = SETTINGS_SCHEMA[path];
@@ -5068,7 +5156,7 @@ export function getUi(path: SettingPath): AnyUiMetadata | undefined {
 
 /** Get all paths for a specific tab */
 export function getPathsForTab(tab: SettingTab): SettingPath[] {
-	return (Object.keys(SETTINGS_SCHEMA) as SettingPath[]).filter(path => {
+	return SETTING_PATHS.filter(path => {
 		const ui = getUi(path);
 		return ui?.tab === tab;
 	});

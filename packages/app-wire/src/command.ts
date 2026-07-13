@@ -1,27 +1,11 @@
+import type { DeviceCapability } from "./capabilities.ts";
+import { decodeCursor } from "./cursor.ts";
 import { fail } from "./errors.ts";
-import {
-	commandId,
-	confirmationId,
-	hostId,
-	leaseId,
-	projectId,
-	requestId,
-	revision,
-	sessionId,
-	terminalId,
-	type CommandId,
-	type ConfirmationId,
-	type HostId,
-	type LeaseId,
-	type RequestId,
-	type Revision,
-	type SessionId,
-} from "./ids.ts";
-import { decodeSessionStateResult, type SessionStateResult } from "./session-state.ts";
 import {
 	boundedArray,
 	boundedMap,
 	boundedMetadata,
+	boundedSettings,
 	boundedText,
 	controlFree,
 	inputObject,
@@ -29,10 +13,27 @@ import {
 	safeRelativePath,
 	safeSeq,
 } from "./guards.ts";
+import {
+	type CommandId,
+	type ConfirmationId,
+	commandId,
+	confirmationId,
+	type HostId,
+	hostId,
+	type LeaseId,
+	leaseId,
+	projectId,
+	type RequestId,
+	type Revision,
+	requestId,
+	revision,
+	type SessionId,
+	sessionId,
+	terminalId,
+} from "./ids.ts";
 import { MAX_FILE_BYTES, MAX_STRING_BYTES, PROTOCOL_VERSION } from "./limits.ts";
-import { decodeCursor, type Cursor } from "./cursor.ts";
-import { decodeSessionListResult, decodeSessionRef, type SessionListResult, type SessionRef } from "./session-index.ts";
-import type { DeviceCapability } from "./capabilities.ts";
+import { decodeSessionListResult, decodeSessionRef, type SessionListResult } from "./session-index.ts";
+import { decodeSessionStateResult } from "./session-state.ts";
 export type RevisionOwner = "none" | "session" | "authority";
 export interface CommandDescriptor {
 	capability: DeviceCapability;
@@ -141,6 +142,13 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		confirmation: "none",
 	},
 	"session.thinking.set": {
+		capability: "sessions.manage",
+		scope: "session",
+		revision: "required",
+		revisionOwner: "session",
+		confirmation: "none",
+	},
+	"session.fast.set": {
 		capability: "sessions.manage",
 		scope: "session",
 		revision: "required",
@@ -564,16 +572,7 @@ function decodePreviewCaptureResult(value: unknown): CommandResult {
 function decodeSettingsResult(value: unknown): CommandResult {
 	const x = result(value);
 	revision(x.revision, "result.revision");
-	const source = boundedMap(x.settings, "result.settings");
-	const settings: Record<string, unknown> = {};
-	for (const [rawPath, rawMetadata] of Object.entries(source)) {
-		const path = controlFree(rawPath, "result.settings.path", 512);
-		const item = metadata(rawMetadata, `result.settings.${path}`);
-		if (item.sensitive === true && (Object.hasOwn(item, "default") || Object.hasOwn(item, "effective")))
-			fail("INVALID_FRAME", "sensitive setting metadata must omit values", `result.settings.${path}`);
-		settings[path] = item;
-	}
-	return { ...x, settings };
+	return { ...x, settings: boundedSettings(x.settings, "result.settings") };
 }
 export function decodeSessionPromptArguments(value: unknown): SessionPromptArguments {
 	const x = args(value);
@@ -637,16 +636,26 @@ export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown)
 	"session.pause": value => leasedArgs(value, []),
 	"session.resume": value => leasedArgs(value, []),
 	"session.model.set": value => {
-		const x = leasedArgs(value, ["provider", "modelId"]);
-		controlFree(x.provider, "args.provider", 256);
-		controlFree(x.modelId, "args.modelId", 256);
+		const x = leasedArgs(value, ["selector", "role", "persistence"]);
+		const selector = x.selector === undefined ? undefined : controlFree(x.selector, "args.selector", 512);
+		const role = x.role === undefined ? undefined : controlFree(x.role, "args.role", 256);
+		if ((selector === undefined) === (role === undefined))
+			fail("INVALID_FRAME", "provide exactly one selector or role", "args");
+		const persistence = controlFree(x.persistence, "args.persistence", 32);
+		if (persistence !== "session" && persistence !== "settings")
+			fail("INVALID_FRAME", "invalid model persistence", "args.persistence");
 		return x;
 	},
 	"session.thinking.set": value => {
 		const x = leasedArgs(value, ["level"]);
 		const level = controlFree(x.level, "args.level", 64);
-		if (!["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(level))
+		if (!["inherit", "off", "auto", "minimal", "low", "medium", "high", "xhigh", "max"].includes(level))
 			fail("INVALID_FRAME", "invalid thinking level", "args.level");
+		return x;
+	},
+	"session.fast.set": value => {
+		const x = leasedArgs(value, ["enabled"]);
+		if (typeof x.enabled !== "boolean") fail("INVALID_FRAME", "enabled must be boolean", "args.enabled");
 		return x;
 	},
 	"session.ui.respond": decodeSessionUiResponse,
@@ -804,6 +813,7 @@ export const COMMAND_RESULT_DECODERS: Readonly<Record<string, (value: unknown) =
 	},
 	"session.model.set": decodeAcceptedResult,
 	"session.thinking.set": decodeAcceptedResult,
+	"session.fast.set": decodeAcceptedResult,
 	"session.ui.respond": decodeAcceptedResult,
 	"session.cancel": value => boolField(value, "cancelled"),
 	"session.close": value => boolField(value, "closed"),

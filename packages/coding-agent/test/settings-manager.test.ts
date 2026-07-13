@@ -875,4 +875,155 @@ describe("Settings", () => {
 			});
 		});
 	});
+
+	describe("host-local settings", () => {
+		const getLocalConfigPath = () => path.join(agentDir, "local", "config.yml");
+
+		const writeLocalSettings = async (settings: Record<string, unknown>) => {
+			fs.mkdirSync(path.dirname(getLocalConfigPath()), { recursive: true });
+			await Bun.write(getLocalConfigPath(), YAML.stringify(settings, null, 2));
+		};
+
+		const readLocalSettings = async (): Promise<Record<string, unknown>> => {
+			const file = Bun.file(getLocalConfigPath());
+			if (!(await file.exists())) return {};
+			const content = await file.text();
+			const parsed = YAML.parse(content);
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+			return parsed as Record<string, unknown>;
+		};
+
+		it("ignores values from global and project files and reads from local/config.yml", async () => {
+			// Write values for a hostLocal setting to global and project configs
+			await writeSettings({ appserver: { remoteAddress: "global-address" } });
+			await Bun.write(
+				path.join(getProjectAgentDir(projectDir), "settings.json"),
+				JSON.stringify({ appserver: { remoteAddress: "project-address" } }),
+			);
+
+			// Local config specifies another value
+			await writeLocalSettings({ appserver: { remoteAddress: "local-address" } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("appserver.remoteAddress")).toBe("local-address");
+		});
+
+		it("falls back to schema default when local config is empty, ignoring global/project", async () => {
+			await writeSettings({ appserver: { remoteAddress: "global-address" } });
+			await Bun.write(
+				path.join(getProjectAgentDir(projectDir), "settings.json"),
+				JSON.stringify({ appserver: { remoteAddress: "project-address" } }),
+			);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("appserver.remoteAddress")).toBe(""); // default value is ""
+		});
+
+		it("respects merge precedence: default < hostLocal < configOverlay < override", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("appserver.remoteAddress")).toBe(""); // default
+
+			// HostLocal layer
+			await writeLocalSettings({ appserver: { remoteAddress: "local-address" } });
+			const settingsWithLocal = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+			expect(settingsWithLocal.get("appserver.remoteAddress")).toBe("local-address");
+
+			// Explicit config overlay
+			const overlayPath = tempDir.join("overlay.yml");
+			await Bun.write(overlayPath, YAML.stringify({ appserver: { remoteAddress: "overlay-address" } }));
+			const settingsWithOverlay = await Settings.loadIsolated({
+				cwd: projectDir,
+				agentDir,
+				configFiles: [overlayPath],
+			});
+			// We need local file to exist so we can verify precedence
+			await writeLocalSettings({ appserver: { remoteAddress: "local-address" } });
+			expect(settingsWithOverlay.get("appserver.remoteAddress")).toBe("overlay-address");
+
+			// Runtime override wins over everything
+			settingsWithOverlay.override("appserver.remoteAddress", "override-address");
+			expect(settingsWithOverlay.get("appserver.remoteAddress")).toBe("override-address");
+		});
+
+		it("set() writes only to local/config.yml and leaves global config.yml unchanged", async () => {
+			await writeSettings({ setupVersion: 1 });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			settings.set("appserver.remoteAddress", "new-local-address");
+			settings.set("setupVersion", 2);
+			await settings.flush();
+
+			// Verify global config was updated for setupVersion but has NO remoteAddress
+			const globalConfig = await readSettings();
+			expect(globalConfig.setupVersion).toBe(2);
+			expect((globalConfig.appserver as any)?.remoteAddress).toBeUndefined();
+
+			// Verify local config has remoteAddress
+			const localConfig = await readLocalSettings();
+			expect((localConfig.appserver as any)?.remoteAddress).toBe("new-local-address");
+		});
+
+		it("clearGlobal() deletes from local/config.yml and leaves global config.yml unchanged", async () => {
+			await writeLocalSettings({ appserver: { remoteAddress: "local-address" } });
+			await writeSettings({ setupVersion: 1 });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("appserver.remoteAddress")).toBe("local-address");
+
+			settings.clearGlobal("appserver.remoteAddress");
+			await settings.flush();
+
+			// Verify local config no longer has remoteAddress
+			const localConfig = await readLocalSettings();
+			expect((localConfig.appserver as any)?.remoteAddress).toBeUndefined();
+
+			// Verify global config is unchanged
+			const globalConfig = await readSettings();
+			expect(globalConfig.setupVersion).toBe(1);
+			expect((globalConfig.appserver as any)?.remoteAddress).toBeUndefined();
+		});
+
+		it("exposes local value in global layer of desktop snapshot and restores it correctly", async () => {
+			await writeLocalSettings({ appserver: { remoteAddress: "local-address" } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			const snapshot = settings.getDesktopSnapshot("appserver.remoteAddress");
+			expect(snapshot.global.present).toBe(true);
+			expect(snapshot.global.value).toBe("local-address");
+			expect(snapshot.project.present).toBe(false);
+
+			// Mutate setting
+			settings.set("appserver.remoteAddress", "mutated-address");
+			expect(settings.get("appserver.remoteAddress")).toBe("mutated-address");
+
+			// Rollback to snapshot
+			settings.restoreDesktopSnapshot(snapshot);
+			await settings.flush();
+
+			expect(settings.get("appserver.remoteAddress")).toBe("local-address");
+
+			// Verify local config has original address and global config is untouched
+			const localConfig = await readLocalSettings();
+			expect((localConfig.appserver as any)?.remoteAddress).toBe("local-address");
+
+			const globalConfig = await readSettings();
+			expect(globalConfig.appserver).toBeUndefined();
+		});
+
+		it("cloneForCwd() and loadReadOnly() and isolated() preserve host-local behavior", async () => {
+			await writeLocalSettings({ appserver: { remoteAddress: "local-address" } });
+
+			// loadReadOnly
+			const readOnly = await Settings.loadReadOnly({ cwd: projectDir, agentDir });
+			expect(readOnly.get("appserver.remoteAddress")).toBe("local-address");
+
+			// cloneForCwd
+			const clone = await readOnly.cloneForCwd(projectDir);
+			expect(clone.get("appserver.remoteAddress")).toBe("local-address");
+
+			// isolated (inMemory) doesn't read from disk but preserves override/local in memory
+			const isolated = Settings.isolated({ "appserver.remoteAddress": "isolated-address" });
+			expect(isolated.get("appserver.remoteAddress")).toBe("isolated-address");
+		});
+	});
 });

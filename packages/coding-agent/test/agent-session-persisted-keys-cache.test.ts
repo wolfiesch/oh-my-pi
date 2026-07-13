@@ -7,18 +7,27 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
+async function waitFor(predicate: () => boolean, message: string): Promise<void> {
+	const deadline = Date.now() + 2_000;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error(message);
+		await Bun.sleep(1);
+	}
+}
+
 describe("AgentSession persistence-keys cache", () => {
 	let session: AgentSession;
 	let tempDir: string;
 	let sessionManager: SessionManager;
 	let authStorage: AuthStorage | undefined;
+	let events: AgentSessionEvent[];
 
 	beforeEach(async () => {
 		tempDir = path.join(os.tmpdir(), `pi-cache-test-${Snowflake.next()}`);
@@ -52,7 +61,8 @@ describe("AgentSession persistence-keys cache", () => {
 			modelRegistry,
 		});
 
-		session.subscribe(() => {});
+		events = [];
+		session.subscribe(event => events.push(event));
 	});
 
 	afterEach(async () => {
@@ -86,6 +96,110 @@ describe("AgentSession persistence-keys cache", () => {
 
 		const count2 = sessionManager.getBranch().filter(e => e.type === "message").length;
 		expect(count2).toBe(1);
+	});
+
+	it("emits one exact stream ID through lifecycle and maps it after the durable append", async () => {
+		const order: string[] = [];
+		session.subscribe(event => {
+			if (
+				event.type === "message_start" ||
+				event.type === "message_update" ||
+				event.type === "message_end" ||
+				event.type === "message_persisted"
+			) {
+				order.push(event.type);
+			}
+		});
+		const unsubscribeEntry = sessionManager.subscribeEntryAppended(entry => order.push(`entry:${entry.id}`));
+		try {
+			const message = createAssistantMessage("correlated");
+			message.timestamp = 1_000;
+			session.agent.emitExternalEvent({ type: "message_start", message });
+			session.agent.emitExternalEvent({
+				type: "message_update",
+				message,
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "correlated" },
+			} as never);
+			session.agent.emitExternalEvent({ type: "message_end", message });
+
+			await waitFor(
+				() => events.some(event => event.type === "message_persisted"),
+				"timed out waiting for assistant persistence correlation",
+			);
+			await sessionManager.flush();
+
+			const lifecycle = events.filter(
+				(
+					event,
+				): event is Extract<AgentSessionEvent, { type: "message_start" | "message_update" | "message_end" }> =>
+					event.type === "message_start" || event.type === "message_update" || event.type === "message_end",
+			);
+			const streamIds = lifecycle.map(event => event.streamId);
+			expect(streamIds).toHaveLength(3);
+			expect(new Set(streamIds).size).toBe(1);
+			expect(streamIds[0]).toBeString();
+
+			const persisted = events.find(event => event.type === "message_persisted");
+			if (persisted?.type !== "message_persisted") throw new Error("expected persistence mapping");
+			const entry = sessionManager.getBranch().find(value => value.type === "message" && value.message === message);
+			expect(entry?.id).toBeString();
+			expect(persisted).toMatchObject({ streamId: streamIds[0], entryId: entry?.id });
+
+			const messageEndIndex = order.indexOf("message_end");
+			const entryIndex = order.indexOf(`entry:${entry?.id}`);
+			const persistedIndex = order.indexOf("message_persisted");
+			expect(messageEndIndex).toBeGreaterThanOrEqual(0);
+			expect(entryIndex).toBeGreaterThan(messageEndIndex);
+			expect(persistedIndex).toBeGreaterThan(entryIndex);
+		} finally {
+			unsubscribeEntry();
+		}
+	});
+
+	it("maps same-millisecond replies exactly and reuses an already-persisted identical entry", async () => {
+		const first = createAssistantMessage("first");
+		first.timestamp = 2_000;
+		const second = createAssistantMessage("second");
+		second.timestamp = 2_000;
+
+		for (const message of [first, second, first]) {
+			const expectedCount = events.filter(event => event.type === "message_persisted").length + 1;
+			session.agent.emitExternalEvent({ type: "message_start", message });
+			session.agent.emitExternalEvent({ type: "message_end", message });
+			await waitFor(
+				() => events.filter(event => event.type === "message_persisted").length === expectedCount,
+				"timed out waiting for same-millisecond persistence mapping",
+			);
+		}
+		await sessionManager.flush();
+
+		const entries = sessionManager.getBranch().filter(entry => entry.type === "message");
+		expect(entries).toHaveLength(2);
+		const mappings = events.filter(
+			(event): event is Extract<AgentSessionEvent, { type: "message_persisted" }> =>
+				event.type === "message_persisted",
+		);
+		expect(mappings).toHaveLength(3);
+		expect(new Set(mappings.map(event => event.streamId)).size).toBe(3);
+		expect(mappings.map(event => event.entryId)).toEqual([entries[0].id, entries[1].id, entries[0].id]);
+	});
+
+	it("emits an explicit skipped mapping for an empty provider error", async () => {
+		const message = createAssistantMessage("");
+		message.content = [];
+		message.stopReason = "error";
+		message.timestamp = 3_000;
+		session.agent.emitExternalEvent({ type: "message_start", message });
+		session.agent.emitExternalEvent({ type: "message_end", message });
+		await waitFor(
+			() => events.some(event => event.type === "message_persisted"),
+			"timed out waiting for skipped persistence mapping",
+		);
+		await sessionManager.flush();
+
+		const persisted = events.find(event => event.type === "message_persisted");
+		expect(persisted).toMatchObject({ type: "message_persisted", entryId: null });
+		expect(sessionManager.getBranch().filter(entry => entry.type === "message")).toEqual([]);
 	});
 
 	it("caches missing-key checks across a growing branch", async () => {
