@@ -31,6 +31,7 @@ import { applyStartupCwd } from "./cli/startup-cwd";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import {
+	expandRoleAlias,
 	getModelMatchPreferences,
 	resolveCliModel,
 	resolveModelRoleValue,
@@ -50,6 +51,7 @@ import { injectOmpExtensionCliRoots } from "./discovery/omp-extension-roots";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
+import { registerDaemonProjectPresence } from "./launch/presence";
 import type { MCPManager } from "./mcp";
 import { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
@@ -852,6 +854,7 @@ export async function buildSessionOptions(
 			cliProvider: parsed.provider,
 			cliModel: parsed.model,
 			modelRegistry,
+			settings: activeSettings,
 			preferences: modelMatchPreferences,
 		});
 		if (resolved.warning) {
@@ -903,6 +906,47 @@ export async function buildSessionOptions(
 			}
 		}
 		if (!options.model) options.model = scopedModels[0].model;
+	}
+
+	if (parsed.noPrewalk && (parsed.prewalk || parsed.prewalkInto !== undefined)) {
+		throw new Error("--no-prewalk cannot be combined with --prewalk or --prewalk-into");
+	}
+	const prewalkEnabled = parsed.noPrewalk
+		? false
+		: parsed.prewalk === true || parsed.prewalkInto !== undefined
+			? true
+			: activeSettings.get("prewalk.enabled");
+	if (prewalkEnabled) {
+		const rolePattern = expandRoleAlias(parsed.prewalkInto ?? "@smol", activeSettings);
+		const resolved = resolveCliModel({ cliModel: rolePattern, modelRegistry, preferences: modelMatchPreferences });
+		if (resolved.warning) {
+			process.stderr.write(`${chalk.yellow(`Warning: ${resolved.warning}`)}\n`);
+		}
+		if (resolved.error || !resolved.model) {
+			throw new Error(resolved.error ?? `Model "${parsed.prewalkInto ?? "@smol"}" not found`);
+		}
+		if (!modelRegistry.hasConfiguredAuth(resolved.model)) {
+			throw new Error(`No API key for ${resolved.model.provider}/${resolved.model.id}`);
+		}
+		options.prewalk = { target: resolved.model, thinkingLevel: resolved.thinkingLevel };
+	}
+
+	if (parsed.planYoloInto !== undefined && !parsed.planYolo) {
+		throw new Error("--plan-yolo-into requires --plan-yolo");
+	}
+	if (parsed.planYolo) {
+		const rolePattern = expandRoleAlias(parsed.planYoloInto ?? "@smol", activeSettings);
+		const resolved = resolveCliModel({ cliModel: rolePattern, modelRegistry, preferences: modelMatchPreferences });
+		if (resolved.warning) {
+			process.stderr.write(`${chalk.yellow(`Warning: ${resolved.warning}`)}\n`);
+		}
+		if (resolved.error || !resolved.model) {
+			throw new Error(resolved.error ?? `Model "${parsed.planYoloInto ?? "@smol"}" not found`);
+		}
+		if (!modelRegistry.hasConfiguredAuth(resolved.model)) {
+			throw new Error(`No API key for ${resolved.model.provider}/${resolved.model.id}`);
+		}
+		options.planYolo = { target: resolved.model, thinkingLevel: resolved.thinkingLevel };
 	}
 
 	// Thinking level
@@ -991,11 +1035,12 @@ interface RunRootCommandDependencies {
 	settings?: Settings;
 	forceSetupWizard?: boolean;
 }
+const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
 export async function runRootCommand(
 	parsed: Args,
 	rawArgs: string[],
-	deps: RunRootCommandDependencies = {},
+	deps: RunRootCommandDependencies = DEFAULT_RUN_ROOT_DEPENDENCIES,
 ): Promise<void> {
 	logger.startTiming();
 	startStartupWatchdog();
@@ -1141,6 +1186,7 @@ export async function runRootCommand(
 			modelPatterns,
 			modelRegistry,
 			modelMatchPreferences,
+			settingsInstance,
 		);
 	}
 
@@ -1252,6 +1298,9 @@ export async function runRootCommand(
 	}
 
 	await pluginPreloadPromise;
+	if (deps === DEFAULT_RUN_ROOT_DEPENDENCIES) {
+		await logger.time("registerDaemonProjectPresence", registerDaemonProjectPresence, cwd);
+	}
 
 	scheduleMarketplaceAutoUpdate({
 		autoUpdate: settingsInstance.get("marketplace.autoUpdate"),

@@ -2250,6 +2250,13 @@ describe("ACP agent", () => {
 			return { connection, calls };
 		}
 
+		/** Narrows `CreateElicitationRequest` to the `mode: "form"` branch; the SDK's `mode: string` catch-all arm otherwise defeats literal narrowing on `mode !== "form"`. */
+		function isFormElicitation(
+			request: CreateElicitationRequest,
+		): request is Extract<CreateElicitationRequest, { mode: "form" }> {
+			return request.mode === "form";
+		}
+
 		it("translates select to a single-property string-enum elicitation", async () => {
 			const { connection, calls } = createElicitConnection(async () => ({
 				action: "accept",
@@ -2264,7 +2271,7 @@ describe("ACP agent", () => {
 			const request = calls[0]!;
 			expect(request.mode).toBe("form");
 			expect(request.message).toBe("Pick one");
-			if (request.mode !== "form" || !("sessionId" in request)) {
+			if (!isFormElicitation(request) || !("sessionId" in request)) {
 				throw new Error("expected session-scoped form elicitation");
 			}
 			expect(request.sessionId).toBe("session-select");
@@ -2287,7 +2294,7 @@ describe("ACP agent", () => {
 			expect(result).toBe(true);
 			expect(calls).toHaveLength(1);
 			const request = calls[0]!;
-			if (request.mode !== "form") {
+			if (!isFormElicitation(request)) {
 				throw new Error("expected form-mode elicitation");
 			}
 			expect(request.message).toBe("Proceed?\n\nThis will overwrite the file.");
@@ -2307,7 +2314,7 @@ describe("ACP agent", () => {
 			expect(result).toBe("claude");
 			expect(calls).toHaveLength(1);
 			const request = calls[0]!;
-			if (request.mode !== "form") {
+			if (!isFormElicitation(request)) {
 				throw new Error("expected form-mode elicitation");
 			}
 			expect(request.message).toBe("Your name?");
@@ -2456,7 +2463,7 @@ describe("ACP agent", () => {
 
 			expect(calls).toHaveLength(1);
 			const request = calls[0]!;
-			if (request.mode !== "form") throw new Error("expected form-mode elicitation");
+			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
 			expect(request.requestedSchema.properties?.value).toEqual({ type: "string" });
 		});
 

@@ -67,10 +67,12 @@ import { ExtensionDashboard } from "../components/extensions";
 import { HistorySearchComponent } from "../components/history-search";
 import { LoginDialogComponent } from "../components/login-dialog";
 import { LogoutAccountSelectorComponent } from "../components/logout-account-selector";
-import { ModelHubComponent, type ModelHubMode } from "../components/model-hub";
+import { ModelHubComponent } from "../components/model-hub";
+import { ModelPickerComponent } from "../components/model-picker";
 import { OAuthSelectorComponent } from "../components/oauth-selector";
 import { PluginSelectorComponent } from "../components/plugin-selector";
 import { ResetUsageSelectorComponent } from "../components/reset-usage-selector";
+import { renderSegmentTrack } from "../components/segment-track";
 import { SessionSelectorComponent } from "../components/session-selector";
 import { SettingsSelectorComponent } from "../components/settings-selector";
 import { ToolExecutionComponent } from "../components/tool-execution";
@@ -451,10 +453,21 @@ export class SelectorController {
 				this.ctx.rebuildChatFromMessages();
 				this.ctx.ui.resetDisplay();
 				break;
+			case "display.collapseCompacted":
+				// Rebuild swaps between the collapsed tail and the full inline
+				// history; full reset retires blocks already committed to native
+				// scrollback (mirrors cacheMissMarker).
+				this.ctx.rebuildChatFromMessages();
+				this.ctx.ui.resetDisplay();
+				break;
 			case "tui.tight":
 				setTuiTight(value as boolean);
 				this.ctx.ui.invalidate();
 				this.ctx.ui.requestRender();
+				break;
+
+			case "tui.scrollbackRebuild":
+				this.ctx.ui.setScrollbackRebuild(value as boolean);
 				break;
 
 			case "tui.renderMermaid":
@@ -586,7 +599,85 @@ export class SelectorController {
 	}
 
 	showModelSelector(options?: { temporaryOnly?: boolean }): void {
-		this.#showModelHub({ mode: options?.temporaryOnly ? "pick" : "roles" });
+		if (options?.temporaryOnly) {
+			this.#showModelPicker();
+			return;
+		}
+		this.#showModelHub({});
+	}
+
+	/**
+	 * Compact session-only model picker (alt+p / `/switch`): a floating
+	 * bottom-anchored overlay over the transcript. The current model is
+	 * highlighted and preselected; a leading `@` searches ctrl+p quick roles.
+	 */
+	#showModelPicker(): void {
+		const currentContextTokens = this.ctx.session.getContextUsage()?.tokens ?? 0;
+		const current = this.ctx.session.model;
+		const quickRoleOrder = this.ctx.settings.get("cycleOrder");
+		const quickRoleCycle = this.ctx.session.getRoleModelCycle(quickRoleOrder);
+		let overlayHandle: OverlayHandle | undefined;
+		let closed = false;
+		const done = () => {
+			if (closed) return;
+			closed = true;
+			overlayHandle?.hide();
+			this.focusActiveEditorArea();
+			this.ctx.ui.requestRender();
+		};
+		const picker = new ModelPickerComponent(
+			this.ctx.ui,
+			this.ctx.settings,
+			this.ctx.session.modelRegistry,
+			this.ctx.session.scopedModels,
+			{
+				onPick: async (model, selector) => {
+					try {
+						// Session-only: update agent state but don't persist the model to settings.
+						await this.ctx.session.setModelTemporary(model);
+						this.ctx.statusLine.invalidate();
+						this.ctx.updateEditorBorderColor();
+						const roleSelectorHint = this.ctx.keybindings.getKeys("app.model.select")[0] ?? "Alt+M";
+						this.ctx.showStatus(`Session-only model: ${selector}. Use ${roleSelectorHint} or /model for roles.`);
+						done();
+					} catch (error) {
+						this.ctx.showError(error instanceof Error ? error.message : String(error));
+					}
+				},
+				onPickRole: async entry => {
+					try {
+						await this.ctx.session.applyRoleModel(entry);
+						this.ctx.statusLine.invalidate();
+						this.ctx.updateEditorBorderColor();
+						this.ctx.showModelCycleTrack(
+							renderSegmentTrack(
+								quickRoleOrder.map(role => ({ label: role })),
+								quickRoleOrder.indexOf(entry.role),
+							),
+						);
+						done();
+					} catch (error) {
+						this.ctx.showError(error instanceof Error ? error.message : String(error));
+					}
+				},
+				onCancel: done,
+			},
+			{
+				currentContextTokens,
+				currentSelector: current ? `${current.provider}/${current.id}` : undefined,
+				quickRoles: quickRoleCycle?.models,
+				quickRoleOrder,
+				currentQuickRole: quickRoleCycle?.models[quickRoleCycle.currentIndex]?.role,
+			},
+		);
+		overlayHandle = this.ctx.ui.showOverlay(picker, {
+			anchor: "bottom-center",
+			width: "100%",
+			maxHeight: "100%",
+			margin: 0,
+		});
+		this.ctx.ui.setFocus(picker);
+		this.ctx.ui.requestRender();
 	}
 
 	/**
@@ -595,13 +686,13 @@ export class SelectorController {
 	 * untouched underneath. `initialProviderId` preselects a provider's sidebar
 	 * entry — used when reopening the hub after a /login round-trip.
 	 */
-	#showModelHub(hubOptions: { mode: ModelHubMode; initialProviderId?: string }): void {
+	#showModelHub(hubOptions: { initialProviderId?: string }): void {
 		const currentContextTokens = this.ctx.session.getContextUsage()?.tokens ?? 0;
 		let overlayHandle: OverlayHandle | undefined;
 		let hub: ModelHubComponent | undefined;
 		let closed = false;
 		const done = () => {
-			// Re-entrant guard: cancel paths (Esc, pick, login forward) may race;
+			// Re-entrant guard: cancel paths (Esc, login forward) may race;
 			// the overlay must hide exactly once.
 			if (closed) return;
 			closed = true;
@@ -686,21 +777,6 @@ export class SelectorController {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
 					}
 				},
-				onPick: async (model, selector) => {
-					try {
-						// Session-only: update agent state but don't persist the model to settings.
-						await this.ctx.session.setModelTemporary(model);
-						this.ctx.statusLine.invalidate();
-						this.ctx.updateEditorBorderColor();
-						const roleSelectorHint = this.ctx.keybindings.getKeys("app.model.select")[0] ?? "Alt+M";
-						this.ctx.showStatus(
-							`Session-only model: ${selector ?? model.id}. Use ${roleSelectorHint} or /model for roles.`,
-						);
-						done();
-					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
-					}
-				},
 				onLoginRequest: providerId => {
 					done();
 					void this.#loginThenReopenModelHub(providerId);
@@ -718,8 +794,6 @@ export class SelectorController {
 				onCancel: () => done(),
 			},
 			{
-				mode: hubOptions.mode,
-				currentContextTokens,
 				initialProviderId: hubOptions.initialProviderId,
 			},
 		);
@@ -738,7 +812,7 @@ export class SelectorController {
 	async #loginThenReopenModelHub(providerId: string): Promise<void> {
 		const succeeded = await this.#handleOAuthLogin(providerId);
 		if (succeeded) {
-			this.#showModelHub({ mode: "roles", initialProviderId: providerId });
+			this.#showModelHub({ initialProviderId: providerId });
 		}
 	}
 

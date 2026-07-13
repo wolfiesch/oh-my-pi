@@ -30,6 +30,7 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	type AgentToolResult,
 	type AgentTurnEndContext,
 	AppendOnlyContextManager,
 	type AsideMessage,
@@ -251,6 +252,7 @@ import { parseTurnBudget } from "../modes/turn-budget";
 import { containsUltrathink, ULTRATHINK_NOTICE } from "../modes/ultrathink";
 import { computeNonMessageBreakdown, computeNonMessageTokens } from "../modes/utils/context-usage";
 import { containsWorkflow, renderWorkflowNotice } from "../modes/workflow";
+import { resolveApprovedPlan } from "../plan-mode/approved-plan";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
 import type { PlanModeState } from "../plan-mode/state";
 import advisorSystemPrompt from "../prompts/advisor/system.md" with { type: "text" };
@@ -271,6 +273,10 @@ import planModeReferencePrompt from "../prompts/system/plan-mode-reference.md" w
 import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool-decision-reminder.md" with {
 	type: "text",
 };
+import planYoloHandoffPrompt from "../prompts/system/plan-yolo-handoff.md" with { type: "text" };
+import prewalkChecklistPrompt from "../prompts/system/prewalk-checklist.md" with { type: "text" };
+import prewalkContinuePrompt from "../prompts/system/prewalk-continue.md" with { type: "text" };
+import prewalkPlanPrompt from "../prompts/system/prewalk-plan.md" with { type: "text" };
 import rewindReportTemplate from "../prompts/system/rewind-report.md" with { type: "text" };
 import sideChannelNoToolsReminder from "../prompts/system/side-channel-no-tools.md" with { type: "text" };
 import thinkingLoopRedirectTemplate from "../prompts/system/thinking-loop-redirect.md" with { type: "text" };
@@ -319,7 +325,7 @@ import type { CheckpointState, CompletedRewindState } from "../tools/checkpoint"
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
 import { isAutoQaEnabled } from "../tools/report-tool-issue";
-import { buildResolveReminderMessage } from "../tools/resolve";
+import { buildResolveReminderMessage, type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
@@ -414,7 +420,31 @@ const MID_RUN_TODO_NUDGE_MUTATING_TOOLS: Record<string, true> = {
 /** `customType` for the hidden mid-run todo nudge; `display: false`, so it reaches
  *  the model but never renders in the TUI or transcript. */
 const MID_RUN_TODO_NUDGE_MESSAGE_TYPE = "mid-run-todo-nudge";
-
+/** Hidden plan nudge injected by prewalk; scrubbed from the LLM context
+ *  when the switch happens. */
+const PREWALK_PLAN_MESSAGE_TYPE = "prewalk-plan";
+/** Hidden safety-net nudge forcing one more turn after a text-only reply to
+ *  the plan nudge, which would otherwise end the run with no code written. */
+const PREWALK_CONTINUE_MESSAGE_TYPE = "prewalk-continue";
+/** Hidden "verify before finishing" checklist steered into the run at the
+ *  switch, aimed at the fast model's specific failure patterns: partial
+ *  multi-site fixes, unnecessarily broad rewrites, and reported-test-only
+ *  verification. */
+const PREWALK_CHECKLIST_MESSAGE_TYPE = "prewalk-checklist";
+/** Tools whose first successful call triggers the switch — once the todo
+ *  gate is open (see {@link AgentSession.#prewalkTodoSeen}). Bash is
+ *  deliberately excluded: it doubles as exploration (ls/cat) and fired
+ *  turn-1 switches in practice. `todo` is deliberately NOT a trigger: firing
+ *  at the todo init handed the fast model 100% of the implementation with
+ *  zero started work and measurably regressed pass rates. */
+const PREWALK_ACTION_TOOLS: Record<string, true> = {
+	edit: true,
+	write: true,
+};
+/** `customType` for the hidden hand-off message steered to the target model
+ *  once PlanYolo auto-approves the plan. Unlike prewalk's plan nudge this
+ *  is never scrubbed — it IS the instruction the target model acts on. */
+const PLAN_YOLO_HANDOFF_MESSAGE_TYPE = "plan-yolo-handoff";
 /** Abort reason for the Gemini reasoning-header runaway interrupt. Surfaced on the
  *  discarded assistant turn only; never reaches the model. */
 const GEMINI_HEADER_INTERRUPT_REASON = "Interrupted: emit a tool call instead of more planning";
@@ -623,8 +653,9 @@ const COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION: CompactionCheckResult = {
 
 /**
  * User-facing notice for a compaction dead end: maintenance freed too little
- * to retry safely. `remedies` names the recovery actions available on the
- * emitting path (the shake-rescue path can additionally offer `/shake images`).
+ * to retry safely. `remedies` names the recovery actions left on the emitting
+ * path — by the time the post-pass dead end fires, the tiered rescue has
+ * already attempted both elide and image-drop automatically.
  */
 function compactionDeadEndWarning(remedies: string): string {
 	return (
@@ -704,6 +735,34 @@ export interface AsyncJobSnapshot {
 }
 
 export type { ShakeMode, ShakeResult };
+/**
+ * Prewalk: switches an active session one-way from its starting model to
+ * a fast/cheap `target` at the first completed turn that runs an edit/write
+ * tool once the todo list exists. A hidden plan nudge asks the starting
+ * model to write a plan, initialize its todo list from it, and start; the
+ * todo call opens the trigger gate (it never fires the switch itself), so
+ * the starting model always begins the implementation. A hidden
+ * checklist nudge asks the target model to verify its work before
+ * finishing. Both are always on — this is the one mechanism that won out
+ * over turn-count and ungated variants in testing.
+ */
+export interface Prewalk {
+	target: Model;
+	thinkingLevel?: ConfiguredThinkingLevel;
+}
+
+/**
+ * PlanYolo: forces the session into read-only plan mode at start, then
+ * auto-approves the plan the instant the model calls `resolve({ action:
+ * "apply" })` for it — no interactive review — and switches to a fast/cheap
+ * `target` model to implement it. The headless counterpart to interactive
+ * plan mode's "Approve and execute", for print/non-interactive runs where
+ * there is no one to click Approve.
+ */
+export interface PlanYolo {
+	target: Model;
+	thinkingLevel?: ConfiguredThinkingLevel;
+}
 
 // ============================================================================
 // Types
@@ -719,6 +778,12 @@ export interface AgentSessionConfig {
 	scopedModels?: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
 	/** Initial session thinking selector. */
 	thinkingLevel?: ConfiguredThinkingLevel;
+	/** Prewalk from the starting model to a fast/cheap target at the first edit/write once the todo list exists. */
+	prewalk?: Prewalk;
+	/** Force read-only plan mode at start, auto-approve on the model's first
+	 *  `resolve` call, then switch to the target to implement. */
+	planYolo?: PlanYolo;
+
 	/** Initial per-family service tiers (OpenAI / Anthropic / Google) for the live session. */
 	serviceTierByFamily?: ServiceTierByFamily;
 	/** Prompt templates for expansion */
@@ -1631,6 +1696,17 @@ export class AgentSession {
 	#autoThinking: boolean = false;
 	/** The level `auto` last resolved to (for UI); undefined until a turn is classified. */
 	#autoResolvedLevel: Effort | undefined;
+	#prewalk: Prewalk | undefined;
+	/** True once the plan nudge has been queued; scrubbed from context at the switch. */
+	#prewalkPlanInjected = false;
+	/** True once any successful `todo` call landed — opens the prewalk
+	 *  trigger gate: the switch fires at the first edit/write AFTER the todo
+	 *  list exists (sessions without a todo tool skip the gate). */
+	#prewalkTodoSeen = false;
+	#planYolo: PlanYolo | undefined;
+	#planYoloPreviousTools: string[] | undefined;
+	#planYoloArmed = false;
+
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -2121,6 +2197,253 @@ export class AgentSession {
 		this.#emit(pending);
 	}
 
+	/** Advance the one-way prewalk switch at a completed assistant-turn boundary. */
+	async #advancePrewalk(liveMessages: AgentMessage[], context: AgentTurnEndContext | undefined): Promise<void> {
+		const prewalk = this.#prewalk;
+		if (!prewalk || context?.message.role !== "assistant") return;
+
+		// Structural safety net: every branch below assumes the agent loop will
+		// run another turn. It won't if THIS turn had no tool calls — the loop
+		// treats a text-only turn as "the agent is done" and ends the session
+		// with no further prompting. The plan nudge explicitly asks for a prose
+		// reply, which makes a text-only turn common right after it — observed
+		// silently killing production SWE-bench runs before any code was ever
+		// written. Force one more turn only in that specific, self-created
+		// hazard window.
+		if (this.#prewalkPlanInjected && context.toolResults.length === 0) {
+			this.agent.steer({
+				role: "custom",
+				customType: PREWALK_CONTINUE_MESSAGE_TYPE,
+				content: prewalkContinuePrompt,
+				attribution: "agent",
+				display: false,
+				timestamp: Date.now(),
+			});
+		}
+
+		// Todo gate: the plan nudge instructs "finish the plan, then init the
+		// todo list from it and start" — so the switch waits until a todo list
+		// exists AND the model has actually started implementing (first
+		// edit/write). The todo call itself never triggers: firing there handed
+		// the fast model the whole implementation cold. Sessions without a todo
+		// tool skip the gate.
+		if (context.toolResults.some(result => result.toolName === "todo")) {
+			this.#prewalkTodoSeen = true;
+		}
+		const todoGateOpen = this.#prewalkTodoSeen || !this.#toolRegistry.has("todo");
+		const action = todoGateOpen
+			? context.toolResults.find(result => PREWALK_ACTION_TOOLS[result.toolName])
+			: undefined;
+		if (!action) {
+			if (!this.#prewalkPlanInjected) {
+				this.#prewalkPlanInjected = true;
+				this.agent.steer({
+					role: "custom",
+					customType: PREWALK_PLAN_MESSAGE_TYPE,
+					content: prewalkPlanPrompt,
+					display: false,
+					attribution: "agent",
+					timestamp: Date.now(),
+				});
+				this.emitNotice("info", "Prewalk: injected deep-plan nudge.", "prewalk");
+			}
+			return;
+		}
+
+		await this.#waitForSessionMessagePersistence(context.message);
+		for (const toolResult of context.toolResults) {
+			await this.#waitForSessionMessagePersistence(toolResult);
+		}
+
+		this.#scrubPrewalkPlanNudge(liveMessages);
+		const target = prewalk.target;
+		if (this.model && modelsAreEqual(this.model, target)) {
+			this.#prewalk = undefined;
+			return;
+		}
+
+		await this.setModelTemporary(target, prewalk.thinkingLevel, { ephemeral: true });
+		this.#prewalk = undefined;
+		this.emitNotice(
+			"info",
+			`Prewalk: switched to ${target.provider}/${target.id} after first ${action.toolName} call.`,
+			"prewalk",
+		);
+		this.agent.steer({
+			role: "custom",
+			customType: PREWALK_CHECKLIST_MESSAGE_TYPE,
+			content: prewalkChecklistPrompt,
+			attribution: "agent",
+			display: false,
+			timestamp: Date.now(),
+		});
+	}
+
+	/**
+	 * Arm prewalk outside the normal startup path (the `/prewalk` slash
+	 * command): sets the target and immediately steers the plan nudge rather
+	 * than waiting for the next turn boundary, since an explicit manual
+	 * invocation means "start this now." A no-op with a notice if a prewalk
+	 * is already armed and waiting.
+	 */
+	armPrewalk(target: Model, thinkingLevel?: ConfiguredThinkingLevel): void {
+		if (this.#prewalk) {
+			this.emitNotice(
+				"info",
+				`Prewalk: already armed for ${this.#prewalk.target.provider}/${this.#prewalk.target.id}, waiting for the first edit/write.`,
+				"prewalk",
+			);
+			return;
+		}
+		this.#prewalk = { target, thinkingLevel };
+		this.#prewalkPlanInjected = true;
+		this.agent.steer({
+			role: "custom",
+			customType: PREWALK_PLAN_MESSAGE_TYPE,
+			content: prewalkPlanPrompt,
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+		this.emitNotice(
+			"info",
+			`Prewalk: armed for ${target.provider}/${target.id} — will switch at the first edit/write once the todo list exists.`,
+			"prewalk",
+		);
+	}
+
+	/**
+	 * Remove the plan nudge from the LLM context before the model switch: the
+	 * fast model inherits the plan the nudge produced, not the nudge itself.
+	 * Splices the loop's live context array in place (the run streams from
+	 * it) and mirrors the removal into agent state. The persisted transcript
+	 * keeps the message for audit; a session reload re-materializes it,
+	 * which is acceptable for prewalk's single-run lifecycle.
+	 */
+	#scrubPrewalkPlanNudge(liveMessages: AgentMessage[]): void {
+		if (!this.#prewalkPlanInjected) return;
+		const isPlanNudge = (m: AgentMessage): boolean =>
+			m.role === "custom" && m.customType === PREWALK_PLAN_MESSAGE_TYPE;
+		for (let i = liveMessages.length - 1; i >= 0; i--) {
+			if (isPlanNudge(liveMessages[i])) liveMessages.splice(i, 1);
+		}
+		const stateMessages = this.agent.state.messages;
+		const filtered = stateMessages.filter(m => !isPlanNudge(m));
+		if (filtered.length !== stateMessages.length) this.agent.replaceMessages(filtered);
+	}
+
+	/**
+	 * Lazily arm PlanYolo before the first prompt is built: restricts tools to
+	 * the plan-mode read-only set (plus `resolve`/`write`, both normally
+	 * discovery-hidden), marks plan-mode state so `#buildPlanModeMessage`
+	 * injects the standard plan-mode-active instructions on this and every
+	 * following prompt, and registers the auto-approve resolve handler.
+	 * Idempotent — a no-op once armed or when PlanYolo is not configured.
+	 */
+	async #armPlanYoloIfNeeded(): Promise<void> {
+		if (!this.#planYolo || this.#planYoloArmed) return;
+		this.#planYoloArmed = true;
+		const previousTools = this.getActiveToolNames();
+		const augmentations = ["resolve"];
+		if (this.hasBuiltInTool("write")) augmentations.push("write");
+		await this.setActiveToolsByName([...new Set([...previousTools, ...augmentations])]);
+		this.#planYoloPreviousTools = previousTools;
+		this.setPlanModeState({
+			enabled: true,
+			planFilePath: this.getPlanReferencePath() || "local://PLAN.md",
+			workflow: "parallel",
+		});
+		this.setStandingResolveHandler(input => this.#runPlanYoloApprovalResolve(input));
+	}
+
+	/**
+	 * Standing resolve handler while PlanYolo's plan phase is active. Auto-
+	 * approves the instant the model calls `resolve { action: "apply" }` for
+	 * the plan — no interactive review, the headless counterpart to plan
+	 * mode's "Approve and execute" — then restores tools, exits plan-mode
+	 * state, switches to the configured `target`, and hands off the approved
+	 * plan for it to implement.
+	 */
+	#runPlanYoloApprovalResolve(input: unknown): Promise<AgentToolResult<ResolveToolDetails>> {
+		return runResolveInvocation(input as Parameters<typeof runResolveInvocation>[0], {
+			sourceToolName: "plan_approval",
+			label: "Plan ready for approval",
+			apply: async (_reason, extra) => {
+				const planYolo = this.#planYolo;
+				const state = this.getPlanModeState();
+				if (!planYolo || !state?.enabled) {
+					throw new ToolError("Plan mode is not active.");
+				}
+				const { planFilePath, title } = await resolveApprovedPlan({
+					suppliedTitle: extra?.title,
+					statePlanFilePath: state.planFilePath,
+					readPlan: url => this.#readPlanYoloFile(url),
+					listPlanFiles: () => this.#listPlanYoloFiles(),
+				});
+				const previousTools = this.#planYoloPreviousTools;
+				if (previousTools) {
+					await this.setActiveToolsByName(previousTools);
+				}
+				this.setStandingResolveHandler(null);
+				this.setPlanModeState(undefined);
+				this.#planYolo = undefined;
+				this.#planYoloPreviousTools = undefined;
+				await this.setModelTemporary(planYolo.target, planYolo.thinkingLevel, { ephemeral: true });
+				this.emitNotice(
+					"info",
+					`Plan-yolo: plan approved, switched to ${planYolo.target.provider}/${planYolo.target.id} to implement "${title}".`,
+					"plan-yolo",
+				);
+				this.agent.steer({
+					role: "custom",
+					customType: PLAN_YOLO_HANDOFF_MESSAGE_TYPE,
+					content: prompt.render(planYoloHandoffPrompt, { planFilePath, title }),
+					attribution: "agent",
+					display: false,
+					timestamp: Date.now(),
+				});
+				return {
+					content: [
+						{ type: "text" as const, text: `Plan approved. Implementing now with ${planYolo.target.id}.` },
+					],
+					details: { planFilePath, title, planExists: true },
+				};
+			},
+		});
+	}
+
+	async #readPlanYoloFile(planFilePath: string): Promise<string | null> {
+		const resolvedPath = planFilePath.startsWith("local:")
+			? resolveLocalUrlToPath(normalizeLocalScheme(planFilePath), this.#localProtocolOptions())
+			: resolveToCwd(planFilePath, this.sessionManager.getCwd());
+		try {
+			return await Bun.file(resolvedPath).text();
+		} catch (error) {
+			if (isEnoent(error)) return null;
+			throw error;
+		}
+	}
+
+	/** `local://` URLs of plan files in the session-local root, newest first —
+	 *  a fallback for `resolveApprovedPlan` when the agent dropped `extra.title`. */
+	async #listPlanYoloFiles(): Promise<string[]> {
+		const localRoot = resolveLocalUrlToPath("local://", this.#localProtocolOptions());
+		try {
+			const entries = await fs.promises.readdir(localRoot, { withFileTypes: true });
+			const plans = await Promise.all(
+				entries
+					.filter(entry => entry.isFile() && /plan\.md$/i.test(entry.name))
+					.map(async entry => {
+						const stat = await fs.promises.stat(path.join(localRoot, entry.name)).catch(() => null);
+						return { url: `local://${entry.name}`, mtime: stat?.mtimeMs ?? 0 };
+					}),
+			);
+			return plans.sort((a, b) => b.mtime - a.mtime).map(plan => plan.url);
+		} catch {
+			return [];
+		}
+	}
+
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
@@ -2141,7 +2464,14 @@ export class AgentSession {
 		} else {
 			this.#thinkingLevel = config.thinkingLevel;
 		}
+		if (config.prewalk) {
+			this.#prewalk = config.prewalk;
+		}
+		if (config.planYolo) {
+			this.#planYolo = config.planYolo;
+		}
 		this.#applyThinkingLevelToAgent(this.#thinkingLevel);
+
 		this.#promptTemplates = config.promptTemplates ?? [];
 		this.#slashCommands = config.slashCommands ?? [];
 		this.#extensionRunner = config.extensionRunner;
@@ -2214,6 +2544,7 @@ export class AgentSession {
 				});
 				if (detection) this.#maybeInjectToolCallLoopRedirect(messages, detection);
 			}
+			await this.#advancePrewalk(messages, context);
 			this.#advisorPrimaryTurnsCompleted++;
 			if (this.#advisors.length > 0) {
 				for (const a of this.#advisors) {
@@ -4209,6 +4540,17 @@ export class AgentSession {
 			}
 			if (this.#isRetryableError(msg)) {
 				const didRetry = await this.#handleRetryableError(msg);
+				if (didRetry) {
+					await emitAgentEndNotification();
+					return;
+				}
+			} else if (this.#isHardErrorFallbackEligible(msg)) {
+				// A non-retryable hard error on a model covered by a configured
+				// fallback chain: retrying the SAME model is pointless, but a
+				// DIFFERENT model is a fresh chance — consult the chain before
+				// surfacing the failure. #handleRetryableError bails out (no
+				// backoff-retry of the failing model) when no switch happens.
+				const didRetry = await this.#handleRetryableError(msg, { hardErrorFallback: true });
 				if (didRetry) {
 					await emitAgentEndNotification();
 					return;
@@ -7311,6 +7653,11 @@ export class AgentSession {
 		return this.#planModeState;
 	}
 
+	/** Prewalk state, if armed and active */
+	getPrewalkState(): Prewalk | undefined {
+		return this.#prewalk;
+	}
+
 	setPlanModeState(state: PlanModeState | undefined): void {
 		this.#planModeState = state;
 		if (state?.enabled) {
@@ -8050,6 +8397,8 @@ export class AgentSession {
 			if (lastAssistant && !options?.skipCompactionCheck) {
 				await this.#checkCompaction(lastAssistant, false, false, false);
 			}
+
+			await this.#armPlanYoloIfNeeded();
 
 			// Build messages array (session context, eager todo prelude, then active prompt message)
 			const messages: AgentMessage[] = [];
@@ -9485,7 +9834,7 @@ export class AgentSession {
 		const all = this.#modelRegistry.getAvailable();
 		const patterns = this.settings.get("enabledModels");
 		if (!patterns || patterns.length === 0) return all;
-		return filterAvailableModelsByEnabledPatterns(all, patterns);
+		return filterAvailableModelsByEnabledPatterns(all, patterns, this.settings);
 	}
 	/**
 	 * Resolve and apply a selector or configured role through the live settings-backed registry.
@@ -9925,6 +10274,11 @@ export class AgentSession {
 	 * candidate is small or the session has been idle long enough that the
 	 * provider prompt cache is cold), so it is cheap to run every turn. Gated
 	 * on the `compaction.supersedeReads` and `compaction.dropUseless` settings.
+	 *
+	 * Persists via `rewriteEntries` like every other history rewrite — the
+	 * session file must match the live (pruned) context or file-based forks
+	 * (`/fork`, `/tan`) and resume rebuild a divergent prefix and cold-miss the
+	 * provider prompt cache.
 	 */
 	async #pruneStaleToolResults(): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
 		const { supersedeReads, dropUseless } = this.settings.getGroup("compaction");
@@ -9947,6 +10301,7 @@ export class AgentSession {
 			return undefined;
 		}
 
+		await this.sessionManager.rewriteEntries();
 		const sessionContext = this.buildDisplaySessionContext();
 		this.agent.replaceMessages(sessionContext.messages);
 		this.#resetAllAdvisorRuntimes();
@@ -10388,6 +10743,7 @@ export class AgentSession {
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.buildDisplaySessionContext();
 			this.agent.replaceMessages(sessionContext.messages);
+			this.#rebasePendingContextSnapshotAfterCompaction();
 			// Compaction discarded the conversation history that carried the approved
 			// plan reference. Clear the sent-flag so #buildPlanReferenceMessage re-reads
 			// the plan from disk and re-injects it on the next turn (issue #1246).
@@ -12782,49 +13138,85 @@ export class AgentSession {
 	}
 
 	/**
-	 * Last-resort reducer when {@link #runAutoCompaction} would otherwise dead-end.
-	 * The summarizer cut at the only available turn boundary, but the kept tail is
-	 * still over the recovery band because a single recent turn (a large
-	 * tool-result, a heavy fenced/XML block) is itself bigger than the band and
-	 * `findCutPoint` cannot cut inside one message. `shake("elide")` reaches INSIDE
-	 * that tail — it offloads heavy tool-result / block content to one
-	 * `artifact://` blob and leaves a recoverable placeholder — so residual context
-	 * genuinely drops instead of the guard pausing maintenance and looping the
-	 * warning. Without it the guard would pause/warn here; with it the caller
-	 * re-tests its progress predicate after the elide pass and only falls through
-	 * to the warning when residual stays over.
+	 * Last-resort tiered reducer when {@link #runAutoCompaction} would otherwise
+	 * dead-end. The summarizer cut at the only available turn boundary, but the
+	 * kept tail is still over the recovery band because a single recent turn (a
+	 * large tool-result, a heavy fenced/XML block, attached images) is itself
+	 * bigger than the band and `findCutPoint` cannot cut inside one message.
 	 *
-	 * Image-only tails are out of scope: `collectShakeRegions` skips image-only
-	 * tool results and user-message images aren't counted by the local estimate
-	 * that gates the dead-end, so those still surface the warning (remedy:
-	 * `/shake images`).
+	 * Tier 1 — `shake("elide")` reaches INSIDE that tail: heavy tool-result /
+	 * block content is offloaded to one `artifact://` blob behind a recoverable
+	 * placeholder. Skipped when this pass already ran a shake (`skipElide`).
+	 * Tier 2 — `dropImages()`: the manual `/shake images` remedy, automated.
+	 * Image blocks are stripped from the branch; unlike elided text they are NOT
+	 * artifact-recoverable, so this tier only runs once elide has failed the
+	 * progress re-test.
 	 *
-	 * Returns the elide {@link ShakeResult} when something was offloaded (so the
-	 * caller can re-test and report), or `undefined` when nothing was eligible or
-	 * the pass aborted/failed.
+	 * Each tier that rewrote history re-anchors the in-flight context snapshot,
+	 * then the caller's progress predicate is re-tested; the first tier that
+	 * restores progress emits one info notice describing everything freed and
+	 * stops. Returns whether progress was restored — `false` falls through to
+	 * the dead-end warning.
 	 */
-	async #tryShakeRescueForDeadEnd(signal: AbortSignal): Promise<ShakeResult | undefined> {
-		if (signal.aborted) return undefined;
+	async #rescueCompactionDeadEnd(
+		signal: AbortSignal,
+		options: { skipElide: boolean; hasProgress: () => boolean },
+	): Promise<boolean> {
+		if (signal.aborted) return false;
+		let elided = 0;
+		let elidedTokens = 0;
+		let elideSink = "placeholders";
+		if (!options.skipElide) {
+			try {
+				const result = await this.shake("elide", { signal });
+				elided = result.toolResultsDropped + result.blocksDropped;
+				elidedTokens = result.tokensFreed;
+				if (result.artifactId) elideSink = "an artifact";
+				if (elided > 0) {
+					// The elide pass rewrote history; re-anchor the in-flight snapshot
+					// so the caller's headroom/retry-fit re-test measures the shaken
+					// context.
+					this.#rebasePendingContextSnapshotAfterCompaction();
+				}
+			} catch (error) {
+				logger.warn("Dead-end shake rescue failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			if (elided > 0 && options.hasProgress()) {
+				this.emitNotice(
+					"info",
+					`Compaction dead-end recovery: ${this.#describeElideRescue(elided, elidedTokens, elideSink)} so maintenance could make progress.`,
+					"compaction",
+				);
+				return true;
+			}
+		}
+		if (signal.aborted) return false;
+		let imagesDropped = 0;
 		try {
-			const result = await this.shake("elide", { signal });
-			return result.toolResultsDropped + result.blocksDropped > 0 ? result : undefined;
+			imagesDropped = (await this.dropImages()).removed;
+			if (imagesDropped > 0) this.#rebasePendingContextSnapshotAfterCompaction();
 		} catch (error) {
-			logger.warn("Dead-end shake rescue failed", {
+			logger.warn("Dead-end image-drop rescue failed", {
 				error: error instanceof Error ? error.message : String(error),
 			});
-			return undefined;
 		}
+		if (imagesDropped > 0 && options.hasProgress()) {
+			const elidedPart = elided > 0 ? `${this.#describeElideRescue(elided, elidedTokens, elideSink)} and ` : "";
+			this.emitNotice(
+				"info",
+				`Compaction dead-end recovery: ${elidedPart}dropped ${imagesDropped} attached image${imagesDropped === 1 ? "" : "s"} so maintenance could make progress.`,
+				"compaction",
+			);
+			return true;
+		}
+		return false;
 	}
 
-	/** Notice describing a successful dead-end elide rescue. */
-	#emitShakeRescueNotice(result: ShakeResult): void {
-		const elided = result.toolResultsDropped + result.blocksDropped;
-		const sink = result.artifactId ? "an artifact" : "placeholders";
-		this.emitNotice(
-			"info",
-			`Compaction dead-end recovery: elided ${elided} heavy block${elided === 1 ? "" : "s"} (~${result.tokensFreed.toLocaleString()} tokens) to ${sink} so maintenance could make progress.`,
-			"compaction",
-		);
+	/** Notice fragment for a dead-end elide tier: what was freed and where it went. */
+	#describeElideRescue(elided: number, tokensFreed: number, sink: string): string {
+		return `elided ${elided} heavy block${elided === 1 ? "" : "s"} (~${tokensFreed.toLocaleString()} tokens) to ${sink}`;
 	}
 
 	/**
@@ -13332,6 +13724,7 @@ export class AgentSession {
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.buildDisplaySessionContext();
 			this.agent.replaceMessages(sessionContext.messages);
+			this.#rebasePendingContextSnapshotAfterCompaction();
 			// Compaction discarded the conversation history that carried the approved
 			// plan reference. Clear the sent-flag so #buildPlanReferenceMessage re-reads
 			// the plan from disk and re-injects it on the next turn (issue #1246).
@@ -13365,23 +13758,28 @@ export class AgentSession {
 				details,
 				preserveData,
 			};
-			await this.#emitSessionEvent({ type: "auto_compaction_end", action, result, aborted: false, willRetry });
-
-			// Post-maintenance progress guard. Snapcompact can project over budget and
-			// fall back to a context-full summary; the summarizer keeps `keepRecentTokens`
-			// of recent history verbatim and findCutPoint can only cut at turn
-			// boundaries (never tool results), so a single oversized recent turn (e.g. a
-			// huge tool result) leaves the rewritten context still above threshold.
-			// Scheduling the continuation regardless means the next agent_end re-enters
-			// #checkCompaction over the same oversized tail and re-fires forever. The
-			// retry and the threshold auto-continue use different progress tests (a
-			// recoverable overflow only has to fit; the auto-continue thrash needs the
-			// stricter recovery band), so each branch evaluates its own below.
+			// Post-maintenance progress guard — evaluated BEFORE emitting
+			// auto_compaction_end so the TUI rebuild triggered by that event
+			// already reflects any rescue rewrite (elide / image-drop) and the
+			// dead-end warning stamped on the compaction entry. Snapcompact can
+			// project over budget and fall back to a context-full summary; the
+			// summarizer keeps `keepRecentTokens` of recent history verbatim and
+			// findCutPoint can only cut at turn boundaries (never tool results),
+			// so a single oversized recent turn (e.g. a huge tool result) leaves
+			// the rewritten context still above threshold. Scheduling the
+			// continuation regardless means the next agent_end re-enters
+			// #checkCompaction over the same oversized tail and re-fires forever.
+			// The retry and the threshold auto-continue use different progress
+			// tests (a recoverable overflow only has to fit; the auto-continue
+			// thrash needs the stricter recovery band), so each branch evaluates
+			// its own below.
 			let continuationScheduled = false;
 			// A non-idle pass that wanted to continue (retry or auto-continue) but freed
 			// too little for that path to proceed is a dead-end: warn once so the user
 			// understands why maintenance paused instead of silently looping.
 			let noProgressDeadEnd = false;
+			let retryFits = false;
+			let hasHeadroom = false;
 
 			if (willRetry) {
 				const messages = this.agent.state.messages;
@@ -13397,6 +13795,7 @@ export class AgentSession {
 						(reason === "incomplete" && lastAssistant.stopReason === "length");
 					if (shouldDrop) {
 						this.agent.replaceMessages(messages.slice(0, -1));
+						this.#rebasePendingContextSnapshotAfterCompaction();
 					}
 				}
 
@@ -13405,18 +13804,14 @@ export class AgentSession {
 				// won't include) is excluded. Reusing the auto-continue recovery band
 				// here turned recoverable overflows into manual dead-ends (#3412 review),
 				// so use the looser fit budget.
-				let retryFits = this.#compactionCreatedRetryFit();
-				if (!retryFits && !fallbackFromShake) {
-					const rescue = await this.#tryShakeRescueForDeadEnd(autoCompactionSignal);
-					if (rescue && this.#compactionCreatedRetryFit()) {
-						retryFits = true;
-						this.#emitShakeRescueNotice(rescue);
-					}
+				retryFits = this.#compactionCreatedRetryFit();
+				if (!retryFits) {
+					retryFits = await this.#rescueCompactionDeadEnd(autoCompactionSignal, {
+						skipElide: fallbackFromShake,
+						hasProgress: () => this.#compactionCreatedRetryFit(),
+					});
 				}
-				if (retryFits) {
-					this.#scheduleAgentContinue({ delayMs: 100, generation });
-					continuationScheduled = true;
-				} else {
+				if (!retryFits) {
 					noProgressDeadEnd = true;
 				}
 			} else if (reason !== "idle") {
@@ -13427,22 +13822,35 @@ export class AgentSession {
 				// when auto-continue is disabled, a no-headroom threshold pass must still
 				// block later automatic continuations (todo reminders/session_stop hooks)
 				// from re-entering the same oversized context.
-				let hasHeadroom = this.#compactionCreatedHeadroom();
-				if (!hasHeadroom && !fallbackFromShake) {
-					const rescue = await this.#tryShakeRescueForDeadEnd(autoCompactionSignal);
-					if (rescue && this.#compactionCreatedHeadroom()) {
-						hasHeadroom = true;
-						this.#emitShakeRescueNotice(rescue);
-					}
+				hasHeadroom = this.#compactionCreatedHeadroom();
+				if (!hasHeadroom) {
+					hasHeadroom = await this.#rescueCompactionDeadEnd(autoCompactionSignal, {
+						skipElide: fallbackFromShake,
+						hasProgress: () => this.#compactionCreatedHeadroom(),
+					});
 				}
-				if (hasHeadroom) {
-					if (shouldAutoContinue) {
-						this.#scheduleAutoContinuePrompt(generation);
-						continuationScheduled = true;
-					}
-				} else {
+				if (!hasHeadroom) {
 					noProgressDeadEnd = true;
 				}
+			}
+
+			const deadEndWarning = noProgressDeadEnd ? compactionDeadEndWarning("clear large tool output") : undefined;
+			if (deadEndWarning && savedCompactionEntry) {
+				// Stamp the divider: the compaction bar badges the dead-end and
+				// carries the full warning in its ctrl+o detail, so the pause
+				// stays explained even after the notice row scrolls away.
+				savedCompactionEntry.warning = deadEndWarning;
+				await this.sessionManager.rewriteEntries();
+			}
+
+			await this.#emitSessionEvent({ type: "auto_compaction_end", action, result, aborted: false, willRetry });
+
+			if (retryFits) {
+				this.#scheduleAgentContinue({ delayMs: 100, generation });
+				continuationScheduled = true;
+			} else if (hasHeadroom && shouldAutoContinue) {
+				this.#scheduleAutoContinuePrompt(generation);
+				continuationScheduled = true;
 			}
 			if (!continuationScheduled && !suppressContinuation && this.agent.hasQueuedMessages()) {
 				// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
@@ -13456,12 +13864,8 @@ export class AgentSession {
 				continuationScheduled = true;
 			}
 
-			if (noProgressDeadEnd) {
-				this.emitNotice(
-					"warning",
-					compactionDeadEndWarning("clear large tool output, run `/shake images` to drop attached images,"),
-					"compaction",
-				);
+			if (deadEndWarning) {
+				this.emitNotice("warning", deadEndWarning, "compaction");
 			}
 			if (continuationScheduled) return COMPACTION_CHECK_CONTINUATION;
 			return noProgressDeadEnd ? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION : COMPACTION_CHECK_NONE;
@@ -14130,6 +14534,34 @@ export class AgentSession {
 	}
 
 	/**
+	 * True when a turn failed with a hard (non-retryable) provider error but a
+	 * configured `retry.fallbackChains` entry covers the active model: the same
+	 * model is not worth retrying, yet a DIFFERENT model is a fresh chance, so
+	 * the chain is consulted before the error becomes final. Skips failures a
+	 * model switch cannot fix or must not replay: cancellations (abort-flavored
+	 * errors are not model faults), context overflow (compaction's job),
+	 * classifier refusals (chain consult is handled on the retryable path with
+	 * `pinFallback`), and turns that already emitted a tool call (replaying
+	 * could duplicate work).
+	 */
+	#isHardErrorFallbackEligible(message: AssistantMessage): boolean {
+		if (message.stopReason !== "error") return false;
+		const model = this.model;
+		if (!model) return false;
+		const retrySettings = this.settings.getGroup("retry");
+		if (!retrySettings.enabled || !retrySettings.modelFallback) return false;
+		if (this.#isClassifierRefusal(message)) return false;
+		const id = this.#classifyRetryMessage(message);
+		if (AIError.is(id, AIError.Flag.Abort) || AIError.is(id, AIError.Flag.UserInterrupt)) return false;
+		if (AIError.isContextOverflow(message, model.contextWindow ?? 0)) return false;
+		if (this.#hasReplayUnsafeToolOutput(message)) return false;
+		const currentSelector = formatRetryFallbackSelector(model, this.thinkingLevel);
+		const role = this.#activeRetryFallback?.role ?? this.#resolveRetryFallbackRole(currentSelector);
+		if (!role) return false;
+		return this.#findRetryFallbackCandidates(role, currentSelector).length > 0;
+	}
+
+	/**
 	 * Switch the active model from a Fireworks Fast (`-fast`) variant to its base
 	 * (Standard) id and stick there for the rest of the session — the auto
 	 * fallback that makes Fast a safe default. Returns false when the current
@@ -14252,12 +14684,16 @@ export class AgentSession {
 	}
 
 	/**
-	 * Handle retryable errors with exponential backoff.
+	 * Handle retryable errors with exponential backoff, credential rotation, and
+	 * model-fallback chains. Also entered for NON-retryable errors when a switch
+	 * is the recovery (`fireworksFastFallback`, `hardErrorFallback`): then a
+	 * successful model switch retries immediately, and a failed switch surfaces
+	 * the error without a same-model backoff retry.
 	 * @returns true if retry was initiated, false if max retries exceeded or disabled
 	 */
 	async #handleRetryableError(
 		message: AssistantMessage,
-		options?: { allowModelFallback?: boolean; fireworksFastFallback?: boolean },
+		options?: { allowModelFallback?: boolean; fireworksFastFallback?: boolean; hardErrorFallback?: boolean },
 	): Promise<boolean> {
 		const retrySettings = this.settings.getGroup("retry");
 		// The Fireworks Fast→base degrade is an intrinsic model-selection safety net,
@@ -14399,11 +14835,16 @@ export class AgentSession {
 			this.#resolveRetry();
 			return false;
 		}
-		// Fast→base was requested but the base switch could not happen (e.g. the
-		// base model has no credential). Don't fall through to backing-off and
-		// retrying the failing fast model for a hard router error that the generic
-		// classifier wouldn't retry — surface it instead.
-		if (options?.fireworksFastFallback && !switchedModel && !this.#isRetryableError(message)) {
+		// A fallback switch was the whole reason we entered (Fast→base degrade or
+		// a hard-error chain consult) but it could not happen (e.g. no candidate
+		// has a credential). Don't fall through to backing-off and retrying the
+		// failing model for an error the generic classifier wouldn't retry —
+		// surface it instead.
+		if (
+			(options?.fireworksFastFallback || options?.hardErrorFallback) &&
+			!switchedModel &&
+			!this.#isRetryableError(message)
+		) {
 			this.#retryAttempt = 0;
 			this.#resolveRetry();
 			return false;
@@ -16175,6 +16616,28 @@ export class AgentSession {
 	): void {
 		this.#pendingContextSnapshot = snapshot;
 		this.#contextUsageRevision++;
+	}
+
+	/**
+	 * Rebase the in-flight pending context snapshot onto the current message
+	 * set after a compaction (or its dead-end rescue) rewrote history mid-run.
+	 * The snapshot captures the prompt as submitted at run start and lives for
+	 * the whole run; once a compaction entry lands, every earlier usage anchor
+	 * is hidden from {@link getContextBreakdown}, so the stale run-start figure
+	 * would be reported as live context until the next provider response. That
+	 * inflated residual is what the post-compaction headroom/retry-fit checks
+	 * measure — a run that started above the recovery band then trips the
+	 * "freed too little context" dead-end even when compaction genuinely
+	 * shrank the context. No-op while no prompt is in flight.
+	 */
+	#rebasePendingContextSnapshotAfterCompaction(): void {
+		if (!this.#pendingContextSnapshot) return;
+		const nonMessageTokens = computeNonMessageTokens(this);
+		this.#setPendingContextSnapshot({
+			promptTokens: nonMessageTokens + this.messages.reduce((sum, msg) => sum + estimateTokens(msg), 0),
+			nonMessageTokens,
+			cutoffCount: this.messages.length,
+		});
 	}
 
 	#ingestProviderUsageHeaders(response: ProviderResponseMetadata, model?: Model): void {

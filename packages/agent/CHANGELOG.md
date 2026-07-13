@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [16.5.0] - 2026-07-13
+
+### Added
+
+- Added an automated image-dropping rescue tier to compaction dead-end recovery.
+- Added visual warnings and detailed recovery instructions to the session timeline when compaction fails to free sufficient space.
+
 ## [16.4.5] - 2026-07-11
 
 ### Added
