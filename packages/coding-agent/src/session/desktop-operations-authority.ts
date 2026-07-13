@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
-import { decodeCatalog, safeRelativePath as appWireSafeRelativePath } from "@oh-my-pi/app-wire";
+import { safeRelativePath as appWireSafeRelativePath, decodeCatalog } from "@oh-my-pi/app-wire";
 import {
 	Process as NativeProcess,
 	PtySession,
@@ -184,8 +184,15 @@ interface ProtocolSafeDirectoryEntry {
 	size?: number;
 }
 function protocolSafeDirectoryEntry(entry: SecureDirectoryEntry): ProtocolSafeDirectoryEntry | undefined {
-	const kind = entry.kind === "file" || entry.kind === "directory" || entry.kind === "symlink" ? entry.kind : undefined;
-	if (!kind || !entry.name || entry.name.includes("/") || entry.name.includes("\\") || /[\u0000-\u001f\u007f]/.test(entry.name))
+	const kind =
+		entry.kind === "file" || entry.kind === "directory" || entry.kind === "symlink" ? entry.kind : undefined;
+	if (
+		!kind ||
+		!entry.name ||
+		entry.name.includes("/") ||
+		entry.name.includes("\\") ||
+		/[\u0000-\u001f\u007f]/.test(entry.name)
+	)
 		return undefined;
 	try {
 		const path = appWireSafeRelativePath(entry.path);

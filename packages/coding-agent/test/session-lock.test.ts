@@ -1,13 +1,13 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	__internalsForTesting,
 	acquireSessionLock,
 	inspectSessionLock,
 	lockPathForSession,
 	SessionLockError,
-	__internalsForTesting,
 } from "../src/session/session-lock";
 
 const OWNER_A = "00000000-0000-4000-8000-000000000001";
@@ -42,10 +42,24 @@ describe("session lock", () => {
 			processStartMarker: "marker",
 			processProbe: probe(true),
 		});
-		expect(inspectSessionLock(session, { now: () => now, pid: 43, processStartMarker: "other", processProbe: probe(true) }).status).toBe("live");
+		expect(
+			inspectSessionLock(session, {
+				now: () => now,
+				pid: 43,
+				processStartMarker: "other",
+				processProbe: probe(true),
+			}).status,
+		).toBe("live");
 		now += 5000;
 		lock.heartbeat();
-		expect(inspectSessionLock(session, { now: () => now, pid: 43, processStartMarker: "other", processProbe: probe(true) }).heartbeatAgeMs).toBe(0);
+		expect(
+			inspectSessionLock(session, {
+				now: () => now,
+				pid: 43,
+				processStartMarker: "other",
+				processProbe: probe(true),
+			}).heartbeatAgeMs,
+		).toBe(0);
 		lock.release();
 		lock.release();
 		expect(fs.existsSync(lockPathForSession(session))).toBe(false);
@@ -61,14 +75,23 @@ describe("session lock", () => {
 			processStartMarker: "marker",
 			processProbe: probe(true),
 		});
-		expect(() => acquireSessionLock(session, {
-			now: () => now,
-			ownerId: OWNER_B,
-			pid: 43,
-			processStartMarker: "marker-b",
-			processProbe: probe(true),
-		})).toThrow(SessionLockError);
-		expect(inspectSessionLock(session, { now: () => 15_000, pid: 43, processStartMarker: "marker-b", processProbe: probe(true) }).status).toBe("suspect");
+		expect(() =>
+			acquireSessionLock(session, {
+				now: () => now,
+				ownerId: OWNER_B,
+				pid: 43,
+				processStartMarker: "marker-b",
+				processProbe: probe(true),
+			}),
+		).toThrow(SessionLockError);
+		expect(
+			inspectSessionLock(session, {
+				now: () => 15_000,
+				pid: 43,
+				processStartMarker: "marker-b",
+				processProbe: probe(true),
+			}).status,
+		).toBe("suspect");
 		first.release();
 	});
 
@@ -90,8 +113,50 @@ describe("session lock", () => {
 		});
 		expect(second.record.ownerId).toBe(OWNER_B);
 		first.release();
-		expect(inspectSessionLock(session, { now: () => 20_001, pid: 43, processStartMarker: "marker-b", processProbe: probe(false) }).record?.ownerId).toBe(OWNER_B);
+		expect(
+			inspectSessionLock(session, {
+				now: () => 20_001,
+				pid: 43,
+				processStartMarker: "marker-b",
+				processProbe: probe(false),
+			}).record?.ownerId,
+		).toBe(OWNER_B);
 		second.release();
+	});
+
+	it("does not leak the replacement lock when stale-claim cleanup fails", () => {
+		const { session } = fixture();
+		const first = acquireSessionLock(session, {
+			now: () => 0,
+			ownerId: OWNER_A,
+			pid: 42,
+			processStartMarker: "marker",
+			processProbe: probe(false),
+		});
+		const unlinkSync = fs.unlinkSync;
+		const unlinkSpy = vi.spyOn(fs, "unlinkSync").mockImplementation(target => {
+			if (String(target).endsWith(".steal")) {
+				const error = new Error("claim cleanup denied") as NodeJS.ErrnoException;
+				error.code = "EACCES";
+				throw error;
+			}
+			return unlinkSync(target);
+		});
+		try {
+			expect(() =>
+				acquireSessionLock(session, {
+					now: () => 20_001,
+					ownerId: OWNER_B,
+					pid: 43,
+					processStartMarker: "marker-b",
+					processProbe: probe(false),
+				}),
+			).toThrow(SessionLockError);
+			expect(fs.existsSync(lockPathForSession(session))).toBe(false);
+		} finally {
+			unlinkSpy.mockRestore();
+			first.release();
+		}
 	});
 
 	it("does not steal before twenty seconds even when the owner is dead", () => {
@@ -115,7 +180,6 @@ describe("session lock", () => {
 		first.release();
 	});
 
-
 	it("fails closed for foreign hosts, unknown liveness, malformed records, and path mismatches", () => {
 		const { session } = fixture();
 		const first = acquireSessionLock(session, {
@@ -137,7 +201,9 @@ describe("session lock", () => {
 		first.release();
 
 		fs.writeFileSync(lockPathForSession(session), JSON.stringify({ protocolVersion: 1, ownerId: OWNER_A }));
-		expect(inspectSessionLock(session, { pid: 43, processStartMarker: "marker-b", processProbe: probe(false) }).status).toBe("malformed");
+		expect(
+			inspectSessionLock(session, { pid: 43, processStartMarker: "marker-b", processProbe: probe(false) }).status,
+		).toBe("malformed");
 	});
 
 	it("uses canonical real paths for symlink aliases and preserves 0600 claims", () => {
@@ -225,7 +291,14 @@ describe("session lock", () => {
 			processStartMarker: "marker-a",
 			processProbe: { processStartMarker: () => "marker-b", isAlive: () => "unknown" },
 		});
-		expect(inspectSessionLock(session, { now: () => 30_000, pid: 43, processStartMarker: "marker-b", processProbe: probe("unknown") }).stealable).toBe(false);
+		expect(
+			inspectSessionLock(session, {
+				now: () => 30_000,
+				pid: 43,
+				processStartMarker: "marker-b",
+				processProbe: probe("unknown"),
+			}).stealable,
+		).toBe(false);
 		lock.release();
 	});
 });

@@ -14,6 +14,8 @@ import { buildNonInteractiveEnv } from "./non-interactive-env";
 
 export interface BashExecutorOptions {
 	cwd?: string;
+	/** Session-scoped settings used for output retention and column limits. */
+	outputSettings?: Settings;
 	/** Milliseconds before aborting the command; 0 disables the executor deadline. */
 	timeout?: number;
 	onChunk?: (chunk: string) => void;
@@ -260,6 +262,7 @@ function resolveUserShellConfig(settings: Settings, baseConfig: ShellConfig): Sh
 
 export async function executeBash(command: string, options?: BashExecutorOptions): Promise<BashResult> {
 	const settings = await Settings.init();
+	const outputSettings = options?.outputSettings ?? settings;
 	const baseShellConfig = settings.getShellConfig();
 	const shellConfig =
 		options?.useUserShell === true ? resolveUserShellConfig(settings, baseShellConfig) : baseShellConfig;
@@ -284,8 +287,8 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		onChunk: options?.onChunk,
 		artifactPath: options?.artifactPath,
 		artifactId: options?.artifactId,
-		headBytes: resolveOutputSinkHeadBytes(settings),
-		maxColumns: resolveOutputMaxColumns(settings),
+		headBytes: resolveOutputSinkHeadBytes(outputSettings),
+		maxColumns: resolveOutputMaxColumns(outputSettings),
 		chunkThrottleMs: options?.onChunk ? (options.chunkThrottleMs ?? 50) : 0,
 	});
 

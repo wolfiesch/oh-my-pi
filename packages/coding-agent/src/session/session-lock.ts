@@ -103,7 +103,6 @@ export interface SessionLockHandle {
 	readonly released: boolean;
 }
 
-
 interface SessionLockClaim {
 	protocolVersion: number;
 	ownerId: string;
@@ -140,7 +139,10 @@ function defaultProcessStartMarker(pid: number): string | null {
 			if (closingParen < 0) return null;
 			// After the comm field, fields[0] is stat field 3 (state), so
 			// starttime (field 22) is index 19.
-			const fields = stat.slice(closingParen + 1).trim().split(/\s+/);
+			const fields = stat
+				.slice(closingParen + 1)
+				.trim()
+				.split(/\s+/);
 			const startTime = fields[19];
 			return startTime ? `linux:${startTime}` : null;
 		} catch {
@@ -235,7 +237,8 @@ function parseRecord(text: string, expectedSessionFile?: string): SessionLockRec
 		return null;
 	}
 	if (!isRecord(value)) return null;
-	if (Object.keys(value).length !== Object.keys(LOCK_KEYS).length || Object.keys(value).some(key => !LOCK_KEYS[key])) return null;
+	if (Object.keys(value).length !== Object.keys(LOCK_KEYS).length || Object.keys(value).some(key => !LOCK_KEYS[key]))
+		return null;
 	const protocolVersion = value.protocolVersion;
 	const ownerId = value.ownerId;
 	const pid = value.pid;
@@ -287,8 +290,21 @@ function parseClaim(text: string, expectedSessionFile: string): SessionLockClaim
 	if (byteLength(text) > MAX_LOCK_BYTES) return null;
 	try {
 		const value = JSON.parse(text) as Record<string, unknown>;
-		const expectedKeys = ["protocolVersion", "ownerId", "pid", "processStartMarker", "hostname", "createdAt", "sessionFile"];
-		if (!isRecord(value) || Object.keys(value).length !== expectedKeys.length || Object.keys(value).some(key => !expectedKeys.includes(key))) return null;
+		const expectedKeys = [
+			"protocolVersion",
+			"ownerId",
+			"pid",
+			"processStartMarker",
+			"hostname",
+			"createdAt",
+			"sessionFile",
+		];
+		if (
+			!isRecord(value) ||
+			Object.keys(value).length !== expectedKeys.length ||
+			Object.keys(value).some(key => !expectedKeys.includes(key))
+		)
+			return null;
 		if (
 			value.protocolVersion !== SESSION_LOCK_PROTOCOL_VERSION ||
 			typeof value.ownerId !== "string" ||
@@ -301,7 +317,8 @@ function parseClaim(text: string, expectedSessionFile: string): SessionLockClaim
 			!Number.isFinite(value.createdAt) ||
 			typeof value.sessionFile !== "string" ||
 			value.sessionFile !== normalizeSessionFile(expectedSessionFile)
-		) return null;
+		)
+			return null;
 		return value as unknown as SessionLockClaim;
 	} catch {
 		return null;
@@ -493,13 +510,25 @@ function lockedError(sessionFile: string, inspection: SessionLockInspection): Se
 }
 
 function ioError(sessionFile: string, lockPath: string, error: unknown): SessionLockError {
-	return new SessionLockError("io", `Session lock I/O failed for ${lockPath}`, sessionFile, lockPath, undefined, error);
+	return new SessionLockError(
+		"io",
+		`Session lock I/O failed for ${lockPath}`,
+		sessionFile,
+		lockPath,
+		undefined,
+		error,
+	);
 }
 
 export function acquireSessionLock(sessionFile: string, options: SessionLockOptions = {}): SessionLockHandle {
 	const normalized = normalizeSessionFile(sessionFile);
 	if (byteLength(normalized) > MAX_SESSION_PATH_BYTES) {
-		throw new SessionLockError("malformed", "Session path exceeds lock record limit", normalized, lockPathFor(normalized));
+		throw new SessionLockError(
+			"malformed",
+			"Session path exceeds lock record limit",
+			normalized,
+			lockPathFor(normalized),
+		);
 	}
 	const lockPath = lockPathFor(normalized);
 	const rt = runtime(options);
@@ -547,6 +576,7 @@ export function acquireSessionLock(sessionFile: string, options: SessionLockOpti
 
 		const claimPath = claimPathFor(lockPath);
 		let claimed = false;
+		let claimRemovalError: SessionLockError | undefined;
 		try {
 			recoverClaim(claimPath, normalized, rt);
 			claimed = writeClaim(claimPath, claim());
@@ -565,9 +595,19 @@ export function acquireSessionLock(sessionFile: string, options: SessionLockOpti
 				try {
 					removeClaim(claimPath);
 				} catch (error) {
-					if (acquired) throw ioError(normalized, lockPath, error);
+					if (acquired) claimRemovalError = ioError(normalized, lockPath, error);
 				}
 			}
+		}
+		if (claimRemovalError) {
+			try {
+				const current = readRecord(lockPath, normalized);
+				if (current.kind === "record" && sameOwner(current.record, record)) fs.unlinkSync(lockPath);
+			} catch {
+				// Preserve the claim-cleanup failure. A later inspection still fails
+				// closed if the newly installed owner record could not be removed.
+			}
+			throw claimRemovalError;
 		}
 	}
 	if (!acquired) throw lockedError(normalized, inspectWithRuntime(normalized, rt));
@@ -581,10 +621,22 @@ export function acquireSessionLock(sessionFile: string, options: SessionLockOpti
 		try {
 			recoverClaim(claimPath, normalized, rt);
 			claimed = writeClaim(claimPath, claim());
-			if (!claimed) throw new SessionLockError("locked", "Session lock mutation is claimed by another owner", normalized, lockPath);
+			if (!claimed)
+				throw new SessionLockError(
+					"locked",
+					"Session lock mutation is claimed by another owner",
+					normalized,
+					lockPath,
+				);
 			const current = inspectWithRuntime(normalized, rt);
 			if (current.status === "malformed" || !current.record || !sameOwner(current.record, record)) {
-				throw new SessionLockError("not-owner", `Session lock ownership was lost for ${normalized}`, normalized, lockPath, current);
+				throw new SessionLockError(
+					"not-owner",
+					`Session lock ownership was lost for ${normalized}`,
+					normalized,
+					lockPath,
+					current,
+				);
 			}
 			const next: SessionLockRecord = { ...record, heartbeatAt: rt.now() };
 			writeAtomic(lockPath, next);

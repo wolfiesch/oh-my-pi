@@ -12,7 +12,6 @@ import type { AssistantMessage, Message, ToolCall } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import * as piNatives from "@oh-my-pi/pi-natives";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -23,6 +22,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import * as piNatives from "@oh-my-pi/pi-natives";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
@@ -2134,8 +2134,13 @@ describe("AgentSession TTSR resume gate", () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const partialDeltasHandled = Promise.withResolvers<void>();
 		const releaseCompletions = Promise.withResolvers<void>();
+		const astMatchesStarted = Promise.withResolvers<void>();
+		const releaseAstMatches = Promise.withResolvers<void>();
+		const afterToolCallsEntered = Promise.withResolvers<void>();
 		let digestCallsBeforeCompletion = 0;
 		let streamCallCount = 0;
+		let astMatchStartCount = 0;
+		let afterToolCallCount = 0;
 		const executedToolNames: string[] = [];
 		const sourceDigest = (args: unknown): string | undefined => {
 			if (!args || typeof args !== "object") return undefined;
@@ -2167,7 +2172,13 @@ describe("AgentSession TTSR resume gate", () => {
 		};
 		ttsrManager.addRule(astEditRule);
 		ttsrManager.addRule(astWriteRule);
-		const astMatchSpy = vi.spyOn(piNatives, "astMatch");
+		const nativeAstMatch = piNatives.astMatch;
+		const astMatchSpy = vi.spyOn(piNatives, "astMatch").mockImplementation(async request => {
+			astMatchStartCount++;
+			if (astMatchStartCount === 2) astMatchesStarted.resolve();
+			await releaseAstMatches.promise;
+			return nativeAstMatch(request);
+		});
 
 		const editCall: ToolCall = {
 			type: "toolCall",
@@ -2179,7 +2190,10 @@ describe("AgentSession TTSR resume gate", () => {
 			type: "toolCall",
 			id: "call_ast_write",
 			name: "write",
-			arguments: { path: "src/write-target.ts", content: "const written = (value as { content: unknown }).content;" },
+			arguments: {
+				path: "src/write-target.ts",
+				content: "const written = (value as { content: unknown }).content;",
+			},
 		};
 		const partial = makeToolCallMessage([
 			{ ...editCall, arguments: { path: "src/edit-target.ts", input: "const edit = (value" } },
@@ -2254,11 +2268,19 @@ describe("AgentSession TTSR resume gate", () => {
 			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir, "models.yml")),
 			ttsrManager,
 		});
+		const productionAfterToolCall = agent.afterToolCall!;
+		agent.afterToolCall = async (ctx, signal) => {
+			afterToolCallCount++;
+			if (afterToolCallCount === 2) afterToolCallsEntered.resolve();
+			return productionAfterToolCall(ctx, signal);
+		};
 
 		const prompt = session.prompt("Apply the edits");
 		await partialDeltasHandled.promise;
 		expect(astMatchSpy).not.toHaveBeenCalled();
 		releaseCompletions.resolve();
+		await Promise.all([astMatchesStarted.promise, afterToolCallsEntered.promise]);
+		releaseAstMatches.resolve();
 		await prompt;
 
 		expect(astMatchSpy).toHaveBeenCalledTimes(2);
@@ -2266,12 +2288,23 @@ describe("AgentSession TTSR resume gate", () => {
 			"const edit = (value as { content: unknown }).content;",
 			"const written = (value as { content: unknown }).content;",
 		]);
-		expect((await Promise.all(astMatchSpy.mock.results.map(result => result.value as Promise<{ totalMatches: number }>))).map(result => result.totalMatches)).toEqual([
-			1,
-			1,
-		]);
+		expect(
+			(
+				await Promise.all(astMatchSpy.mock.results.map(result => result.value as Promise<{ totalMatches: number }>))
+			).map(result => result.totalMatches),
+		).toEqual([1, 1]);
 		expect(executedToolNames).toEqual(["edit", "write"]);
 		expect(ttsrManager.getInjectedRuleNames().sort()).toEqual(["ast-edit-console-log", "ast-write-console-log"]);
+		const resultTextByTool = new Map<string, string>();
+		for (const message of agent.state.messages) {
+			if (message.role !== "toolResult") continue;
+			resultTextByTool.set(
+				message.toolName,
+				message.content.map(block => (block.type === "text" ? block.text : "")).join("\n"),
+			);
+		}
+		expect(resultTextByTool.get("edit")).toContain(astEditRule.content);
+		expect(resultTextByTool.get("write")).toContain(astWriteRule.content);
 	});
 
 	it("runs malformed completed AST payloads once without a per-delta matcher flood", async () => {
@@ -2280,7 +2313,13 @@ describe("AgentSession TTSR resume gate", () => {
 		const releaseCompletion = Promise.withResolvers<void>();
 		let digestCalls = 0;
 		let streamCallCount = 0;
-		const ttsrManager = new TtsrManager({ enabled: true, contextMode: "discard", interruptMode: "never", repeatMode: "once", repeatGap: 10 });
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "never",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
 		ttsrManager.addRule({
 			name: "malformed-ast-payload",
 			path: "/tmp/malformed-ast-payload.md",
@@ -2305,7 +2344,8 @@ describe("AgentSession TTSR resume gate", () => {
 			description: "Test edit tool",
 			parameters: type({ path: "string", input: "string" }),
 			matcherDigest: args => {
-				if (!args || typeof args !== "object" || !("input" in args) || typeof args.input !== "string") return undefined;
+				if (!args || typeof args !== "object" || !("input" in args) || typeof args.input !== "string")
+					return undefined;
 				if (++digestCalls === 3) partialDeltasHandled.resolve();
 				return args.input;
 			},
@@ -2363,7 +2403,13 @@ describe("AgentSession TTSR resume gate", () => {
 		const deltaMatched = Promise.withResolvers<void>();
 		const releaseCompletion = Promise.withResolvers<void>();
 		let streamCallCount = 0;
-		const ttsrManager = new TtsrManager({ enabled: true, contextMode: "discard", interruptMode: "never", repeatMode: "once", repeatGap: 10 });
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "never",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
 		ttsrManager.addRule({
 			name: "streaming-regex",
 			path: "/tmp/streaming-regex.md",

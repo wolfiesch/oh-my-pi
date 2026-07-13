@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { getProjectDir, logger } from "@oh-my-pi/pi-utils";
+import type { Settings } from "../../config/settings";
 import type { ToolSession } from "../../tools";
 import {
 	attachSessionOwner,
@@ -70,6 +71,8 @@ export interface PythonExecutorOptions {
 	/** Artifact path/id for full output storage */
 	artifactPath?: string;
 	artifactId?: string;
+	/** Session-scoped settings used for output retention and column limits. */
+	outputSettings?: Settings;
 	/**
 	 * On-disk roots the prelude helpers (`read`/`write`) substitute for
 	 * internal-URL schemes (e.g. `{ local: "/…/artifacts/local" }`). Exported to

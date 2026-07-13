@@ -1848,6 +1848,8 @@ export class AgentSession {
 	#pendingTtsrInjections: Rule[] = [];
 	/** Completed tool-call stream keys already submitted for AST matching this turn. */
 	#completedTtsrAstToolCalls = new Set<string>();
+	/** Finalized AST checks that must settle before the matching tool result is emitted. */
+	#pendingTtsrAstToolCalls = new Map<string, { activate: () => void; completion: Promise<boolean> }>();
 	/** Per-tool TTSR rules whose `interruptMode` opted out of aborting the stream.
 	 *  These are folded into the matched tool call's `toolResult` content as an
 	 *  in-band system reminder, instead of spawning a separate follow-up turn. */
@@ -3766,11 +3768,19 @@ export class AgentSession {
 			this.#recordToolExecutionStart(event);
 		}
 
+		// Agent-core invokes subscribers fire-and-forget. Start the finalized AST
+		// check before this handler's first await so a fast tool cannot reach its
+		// result hook before the check is visible. Normal event processing activates
+		// it after the message_update is emitted; the matching tool's result hook can
+		// activate it sooner when a slow subscriber would otherwise cause a race.
+		const pendingTtsrAst = this.#beginTtsrAstToolCall(event);
 		try {
 			await this.#emitSessionEvent(displayEvent);
 		} catch (error) {
 			messageEndPersistence?.release();
 			throw error;
+		} finally {
+			pendingTtsrAst?.activate();
 		}
 
 		if (event.type === "turn_start") {
@@ -3839,22 +3849,8 @@ export class AgentSession {
 			}
 		}
 
-		// Regex conditions remain incremental, but AST matching must only see the
-		// completed edit/write payload. `toolcall_end.toolCall` is the provider's
-		// finalized call; using it here avoids parsing or caching partial digests
-		// from preceding `toolcall_delta` snapshots.
-		if (
-			event.type === "message_update" &&
-			event.assistantMessageEvent.type === "toolcall_end" &&
-			this.#ttsrManager?.hasAstRules()
-		) {
-			const assistantEvent = event.assistantMessageEvent;
-			const matchContext = this.#getTtsrToolMatchContext(assistantEvent.toolCall, assistantEvent.contentIndex);
-			const targetMessageTimestamp = event.message.role === "assistant" ? event.message.timestamp : undefined;
-			const astMatches = await this.#checkTtsrAstToolCall(matchContext, assistantEvent.toolCall);
-			if (astMatches.length > 0 && this.#handleTtsrMatches(astMatches, matchContext, targetMessageTimestamp)) {
-				return;
-			}
+		if (pendingTtsrAst) {
+			if (await pendingTtsrAst.completion) return;
 		}
 
 		if (
@@ -4584,7 +4580,12 @@ export class AgentSession {
 		}
 	}
 
-	#afterToolCall(ctx: AfterToolCallContext): AfterToolCallResult | undefined {
+	async #afterToolCall(ctx: AfterToolCallContext): Promise<AfterToolCallResult | undefined> {
+		const pendingAst = this.#pendingTtsrAstToolCalls.get(`toolcall:${ctx.toolCall.id}`);
+		if (pendingAst) {
+			pendingAst.activate();
+			await pendingAst.completion;
+		}
 		if (
 			this.#isTerminalYieldToolResult({
 				toolName: ctx.toolCall.name,
@@ -4845,6 +4846,63 @@ export class AgentSession {
 			filePaths: filePaths.length > 0 ? filePaths : [filePath],
 			streamKey: base.streamKey ? `${base.streamKey}#${filePath}` : undefined,
 		};
+	}
+
+	/**
+	 * Start one finalized AST match synchronously and expose a keyed completion
+	 * barrier to the matching tool-result hook.
+	 *
+	 * Agent-core deliberately emits subscriber events without awaiting them. AST
+	 * matching is async, so a fast edit/write can otherwise finish before its rule
+	 * is bucketed, permanently losing the in-band reminder. Activation is deferred
+	 * until the message_update has normally reached session subscribers, but the
+	 * tool-result hook may activate the same idempotent barrier first when needed.
+	 */
+	#beginTtsrAstToolCall(event: AgentEvent): { activate: () => void; completion: Promise<boolean> } | undefined {
+		if (
+			event.type !== "message_update" ||
+			event.assistantMessageEvent.type !== "toolcall_end" ||
+			!this.#ttsrManager?.hasAstRules()
+		) {
+			return undefined;
+		}
+
+		const assistantEvent = event.assistantMessageEvent;
+		const matchContext = this.#getTtsrToolMatchContext(assistantEvent.toolCall, assistantEvent.contentIndex);
+		const completionKey = matchContext.streamKey;
+		if (!completionKey) return undefined;
+
+		const existing = this.#pendingTtsrAstToolCalls.get(completionKey);
+		if (existing) return existing;
+		if (this.#completedTtsrAstToolCalls.has(completionKey)) return undefined;
+
+		const matches = this.#checkTtsrAstToolCall(matchContext, assistantEvent.toolCall);
+		const targetMessageTimestamp = event.message.role === "assistant" ? event.message.timestamp : undefined;
+		const activation = Promise.withResolvers<void>();
+		let completion: Promise<boolean>;
+		completion = (async () => {
+			await activation.promise;
+			const astMatches = await matches;
+			return astMatches.length > 0 && this.#handleTtsrMatches(astMatches, matchContext, targetMessageTimestamp);
+		})()
+			.catch(error => {
+				logger.warn("TTSR finalized AST match failed", {
+					toolCallId: assistantEvent.toolCall.id,
+					toolName: assistantEvent.toolCall.name,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return false;
+			})
+			.finally(() => {
+				if (this.#pendingTtsrAstToolCalls.get(completionKey)?.completion === completion) {
+					this.#pendingTtsrAstToolCalls.delete(completionKey);
+				}
+			});
+
+		const pending = { activate: activation.resolve, completion };
+		this.#pendingTtsrAstToolCalls.set(completionKey, pending);
+		this.#trackPostPromptTask(completion);
+		return pending;
 	}
 
 	/**

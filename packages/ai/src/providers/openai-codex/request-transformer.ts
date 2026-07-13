@@ -4,7 +4,6 @@ import { requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { Model } from "../../types";
 import { mapOpenAIReasoningEffort } from "../openai-shared";
 
-
 /** Reasoning replay scope for the Codex Responses API (`reasoning.context`). */
 export type CodexReasoningContext = "auto" | "current_turn" | "all_turns";
 

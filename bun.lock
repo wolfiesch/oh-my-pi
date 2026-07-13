@@ -55,14 +55,11 @@
     },
     "packages/app-wire": {
       "name": "@oh-my-pi/app-wire",
-      "version": "0.4.4",
+      "version": "0.5.1",
     },
     "packages/appserver": {
       "name": "@oh-my-pi/appserver",
       "version": "0.1.0",
-      "bin": {
-        "ompd": "./bin/ompd.ts",
-      },
       "dependencies": {
         "@oh-my-pi/app-wire": "workspace:*",
       },
@@ -92,6 +89,8 @@
         "@agentclientprotocol/sdk": "catalog:",
         "@babel/parser": "catalog:",
         "@mozilla/readability": "catalog:",
+        "@oh-my-pi/app-wire": "workspace:*",
+        "@oh-my-pi/appserver": "workspace:*",
         "@oh-my-pi/hashline": "catalog:",
         "@oh-my-pi/omp-mechanism": "catalog:",
         "@oh-my-pi/omp-stats": "catalog:",

@@ -412,6 +412,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		fs.utimesSync(sessionFile!, oldSessionMtime, oldSessionMtime);
 		const persistedBeforeResume = fs.readFileSync(sessionFile!, "utf8");
 		const persistedMtimeBeforeResume = fs.statSync(sessionFile!).mtimeMs;
+		await sessionManager.close();
 		const resumedManager = await SessionManager.open(sessionFile!, tempDir);
 		const { session } = await createAgentSession({
 			cwd: tempDir,

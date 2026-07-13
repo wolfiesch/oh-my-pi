@@ -295,6 +295,7 @@ describe("UiHelpers.renderInitialMessages — image replay", () => {
 		await session.flush();
 		const sessionFile = session.getSessionFile();
 		if (!sessionFile) throw new Error("Expected persisted session file");
+		await session.close();
 		const reloaded = await SessionManager.open(sessionFile);
 		const transcript = reloaded.buildSessionContext({ transcript: true });
 		const { ctx, chatContainer } = makeRenderCtx(transcript);
@@ -304,6 +305,7 @@ describe("UiHelpers.renderInitialMessages — image replay", () => {
 		expect(countImageComponents(chatContainer)).toBe(2);
 		expect(Bun.stripANSI(chatContainer.render(100).join("\n"))).toContain("Read reopened.png");
 		expect(ctx.ui.requestRender).toHaveBeenCalledWith(true, { clearScrollback: true });
+		await reloaded.close();
 	});
 });
 

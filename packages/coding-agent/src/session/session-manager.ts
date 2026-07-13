@@ -58,11 +58,7 @@ import {
 } from "./session-entries";
 import { findMostRecentSession, listAllSessions, listSessions, type SessionInfo } from "./session-listing";
 import { loadEntriesFromFile, readTitleSlotFromFile, resolveBlobRefsInEntries } from "./session-loader";
-import {
-	acquireSessionLock,
-	type SessionLockHandle,
-	type SessionLockOptions,
-} from "./session-lock";
+import { acquireSessionLock, type SessionLockHandle, type SessionLockOptions } from "./session-lock";
 import { generateId, migrateToCurrentVersion } from "./session-migrations";
 import {
 	computeDefaultSessionDir,
@@ -661,20 +657,26 @@ export class SessionManager {
 	 */
 	async #rewriteAtomically(): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
-		if (!this.#shouldHaveSessionFile()) return;
 		this.#acquireSessionLock();
 
 		const startEpoch = this.#diskEpoch;
-		await this.#scheduleDiskWork(
-			async () => {
-				if (await this.#runFencedAtomicRewrite(startEpoch)) {
-					this.#fileIsCurrent = true;
-					this.#rewriteRequired = false;
-					this.#hasTitleSlot = true;
-				}
-			},
-			{ epoch: startEpoch },
-		);
+		try {
+			await this.#scheduleDiskWork(
+				async () => {
+					if (await this.#runFencedAtomicRewrite(startEpoch)) {
+						this.#fileIsCurrent = true;
+						this.#rewriteRequired = false;
+						this.#hasTitleSlot = true;
+					}
+				},
+				{ epoch: startEpoch },
+			);
+		} catch (error) {
+			// A disk failure makes this manager unwritable. Relinquish ownership so
+			// recovery or another process can repair/materialize the session.
+			this.#releaseSessionLock();
+			throw error;
+		}
 	}
 
 	/**
@@ -993,7 +995,11 @@ export class SessionManager {
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
 		const activeFile = this.#sessionFile;
 		let nextLock = this.#sessionLock;
-		if (snapshot.onDisk && snapshot.sessionFile && (!this.#sessionLock || path.resolve(snapshot.sessionFile) !== path.resolve(activeFile ?? ""))) {
+		if (
+			snapshot.onDisk &&
+			snapshot.sessionFile &&
+			(!this.#sessionLock || path.resolve(snapshot.sessionFile) !== path.resolve(activeFile ?? ""))
+		) {
 			nextLock = acquireSessionLock(snapshot.sessionFile, this.#lockOptions);
 		} else if (!snapshot.onDisk) {
 			this.#releaseSessionLock();
@@ -2008,31 +2014,31 @@ export class SessionManager {
 			migrateToCurrentVersion(sourceEntries);
 			await resolveBlobRefsInEntries(sourceEntries, manager.#blobs);
 
-		const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		const history = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
-		manager.#resetToNewSession(
-			{
-				parentSession: sourceHeader?.id,
-				providerPromptCacheKey: sourceHeader?.providerPromptCacheKey ?? sourceHeader?.id,
-			},
-			options?.sessionFile,
-		);
-		manager.#header.title = sourceHeader?.title;
-		manager.#header.titleSource = sourceHeader?.titleSource;
-		manager.#sessionName = manager.#header.title;
-		manager.#titleSource = manager.#header.titleSource;
-		manager.#titleUpdatedAt = nowIso();
-		manager.#hasTitleSlot = true;
-		manager.#entries = history;
-		manager.#index.rebuild(history);
-		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
-		manager.#forceFileCreation = true;
-		await manager.#rewriteAtomically();
-		return manager;
-	} catch (error) {
-		manager.#releaseSessionLock();
-		throw error;
-	}
+			const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+			const history = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+			manager.#resetToNewSession(
+				{
+					parentSession: sourceHeader?.id,
+					providerPromptCacheKey: sourceHeader?.providerPromptCacheKey ?? sourceHeader?.id,
+				},
+				options?.sessionFile,
+			);
+			manager.#header.title = sourceHeader?.title;
+			manager.#header.titleSource = sourceHeader?.titleSource;
+			manager.#sessionName = manager.#header.title;
+			manager.#titleSource = manager.#header.titleSource;
+			manager.#titleUpdatedAt = nowIso();
+			manager.#hasTitleSlot = true;
+			manager.#entries = history;
+			manager.#index.rebuild(history);
+			manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
+			manager.#forceFileCreation = true;
+			await manager.#rewriteAtomically();
+			return manager;
+		} catch (error) {
+			manager.#releaseSessionLock();
+			throw error;
+		}
 	}
 
 	static async open(

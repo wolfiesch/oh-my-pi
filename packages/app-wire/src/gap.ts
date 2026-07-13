@@ -1,8 +1,8 @@
-import { decodeCursor, type Cursor } from "./cursor.ts";
-import { hostId, sessionId, type HostId, type SessionId } from "./ids.ts";
-import { inputObject, controlFree } from "./guards.ts";
-import { PROTOCOL_VERSION } from "./limits.ts";
+import { type Cursor, decodeCursor } from "./cursor.ts";
 import { fail } from "./errors.ts";
+import { controlFree, inputObject } from "./guards.ts";
+import { type HostId, hostId, type SessionId, sessionId } from "./ids.ts";
+import { PROTOCOL_VERSION } from "./limits.ts";
 export interface GapFrame {
 	v: typeof PROTOCOL_VERSION;
 	type: "gap";

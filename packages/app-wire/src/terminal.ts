@@ -1,7 +1,7 @@
-import { hostId, sessionId, terminalId, type HostId, type SessionId, type TerminalId } from "./ids.ts";
-import { inputObject, controlFree, boundedText } from "./guards.ts";
-import { MAX_TERMINAL_OUTPUT_BYTES, PROTOCOL_VERSION } from "./limits.ts";
 import { fail } from "./errors.ts";
+import { boundedText, controlFree, inputObject } from "./guards.ts";
+import { type HostId, hostId, type SessionId, sessionId, type TerminalId, terminalId } from "./ids.ts";
+import { MAX_TERMINAL_OUTPUT_BYTES, PROTOCOL_VERSION } from "./limits.ts";
 export interface TerminalFrame {
 	v: typeof PROTOCOL_VERSION;
 	type: "terminal";

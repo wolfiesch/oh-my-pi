@@ -1,13 +1,11 @@
 import { createHash } from "node:crypto";
 import {
-	hostId,
-	revision,
 	type DurableEntry,
 	type HostId,
-	type SessionEvent,
-	type SessionId,
-	type SessionRef,
+	revision,
 	type ServerFrame,
+	type SessionEvent,
+	type SessionRef,
 	type SessionStateResult,
 } from "@oh-my-pi/app-wire";
 import type { Projection, SessionRecord } from "./types.ts";

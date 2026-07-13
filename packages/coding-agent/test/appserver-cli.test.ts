@@ -118,6 +118,7 @@ describe("appserver CLI routing", () => {
 		handlers.get("SIGTERM")?.();
 		startGate.resolve();
 		await promise;
+		expect(starts).toBe(1);
 		expect(stops).toBe(1);
 		expect(removed.sort()).toEqual(["SIGINT", "SIGTERM"]);
 	});

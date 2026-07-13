@@ -1,8 +1,8 @@
 export {
-	DesktopConfigAuthority,
-	createDesktopConfigAuthority,
 	type CatalogGetArgs,
 	type CatalogProvider,
+	createDesktopConfigAuthority,
+	DesktopConfigAuthority,
 	type DesktopConfigAuthorityOptions,
 	type DesktopSettingsPort,
 	type OperationContextLike,

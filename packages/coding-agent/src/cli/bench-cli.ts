@@ -453,7 +453,12 @@ function resolveBenchModels(
 		}
 		if (result.warning) writeStderr(`${chalk.yellow(`Warning: ${result.warning}`)}\n`);
 		let model = result.model;
-		const authenticated = resolveAuthenticatedAlternative(effectiveSelector, model, modelRegistry, preferences.providerOrder);
+		const authenticated = resolveAuthenticatedAlternative(
+			effectiveSelector,
+			model,
+			modelRegistry,
+			preferences.providerOrder,
+		);
 		if (authenticated) {
 			writeStderr(
 				`${chalk.yellow(

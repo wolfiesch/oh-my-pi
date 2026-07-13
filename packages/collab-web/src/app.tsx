@@ -8,7 +8,7 @@ import { ConnectScreen } from "./components/shell/ConnectScreen";
 import { HeaderBar } from "./components/shell/HeaderBar";
 import { Toasts } from "./components/shell/Toasts";
 import { Transcript } from "./components/transcript/Transcript";
-import { GuestClient, type ConnectionPhase } from "./lib/client";
+import { type ConnectionPhase, GuestClient } from "./lib/client";
 import { useGuestSnapshot } from "./lib/use-guest";
 import type { ToolRenderHost } from "./tool-render";
 import "./components/shell/shell.css";
@@ -227,7 +227,8 @@ export function App(): ReactNode {
 
 		const liveLink = await fetchCurrentRoomLink(abort.signal);
 		if (rejoinAbortRef.current === abort) rejoinAbortRef.current = null;
-		if (abort.signal.aborted || clientRef.current !== expectedClient || connectAttemptRef.current !== expectedAttempt) return;
+		if (abort.signal.aborted || clientRef.current !== expectedClient || connectAttemptRef.current !== expectedAttempt)
+			return;
 
 		const link = liveLink ?? credsRef.current?.link ?? storedLastLink();
 		if (link) connect(link, name);
@@ -427,7 +428,14 @@ interface SessionProps {
 	onRejoin(): void;
 }
 
-function Session({ client, autoReconnecting, installAvailable, onInstall, onLeave, onRejoin }: SessionProps): ReactNode {
+function Session({
+	client,
+	autoReconnecting,
+	installAvailable,
+	onInstall,
+	onLeave,
+	onRejoin,
+}: SessionProps): ReactNode {
 	const snap = useGuestSnapshot(client);
 	const [railOpen, setRailOpen] = useState(false);
 	const [selectedId, setSelectedId] = useState<string | null>(null);

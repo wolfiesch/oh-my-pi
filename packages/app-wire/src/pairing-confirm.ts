@@ -1,22 +1,22 @@
-import { decodeFeatureList, decodeCapabilities } from "./capabilities.ts";
+import { decodeCapabilities, decodeFeatureList } from "./capabilities.ts";
 import { fail } from "./errors.ts";
+import { controlFree, deviceToken, inputObject, string } from "./guards.ts";
 import {
-	confirmationId,
-	hostId,
-	pairingId,
-	commandId,
-	requestId,
-	revision,
-	sessionId,
-	type ConfirmationId,
-	type HostId,
-	type PairingId,
 	type CommandId,
+	type ConfirmationId,
+	commandId,
+	confirmationId,
+	type HostId,
+	hostId,
+	type PairingId,
+	pairingId,
 	type RequestId,
 	type Revision,
+	requestId,
+	revision,
 	type SessionId,
+	sessionId,
 } from "./ids.ts";
-import { boundedMap, controlFree, deviceToken, inputObject, string } from "./guards.ts";
 import { PROTOCOL_VERSION } from "./limits.ts";
 export interface ConfirmationChallenge {
 	v: typeof PROTOCOL_VERSION;

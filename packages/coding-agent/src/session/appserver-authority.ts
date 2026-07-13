@@ -1,7 +1,12 @@
 import { statSync } from "node:fs";
 import { type DurableEntry, hostId, type ProjectId, type SessionId } from "@oh-my-pi/app-wire";
 import type { LockCheckHook, SessionAuthority, SessionAuthoritySession, SessionRecord } from "@oh-my-pi/appserver";
-import { FileSessionDiscovery, type DesktopOperationsAuthority, type OperationContext, stableProjectId } from "@oh-my-pi/appserver";
+import {
+	type DesktopOperationsAuthority,
+	FileSessionDiscovery,
+	type OperationContext,
+	stableProjectId,
+} from "@oh-my-pi/appserver";
 import { getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";

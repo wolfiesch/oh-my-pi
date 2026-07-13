@@ -6,15 +6,19 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const tempDirs: TempDir[] = [];
+const managers: SessionManager[] = [];
 
 function makeManager(): { manager: SessionManager; cwd: string } {
 	const dir = TempDir.createSync("@pi-collab-repl-");
 	tempDirs.push(dir);
 	const cwd = dir.path();
-	return { manager: SessionManager.create(cwd, path.join(cwd, "sessions")), cwd };
+	const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+	managers.push(manager);
+	return { manager, cwd };
 }
 
 afterEach(async () => {
+	await Promise.all(managers.splice(0).map(manager => manager.close()));
 	await Promise.all(tempDirs.splice(0).map(dir => dir.remove()));
 });
 
@@ -85,6 +89,7 @@ describe("SessionManager collab replication", () => {
 		await manager.rewriteEntries();
 		const file = manager.getSessionFile();
 		if (!file) throw new Error("expected a persisted session file");
+		await manager.close();
 		const { manager: loaded } = makeManager();
 		await loaded.setSessionFile(file);
 		expect(loaded.getEntry("feed0001")?.parentId).toBe(rootId);

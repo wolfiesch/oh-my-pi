@@ -4,6 +4,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { removeWithRetries, TempDir } from "@oh-my-pi/pi-utils";
 
 const tempDirs: TempDir[] = [];
+const managers: SessionManager[] = [];
 
 function makeTempDir(prefix: string): string {
 	const dir = TempDir.createSync(prefix);
@@ -12,8 +13,14 @@ function makeTempDir(prefix: string): string {
 }
 
 afterEach(async () => {
+	await Promise.all(managers.splice(0).map(manager => manager.close()));
 	await Promise.all(tempDirs.splice(0).map(dir => dir.remove()));
 });
+
+function trackManager(manager: SessionManager): SessionManager {
+	managers.push(manager);
+	return manager;
+}
 
 /**
  * Persist a single-message session under `cwd`/`sessionDir` and return its file path.
@@ -25,6 +32,7 @@ async function writeSession(cwd: string, sessionDir: string): Promise<string> {
 	await manager.rewriteEntries();
 	const file = manager.getSessionFile();
 	if (!file) throw new Error("expected a persisted session file");
+	await manager.close();
 	return file;
 }
 
@@ -36,7 +44,7 @@ describe("SessionManager cwd adoption on resume", () => {
 		const fileB = await writeSession(projectB, sessionsB);
 
 		// A manager started in project A loads a session that lives in project B.
-		const manager = SessionManager.create(projectA, path.join(projectA, "sessions"));
+		const manager = trackManager(SessionManager.create(projectA, path.join(projectA, "sessions")));
 		expect(manager.getCwd()).toBe(path.resolve(projectA));
 
 		await manager.setSessionFile(fileB);
@@ -71,7 +79,7 @@ describe("SessionManager cwd adoption on resume", () => {
 		await Bun.write(fileB, `${lines.join("\n")}\n`);
 
 		const launchDir = path.join(projectA, "sessions");
-		const manager = SessionManager.create(projectA, launchDir);
+		const manager = trackManager(SessionManager.create(projectA, launchDir));
 		await manager.setSessionFile(fileB);
 
 		expect(manager.getCwd()).toBe(path.resolve(projectA));
@@ -85,7 +93,7 @@ describe("SessionManager cwd adoption on resume", () => {
 		const sessionsB = path.join(projectB, "sessions");
 		const fileB = await writeSession(projectB, sessionsB);
 
-		const manager = SessionManager.create(projectA, sessionsA);
+		const manager = trackManager(SessionManager.create(projectA, sessionsA));
 		const snapshot = manager.captureState();
 
 		await manager.setSessionFile(fileB);
@@ -106,7 +114,7 @@ describe("SessionManager cwd adoption on resume", () => {
 		await removeWithRetries(goneProject);
 
 		const launchSessions = path.join(launch, "sessions");
-		const manager = SessionManager.create(launch, launchSessions);
+		const manager = trackManager(SessionManager.create(launch, launchSessions));
 		await manager.setSessionFile(file);
 
 		// Adopting the missing cwd would make the follow-up `setProjectDir` chdir
@@ -122,7 +130,7 @@ describe("SessionManager cwd adoption on resume", () => {
 		const file = await writeSession(goneProject, store);
 		await removeWithRetries(goneProject);
 
-		const manager = await SessionManager.open(file, undefined, undefined, { initialCwd: launch });
+		const manager = trackManager(await SessionManager.open(file, undefined, undefined, { initialCwd: launch }));
 
 		expect(manager.getCwd()).toBe(path.resolve(launch));
 		// /new and /branch anchor to the launch cwd, not the deleted project's store.

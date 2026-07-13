@@ -1,6 +1,6 @@
 import { fail } from "./errors.ts";
-import { entryId, hostId, sessionId, type EntryId, type HostId, type SessionId } from "./ids.ts";
-import { boundedMap, inputObject, controlFree } from "./guards.ts";
+import { boundedMap, controlFree, inputObject } from "./guards.ts";
+import { type EntryId, entryId, type HostId, hostId, type SessionId, sessionId } from "./ids.ts";
 export interface DurableEntry {
 	id: EntryId;
 	parentId: EntryId | null;

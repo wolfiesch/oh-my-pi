@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllKernelSessions, executePythonWithKernel } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import { DEFAULT_MAX_BYTES } from "@oh-my-pi/pi-coding-agent/session/streaming-output";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -114,6 +115,7 @@ describe("executePythonWithKernel", () => {
 		const result = await executePythonWithKernel(kernel, "print('big')", {
 			artifactPath,
 			artifactId: "0",
+			outputSettings: Settings.isolated(),
 		});
 
 		expect(result.truncated).toBe(true);

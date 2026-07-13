@@ -237,7 +237,9 @@ function validateNested(value: unknown, path: string, depth = 0): void {
 	if (value === null || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) return;
 	if (Array.isArray(value)) {
 		if (value.length > MAX_ITEMS) throw new Error(`array exceeds limit for ${path}`);
-		value.forEach((item, index) => validateNested(item, `${path}[${index}]`, depth + 1));
+		value.forEach((item, index) => {
+			validateNested(item, `${path}[${index}]`, depth + 1);
+		});
 		return;
 	}
 	if (value && typeof value === "object") {

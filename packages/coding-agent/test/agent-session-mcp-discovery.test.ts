@@ -748,6 +748,7 @@ describe("AgentSession MCP discovery", () => {
 		await olderSessionManager.rewriteEntries();
 		const olderSessionBeforeSwitch = fs.readFileSync(olderSessionFile!, "utf8");
 		const olderSessionMtimeBeforeSwitch = fs.statSync(olderSessionFile!).mtimeMs;
+		await olderSessionManager.close();
 
 		const sessionManager = SessionManager.create(tempDir, tempDir);
 		const originalSessionFile = sessionManager.getSessionFile();

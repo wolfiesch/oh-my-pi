@@ -1,9 +1,7 @@
 import { type } from "arktype";
-import type { FetchImpl, ModelSpec } from "../types";
-import { discoveryFetch, isRecord } from "../utils";
+import type { ModelSpec } from "../types";
+import { discoveryFetch } from "../utils";
 import { CODEX_BASE_URL, CODEX_CLIENT_VERSION, OPENAI_HEADER_VALUES, OPENAI_HEADERS } from "../wire/codex";
-const DEFAULT_CODEX_CLIENT_VERSION = CODEX_CLIENT_VERSION;
-const NPM_CODEX_LATEST_URL = "https://registry.npmjs.org/@openai/codex/latest";
 
 const DEFAULT_MODEL_LIST_PATHS = ["/codex/models", "/models"] as const;
 const DEFAULT_CONTEXT_WINDOW = 272_000;
@@ -62,9 +60,7 @@ export interface CodexModelDiscoveryOptions {
 	/** Abort signal for network request cancellation. */
 	signal?: AbortSignal;
 	/** Optional fetch implementation override for tests. */
-	fetchFn?: FetchImpl;
-	/** Optional registry fetch implementation override for client version lookup. */
-	registryFetchFn?: FetchImpl;
+	fetchFn?: typeof fetch;
 }
 
 /**
@@ -85,11 +81,7 @@ export async function fetchCodexModels(options: CodexModelDiscoveryOptions): Pro
 	const fetchFn = discoveryFetch(options.fetchFn);
 	const baseUrl = normalizeBaseUrl(options.baseUrl);
 	const paths = normalizePaths(options.paths);
-	const clientVersion = await resolveCodexClientVersion(
-		options.clientVersion,
-		options.registryFetchFn ?? fetchFn,
-		options.signal,
-	);
+	const clientVersion = normalizeClientVersion(options.clientVersion) ?? CODEX_CLIENT_VERSION;
 	const headers = buildCodexHeaders(options, clientVersion);
 
 	let sawSuccessfulResponse = false;
@@ -168,28 +160,6 @@ function buildCodexHeaders(options: CodexModelDiscoveryOptions, clientVersion: s
 	return headers;
 }
 
-export async function resolveCodexClientVersion(
-	clientVersion: string | undefined,
-	fetchFn: FetchImpl,
-	signal: AbortSignal | undefined,
-): Promise<string> {
-	const normalizedClientVersion = normalizeClientVersion(clientVersion);
-	if (normalizedClientVersion) return normalizedClientVersion;
-	try {
-		const response = await fetchFn(NPM_CODEX_LATEST_URL, {
-			method: "GET",
-			headers: { Accept: "application/json" },
-			signal,
-		});
-		if (!response.ok) return DEFAULT_CODEX_CLIENT_VERSION;
-		const payload: unknown = await response.json();
-		if (!isRecord(payload)) return DEFAULT_CODEX_CLIENT_VERSION;
-		return normalizeClientVersion(payload.version) ?? DEFAULT_CODEX_CLIENT_VERSION;
-	} catch (error) {
-		if (error instanceof DOMException && error.name === "AbortError") throw error;
-		return DEFAULT_CODEX_CLIENT_VERSION;
-	}
-}
 function normalizeClientVersion(value: unknown): string | undefined {
 	if (typeof value !== "string") {
 		return undefined;

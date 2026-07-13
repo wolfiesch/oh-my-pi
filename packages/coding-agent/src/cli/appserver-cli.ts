@@ -5,6 +5,7 @@ import type { AppserverHandle } from "@oh-my-pi/appserver";
 import { createRemoteAppserver, defaultSocketPath } from "@oh-my-pi/appserver";
 import { getProfileRootDir, postmortem } from "@oh-my-pi/pi-utils";
 import type { Settings as SettingsType } from "../config/settings";
+import { getCodingAgentAppserverIdentity } from "./appserver-identity";
 
 export type AppserverAction = "serve" | "status" | "pair" | "devices" | "revoke";
 export type RemoteMode = "direct" | "serve";
@@ -45,6 +46,7 @@ export interface AppserverDeviceSummary {
 	lastSeenAt: number | null;
 	revokedAt: number | null;
 }
+
 export type AppserverStatus =
 	| { state: "running"; health: AppserverHealth }
 	| { state: "stopped"; reason: "unreachable" | "malformed" | "failed" };
@@ -311,6 +313,7 @@ async function defaultCreateAppserver(
 	} catch {}
 	const runtime = createAppserverRuntime(runtimeOptions);
 	const base = {
+		...getCodingAgentAppserverIdentity(),
 		sessionAuthority: runtime.sessionAuthority,
 		discovery: runtime.discovery,
 		operationsAuthority: runtime.operationsAuthority,
@@ -371,9 +374,14 @@ export async function runAppserverServe(
 		// invalid combinations that validation should report to the caller.
 		config = validateAppserverServeConfig({ ...rawConfig });
 	} else {
-		const settings =
-			deps.settings ??
-			(deps.loadSettings ? await deps.loadSettings() : (loadedSettings = await defaultLoadAppserverSettings()));
+		let settings = deps.settings;
+		if (!settings) {
+			if (deps.loadSettings) settings = await deps.loadSettings();
+			else {
+				loadedSettings = await defaultLoadAppserverSettings();
+				settings = loadedSettings;
+			}
+		}
 		config = validateAppserverServeConfig(persistedServeConfig(settings));
 	}
 	const create = deps.createAppserver ?? (value => defaultCreateAppserver(value, loadedSettings));

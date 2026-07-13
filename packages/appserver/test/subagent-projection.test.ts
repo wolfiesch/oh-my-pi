@@ -15,7 +15,7 @@ describe("appserver subagent projection", () => {
 					id: "WorkerA",
 					index: 2,
 					agent: "task",
-					description: "Inspect /home/lycaon/private token=plaintext",
+					description: "Inspect /home/tester/private token=plaintext",
 					status: "started",
 					lastUpdate: 50,
 				},

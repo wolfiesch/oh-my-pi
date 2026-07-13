@@ -7,16 +7,21 @@ import type {
 	HelloFrame,
 	HostId,
 	PairStartFrame,
-	ServerFrame,
 	ProjectId,
 	Revision,
+	ServerFrame,
 	SessionEvent,
 	SessionId,
 	SessionRef,
 } from "@oh-my-pi/app-wire";
 import type { DesktopOperationsAuthority } from "./operations/dispatcher.ts";
-import type { ListenerPeerContext, RemoteConnection, RemoteListenerConfig, RemotePeerIdentity } from "./remote/types.ts";
 import type { BunRemoteListener } from "./remote/listener.ts";
+import type {
+	ListenerPeerContext,
+	RemoteConnection,
+	RemoteListenerConfig,
+	RemotePeerIdentity,
+} from "./remote/types.ts";
 
 export interface ConnectionTransport {
 	readonly connectionId: string;
@@ -40,8 +45,14 @@ export interface RemoteAuthorizationContext {
 }
 export interface RemoteConnectionPolicy {
 	authenticate(connection: RemoteConnection, hello: HelloFrame): RemoteHelloDecision | Promise<RemoteHelloDecision>;
-	pairStart?(connection: RemoteConnection, frame: PairStartFrame): ServerFrame | undefined | Promise<ServerFrame | undefined>;
-	handleCommand?(connection: RemoteConnection, frame: CommandFrame): ServerFrame | undefined | Promise<ServerFrame | undefined>;
+	pairStart?(
+		connection: RemoteConnection,
+		frame: PairStartFrame,
+	): ServerFrame | undefined | Promise<ServerFrame | undefined>;
+	handleCommand?(
+		connection: RemoteConnection,
+		frame: CommandFrame,
+	): ServerFrame | undefined | Promise<ServerFrame | undefined>;
 	authorize(
 		connection: RemoteConnection,
 		frame: ClientFrame,
@@ -62,9 +73,7 @@ export interface FileSystem {
 	mkdir(path: string, options?: { recursive?: boolean; mode?: number }): Promise<void>;
 	chmod(path: string, mode: number): Promise<void>;
 	unlink(path: string): Promise<void>;
-	stat(
-		path: string,
-	): Promise<{
+	stat(path: string): Promise<{
 		isFile(): boolean;
 		isDirectory(): boolean;
 		mode: number;

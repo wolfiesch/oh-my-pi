@@ -623,7 +623,7 @@ describe("appserver transcript event translator", () => {
 			message: {
 				role: "assistant",
 				stopReason: "error",
-				errorMessage: "Bearer abcdefghijklmnop failed at /home/lycaon/private token=plaintext",
+				errorMessage: "Bearer abcdefghijklmnop failed at /home/tester/private token=plaintext",
 				errorStatus: 503,
 				errorId: 12,
 			},
@@ -631,7 +631,7 @@ describe("appserver transcript event translator", () => {
 		});
 		expect(error).toMatchObject([{ type: "turn.error", errorStatus: 503, errorId: 12 }, { type: "turn.end" }]);
 		expect(JSON.stringify(error)).not.toContain("abcdefghijklmnop");
-		expect(JSON.stringify(error)).not.toContain("/home/lycaon");
+		expect(JSON.stringify(error)).not.toContain("/home/tester");
 		expect(JSON.stringify(error)).not.toContain("plaintext");
 
 		const nonAuthoritative = translator.translate({
@@ -648,7 +648,7 @@ describe("appserver transcript event translator", () => {
 			type: "auto_compaction_end",
 			action: "context-full",
 			result: {
-				summary: "Kept /home/lycaon/private token=plaintext",
+				summary: "Kept /home/tester/private token=plaintext",
 				firstKeptEntryId: "entry-1",
 				tokensBefore: 10,
 				details: { authorization: "Bearer abcdefghijklmnop" },
@@ -693,7 +693,7 @@ describe("appserver transcript event translator", () => {
 				event: {
 					type: "notice",
 					level: "error",
-					message: "Bearer abcdefghijklmnop failed at /home/lycaon/private",
+					message: "Bearer abcdefghijklmnop failed at /home/tester/private",
 				},
 			},
 		});

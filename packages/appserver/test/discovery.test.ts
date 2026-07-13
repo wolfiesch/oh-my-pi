@@ -37,7 +37,7 @@ function transcript(entries: Record<string, unknown>[], title?: string): string 
 	const prelude = title === undefined ? [] : [{ type: "title", v: 1, title, updatedAt: stamp, pad: "" }];
 	return [
 		...prelude,
-		{ type: "session", version: 3, id: "session-1", cwd: "/home/lycaon/project", timestamp: stamp },
+		{ type: "session", version: 3, id: "session-1", cwd: "/home/tester/project", timestamp: stamp },
 		...entries,
 	]
 		.map(line)
@@ -57,7 +57,7 @@ describe("current OMP JSONL projection", () => {
 				id: "init",
 				parentId: null,
 				timestamp: stamp,
-				systemPrompt: "do not leak /home/lycaon/secret",
+				systemPrompt: "do not leak /home/tester/secret",
 				task: "task",
 				tools: ["read"],
 			},
@@ -83,7 +83,7 @@ describe("current OMP JSONL projection", () => {
 							type: "toolCall",
 							id: "call-1",
 							name: "read",
-							arguments: { path: "/home/lycaon/project/src/app.ts", values: hugeArgs },
+							arguments: { path: "/home/tester/project/src/app.ts", values: hugeArgs },
 						},
 					],
 				},
@@ -129,7 +129,7 @@ describe("current OMP JSONL projection", () => {
 		const [session] = await discovery.list();
 		expect(session?.title).toBe("Fixed Title");
 		expect(session?.projectName).toBe("project");
-		expect(session?.cwd).toBe("/home/lycaon/project");
+		expect(session?.cwd).toBe("/home/tester/project");
 		expect(session?.model).toBe("openai/gpt-5.6");
 		expect(session?.thinking).toBe("high");
 		expect(session?.entries.map(entry => entry.kind)).toEqual(["message", "message", "tool-use", "message"]);
@@ -140,7 +140,7 @@ describe("current OMP JSONL projection", () => {
 		const toolArgs = tool?.data.args && typeof tool.data.args === "object" ? JSON.stringify(tool.data.args) : "";
 		expect(new TextEncoder().encode(toolArgs).byteLength).toBeLessThan(128 * 1024);
 		expect(JSON.stringify(session?.entries)).not.toContain("systemPrompt");
-		expect(JSON.stringify(session?.entries)).not.toContain("/home/lycaon");
+		expect(JSON.stringify(session?.entries)).not.toContain("/home/tester");
 		expect(session?.entries[1]?.data).toEqual({ role: "assistant", text: "", reasoning: "I should inspect safely." });
 	});
 
@@ -253,6 +253,74 @@ describe("current OMP JSONL projection", () => {
 		);
 		const [session] = await discovery.list();
 		expect(session?.title).toBe("Please inspect this project");
+	});
+
+	test("keeps valid session history around a malformed middle entry", async () => {
+		const header = sessionTranscript("session-malformed-middle", "/tmp/project", "Recovered session");
+		const before = line({
+			type: "message",
+			id: "before",
+			parentId: null,
+			timestamp: stamp,
+			message: { role: "user", content: "before malformed entry" },
+		});
+		const after = line({
+			type: "message",
+			id: "after",
+			parentId: "before",
+			timestamp: stamp,
+			message: { role: "assistant", content: "after malformed entry" },
+		});
+		const discovery = new FileSessionDiscovery(
+			"/root",
+			fakeFs({ "/root/session.jsonl": [header, before, '{"type":', after].join("\n") }, ["/root"]),
+			host,
+		);
+
+		const [session] = await discovery.list();
+		expect(String(session?.sessionId)).toBe("session-malformed-middle");
+		expect(session?.entries.map(entry => entry.data.text)).toEqual([
+			"before malformed entry",
+			"after malformed entry",
+		]);
+	});
+
+	test("keeps valid session history when the final JSONL write is crash-truncated", async () => {
+		const header = sessionTranscript("session-truncated-tail", "/tmp/project", "Recovered tail");
+		const complete = line({
+			type: "message",
+			id: "complete",
+			parentId: null,
+			timestamp: stamp,
+			message: { role: "user", content: "complete entry" },
+		});
+		const discovery = new FileSessionDiscovery(
+			"/root",
+			fakeFs({ "/root/session.jsonl": `${header}\n${complete}\n{"type":"message","id":"partial"` }, ["/root"]),
+			host,
+		);
+
+		const [session] = await discovery.list();
+		expect(String(session?.sessionId)).toBe("session-truncated-tail");
+		expect(session?.entries.map(entry => entry.data.text)).toEqual(["complete entry"]);
+	});
+
+	test("still rejects malformed or missing headers and oversized entry lines", async () => {
+		const validHeader = sessionTranscript("oversized-entry", "/tmp/project", "Oversized entry");
+		const files = {
+			"/root/malformed-header.jsonl": '{"type":"session"',
+			"/root/missing-header.jsonl": line({
+				type: "message",
+				id: "message-only",
+				parentId: null,
+				timestamp: stamp,
+				message: { role: "user", content: "no header" },
+			}),
+			"/root/oversized-entry.jsonl": `${validHeader}\n${"x".repeat(1024 * 1024 + 1)}`,
+		};
+		const discovery = new FileSessionDiscovery("/root", fakeFs(files, ["/root"]), host);
+
+		expect(await discovery.list()).toEqual([]);
 	});
 
 	test("limits snapshots to 1000 entries with an omission notice", async () => {

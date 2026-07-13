@@ -19,8 +19,6 @@ const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 const WEEK_MS = 7 * DAY_MS;
 const MONTH_MS = 30 * DAY_MS;
-const FIVE_HOURS_MS = 5 * HOUR_MS;
-const THIRTY_DAYS_MS = 30 * DAY_MS;
 
 interface ZaiUsageDetail {
 	modelCode?: string;
@@ -191,19 +189,6 @@ function buildModelUsageUrl(baseUrl: string, now: Date): string {
 	const startTime = formatDate(start);
 	const endTime = formatDate(now);
 	return `${baseUrl}${MODEL_USAGE_PATH}?startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}`;
-}
-
-function tokenWindowForUnit(unit: number | undefined): UsageWindow & { scopeId: string } {
-	if (unit === 3) {
-		return { id: "5h", scopeId: "5h", label: "5h", durationMs: FIVE_HOURS_MS };
-	}
-	if (unit === 6) {
-		return { id: "weekly", scopeId: "weekly", label: "Weekly", durationMs: SEVEN_DAYS_MS };
-	}
-	if (unit === 5) {
-		return { id: "monthly", scopeId: "monthly", label: "Monthly", durationMs: THIRTY_DAYS_MS };
-	}
-	return { id: `tokens-u${unit ?? "unknown"}`, scopeId: `tokens-u${unit ?? "unknown"}`, label: "Tokens", durationMs: SEVEN_DAYS_MS };
 }
 
 async function fetchZaiUsage(params: UsageFetchParams, ctx: UsageFetchContext): Promise<UsageReport | null> {

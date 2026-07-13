@@ -457,7 +457,7 @@ describe("live Unix websocket protocol", () => {
 				parentId: null,
 				type: "session_init",
 				timestamp: stamp,
-				systemPrompt: "hidden /home/lycaon/system",
+				systemPrompt: "hidden /home/tester/system",
 				token: "secret",
 			},
 		});
@@ -469,7 +469,7 @@ describe("live Unix websocket protocol", () => {
 				type: "custom_message",
 				timestamp: stamp,
 				display: false,
-				content: "hidden custom /home/lycaon/private",
+				content: "hidden custom /home/tester/private",
 				authorization: "secret",
 			},
 		});
@@ -480,7 +480,7 @@ describe("live Unix websocket protocol", () => {
 				parentId: "hidden",
 				type: "message",
 				timestamp: stamp,
-				message: { role: "user", content: "Inspect /home/lycaon/project" },
+				message: { role: "user", content: "Inspect /home/tester/project" },
 			},
 		});
 		child.push({
@@ -499,7 +499,7 @@ describe("live Unix websocket protocol", () => {
 							id: "call-1",
 							name: "read",
 							title: "Read file",
-							arguments: { path: "/home/lycaon/project/src/app.ts", authorization: "secret" },
+							arguments: { path: "/home/tester/project/src/app.ts", authorization: "secret" },
 						},
 					],
 				},
@@ -517,7 +517,7 @@ describe("live Unix websocket protocol", () => {
 				message: {
 					role: "toolResult",
 					toolCallId: "call-1",
-					content: [{ type: "text", text: "contents from /home/lycaon/project/src/app.ts" }],
+					content: [{ type: "text", text: "contents from /home/tester/project/src/app.ts" }],
 					isError: false,
 				},
 			},
@@ -558,7 +558,7 @@ describe("live Unix websocket protocol", () => {
 			expect(entries[3].entry.data).toEqual({ role: "assistant", text: "Visible note" });
 		expect(JSON.stringify(output.frames)).not.toContain("systemPrompt");
 		expect(JSON.stringify(output.frames)).not.toContain("authorization");
-		expect(JSON.stringify(output.frames)).not.toContain("/home/lycaon");
+		expect(JSON.stringify(output.frames)).not.toContain("/home/tester");
 		await closeClients([client.client]);
 		await appserver.stop();
 	});
@@ -884,7 +884,7 @@ describe("live Unix websocket protocol", () => {
 					id: "WorkerA",
 					agent: "task",
 					status: "running",
-					lastIntent: "Editing /home/lycaon/private.ts",
+					lastIntent: "Editing /home/tester/private.ts",
 					contextTokens: 250,
 					contextWindow: 1_000,
 					tokens: 500,

@@ -1,6 +1,6 @@
 import { dirname, resolve } from "node:path";
 import { parseBounded } from "@oh-my-pi/app-wire";
-import type { RpcSessionEntryFrame, RpcResponse } from "../../coding-agent/src/modes/rpc/rpc-types.ts";
+import type { RpcResponse, RpcSessionEntryFrame } from "../../coding-agent/src/modes/rpc/rpc-types.ts";
 import type { ChildHandle, RpcChildFactory, SessionRecord } from "./types.ts";
 
 const MAX_LINE_BYTES = 1024 * 1024;
@@ -104,11 +104,12 @@ async function* lines(stream: AsyncIterable<string | Uint8Array>): AsyncGenerato
 		}
 		pending += text;
 		if (stringBytes(pending) > MAX_LINE_BYTES) throw new Error("rpc line exceeds 1MiB");
-		let index;
-		while ((index = pending.indexOf("\n")) >= 0) {
+		let index = pending.indexOf("\n");
+		while (index >= 0) {
 			const line = pending.slice(0, index).replace(/\r$/, "");
 			pending = pending.slice(index + 1);
 			yield line;
+			index = pending.indexOf("\n");
 		}
 	}
 	try {

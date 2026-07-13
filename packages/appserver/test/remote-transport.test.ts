@@ -1,21 +1,20 @@
+import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
 import { hostId, projectId, sessionId } from "@oh-my-pi/app-wire";
+import type { DesktopOperationsAuthority } from "../src/operations/dispatcher.ts";
+import { BunRemoteListener, createListenerPlan } from "../src/remote/listener.ts";
+import { TailscaleRemotePolicy } from "../src/remote/policy.ts";
 import type {
 	ListenerPeerContext,
 	RemoteConnection,
 	RemoteConnectionHooks,
-	RemoteListenerConfig,
 	RemotePeerIdentity,
 } from "../src/remote/types.ts";
-import type { AppserverOptions, ChildHandle, RpcChildFactory, SessionRecord } from "../src/types.ts";
-import { createAppserver } from "../src/server.ts";
-import { BunRemoteListener, createListenerPlan } from "../src/remote/listener.ts";
-import { TailscaleRemotePolicy } from "../src/remote/policy.ts";
 import { LocalPairingTicketIssuer, SqliteDeviceRegistry } from "../src/security/index.ts";
-import type { DesktopOperationsAuthority } from "../src/operations/dispatcher.ts";
+import { createAppserver } from "../src/server.ts";
+import type { AppserverOptions, ChildHandle, RpcChildFactory, SessionRecord } from "../src/types.ts";
 
 type FakeClose = { code?: number; reason?: string };
 type FakeSocketData = { peer: ListenerPeerContext; connectionId: string; reserved: boolean; opened: boolean };

@@ -1,7 +1,7 @@
-import { hostId, sessionId, type HostId, type SessionId } from "./ids.ts";
-import { boundedArray, boundedMap, inputObject, safeRelativePath, controlFree, boundedText } from "./guards.ts";
-import { MAX_FILE_BYTES, PROTOCOL_VERSION } from "./limits.ts";
 import { fail } from "./errors.ts";
+import { boundedArray, boundedMap, boundedText, controlFree, inputObject, safeRelativePath } from "./guards.ts";
+import { type HostId, hostId, type SessionId, sessionId } from "./ids.ts";
+import { MAX_FILE_BYTES, PROTOCOL_VERSION } from "./limits.ts";
 export interface FileFrame {
 	v: typeof PROTOCOL_VERSION;
 	type: "files";

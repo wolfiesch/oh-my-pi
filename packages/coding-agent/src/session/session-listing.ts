@@ -2,9 +2,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Message, TextContent } from "@oh-my-pi/pi-ai";
 import { getAgentDir as getDefaultAgentDir, logger, parseJsonlLenient, toError } from "@oh-my-pi/pi-utils";
+import { inspectSessionLock, type SessionLockStatus } from "./session-lock";
 import { computeDefaultSessionDir } from "./session-paths";
 import { FileSessionStorage, type SessionStorage } from "./session-storage";
-import { inspectSessionLock, type SessionLockStatus } from "./session-lock";
 
 /**
  * Coarse lifecycle status of a session, derived from its last persisted message.
@@ -521,8 +521,7 @@ async function scanSessionDir(
 	try {
 		await recoverOrphanedBackups(sessionDir, storage);
 		const files = storage.listFilesSync(sessionDir, "*.jsonl");
-		const sessions = await collectSessionsFromFiles(files, storage, withStatus);
-		return sessions.filter(isWritableResumeCandidate);
+		return await collectSessionsFromFiles(files, storage, withStatus);
 	} catch {
 		return [];
 	}
@@ -563,8 +562,7 @@ export async function listAllSessions(storage: SessionStorage = new FileSessionS
 		const files = await Array.fromAsync(new Bun.Glob("*/*.jsonl").scan(sessionsRoot), name =>
 			path.join(sessionsRoot, name),
 		);
-		const sessions = await collectSessionsFromFiles(files, storage, true);
-		return sessions.filter(isWritableResumeCandidate);
+		return await collectSessionsFromFiles(files, storage, true);
 	} catch {
 		return [];
 	}
@@ -576,7 +574,7 @@ export async function findMostRecentSession(
 	storage: SessionStorage = new FileSessionStorage(),
 ): Promise<string | null> {
 	const sessions = await scanSessionDir(sessionDir, storage, false);
-	return sessions[0]?.path ?? null;
+	return sessions.find(isWritableResumeCandidate)?.path ?? null;
 }
 
 /** Get recent sessions for display in the welcome screen. */
@@ -635,6 +633,7 @@ function isWritableResumeCandidate(session: SessionInfo): boolean {
 	}
 	return status !== "live" && status !== "suspect" && status !== "malformed";
 }
+
 export async function resolveResumableSession(
 	sessionArg: string,
 	cwd: string,

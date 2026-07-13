@@ -1,45 +1,130 @@
-import { decodeCursor, type Cursor } from "./cursor.ts";
-import {
-	hostId,
-	projectId,
-	revision,
-	sessionId,
-	type HostId,
-	type ProjectId,
-	type Revision,
-	type SessionId,
-} from "./ids.ts";
-import { boundedArray, boundedMap, boundedMetadata, inputObject, optionalString, controlFree, isSecretLikeKey, safeSeq } from "./guards.ts";
-import { PROTOCOL_VERSION } from "./limits.ts";
+import { type Cursor, decodeCursor } from "./cursor.ts";
 import { fail } from "./errors.ts";
-export interface ProjectIdentity { projectId: ProjectId; name?: string }
-export interface ContextUsage { used: number; limit: number }
-export interface SessionRef { hostId: HostId; sessionId: SessionId; project: ProjectIdentity; revision: Revision; title: string; status: "active" | "idle" | "closed" | (string & {}); updatedAt: string; liveState?: Record<string, unknown>; model?: string; thinking?: string; pendingApproval?: boolean; pendingUserInput?: boolean; proposedPlan?: string; contextUsage?: ContextUsage }
-export interface SessionListResult { cursor: Cursor; sessions: SessionRef[]; totalCount: number; truncated: boolean }
-export interface SessionsFrame { v: typeof PROTOCOL_VERSION; type: "sessions"; cursor: Cursor; sessions: SessionRef[]; totalCount?: number; truncated?: boolean }
-function decodeListMetadata(value: Record<string, unknown>, path: string, sessionCount: number): { totalCount: number; truncated: boolean } {
-  const totalCount = value.totalCount === undefined ? sessionCount : safeSeq(value.totalCount, `${path}.totalCount`);
-  const truncated = value.truncated === undefined ? totalCount > sessionCount : value.truncated;
-  if (typeof truncated !== "boolean") fail("INVALID_FRAME", "truncated must be boolean", `${path}.truncated`);
-  if (totalCount < sessionCount) fail("INVALID_FRAME", "totalCount cannot be less than sessions length", `${path}.totalCount`);
-  if (truncated !== (totalCount > sessionCount)) fail("INVALID_FRAME", "truncated does not match totalCount", path);
-  return { totalCount, truncated };
+import {
+	boundedArray,
+	boundedMap,
+	boundedMetadata,
+	controlFree,
+	inputObject,
+	isSecretLikeKey,
+	optionalString,
+	safeSeq,
+} from "./guards.ts";
+import {
+	type HostId,
+	hostId,
+	type ProjectId,
+	projectId,
+	type Revision,
+	revision,
+	type SessionId,
+	sessionId,
+} from "./ids.ts";
+import { PROTOCOL_VERSION } from "./limits.ts";
+export interface ProjectIdentity {
+	projectId: ProjectId;
+	name?: string;
 }
-export function decodeSessionRef(value: unknown, path: string): SessionRef { const session = boundedMap(value, path); hostId(session.hostId, `${path}.hostId`); sessionId(session.sessionId, `${path}.sessionId`); revision(session.revision, `${path}.revision`); const project = boundedMap(session.project, `${path}.project`); projectId(project.projectId, `${path}.project.projectId`); if (project.name !== undefined) optionalString(project.name, `${path}.project.name`, 256); controlFree(session.title, `${path}.title`, 512); controlFree(session.status, `${path}.status`, 64); controlFree(session.updatedAt, `${path}.updatedAt`, 128); if (session.liveState !== undefined) boundedMetadata(session.liveState, `${path}.liveState`, isSecretLikeKey); if (session.model !== undefined) controlFree(session.model, `${path}.model`, 256); if (session.thinking !== undefined) controlFree(session.thinking, `${path}.thinking`, 256); if (session.pendingApproval !== undefined && typeof session.pendingApproval !== "boolean") fail("INVALID_FRAME", "pendingApproval must be boolean", `${path}.pendingApproval`); if (session.pendingUserInput !== undefined && typeof session.pendingUserInput !== "boolean") fail("INVALID_FRAME", "pendingUserInput must be boolean", `${path}.pendingUserInput`); if (session.proposedPlan !== undefined) optionalString(session.proposedPlan, `${path}.proposedPlan`, 4096); if (session.contextUsage !== undefined) { const usage = boundedMap(session.contextUsage, `${path}.contextUsage`); if (typeof usage.used !== "number" || !Number.isSafeInteger(usage.used) || usage.used < 0 || typeof usage.limit !== "number" || !Number.isSafeInteger(usage.limit) || usage.limit < 0 || usage.used > usage.limit) fail("BOUNDS", "invalid context usage", `${path}.contextUsage`); } return session as unknown as SessionRef; }
+export interface ContextUsage {
+	used: number;
+	limit: number;
+}
+export interface SessionRef {
+	hostId: HostId;
+	sessionId: SessionId;
+	project: ProjectIdentity;
+	revision: Revision;
+	title: string;
+	status: "active" | "idle" | "closed" | (string & {});
+	updatedAt: string;
+	liveState?: Record<string, unknown>;
+	model?: string;
+	thinking?: string;
+	pendingApproval?: boolean;
+	pendingUserInput?: boolean;
+	proposedPlan?: string;
+	contextUsage?: ContextUsage;
+}
+export interface SessionListResult {
+	cursor: Cursor;
+	sessions: SessionRef[];
+	totalCount: number;
+	truncated: boolean;
+}
+export interface SessionsFrame {
+	v: typeof PROTOCOL_VERSION;
+	type: "sessions";
+	cursor: Cursor;
+	sessions: SessionRef[];
+	totalCount?: number;
+	truncated?: boolean;
+}
+function decodeListMetadata(
+	value: Record<string, unknown>,
+	path: string,
+	sessionCount: number,
+): { totalCount: number; truncated: boolean } {
+	const totalCount = value.totalCount === undefined ? sessionCount : safeSeq(value.totalCount, `${path}.totalCount`);
+	const truncated = value.truncated === undefined ? totalCount > sessionCount : value.truncated;
+	if (typeof truncated !== "boolean") fail("INVALID_FRAME", "truncated must be boolean", `${path}.truncated`);
+	if (totalCount < sessionCount)
+		fail("INVALID_FRAME", "totalCount cannot be less than sessions length", `${path}.totalCount`);
+	if (truncated !== totalCount > sessionCount) fail("INVALID_FRAME", "truncated does not match totalCount", path);
+	return { totalCount, truncated };
+}
+export function decodeSessionRef(value: unknown, path: string): SessionRef {
+	const session = boundedMap(value, path);
+	hostId(session.hostId, `${path}.hostId`);
+	sessionId(session.sessionId, `${path}.sessionId`);
+	revision(session.revision, `${path}.revision`);
+	const project = boundedMap(session.project, `${path}.project`);
+	projectId(project.projectId, `${path}.project.projectId`);
+	if (project.name !== undefined) optionalString(project.name, `${path}.project.name`, 256);
+	controlFree(session.title, `${path}.title`, 512);
+	controlFree(session.status, `${path}.status`, 64);
+	controlFree(session.updatedAt, `${path}.updatedAt`, 128);
+	if (session.liveState !== undefined) boundedMetadata(session.liveState, `${path}.liveState`, isSecretLikeKey);
+	if (session.model !== undefined) controlFree(session.model, `${path}.model`, 256);
+	if (session.thinking !== undefined) controlFree(session.thinking, `${path}.thinking`, 256);
+	if (session.pendingApproval !== undefined && typeof session.pendingApproval !== "boolean")
+		fail("INVALID_FRAME", "pendingApproval must be boolean", `${path}.pendingApproval`);
+	if (session.pendingUserInput !== undefined && typeof session.pendingUserInput !== "boolean")
+		fail("INVALID_FRAME", "pendingUserInput must be boolean", `${path}.pendingUserInput`);
+	if (session.proposedPlan !== undefined) optionalString(session.proposedPlan, `${path}.proposedPlan`, 4096);
+	if (session.contextUsage !== undefined) {
+		const usage = boundedMap(session.contextUsage, `${path}.contextUsage`);
+		if (
+			typeof usage.used !== "number" ||
+			!Number.isSafeInteger(usage.used) ||
+			usage.used < 0 ||
+			typeof usage.limit !== "number" ||
+			!Number.isSafeInteger(usage.limit) ||
+			usage.limit < 0 ||
+			usage.used > usage.limit
+		)
+			fail("BOUNDS", "invalid context usage", `${path}.contextUsage`);
+	}
+	return session as unknown as SessionRef;
+}
 export function decodeSessionListResult(value: unknown): SessionListResult {
-  const result = boundedMap(value, "result");
-  const cursor = decodeCursor(result.cursor, "result.cursor");
-  const values = boundedArray(result.sessions, "result.sessions");
-  const sessions = values.map((entry, index) => decodeSessionRef(entry, `result.sessions[${index}]`));
-  return { ...result, cursor, sessions, ...decodeListMetadata(result, "result", sessions.length) } as SessionListResult;
+	const result = boundedMap(value, "result");
+	const cursor = decodeCursor(result.cursor, "result.cursor");
+	const values = boundedArray(result.sessions, "result.sessions");
+	const sessions = values.map((entry, index) => decodeSessionRef(entry, `result.sessions[${index}]`));
+	return {
+		...result,
+		cursor,
+		sessions,
+		...decodeListMetadata(result, "result", sessions.length),
+	} as SessionListResult;
 }
 export function decodeSessions(input: unknown): SessionsFrame {
-  const frame = inputObject(input);
-  if (frame.v !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v");
-  if (frame.type !== "sessions") fail("INVALID_FRAME", "expected sessions frame", "type");
-  const cursor = decodeCursor(frame.cursor);
-  const values = boundedArray(frame.sessions, "sessions");
-  const sessions = values.map((entry, index) => decodeSessionRef(entry, `sessions[${index}]`));
-  const metadata = decodeListMetadata(frame, "frame", sessions.length);
-  return { ...frame, cursor, sessions, ...metadata } as unknown as SessionsFrame;
+	const frame = inputObject(input);
+	if (frame.v !== PROTOCOL_VERSION) fail("MISSING_VERSION", `expected ${PROTOCOL_VERSION}`, "v");
+	if (frame.type !== "sessions") fail("INVALID_FRAME", "expected sessions frame", "type");
+	const cursor = decodeCursor(frame.cursor);
+	const values = boundedArray(frame.sessions, "sessions");
+	const sessions = values.map((entry, index) => decodeSessionRef(entry, `sessions[${index}]`));
+	const metadata = decodeListMetadata(frame, "frame", sessions.length);
+	return { ...frame, cursor, sessions, ...metadata } as unknown as SessionsFrame;
 }

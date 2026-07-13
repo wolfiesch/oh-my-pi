@@ -9,9 +9,15 @@
 ### Changed
 
 - Appserver remote listener mode, bind address, port, and browser origins now persist in host-local `agent/local/config.yml` instead of synchronized profile config.
+- Session-scoped Bash and Python execution now read output limits from the active session settings instead of process-global defaults.
 
 ### Fixed
 
+- Fixed compiled appserver welcome frames reporting placeholder `local` identities instead of the owning OMP and appserver versions and build kinds.
+- Fixed active or locked sessions disappearing from observational session lists while keeping writable resume selection lock-safe.
+- Fixed one malformed or crash-truncated transcript entry hiding an otherwise valid session from appserver discovery.
+- Fixed concurrent Time-Traveling Stream Rules attaching AST reminders to the wrong tool result when multiple tool calls completed together.
+- Fixed explicit session rewrites and stale-lock takeover failures retaining lock ownership after the write or cleanup failed.
 - Fixed appserver discovery counting nested advisor and subagent transcripts as main sessions.
 - Fixed remote fast-mode changes bypassing the controller-lease checks used by other session mutations.
 

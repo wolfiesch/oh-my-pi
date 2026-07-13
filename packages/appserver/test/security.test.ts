@@ -269,12 +269,6 @@ it("rejects expired or replayed pairing and mismatched identity", () => {
 });
 
 it("invalidates an authenticated principal after revoke epoch change", () => {
-	const localClock = {
-		value: 100,
-		now() {
-			return this.value;
-		},
-	};
 	const registry = new FakeRegistry();
 	const record = {
 		deviceId: "d2",

@@ -1,5 +1,5 @@
 import { Args, Command, Flags, renderCommandHelp } from "@oh-my-pi/pi-utils/cli";
-import { runAppserverCommand, type AppserverAction, type AppserverCommandArgs } from "../cli/appserver-cli";
+import { type AppserverAction, type AppserverCommandArgs, runAppserverCommand } from "../cli/appserver-cli";
 
 const ACTIONS: readonly AppserverAction[] = ["serve", "status", "pair", "devices", "revoke"];
 
@@ -37,24 +37,42 @@ export default class Appserver extends Command {
 				return;
 			}
 			const action = parsed.args.action as AppserverAction;
-			if (action === "serve" && parsed.flags.json) throw new Error("--json is not supported by `omp appserver serve`");
-			if (action !== "serve" && (parsed.flags["remote-mode"] || parsed.flags["remote-address"] || parsed.flags["remote-port"] || parsed.flags["remote-origin"]?.length || parsed.flags["remote-state-dir"] || parsed.flags["trusted-serve-proxy"]))
+			if (action === "serve" && parsed.flags.json)
+				throw new Error("--json is not supported by `omp appserver serve`");
+			if (
+				action !== "serve" &&
+				(parsed.flags["remote-mode"] ||
+					parsed.flags["remote-address"] ||
+					parsed.flags["remote-port"] ||
+					parsed.flags["remote-origin"]?.length ||
+					parsed.flags["remote-state-dir"] ||
+					parsed.flags["trusted-serve-proxy"])
+			)
 				throw new Error("remote listener flags are only valid with `serve`");
-			if (action !== "pair" && (parsed.flags.capability?.length || parsed.flags["ttl-seconds"] !== undefined || parsed.flags["expected-node-id"]))
+			if (
+				action !== "pair" &&
+				(parsed.flags.capability?.length ||
+					parsed.flags["ttl-seconds"] !== undefined ||
+					parsed.flags["expected-node-id"])
+			)
 				throw new Error("pair flags are only valid with `pair`");
-			if (action !== "revoke" && parsed.flags["device-id"]) throw new Error("--device-id is only valid with `revoke`");
+			if (action !== "revoke" && parsed.flags["device-id"])
+				throw new Error("--device-id is only valid with `revoke`");
 			const command: AppserverCommandArgs = {
 				action,
 				flags: {
 					json: parsed.flags.json,
-					serve: action === "serve" ? {
-						remoteMode: parsed.flags["remote-mode"] as "direct" | "serve" | undefined,
-						remoteAddress: parsed.flags["remote-address"],
-						remotePort: parsed.flags["remote-port"],
-						remoteOrigins: parsed.flags["remote-origin"],
-						remoteStateDir: parsed.flags["remote-state-dir"],
-						trustedServeProxy: parsed.flags["trusted-serve-proxy"],
-					} : undefined,
+					serve:
+						action === "serve"
+							? {
+									remoteMode: parsed.flags["remote-mode"] as "direct" | "serve" | undefined,
+									remoteAddress: parsed.flags["remote-address"],
+									remotePort: parsed.flags["remote-port"],
+									remoteOrigins: parsed.flags["remote-origin"],
+									remoteStateDir: parsed.flags["remote-state-dir"],
+									trustedServeProxy: parsed.flags["trusted-serve-proxy"],
+								}
+							: undefined,
 					capabilities: parsed.flags.capability,
 					ttlSeconds: parsed.flags["ttl-seconds"],
 					expectedNodeId: parsed.flags["expected-node-id"],

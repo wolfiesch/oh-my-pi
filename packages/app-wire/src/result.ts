@@ -1,16 +1,16 @@
 import { decodeCommandResult } from "./command.ts";
 import { fail } from "./errors.ts";
-import {
-	commandId,
-	hostId,
-	requestId,
-	sessionId,
-	type CommandId,
-	type HostId,
-	type RequestId,
-	type SessionId,
-} from "./ids.ts";
 import { boundedMap, controlFree, inputObject, string } from "./guards.ts";
+import {
+	type CommandId,
+	commandId,
+	type HostId,
+	hostId,
+	type RequestId,
+	requestId,
+	type SessionId,
+	sessionId,
+} from "./ids.ts";
 import { PROTOCOL_VERSION } from "./limits.ts";
 export interface ResultError {
 	code: string;
@@ -57,7 +57,8 @@ export function decodeResult(input: unknown): ResultFrame {
 	}
 	if (frame.command !== undefined) {
 		const command = controlFree(frame.command, "command", 128);
-		if (frame.ok) return { ...frame, command, result: decodeCommandResult(command, frame.result) } as unknown as ResultFrame;
+		if (frame.ok)
+			return { ...frame, command, result: decodeCommandResult(command, frame.result) } as unknown as ResultFrame;
 	}
 	return frame as unknown as ResultFrame;
 }

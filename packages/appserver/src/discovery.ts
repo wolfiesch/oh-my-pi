@@ -410,8 +410,12 @@ function normalizeEntries(
 } {
 	const projector = new SessionEntryProjector(host, sid, "batch");
 	for (const raw of values) {
-		if (!validRawEntry(raw)) throw new Error("invalid transcript entry");
-		entryId(String(raw.id));
+		if (!validRawEntry(raw)) continue;
+		try {
+			entryId(String(raw.id));
+		} catch {
+			continue;
+		}
 		projector.project(raw);
 	}
 	projector.finish();
@@ -507,15 +511,17 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
 			}
 	}
 	if (!lines.length) throw new Error("empty transcript");
-	const values = lines.map(line => {
+	for (const line of lines) {
 		if ((typeof line === "string" ? encoder.encode(line).byteLength : line.byteLength) > MAX_LINE_BYTES)
 			throw new Error("transcript line exceeds limit");
+	}
+	const parseTranscriptObject = (line: string | Uint8Array): Record<string, unknown> => {
 		const value = parseBounded(line);
 		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid transcript entry");
 		return value as Record<string, unknown>;
-	});
+	};
 	let headerIndex = 0;
-	const first = values[0];
+	const first = parseTranscriptObject(lines[0]);
 	const fixedTitle =
 		first.type === "title" && first.v === 1 && typeof first.title === "string"
 			? cleanText(first.title, 512, true)
@@ -524,7 +530,9 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
 		if (first.v !== 1 || typeof first.title !== "string") throw new Error("invalid transcript prelude");
 		headerIndex = 1;
 	}
-	const header = values[headerIndex];
+	const headerLine = lines[headerIndex];
+	if (!headerLine) throw new Error("invalid transcript header");
+	const header = headerIndex === 0 ? first : parseTranscriptObject(headerLine);
 	if (
 		header?.type !== "session" ||
 		typeof header.id !== "string" ||
@@ -537,7 +545,17 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
 		throw new Error("invalid transcript header");
 	const sid = sessionId(header.id);
 	const cwd = resolve(header.cwd);
-	const normalized = normalizeEntries(values.slice(headerIndex + 1), host, sid, header.timestamp);
+	const values: Record<string, unknown>[] = [];
+	for (const line of lines.slice(headerIndex + 1)) {
+		try {
+			values.push(parseTranscriptObject(line));
+		} catch {
+			// Session files may contain a crash-truncated final write or a malformed
+			// legacy/foreign entry. The validated header remains authoritative; drop
+			// only the bad entry so one partial write cannot hide the whole session.
+		}
+	}
+	const normalized = normalizeEntries(values, host, sid, header.timestamp);
 	const sessionTitle = typeof header.title === "string" ? cleanText(header.title, 512, true) : undefined;
 	const title =
 		fixedTitle || normalized.titleChange || sessionTitle || fallbackTitle(normalized.firstUserText) || "Untitled";
@@ -646,12 +664,8 @@ export class FileSessionDiscovery implements SessionDiscovery {
 		const children = await this.fs.readdir(path);
 		const output: string[] = [];
 		for (const child of children.sort()) {
-			let info;
-			try {
-				info = await this.fs.stat(child);
-			} catch {
-				continue;
-			}
+			const info = await this.fs.stat(child).catch(() => null);
+			if (!info) continue;
 			if (info.isFile() && child.endsWith(".jsonl")) {
 				if (depth <= 1) output.push(child);
 			} else if (

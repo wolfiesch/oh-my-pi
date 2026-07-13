@@ -5,10 +5,10 @@ import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { type ConfiguredThinkingLevel } from "@oh-my-pi/pi-coding-agent/thinking";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-coding-agent/thinking";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 describe("AgentSession selector and thinking validation", () => {
@@ -167,18 +167,14 @@ describe("AgentSession selector and thinking validation", () => {
 
 		// 1. Both defined
 		expect(s.setModelSelector({ selector: "anthropic/claude-sonnet-4-6", role: "slow" })).rejects.toThrow(
-			"Model selection requires a selector or role, but not both"
+			"Model selection requires a selector or role, but not both",
 		);
 
 		// 2. Neither defined
-		expect(s.setModelSelector({})).rejects.toThrow(
-			"Model selection requires a selector or role"
-		);
+		expect(s.setModelSelector({})).rejects.toThrow("Model selection requires a selector or role");
 
 		// 3. Unconfigured role
-		expect(s.setModelSelector({ role: "fast" })).rejects.toThrow(
-			"Model role is not configured: fast"
-		);
+		expect(s.setModelSelector({ role: "fast" })).rejects.toThrow("Model role is not configured: fast");
 
 		// 4. Non-existent selector
 		expect(s.setModelSelector({ selector: "anthropic/claude-nonexistent" })).rejects.toThrow();
@@ -210,7 +206,7 @@ describe("AgentSession selector and thinking validation", () => {
 
 		// Invalid levels (casted to bypass compiler)
 		expect(() => s.setThinkingLevelValidated("bogus" as unknown as ConfiguredThinkingLevel)).toThrow(
-			"Thinking level is unsupported by the current model: bogus"
+			"Thinking level is unsupported by the current model: bogus",
 		);
 		expect(() => s.setThinkingLevelValidated("ultra" as unknown as ConfiguredThinkingLevel)).toThrow();
 

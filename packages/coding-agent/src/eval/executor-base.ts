@@ -35,6 +35,8 @@ export interface KernelExecutorBaseOptions {
 	bridgeSessionId?: string;
 	artifactId?: string;
 	artifactPath?: string;
+	/** Session-scoped settings used for output retention and column limits. */
+	outputSettings?: Settings;
 }
 
 /** Normalised execution result produced by {@link executeWithKernelBase}. */
@@ -292,7 +294,7 @@ export async function executeWithKernelBase<
 		resolveDeadlineMs,
 	} = params;
 
-	const settings = await Settings.init();
+	const settings = options?.outputSettings ?? options?.toolSession?.settings ?? (await Settings.init());
 	const sink = new OutputSink({
 		onChunk: options?.onChunk,
 		artifactPath: options?.artifactPath,

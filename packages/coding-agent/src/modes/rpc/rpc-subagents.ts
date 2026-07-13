@@ -4,7 +4,6 @@ import { AgentRegistry, type RegistryEvent } from "../../registry/agent-registry
 import type { FileEntry, SessionMessageEntry } from "../../session/session-entries";
 import { parseSessionEntries } from "../../session/session-loader";
 import {
-	type AgentProgress,
 	type SubagentEventPayload,
 	type SubagentLifecyclePayload,
 	type SubagentProgressPayload,
@@ -16,9 +15,9 @@ import type { EventBus } from "../../utils/event-bus";
 import type {
 	RpcSubagentEventFrame,
 	RpcSubagentFrame,
+	RpcSubagentLifecyclePayload,
 	RpcSubagentMessagesResult,
 	RpcSubagentSnapshot,
-	RpcSubagentLifecyclePayload,
 	RpcSubagentStatus,
 	RpcSubagentSubscriptionLevel,
 } from "./rpc-types";

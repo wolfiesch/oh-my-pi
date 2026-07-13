@@ -1,4 +1,4 @@
-import { agentId, type AgentFrame, type AgentState, type HostId, type SessionId } from "@oh-my-pi/app-wire";
+import { type AgentFrame, type AgentState, agentId, type HostId, type SessionId } from "@oh-my-pi/app-wire";
 import type {
 	RpcSubagentLifecycleFrame,
 	RpcSubagentProgressFrame,

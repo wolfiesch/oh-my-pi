@@ -136,7 +136,6 @@ export function operationCapabilities(authority: DesktopOperationsAuthority | un
 	return result;
 }
 
-
 function safeError(error: unknown): { code: string; message: string } {
 	const raw =
 		error && typeof error === "object" && "code" in error && typeof error.code === "string"

@@ -1,7 +1,8 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { MANAGED_SKILLS_PROVIDER_ID } from "@oh-my-pi/pi-coding-agent/autolearn/managed-skills";
 import { type Skill as CapabilitySkill, skillCapability } from "@oh-my-pi/pi-coding-agent/capability/skill";
 import { getCapability } from "@oh-my-pi/pi-coding-agent/discovery";
 import {
@@ -44,6 +45,21 @@ const DISABLE_ALL_BUILTIN_SKILLS = {
 } as const;
 
 describe("skills", () => {
+	beforeEach(() => {
+		// Managed skills are intentionally unconditional and have their own discovery
+		// contract suite. Keep this general loader suite independent of whatever the
+		// developer currently has under ~/.omp/agent/managed-skills by replacing only
+		// that provider's result with an empty, per-test discovery result.
+		const capability = getCapability<CapabilitySkill>(skillCapability.id);
+		const managedProvider = capability?.providers.find(provider => provider.id === MANAGED_SKILLS_PROVIDER_ID);
+		if (!managedProvider) throw new Error("Managed skills provider is not registered");
+		spyOn(managedProvider, "load").mockResolvedValue({ items: [], warnings: [] });
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
 	describe("loadSkillsFromDir", () => {
 		const loadFixtureRoot = () => loadSkillsFromDir({ dir: fixturesDir, source: "test" });
 

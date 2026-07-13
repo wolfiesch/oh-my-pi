@@ -847,6 +847,7 @@ describe("AgentSession message pipeline", () => {
 		const nextSessionFile = nextSessionManager.getSessionFile();
 		expect(nextSessionFile).toBeString();
 		await nextSessionManager.flush();
+		await nextSessionManager.close();
 
 		const api = "test-injected-memory-switch-cache";
 		const contexts: Context[] = [];
@@ -914,26 +915,29 @@ describe("AgentSession message pipeline", () => {
 					: ["base", "static memory instructions"],
 			}),
 		});
-		sessions.push(session);
-		setMnemopiSessionState(session, {
-			aliasOf: undefined,
-			setSessionId(_sessionId: string) {},
-			resetConversationTracking() {
-				remembered = false;
-			},
-			async dispose() {},
-		} as unknown as MnemopiSessionState);
+		try {
+			setMnemopiSessionState(session, {
+				aliasOf: undefined,
+				setSessionId(_sessionId: string) {},
+				resetConversationTracking() {
+					remembered = false;
+				},
+				async dispose() {},
+			} as unknown as MnemopiSessionState);
 
-		await session.sendUserMessage("first");
-		expect(session.systemPrompt.join("\n")).toContain(injected);
-		recallAvailable = false;
+			await session.sendUserMessage("first");
+			expect(session.systemPrompt.join("\n")).toContain(injected);
+			recallAvailable = false;
 
-		await session.switchSession(nextSessionFile!);
-		await session.sendUserMessage("second");
+			await session.switchSession(nextSessionFile!);
+			await session.sendUserMessage("second");
 
-		expect(session.systemPrompt.join("\n")).not.toContain(injected);
-		expect(contexts).toHaveLength(2);
-		expect(contexts[1]!.systemPrompt?.join("\n")).not.toContain(injected);
+			expect(session.systemPrompt.join("\n")).not.toContain(injected);
+			expect(contexts).toHaveLength(2);
+			expect(contexts[1]!.systemPrompt?.join("\n")).not.toContain(injected);
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	it("clears promoted memory from the base prompt when starting a new session", async () => {
@@ -1096,25 +1100,28 @@ describe("AgentSession message pipeline", () => {
 					: ["base", "static memory instructions"],
 			}),
 		});
-		sessions.push(session);
-		setMnemopiSessionState(session, {
-			aliasOf: undefined,
-			setSessionId(_sessionId: string) {},
-			resetConversationTracking() {
-				remembered = false;
-			},
-			async dispose() {},
-		} as unknown as MnemopiSessionState);
+		try {
+			setMnemopiSessionState(session, {
+				aliasOf: undefined,
+				setSessionId(_sessionId: string) {},
+				resetConversationTracking() {
+					remembered = false;
+				},
+				async dispose() {},
+			} as unknown as MnemopiSessionState);
 
-		await session.sendUserMessage("first");
-		expect(session.systemPrompt.join("\n")).toContain(injected);
+			await session.sendUserMessage("first");
+			expect(session.systemPrompt.join("\n")).toContain(injected);
 
-		await session.fork();
-		await session.sendUserMessage("second");
+			await session.fork();
+			await session.sendUserMessage("second");
 
-		const forkedPrompt = contexts[1]!.systemPrompt?.join("\n") ?? "";
-		const occurrences = forkedPrompt.split(injected).length - 1;
-		expect(occurrences).toBe(1);
+			const forkedPrompt = contexts[1]!.systemPrompt?.join("\n") ?? "";
+			const occurrences = forkedPrompt.split(injected).length - 1;
+			expect(occurrences).toBe(1);
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	it("ephemeral side-channel forwards native tools, injects developer reminder, leaves toolChoice auto", async () => {

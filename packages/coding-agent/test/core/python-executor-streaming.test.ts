@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { executePythonWithKernel } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import { DEFAULT_MAX_BYTES } from "@oh-my-pi/pi-coding-agent/session/streaming-output";
 import { FakeKernel } from "./helpers";
@@ -11,7 +12,9 @@ describe("executePythonWithKernel streaming", () => {
 			options => options?.onChunk?.(largeOutput),
 		);
 
-		const result = await executePythonWithKernel(kernel, "print('hi')");
+		const result = await executePythonWithKernel(kernel, "print('hi')", {
+			outputSettings: Settings.isolated(),
+		});
 
 		expect(result.truncated).toBe(true);
 		expect(result.output.length).toBeLessThan(largeOutput.length);

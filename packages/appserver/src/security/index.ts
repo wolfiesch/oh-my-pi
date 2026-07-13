@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync } from "node:fs";
-import { chmod, link, lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { chmod, type FileHandle, link, lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { isIP } from "node:net";
 import { dirname } from "node:path";
 import {
@@ -1198,8 +1198,11 @@ export class DefaultRedactor implements Redactor {
 		const seen = new WeakSet<object>();
 		const walk = (input: unknown, depth: number): unknown => {
 			if (depth > 12) return "[redacted]";
-			if (Array.isArray(input))
-				return seen.has(input) ? "[redacted]" : (seen.add(input), input.slice(0, 128).map(x => walk(x, depth + 1)));
+			if (Array.isArray(input)) {
+				if (seen.has(input)) return "[redacted]";
+				seen.add(input);
+				return input.slice(0, 128).map(x => walk(x, depth + 1));
+			}
 			if (input && typeof input === "object") {
 				if (seen.has(input)) return "[redacted]";
 				seen.add(input);
@@ -1344,7 +1347,7 @@ export class JsonlAuditSink implements AuditSink {
 		const record: AuditLockRecord = { pid: process.pid, ownerId: this.ownerId, processStart, createdAt: Date.now() };
 		for (let attempt = 0; attempt < 2; attempt += 1) {
 			const tempPath = `${lockPath}.tmp-${this.ownerId}-${randomBytes(8).toString("hex")}`;
-			let temp;
+			let temp: FileHandle | undefined;
 			try {
 				temp = await open(tempPath, "wx", 0o600);
 				await temp.write(JSON.stringify(record), undefined, "utf8");

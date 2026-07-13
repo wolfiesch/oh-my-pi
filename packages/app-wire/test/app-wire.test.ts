@@ -283,7 +283,14 @@ describe("app-wire authority", () => {
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
-		expect(APP_WIRE_VERSION).toBe("0.5.0");
+		expect(APP_WIRE_VERSION).toBe("0.5.1");
+	});
+	test("welcome identity requires every version and build field", async () => {
+		const welcome = (await fixture("welcome.json")) as Record<string, unknown>;
+		for (const field of ["ompVersion", "ompBuild", "appserverVersion", "appserverBuild"]) {
+			expect(() => decodeServerFrame({ ...welcome, [field]: undefined })).toThrow(AppWireError);
+			expect(() => decodeServerFrame({ ...welcome, [field]: "bad\nidentity" })).toThrow(AppWireError);
+		}
 	});
 	test("exported wire version matches package metadata", async () => {
 		const metadata = (await Bun.file(new URL("../package.json", import.meta.url)).json()) as { version: string };

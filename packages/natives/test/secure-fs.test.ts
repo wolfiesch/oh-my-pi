@@ -26,7 +26,9 @@ describe("secure file jail native API", () => {
 		expect(read.revisionSha256).toBe(first.revisionSha256);
 		const replaced = secureWriteFileAtomic(root, "nested.bin", Buffer.from([9]), first.revisionSha256, 1024);
 		expect(replaced.size).toBe(1);
-		expect(() => secureWriteFileAtomic(root, "nested.bin", Buffer.from([8]), first.revisionSha256, 1024)).toThrow(/CONFLICT/);
+		expect(() => secureWriteFileAtomic(root, "nested.bin", Buffer.from([8]), first.revisionSha256, 1024)).toThrow(
+			/CONFLICT/,
+		);
 		expect((await readFile(path.join(root, "nested.bin"))).equals(Buffer.from([9]))).toBe(true);
 	});
 
@@ -50,8 +52,8 @@ describe("secure file jail native API", () => {
 		await writeFile(path.join(root, "z"), "z");
 		await writeFile(path.join(root, "a"), "a");
 		const listed = secureListDirectory(root, null, 10);
-		expect(listed.entries.map((entry) => entry.name)).toEqual(["a", "z"]);
-		expect(listed.entries.map((entry) => entry.path)).toEqual(["a", "z"]);
+		expect(listed.entries.map(entry => entry.name)).toEqual(["a", "z"]);
+		expect(listed.entries.map(entry => entry.path)).toEqual(["a", "z"]);
 		expect(() => secureListDirectory(root, null, 1)).toThrow(/BOUNDS/);
 	});
 

@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SessionLockError, acquireSessionLock, lockPathForSession } from "../../src/session/session-lock";
 import { findMostRecentSession, resolveResumableSession } from "../../src/session/session-listing";
+import { acquireSessionLock, lockPathForSession, SessionLockError } from "../../src/session/session-lock";
 import { SessionManager } from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";
 
@@ -40,7 +40,11 @@ describe("SessionManager persistent lock integration", () => {
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new Error("missing session file");
 		expect(fs.existsSync(lockPathForSession(sessionFile))).toBe(true);
-		await expect(SessionManager.open(sessionFile, undefined, undefined, { lockOptions: { ...lockOptions, ownerId: OWNER_B, pid: 102 } })).rejects.toBeInstanceOf(SessionLockError);
+		await expect(
+			SessionManager.open(sessionFile, undefined, undefined, {
+				lockOptions: { ...lockOptions, ownerId: OWNER_B, pid: 102 },
+			}),
+		).rejects.toBeInstanceOf(SessionLockError);
 		await manager.dispose();
 		expect(fs.existsSync(lockPathForSession(sessionFile))).toBe(false);
 		const memory = SessionManager.inMemory(cwd);
@@ -61,7 +65,11 @@ describe("SessionManager persistent lock integration", () => {
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new Error("missing session file");
 		expect(fs.existsSync(lockPathForSession(sessionFile))).toBe(true);
-		await expect(SessionManager.open(sessionFile, undefined, undefined, { lockOptions: { ...lockOptions, ownerId: OWNER_B, pid: 104 } })).rejects.toBeInstanceOf(SessionLockError);
+		await expect(
+			SessionManager.open(sessionFile, undefined, undefined, {
+				lockOptions: { ...lockOptions, ownerId: OWNER_B, pid: 104 },
+			}),
+		).rejects.toBeInstanceOf(SessionLockError);
 		await manager.dispose();
 	});
 
@@ -109,7 +117,7 @@ describe("SessionManager persistent lock integration", () => {
 		const { cwd, sessions } = fixture();
 		fs.mkdirSync(cwd);
 		const manager = SessionManager.create(cwd, sessions, new FailingAtomicStorage(), {
-		// Explicitly opt custom storage into the real filesystem lock adapter.
+			// Explicitly opt custom storage into the real filesystem lock adapter.
 			ownerId: OWNER_A,
 			enabled: true,
 			pid: 107,

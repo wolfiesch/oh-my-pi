@@ -160,6 +160,7 @@ function settingsStub(serviceTier: string | undefined): Settings | undefined {
 	return {
 		get: (key: string) =>
 			key === "tier.openai" ? serviceTier : key === "tier.anthropic" || key === "tier.google" ? "none" : undefined,
+		getModelRole: () => undefined,
 	} as unknown as Settings;
 }
 

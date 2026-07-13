@@ -549,6 +549,7 @@ describe("ACP agent", () => {
 
 		firstSession?.sessionManager.appendMessage({ role: "user", content: "fork me", timestamp: Date.now() });
 		await firstSession?.sessionManager.flush();
+		await harness.agent.closeSession({ sessionId: first.sessionId });
 
 		const forked = await harness.agent.unstable_forkSession({
 			sessionId: first.sessionId,
@@ -963,6 +964,7 @@ describe("ACP agent", () => {
 		stored.sessionManager.appendMessage(makeAssistantMessage("reply", "reasoning"));
 		await stored.sessionManager.ensureOnDisk();
 		await stored.sessionManager.flush();
+		await stored.dispose();
 
 		const loaded = await harness.agent.loadSession({
 			sessionId: stored.sessionId,
@@ -1262,6 +1264,7 @@ describe("ACP agent", () => {
 		});
 		await stored.sessionManager.ensureOnDisk();
 		await stored.sessionManager.flush();
+		await stored.dispose();
 
 		await harness.agent.loadSession({
 			sessionId: stored.sessionId,
@@ -1334,6 +1337,7 @@ describe("ACP agent", () => {
 		});
 		await stored.sessionManager.ensureOnDisk();
 		await stored.sessionManager.flush();
+		await stored.dispose();
 
 		await harness.agent.loadSession({
 			sessionId: stored.sessionId,
@@ -1384,6 +1388,7 @@ describe("ACP agent", () => {
 		});
 		await stored.sessionManager.ensureOnDisk();
 		await stored.sessionManager.flush();
+		await stored.dispose();
 
 		await harness.agent.loadSession({
 			sessionId: stored.sessionId,
@@ -1488,6 +1493,7 @@ describe("ACP agent", () => {
 		});
 		await stored.sessionManager.ensureOnDisk();
 		await stored.sessionManager.flush();
+		await stored.dispose();
 
 		await harness.agent.loadSession({
 			sessionId: stored.sessionId,

@@ -9,7 +9,13 @@ export interface BannersProps {
 	onNewLink(): void;
 }
 
-export function Banners({ phase, endedReason, autoReconnecting = false, onRejoin, onNewLink }: BannersProps): ReactNode {
+export function Banners({
+	phase,
+	endedReason,
+	autoReconnecting = false,
+	onRejoin,
+	onNewLink,
+}: BannersProps): ReactNode {
 	if (phase === "connecting" || phase === "waiting") {
 		return (
 			<div className="sh-banner" role="status">

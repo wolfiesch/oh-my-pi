@@ -1,4 +1,3 @@
-import { fail } from "./errors.ts";
 import { controlFree, inputObject, safeSeq } from "./guards.ts";
 import { MAX_EPOCH_BYTES } from "./limits.ts";
 export interface Cursor {

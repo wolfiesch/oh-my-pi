@@ -1,4 +1,3 @@
-import { fail } from "./errors.ts";
 import { controlFree } from "./guards.ts";
 import { MAX_ID_BYTES } from "./limits.ts";
 

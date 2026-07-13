@@ -1,8 +1,15 @@
-import { decodeFeatureList, decodeNegotiatedFeatureList, decodeCapabilities, type Capabilities } from "./capabilities.ts";
-import { decodeCursor, type Cursor } from "./cursor.ts";
+import { type Capabilities, decodeCapabilities, decodeNegotiatedFeatureList } from "./capabilities.ts";
+import { type Cursor, decodeCursor } from "./cursor.ts";
 import { fail } from "./errors.ts";
-import { hostId, sessionId, type HostId, type SessionId } from "./ids.ts";
-import { boundedArray, boundedMap, controlFree, decodeAuthentication, inputObject, type DeviceAuthentication } from "./guards.ts";
+import {
+	boundedArray,
+	boundedMap,
+	controlFree,
+	type DeviceAuthentication,
+	decodeAuthentication,
+	inputObject,
+} from "./guards.ts";
+import { type HostId, hostId, type SessionId, sessionId } from "./ids.ts";
 import { MAX_SAVED_CURSORS, PROTOCOL_VERSION } from "./limits.ts";
 export interface ProtocolRange {
 	min: string;
@@ -94,7 +101,14 @@ export function decodeHello(input: unknown): HelloFrame {
 	}
 	if (frame.capabilities !== undefined) decodeCapabilities(frame.capabilities);
 	const authentication = frame.authentication === undefined ? undefined : decodeAuthentication(frame.authentication);
-	return { ...frame, protocol, client, requestedFeatures, savedCursors, ...(authentication === undefined ? {} : { authentication }) } as unknown as HelloFrame;
+	return {
+		...frame,
+		protocol,
+		client,
+		requestedFeatures,
+		savedCursors,
+		...(authentication === undefined ? {} : { authentication }),
+	} as unknown as HelloFrame;
 }
 export function decodeWelcome(input: unknown): WelcomeFrame {
 	const frame = inputObject(input);
@@ -107,10 +121,13 @@ export function decodeWelcome(input: unknown): WelcomeFrame {
 	controlFree(frame.ompVersion, "ompVersion", 64);
 	controlFree(frame.ompBuild, "ompBuild", 128);
 	controlFree(frame.appserverVersion, "appserverVersion", 64);
+	controlFree(frame.appserverBuild, "appserverBuild", 128);
 	const authentication = frame.authentication;
-	if (authentication !== "local" && authentication !== "pairing-required" && authentication !== "paired") fail("INVALID_FRAME", "invalid welcome authentication state", "authentication");
+	if (authentication !== "local" && authentication !== "pairing-required" && authentication !== "paired")
+		fail("INVALID_FRAME", "invalid welcome authentication state", "authentication");
 	const grantedCapabilities = decodeCapabilities({ client: frame.grantedCapabilities }, "grantedCapabilities").client;
-	if (authentication === "pairing-required" && grantedCapabilities.length !== 0) fail("INVALID_FRAME", "pairing-required welcome must grant no capabilities", "grantedCapabilities");
+	if (authentication === "pairing-required" && grantedCapabilities.length !== 0)
+		fail("INVALID_FRAME", "pairing-required welcome must grant no capabilities", "grantedCapabilities");
 	controlFree(frame.epoch, "epoch", 128);
 	const grantedFeatures = decodeNegotiatedFeatureList(frame.grantedFeatures, "grantedFeatures");
 	const negotiatedLimits = boundedMap(frame.negotiatedLimits, "negotiatedLimits");
