@@ -132,6 +132,7 @@ export function decodePairing(input: unknown): PairingFrame {
 		decodeCapabilities({ client: granted });
 		controlFree(frame.deviceToken, "deviceToken", 512);
 		deviceToken(frame.deviceToken, "deviceToken");
+		controlFree(frame.expiresAt, "expiresAt", 128);
 		return frame as unknown as PairOkFrame;
 	}
 	if (frame.type === "pair.error") {

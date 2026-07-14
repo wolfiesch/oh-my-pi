@@ -203,6 +203,8 @@ export function decodeWatch(input: unknown): WatchFrame {
 		if (upsert.hostId !== ids.hostId || upsert.sessionId !== ids.sessionId)
 			fail("INVALID_FRAME", "upsert belongs to another session", "upsert");
 	}
+	if (result.remove !== undefined && result.remove !== ids.sessionId)
+		fail("INVALID_FRAME", "remove belongs to another session", "remove");
 	return result as unknown as SessionDeltaFrame;
 }
 
@@ -870,16 +872,18 @@ export function decodePreview(input: unknown): PreviewFrame {
 	}
 	if (type === "preview.navigation")
 		return { ...x, type, ...ids, previewId: pid, url: httpUrl(x.url, "url") } as PreviewNavigationFrame;
-	if (type === "preview.capture")
+	if (type === "preview.capture") {
+		if (x.encoding !== "base64") fail("INVALID_FRAME", "preview capture encoding must be base64", "encoding");
 		return {
 			...x,
 			type,
 			...ids,
 			previewId: pid,
 			content: base64(x.content, "content", MAX_FILE_BYTES),
-			encoding: "base64",
+			encoding: x.encoding,
 			mimeType: controlFree(x.mimeType, "mimeType", 128),
 		} as PreviewCaptureFrame;
+	}
 	return {
 		...x,
 		type,

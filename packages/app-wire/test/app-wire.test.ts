@@ -409,6 +409,39 @@ describe("app-wire authority", () => {
 		const malicious = await fixture("session-secret.invalid.json");
 		expect(() => decodeServerFrame(malicious)).toThrow(AppWireError);
 	});
+	test("session delta removals cannot target another session", () => {
+		const delta = {
+			v: "omp-app/1",
+			type: "session.delta",
+			hostId: "h",
+			sessionId: "s",
+			cursor: { epoch: "e", seq: 1 },
+			revision: "r",
+			remove: "s",
+		};
+		expect(decodeAdditiveServerFrame(delta)).toMatchObject({ sessionId: "s", remove: "s" });
+		expect(() => decodeAdditiveServerFrame({ ...delta, remove: "other" })).toThrow(AppWireError);
+	});
+	test("pairing success requires a bounded expiration and preserves it", async () => {
+		const pairing = (await fixture("pairing.json")) as Record<string, unknown>;
+		expect(decodeServerFrame(pairing)).toMatchObject({
+			type: "pair.ok",
+			expiresAt: pairing.expiresAt,
+		});
+		const missingExpiration = { ...pairing };
+		delete missingExpiration.expiresAt;
+		expect(() => decodeServerFrame(missingExpiration)).toThrow(AppWireError);
+		expect(() => decodeServerFrame({ ...pairing, expiresAt: 1 })).toThrow(AppWireError);
+		expect(() => decodeServerFrame({ ...pairing, expiresAt: "x".repeat(129) })).toThrow(AppWireError);
+	});
+	test("preview captures require the declared base64 encoding", async () => {
+		const capture = (await fixture("preview-capture.json")) as Record<string, unknown>;
+		expect(decodeServerFrame(capture)).toMatchObject({ type: "preview.capture", encoding: "base64" });
+		const missingEncoding = { ...capture };
+		delete missingEncoding.encoding;
+		expect(() => decodeServerFrame(missingEncoding)).toThrow(AppWireError);
+		expect(() => decodeServerFrame({ ...capture, encoding: "utf8" })).toThrow(AppWireError);
+	});
 	test("authenticated hello fixtures reject partial/bad auth without echoing token", async () => {
 		const partial = await fixture("hello-auth-partial.invalid.json");
 		const bad = await fixture("hello-auth-bad.invalid.json");
