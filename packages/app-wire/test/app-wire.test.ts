@@ -119,6 +119,16 @@ describe("app-wire authority", () => {
 		expect(decodeDurableEntryFrame(JSON.stringify(frame)).entry.parentId).toBe("i1");
 		expect(decodeDurableEntryFrame(new TextEncoder().encode(JSON.stringify(frame))).revision).toBe("rev-2");
 	});
+	test("hello preserves unknown additive feature requests while welcome grants stay strict", async () => {
+		const futureHello = decodeClientFrame({ ...hello, requestedFeatures: ["resume", "future.client.feature"] });
+		expect(futureHello.type).toBe("hello");
+		if (futureHello.type !== "hello") throw new Error("expected hello frame");
+		expect(futureHello.requestedFeatures).toEqual(["resume", "future.client.feature"]);
+		const welcome = (await fixture("welcome.json")) as Record<string, unknown>;
+		expect(() => decodeServerFrame({ ...welcome, grantedFeatures: ["resume", "future.server.feature"] })).toThrow(
+			AppWireError,
+		);
+	});
 	test("cursor epochs are opaque bounded strings", () => {
 		expect(() =>
 			decodeServerFrame({

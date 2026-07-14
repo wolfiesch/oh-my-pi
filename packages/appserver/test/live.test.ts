@@ -336,6 +336,18 @@ async function liveServer(
 }
 
 describe("live Unix websocket protocol", () => {
+	test("ignores unknown additive client feature requests", async () => {
+		const { appserver, path, root } = await liveServer(new LiveFactory());
+		try {
+			const connected = await readyClient(path, ["sessions.read"], ["resume", "future.client.feature"]);
+			expect(connected.welcome.grantedFeatures).toEqual(["resume"]);
+			await closeClients([connected.client]);
+		} finally {
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("reads only attached transcript-entry images in bounded uncached chunks", async () => {
 		const blobRoot = await mkdtemp(join(tmpdir(), "omp-appserver-blobs-"));
 		await chmod(blobRoot, 0o700);
