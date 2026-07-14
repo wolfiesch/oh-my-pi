@@ -568,6 +568,8 @@ export interface RpcSessionEntrySubscription {
 	dispose(): void;
 }
 
+export const RPC_SESSION_ENTRIES_ENV = "OMP_APP_RPC_SESSION_ENTRIES";
+
 /**
  * Route durable session appends through the RPC output writer.
  *
@@ -578,7 +580,16 @@ export interface RpcSessionEntrySubscription {
  */
 export function createRpcSessionEntrySubscription(
 	output: (frame: RpcSessionEntryFrame) => void,
+	enabled = true,
 ): RpcSessionEntrySubscription {
+	if (!enabled) {
+		return {
+			bind() {},
+			unbind() {},
+			switchTo() {},
+			dispose() {},
+		};
+	}
 	let boundManager: RpcSessionEntryManager | undefined;
 	let unsubscribe: (() => void) | undefined;
 	let disposed = false;
@@ -1150,10 +1161,14 @@ export async function runRpcMode(
 	// may write there.
 	process.env.PI_NOTIFICATIONS = "off";
 
+	const omitInlineImages = process.env[RPC_INLINE_IMAGE_DATA_ENV] === "omit";
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		process.stdout.write(`${JSON.stringify(obj)}\n`);
+		process.stdout.write(`${JSON.stringify(rpcTransportFrame(obj, omitInlineImages))}\n`);
 	};
-	const sessionEntrySubscription = createRpcSessionEntrySubscription(output);
+	const sessionEntrySubscription = createRpcSessionEntrySubscription(
+		output,
+		process.env[RPC_SESSION_ENTRIES_ENV] === "1",
+	);
 	sessionEntrySubscription.bind(session.sessionManager);
 	const emitRpcTitles = shouldEmitRpcTitles();
 

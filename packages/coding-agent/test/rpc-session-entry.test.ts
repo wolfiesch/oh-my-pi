@@ -1,15 +1,19 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import { MAX_ARRAY_ITEMS, parseBounded } from "@oh-my-pi/app-wire";
 import {
 	boundedRpcSessionEvent,
 	createRpcSessionEntrySubscription,
 	RPC_AGENT_END_MAX_BYTES,
+	RPC_INLINE_IMAGE_DATA_ENV,
+	RPC_SESSION_ENTRIES_ENV,
 	type RpcSessionEntryFrame,
 	rpcTransportFrame,
+	runRpcMode,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
-import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { postmortem } from "@oh-my-pi/pi-utils";
 
 type EntryListener = (entry: SessionEntry) => void;
 
@@ -78,6 +82,19 @@ describe("RPC durable session-entry frames", () => {
 			["entry-2", "entry-1", "2026-07-11T12:00:01.000Z"],
 		]);
 		expect(manager.subscribeCalls).toBe(1);
+		subscription.dispose();
+	});
+
+	test("stock RPC mode does not subscribe or emit unsolicited durable-entry frames", () => {
+		const manager = new FakeSessionManager();
+		const frames: RpcSessionEntryFrame[] = [];
+		const subscription = createRpcSessionEntrySubscription(frame => frames.push(frame), false);
+		subscription.bind(manager);
+		manager.append(entry("stock-rpc-entry", null, "2026-07-11T12:00:02.000Z"));
+
+		expect(manager.subscribeCalls).toBe(0);
+		expect(manager.listeners).toHaveLength(0);
+		expect(frames).toEqual([]);
 		subscription.dispose();
 	});
 
@@ -169,6 +186,76 @@ describe("RPC durable session-entry frames", () => {
 		expect(frames).toHaveLength(1);
 		expect(stdoutWrites).toBe(0);
 		subscription.dispose();
+	});
+
+	test("managed RPC stdout projects durable image entries before appserver delivery", async () => {
+		const inlineImageEnv = process.env[RPC_INLINE_IMAGE_DATA_ENV];
+		const sessionEntriesEnv = process.env[RPC_SESSION_ENTRIES_ENV];
+		const notificationsEnv = process.env.PI_NOTIFICATIONS;
+		const stop = new Error("captured managed session entry");
+		const manager = new FakeSessionManager();
+		const bytes = Buffer.concat([
+			Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+			Buffer.alloc(1_024, 0x6a),
+		]);
+		const data = bytes.toString("base64");
+		const digest = createHash("sha256").update(bytes).digest("hex");
+		const durable: SessionEntry = {
+			type: "message",
+			id: "managed-image-entry",
+			parentId: null,
+			timestamp: "2026-07-14T12:00:00.000Z",
+			message: {
+				role: "user",
+				content: [{ type: "image", mimeType: "image/png", data }],
+				timestamp: 1,
+			},
+		};
+		let projected: (RpcSessionEntryFrame & { inlineImageDataOmitted?: true }) | undefined;
+		const registerSpy = vi.spyOn(postmortem, "register").mockReturnValue(() => {});
+		const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			const frame = JSON.parse(String(chunk)) as Record<string, unknown>;
+			if (frame.type === "ready") {
+				manager.append(durable);
+				return true;
+			}
+			if (frame.type === "session_entry") {
+				projected = frame as unknown as RpcSessionEntryFrame & { inlineImageDataOmitted?: true };
+				throw stop;
+			}
+			return true;
+		});
+
+		try {
+			process.env[RPC_INLINE_IMAGE_DATA_ENV] = "omit";
+			process.env[RPC_SESSION_ENTRIES_ENV] = "1";
+
+			const session = {
+				sessionManager: manager,
+				beginDispose() {},
+				async dispose() {},
+			} as unknown as AgentSession;
+			await expect(runRpcMode(session)).rejects.toBe(stop);
+
+			expect(projected?.inlineImageDataOmitted).toBe(true);
+			if (projected?.entry.type !== "message" || projected.entry.message.role !== "user")
+				throw new Error("expected projected user image entry");
+			if (!Array.isArray(projected.entry.message.content)) throw new Error("expected projected image content");
+			const image = projected.entry.message.content.find(block => block.type === "image");
+			expect(image).toMatchObject({ data: "", mimeType: "image/png", appImageSha256: digest });
+			if (durable.message.role !== "user" || !Array.isArray(durable.message.content))
+				throw new Error("expected durable user image entry");
+			expect(durable.message.content[0]).toMatchObject({ data });
+		} finally {
+			stdoutSpy.mockRestore();
+			registerSpy.mockRestore();
+			if (inlineImageEnv === undefined) delete process.env[RPC_INLINE_IMAGE_DATA_ENV];
+			else process.env[RPC_INLINE_IMAGE_DATA_ENV] = inlineImageEnv;
+			if (sessionEntriesEnv === undefined) delete process.env[RPC_SESSION_ENTRIES_ENV];
+			else process.env[RPC_SESSION_ENTRIES_ENV] = sessionEntriesEnv;
+			if (notificationsEnv === undefined) delete process.env.PI_NOTIFICATIONS;
+			else process.env.PI_NOTIFICATIONS = notificationsEnv;
+		}
 	});
 
 	test("appserver transport omits inline image bytes without mutating the durable entry", () => {

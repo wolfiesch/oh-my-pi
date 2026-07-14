@@ -49,7 +49,7 @@ There is no envelope beyond the object shape itself.
 10. Subagent frames (`subagent_lifecycle`, `subagent_progress`, `subagent_event`), gated by `set_subagent_subscription`
 11. Builtin slash-command side channels (`command_output`, `session_info_update`, `config_update`)
 
-12. Durable session-entry notifications (`session_entry`)
+12. Managed durable session-entry notifications (`session_entry`), gated by `OMP_APP_RPC_SESSION_ENTRIES=1`
 
 ### Inbound frame categories (stdin)
 
@@ -58,9 +58,9 @@ There is no envelope beyond the object shape itself.
 3. Host tool updates/results (`host_tool_update`, `host_tool_result`)
 4. Host URI results (`host_uri_result`)
 
-### Durable session-entry notifications
+### Managed durable session-entry notifications
 
-Each exact durable append is emitted once on stdout as an additive frame:
+The local appserver opts its managed RPC children into durable-entry notifications with `OMP_APP_RPC_SESSION_ENTRIES=1`. Standard RPC mode does not emit these additive frames. When enabled, each exact durable append is emitted once on stdout:
 
 ```json
 {
@@ -75,7 +75,9 @@ Each exact durable append is emitted once on stdout as an additive frame:
 }
 ```
 
-`entry` is the typed `SessionEntry` object, including its exact `id`, `parentId`, and `timestamp`; all entry-specific fields are preserved. The JSONL session transcript remains the durable authority for replay and recovery. `session_entry` is a live notification only, not a replacement for reading JSONL.
+`entry` is the typed `SessionEntry` object, including its exact `id`, `parentId`, and `timestamp`. The JSONL session transcript remains the durable authority for replay and recovery. `session_entry` is a live notification only, not a replacement for reading JSONL.
+
+The appserver also sets `OMP_APP_RPC_INLINE_IMAGE_DATA=omit`. In that internal transport only, image-block payloads and standalone image data URLs are omitted recursively from stdout frames and the frame receives `inlineImageDataOmitted: true`. Valid transcript images carry an `appImageSha256` digest so the appserver can resolve the persisted blob without copying base64 through the control channel. The managed transport projects other oversized or structurally unsafe fields to app-wire limits as well. It never resizes, rewrites, or removes the image persisted in the session or sent to the model.
 
 This frame is additive: older RPC consumers may ignore unknown outbound `type` values and continue handling existing responses/events unchanged.
 
@@ -394,13 +396,15 @@ Extension runner errors are emitted separately as:
 
 `message_update` includes streaming deltas in `assistantMessageEvent` (text/thinking/toolcall deltas).
 
-RPC stdout frames remain below the host's 1 MiB line ceiling and satisfy the
-app-wire bounded-JSON structural limits for depth, collection size, and total
-nodes. When an `agent_end` aggregate would exceed any of those limits,
+`agent_end` aggregates remain below the host's 1 MiB line ceiling and satisfy
+the app-wire bounded-JSON structural limits for depth, collection size, and
+total nodes. When an aggregate would exceed any of those limits,
 `messages` contains the newest contiguous suffix that fits and the event adds
 the original `messageCount` plus a terminal `status` of `completed`, `failed`,
-or `cancelled`. Durable messages still arrive individually as `session_entry`
-frames before this terminal event.
+or `cancelled`. Managed appserver children additionally project every stdout
+frame to those transport limits. When `OMP_APP_RPC_SESSION_ENTRIES=1`, durable
+messages arrive individually as `session_entry` frames before the terminal
+event.
 
 When an appserver RPC child crashes, the session is projected as `closed` with
 `liveState.runtimeCrashed: true` while that child is being reaped. Only after it
