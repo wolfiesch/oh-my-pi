@@ -620,6 +620,69 @@ export function createRpcSessionEntrySubscription(
 	};
 }
 
+/** Leave 64 KiB of framing headroom below a one MiB JSONL reader limit. */
+export const RPC_AGENT_END_MAX_BYTES = 1024 * 1024 - 64 * 1024;
+
+const rpcTextEncoder = new TextEncoder();
+
+type RpcAgentEndStatus = "completed" | "failed" | "cancelled";
+
+function serializedJsonBytes(value: object): number | undefined {
+	try {
+		const encoded = JSON.stringify(value);
+		if (encoded === undefined) return undefined;
+		return rpcTextEncoder.encode(encoded).byteLength;
+	} catch {
+		return undefined;
+	}
+}
+
+function fitsRpcLine(value: object): boolean {
+	const bytes = serializedJsonBytes(value);
+	return bytes !== undefined && bytes <= RPC_AGENT_END_MAX_BYTES;
+}
+
+function rpcAgentEndStatus(messages: Extract<AgentSessionEvent, { type: "agent_end" }>["messages"]): RpcAgentEndStatus {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (!message || typeof message !== "object" || !("role" in message) || message.role !== "assistant") continue;
+		if ("stopReason" in message && message.stopReason === "error") return "failed";
+		if ("stopReason" in message && message.stopReason === "aborted") return "cancelled";
+		return "completed";
+	}
+	return "completed";
+}
+
+/**
+ * Keep terminal RPC events below common JSONL reader ceilings.
+ *
+ * `agent_end.messages` repeats messages already delivered by lifecycle events,
+ * so an oversized aggregate can retain the newest contiguous suffix while the
+ * terminal status and original count remain explicit.
+ */
+export function boundedRpcSessionEvent(event: AgentSessionEvent): AgentSessionEvent {
+	if (event.type !== "agent_end" || fitsRpcLine(event)) return event;
+
+	const terminal = {
+		messageCount: event.messages.length,
+		status: rpcAgentEndStatus(event.messages),
+	};
+	const emptyEvent = { ...event, messages: [], ...terminal };
+	const minimalEvent = { type: "agent_end" as const, messages: [], ...terminal };
+	const fallback = fitsRpcLine(emptyEvent) ? emptyEvent : minimalEvent;
+
+	let low = 0;
+	let high = event.messages.length;
+	while (low < high) {
+		const candidateLength = Math.ceil((low + high) / 2);
+		const candidate = { ...event, messages: event.messages.slice(-candidateLength), ...terminal };
+		if (fitsRpcLine(candidate)) low = candidateLength;
+		else high = candidateLength - 1;
+	}
+
+	return low === 0 ? fallback : { ...event, messages: event.messages.slice(-low), ...terminal };
+}
+
 export type RpcSessionChangeCommand = Extract<
 	RpcCommand,
 	{ type: "new_session" } | { type: "switch_session" } | { type: "branch" }

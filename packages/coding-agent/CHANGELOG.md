@@ -56,6 +56,9 @@
 - Fixed Pyright LSP semantic requests hanging during startup.
 - Fixed Codex web search requests for GPT-5.6 Responses-Lite models.
 - Fixed custom model/provider configuration discovery to correctly load ~/.omp/agent/models.yaml when models.yml is absent.
+### Fixed
+
+- Fixed long RPC turns emitting an oversized terminal `agent_end` JSONL frame by retaining the newest message suffix that fits and preserving the original message count and completion status.
 
 ## [16.5.0] - 2026-07-13
 
