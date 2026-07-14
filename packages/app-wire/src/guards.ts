@@ -306,7 +306,7 @@ export interface DeviceAuthentication {
 	deviceToken: string;
 }
 export function deviceToken(value: unknown, path = "deviceToken"): string {
-	if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(value))
+	if (typeof value !== "string" || !/^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u.test(value))
 		fail("INVALID_FRAME", "device token must be canonical base64url for 32 bytes", path);
 	return value;
 }

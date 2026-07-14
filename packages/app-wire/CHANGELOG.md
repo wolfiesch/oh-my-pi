@@ -8,4 +8,5 @@
 
 ### Fixed
 
-- Validate known file, audit, and catalog result fields and support NodeNext `.js` subpath imports from the packed SDK.
+- Validate response exclusivity, canonical device tokens, known file, audit, and catalog result fields, and support
+  NodeNext `.js` subpath imports from the packed SDK.

@@ -41,6 +41,7 @@ export function decodeResult(input: unknown): ResultFrame {
 	if (frame.ok) {
 		if (frame.error !== undefined) fail("INVALID_FRAME", "successful response cannot have error", "error");
 	} else {
+		if (frame.result !== undefined) fail("INVALID_FRAME", "failed response cannot have result", "result");
 		const error = boundedMap(frame.error, "error");
 		controlFree(error.code, "error.code", 128);
 		string(error.message, "error.message", 1024);
