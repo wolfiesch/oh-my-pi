@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decodeServerFrame, entryId, hostId, projectId, type ServerFrame, sessionId } from "@oh-my-pi/app-wire";
@@ -318,6 +318,7 @@ async function liveServer(
 	factory: LiveFactory,
 	records = [record("s1"), record("s2")],
 	ringSize = 256,
+	transcriptImageRoot?: string,
 ): Promise<{ appserver: LocalAppserver; root: string; path: string }> {
 	const root = await mkdtemp(join(tmpdir(), "omp-appserver-live-"));
 	const path = join(root, "run", "app.sock");
@@ -328,12 +329,96 @@ async function liveServer(
 		discovery: new StaticDiscovery(records),
 		childFactory: factory,
 		ringSize,
+		transcriptImageRoot,
 	});
 	await appserver.start();
 	return { appserver, root, path };
 }
 
 describe("live Unix websocket protocol", () => {
+	test("reads only attached transcript-entry images in bounded uncached chunks", async () => {
+		const blobRoot = await mkdtemp(join(tmpdir(), "omp-appserver-blobs-"));
+		await chmod(blobRoot, 0o700);
+		const png = Buffer.concat([
+			Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+			Buffer.alloc(256 * 1024 + 31, 0x4a),
+		]);
+		const sha256 = createHash("sha256").update(png).digest("hex");
+		await writeFile(join(blobRoot, sha256), png, { mode: 0o600 });
+		const imageRecord = record("s1");
+		imageRecord.archivedAt = stamp;
+		imageRecord.entries = [
+			{
+				id: entryId("image-entry"),
+				parentId: null,
+				hostId: host,
+				sessionId: sid("s1"),
+				kind: "message",
+				timestamp: stamp,
+				data: {
+					role: "user",
+					text: "image",
+					images: [{ sha256, mimeType: "image/png" }],
+				},
+			},
+		];
+		const { appserver, path, root } = await liveServer(new LiveFactory(), [imageRecord], 256, blobRoot);
+		try {
+			const connected = await readyClient(path, ["sessions.read"], ["resume", "transcript.images"]);
+			expect(connected.welcome.grantedFeatures).toContain("transcript.images");
+			const readArgs = { entryId: "image-entry", sha256, offset: 0 };
+			connected.client.sendJson(command("before-attach", "before-attach", "session.image.read", "s1", readArgs));
+			expect((await untilResponse(connected.client, "before-attach")).response).toMatchObject({
+				ok: false,
+				error: { code: "session_not_attached" },
+			});
+
+			connected.client.sendJson(command("attach-images", "attach-images", "session.attach", "s1", {}));
+			const [, snapshot] = await responseAndSnapshot(connected.client, "attach-images");
+			expect(snapshot.entries[0]?.data.images).toEqual([{ sha256, mimeType: "image/png" }]);
+
+			connected.client.sendJson(
+				command("wrong-entry", "wrong-entry", "session.image.read", "s1", {
+					...readArgs,
+					entryId: "another-entry",
+				}),
+			);
+			const wrong = (await untilResponse(connected.client, "wrong-entry")).response;
+			expect(wrong).toMatchObject({ ok: false, error: { code: "image_not_found" } });
+			expect(JSON.stringify(wrong)).not.toContain(blobRoot);
+
+			connected.client.sendJson(command("read-first", "reused-read", "session.image.read", "s1", readArgs));
+			const first = (await untilResponse(connected.client, "read-first")).response;
+			expect(first.ok).toBe(true);
+			expect(new TextEncoder().encode(JSON.stringify(first)).byteLength).toBeLessThan(1024 * 1024);
+			const firstResult = first.result as {
+				content: string;
+				nextOffset: number;
+				complete: boolean;
+			};
+			expect(firstResult.complete).toBe(false);
+			expect(Buffer.from(firstResult.content, "base64")).toEqual(png.subarray(0, 256 * 1024));
+
+			connected.client.sendJson(
+				command("read-second", "reused-read", "session.image.read", "s1", {
+					...readArgs,
+					offset: firstResult.nextOffset,
+				}),
+			);
+			const second = (await untilResponse(connected.client, "read-second")).response;
+			expect(second.ok).toBe(true);
+			const secondResult = second.result as { content: string; nextOffset: number; complete: boolean };
+			expect(secondResult.complete).toBe(true);
+			expect(secondResult.nextOffset).toBe(png.byteLength);
+			expect(Buffer.from(secondResult.content, "base64")).toEqual(png.subarray(firstResult.nextOffset));
+			await closeClients([connected.client]);
+		} finally {
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+			await rm(blobRoot, { recursive: true, force: true });
+		}
+	});
+
 	test("keeps managed image spools through disconnect until the child acknowledges reading them", async () => {
 		const factory = new LiveFactory();
 		const { appserver, path, root } = await liveServer(factory, [record("s1")]);

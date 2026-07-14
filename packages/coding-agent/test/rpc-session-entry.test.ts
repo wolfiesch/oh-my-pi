@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { MAX_ARRAY_ITEMS, parseBounded } from "@oh-my-pi/app-wire";
 import {
 	boundedRpcSessionEvent,
 	createRpcSessionEntrySubscription,
 	RPC_AGENT_END_MAX_BYTES,
 	type RpcSessionEntryFrame,
+	rpcTransportFrame,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -39,6 +41,14 @@ function entry(id: string, parentId: string | null, timestamp: string): SessionE
 		customType: "rpc-test",
 		data: { id },
 	};
+}
+
+function imagePayloads(value: unknown): string[] {
+	if (Array.isArray(value)) return value.flatMap(imagePayloads);
+	if (!value || typeof value !== "object") return [];
+	const record = value as Record<string, unknown>;
+	const current = record.type === "image" && typeof record.data === "string" ? [record.data] : [];
+	return [...current, ...Object.values(record).flatMap(imagePayloads)];
 }
 
 describe("RPC durable session-entry frames", () => {
@@ -159,6 +169,220 @@ describe("RPC durable session-entry frames", () => {
 		expect(frames).toHaveLength(1);
 		expect(stdoutWrites).toBe(0);
 		subscription.dispose();
+	});
+
+	test("appserver transport omits inline image bytes without mutating the durable entry", () => {
+		const imageData = "a".repeat(700_000);
+		const durable: SessionEntry = {
+			type: "message",
+			id: "image-entry",
+			parentId: null,
+			timestamp: "2026-07-14T12:00:00.000Z",
+			message: {
+				role: "user",
+				content: [
+					{ type: "text", text: "compare these" },
+					{ type: "image", mimeType: "image/png", data: imageData },
+					{ type: "image", mimeType: "image/jpeg", data: imageData },
+				],
+				timestamp: 1,
+			},
+		};
+		const rawFrame: RpcSessionEntryFrame = { type: "session_entry", entry: durable };
+		expect(new TextEncoder().encode(JSON.stringify(rawFrame)).byteLength).toBeGreaterThan(1_048_576);
+
+		const projected = rpcTransportFrame(rawFrame, true);
+		expect(() => parseBounded(JSON.stringify(projected))).not.toThrow();
+		expect(projected.inlineImageDataOmitted).toBe(true);
+		expect(imagePayloads(projected)).toEqual(["", ""]);
+		expect(imagePayloads(durable)).toEqual([imageData, imageData]);
+	});
+
+	test("managed image omission carries a verified blob digest while stock RPC stays untouched", () => {
+		const bytes = Buffer.concat([
+			Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+			Buffer.alloc(1_024, 0x4a),
+		]);
+		const data = bytes.toString("base64");
+		const digest = createHash("sha256").update(bytes).digest("hex");
+		const frame = {
+			type: "session_entry",
+			entry: {
+				type: "message",
+				id: "digest-entry",
+				parentId: null,
+				timestamp: "2026-07-14T12:00:00.000Z",
+				message: {
+					role: "user",
+					content: [
+						{
+							type: "image",
+							mimeType: "image/png",
+							data,
+							appImageSha256: "f".repeat(64),
+						},
+					],
+				},
+			},
+		};
+		expect(rpcTransportFrame(frame, false)).toBe(frame);
+		const projected = rpcTransportFrame(frame, true) as Record<string, unknown>;
+		const entry = projected.entry as Record<string, unknown>;
+		const message = entry.message as Record<string, unknown>;
+		const image = (message.content as Array<Record<string, unknown>>)[0]!;
+		expect(image).toMatchObject({ type: "image", mimeType: "image/png", data: "", appImageSha256: digest });
+		expect((frame.entry.message.content[0] as Record<string, unknown>).appImageSha256 as string).toBe("f".repeat(64));
+	});
+
+	test("appserver transport also bounds image-bearing lifecycle events", () => {
+		const imageData = "b".repeat(1_100_000);
+		const event: AgentSessionEvent = {
+			type: "message_start",
+			message: {
+				role: "user",
+				content: [{ type: "image", mimeType: "image/png", data: imageData }],
+				timestamp: 1,
+			},
+		};
+		const projected = rpcTransportFrame(event, true);
+		expect(() => parseBounded(JSON.stringify(projected))).not.toThrow();
+		expect(projected.inlineImageDataOmitted).toBe(true);
+		expect(event.message.role === "user" && Array.isArray(event.message.content)).toBe(true);
+		if (event.message.role !== "user" || !Array.isArray(event.message.content))
+			throw new Error("expected user image");
+		const original = event.message.content.find(block => block.type === "image");
+		expect(original?.data).toBe(imageData);
+	});
+
+	test("ordinary frames retain object identity", () => {
+		const frame = { type: "notice", message: "ready" };
+		expect(rpcTransportFrame(frame, true)).toBe(frame);
+		expect(rpcTransportFrame(frame, false)).toBe(frame);
+	});
+
+	test("appserver transport omits standalone image data URLs", () => {
+		const dataUrl = `data:image/png;base64,${"c".repeat(1_100_000)}`;
+		const frame = { type: "tool_execution_end", result: { preview: dataUrl } };
+		const projected = rpcTransportFrame(frame, true);
+		expect(() => parseBounded(JSON.stringify(projected))).not.toThrow();
+		expect(projected).toEqual({
+			type: "tool_execution_end",
+			result: { preview: "[inline image data omitted]" },
+			inlineImageDataOmitted: true,
+			transportDataOmitted: true,
+			transportOmissionReasons: ["inline_image_data"],
+		});
+		expect(frame.result.preview).toBe(dataUrl);
+	});
+
+	test("appserver transport drops oversized MCP raw content while retaining tool routing", () => {
+		const rawContent = [{ type: "text", text: "m".repeat(1_100_000) }];
+		const frame = {
+			type: "tool_execution_end",
+			toolCallId: "mcp-call-1",
+			toolName: "mcp__example__read",
+			isError: false,
+			result: {
+				content: [{ type: "text", text: "bounded summary" }],
+				details: { rawContent, provider: "example" },
+			},
+		};
+		expect(() => parseBounded(JSON.stringify(frame))).toThrow();
+
+		const projected = rpcTransportFrame(frame, true);
+		expect(() => parseBounded(JSON.stringify(projected))).not.toThrow();
+		expect(projected.type).toBe("tool_execution_end");
+		expect(projected.toolCallId).toBe("mcp-call-1");
+		expect(projected.toolName).toBe("mcp__example__read");
+		expect(projected.isError).toBe(false);
+		expect(projected.transportDataOmitted).toBe(true);
+		expect(projected.transportOmissionReasons).toContain("raw_content");
+		expect((projected.result.details as Record<string, unknown>).rawContent).toBe("[transport data omitted]");
+		expect(frame.result.details.rawContent).toBe(rawContent);
+	});
+
+	test("appserver transport bounds a large durable entry without mutating it", () => {
+		const text = "session text ".repeat(100_000);
+		const frame = {
+			type: "session_entry",
+			entry: {
+				type: "custom",
+				id: "large-session-entry",
+				parentId: "parent-entry",
+				timestamp: "2026-07-14T12:00:00.000Z",
+				customType: "mcp-result",
+				data: { text },
+			},
+		};
+		expect(() => parseBounded(JSON.stringify(frame))).toThrow();
+
+		const projected = rpcTransportFrame(frame, true);
+		expect(() => parseBounded(JSON.stringify(projected))).not.toThrow();
+		expect(projected.type).toBe("session_entry");
+		expect(projected.entry.id).toBe("large-session-entry");
+		expect(projected.entry.parentId).toBe("parent-entry");
+		expect(projected.entry.data.text.length).toBeLessThan(text.length);
+		expect(projected.transportOmissionReasons).toContain("oversized_string");
+		expect(frame.entry.data.text).toBe(text);
+	});
+
+	test("appserver transport projects collection, depth, and node overflows", () => {
+		const deep: Record<string, unknown> = {};
+		let cursor = deep;
+		for (let index = 0; index < 40; index++) {
+			const next: Record<string, unknown> = {};
+			cursor.next = next;
+			cursor = next;
+		}
+		const wide = Object.fromEntries(Array.from({ length: 600 }, (_, index) => [`key-${index}`, index]));
+		const frame = {
+			type: "future_event",
+			id: "routing-id",
+			items: Array.from({ length: 1_100 }, (_, index) => ({ index, values: [index, index + 1] })),
+			wide,
+			deep,
+		};
+		expect(() => parseBounded(JSON.stringify(frame))).toThrow();
+
+		const projected = rpcTransportFrame(frame, true);
+		expect(() => parseBounded(JSON.stringify(projected))).not.toThrow();
+		expect(projected.type).toBe("future_event");
+		expect(projected.id).toBe("routing-id");
+		expect(projected.transportDataOmitted).toBe(true);
+		expect(projected.transportOmissionReasons).toContain("array_items");
+		expect(projected.transportOmissionReasons).toContain("map_keys");
+		expect(projected.transportOmissionReasons).toContain("json_depth_limit");
+	});
+
+	test("standard RPC transport leaves even oversized frames byte-for-byte untouched", () => {
+		const frame = { type: "future_event", payload: "z".repeat(1_100_000) };
+		expect(rpcTransportFrame(frame, false)).toBe(frame);
+		expect(rpcTransportFrame(frame, false)).toEqual(frame);
+	});
+
+	test("appserver transport preserves routing for cyclic and marker-overflow frames", () => {
+		const cyclic: Record<string, unknown> = { type: "future_event", id: "cyclic-routing", status: "active" };
+		cyclic.self = cyclic;
+		const projectedCycle = rpcTransportFrame(cyclic, true);
+		expect(() => parseBounded(JSON.stringify(projectedCycle))).not.toThrow();
+		expect(projectedCycle.type).toBe("future_event");
+		expect(projectedCycle.id).toBe("cyclic-routing");
+		expect(projectedCycle.status).toBe("active");
+		expect(projectedCycle.transportOmissionReasons).toContain("cyclic_value");
+		expect(cyclic.self).toBe(cyclic);
+
+		const fullMap = {
+			type: "tool_execution_end",
+			result: { preview: "data:image/png;base64,abc" },
+			...Object.fromEntries(Array.from({ length: 510 }, (_, index) => [`field-${index}`, index])),
+		};
+		expect(Object.keys(fullMap)).toHaveLength(512);
+		expect(() => parseBounded(JSON.stringify(fullMap))).not.toThrow();
+		const projectedMap = rpcTransportFrame(fullMap, true);
+		expect(() => parseBounded(JSON.stringify(projectedMap))).not.toThrow();
+		expect(projectedMap.type).toBe("tool_execution_end");
+		expect(projectedMap.inlineImageDataOmitted).toBe(true);
+		expect(projectedMap.transportOmissionReasons).toContain("map_keys");
 	});
 });
 

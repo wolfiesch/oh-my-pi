@@ -11,7 +11,20 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 
-import { MAX_ARRAY_ITEMS, MAX_INPUT_BYTES, MAX_STRING_BYTES, parseBounded } from "@oh-my-pi/app-wire";
+import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
+import {
+	MAX_ARRAY_ITEMS,
+	MAX_INPUT_BYTES,
+	MAX_JSON_DEPTH,
+	MAX_JSON_NODES,
+	MAX_MAP_KEYS,
+	MAX_STRING_BYTES,
+	parseBounded,
+	TRANSCRIPT_IMAGE_MAX_BYTES,
+	TRANSCRIPT_IMAGE_MIME_TYPES,
+	utf8ByteLength,
+} from "@oh-my-pi/app-wire";
 import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
@@ -30,6 +43,7 @@ import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
+import { BLOB_EXTERNALIZE_THRESHOLD } from "../../session/session-persistence";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import type { EventBus } from "../../utils/event-bus";
@@ -107,6 +121,357 @@ export const RPC_AGENT_END_MAX_BYTES = MAX_INPUT_BYTES - MAX_STRING_BYTES;
 
 const rpcTextEncoder = new TextEncoder();
 
+export const RPC_INLINE_IMAGE_DATA_ENV = "OMP_APP_RPC_INLINE_IMAGE_DATA";
+
+export type RpcTransportFrame<T extends object = object> = T & {
+	/** The full image bytes remain in the OMP transcript but were omitted from this JSONL notification. */
+	inlineImageDataOmitted?: true;
+	/** Some non-routing data was projected to keep this internal notification within app-wire bounds. */
+	transportDataOmitted?: true;
+	/** Coarse, bounded reasons for transport-only projection. */
+	transportOmissionReasons?: string[];
+};
+
+const RPC_TRANSCRIPT_IMAGE_DIGEST_KEY = "appImageSha256";
+
+interface RpcImageProjection {
+	value: unknown;
+	omitted: boolean;
+}
+
+function transcriptImageDigest(data: string, mimeType: unknown): string | undefined {
+	if (
+		data.length < BLOB_EXTERNALIZE_THRESHOLD ||
+		data.length > Math.ceil(TRANSCRIPT_IMAGE_MAX_BYTES / 3) * 4 ||
+		!(TRANSCRIPT_IMAGE_MIME_TYPES as readonly unknown[]).includes(mimeType) ||
+		data.length % 4 !== 0 ||
+		!/^[A-Za-z0-9+/]*={0,2}$/u.test(data)
+	)
+		return undefined;
+	const decoded = Buffer.from(data, "base64");
+	if (
+		decoded.byteLength === 0 ||
+		decoded.byteLength > TRANSCRIPT_IMAGE_MAX_BYTES ||
+		decoded.toString("base64") !== data
+	)
+		return undefined;
+	return createHash("sha256").update(decoded).digest("hex");
+}
+
+function omitInlineImageData(value: unknown): RpcImageProjection {
+	if (typeof value === "string" && /^data:image\/[a-z0-9.+-]+;base64,/iu.test(value)) {
+		return { value: "[inline image data omitted]", omitted: true };
+	}
+	if (Array.isArray(value)) {
+		let omitted = false;
+		const items = value.map(item => {
+			const projected = omitInlineImageData(item);
+			omitted ||= projected.omitted;
+			return projected.value;
+		});
+		return omitted ? { value: items, omitted } : { value, omitted };
+	}
+	if (!isRecord(value)) return { value, omitted: false };
+	if (value.type === "image" && typeof value.data === "string" && value.data.length > 0) {
+		const projected: Record<string, unknown> = {};
+		for (const [key, item] of Object.entries(value)) {
+			if (key === RPC_TRANSCRIPT_IMAGE_DIGEST_KEY) continue;
+			projected[key] = key === "data" ? "" : item;
+		}
+		const digest = transcriptImageDigest(value.data, value.mimeType);
+		if (digest) projected[RPC_TRANSCRIPT_IMAGE_DIGEST_KEY] = digest;
+		return { value: projected, omitted: true };
+	}
+
+	let omitted = false;
+	const projected: Record<string, unknown> = {};
+	for (const [key, item] of Object.entries(value)) {
+		if (key === RPC_TRANSCRIPT_IMAGE_DIGEST_KEY) {
+			omitted = true;
+			continue;
+		}
+		const result = omitInlineImageData(item);
+		omitted ||= result.omitted;
+		projected[key] = result.value;
+	}
+	return omitted ? { value: projected, omitted } : { value, omitted };
+}
+
+const RPC_TRANSPORT_MAX_ARRAY_ITEMS = Math.min(MAX_ARRAY_ITEMS - 1, 900);
+const RPC_TRANSPORT_MAX_MAP_KEYS = Math.min(MAX_MAP_KEYS - 4, 450);
+const RPC_TRANSPORT_MAX_DEPTH = Math.min(MAX_JSON_DEPTH - 4, 28);
+const RPC_TRANSPORT_MAX_NODES = Math.min(MAX_JSON_NODES - 1_000, 10_000);
+const RPC_TRANSPORT_STRING_CONTENT_BYTES = 550_000;
+const RPC_TRANSPORT_STRING_BYTES = Math.min(MAX_STRING_BYTES - 256, 60_000);
+const RPC_TRANSPORT_KEY_BYTES = 1_024;
+const RPC_TRANSPORT_OMITTED = "[transport data omitted]";
+const RPC_TRANSPORT_TRUNCATED = "… [transport data truncated]";
+const RPC_TRANSPORT_MARKER_KEYS = new Set([
+	"inlineImageDataOmitted",
+	RPC_TRANSCRIPT_IMAGE_DIGEST_KEY,
+	"transportDataOmitted",
+	"transportOmissionReasons",
+]);
+const RPC_TRANSPORT_ENVELOPE_KEYS = [
+	"type",
+	"id",
+	"requestId",
+	"commandId",
+	"command",
+	"toolCallId",
+	"toolName",
+	"sessionId",
+	"agentId",
+	"parentId",
+	"status",
+	"success",
+	"isError",
+] as const;
+
+interface RpcProjectionState {
+	contentBytes: number;
+	nodes: number;
+	omissions: Set<string>;
+	ancestors: WeakSet<object>;
+}
+
+function sanitizedUnicode(value: string, state: RpcProjectionState): string {
+	let result = "";
+	let changed = false;
+	for (let index = 0; index < value.length; index++) {
+		const code = value.charCodeAt(index);
+		if (code >= 0xd800 && code <= 0xdbff) {
+			const next = value.charCodeAt(index + 1);
+			if (next >= 0xdc00 && next <= 0xdfff) {
+				result += value[index]! + value[index + 1]!;
+				index++;
+			} else {
+				result += "�";
+				changed = true;
+			}
+		} else if (code >= 0xdc00 && code <= 0xdfff) {
+			result += "�";
+			changed = true;
+		} else result += value[index]!;
+	}
+	if (changed) state.omissions.add("invalid_unicode_replaced");
+	return result;
+}
+
+function encodedStringContentBytes(value: string): number {
+	const encoded = JSON.stringify(value);
+	return rpcTextEncoder.encode(encoded.slice(1, -1)).byteLength;
+}
+
+function truncateProjectedString(value: string, state: RpcProjectionState): string {
+	const safe = sanitizedUnicode(value, state);
+	const available = Math.max(0, RPC_TRANSPORT_STRING_CONTENT_BYTES - state.contentBytes);
+	const fullUtf8Bytes = utf8ByteLength(safe);
+	const fullEncodedBytes = encodedStringContentBytes(safe);
+	if (
+		fullUtf8Bytes <= RPC_TRANSPORT_STRING_BYTES &&
+		fullEncodedBytes <= available &&
+		fullEncodedBytes <= RPC_TRANSPORT_STRING_BYTES
+	) {
+		state.contentBytes += fullEncodedBytes;
+		return safe;
+	}
+
+	state.omissions.add("oversized_string");
+	const suffixUtf8 = utf8ByteLength(RPC_TRANSPORT_TRUNCATED);
+	const suffixEncoded = encodedStringContentBytes(RPC_TRANSPORT_TRUNCATED);
+	const utf8Limit = Math.max(0, RPC_TRANSPORT_STRING_BYTES - suffixUtf8);
+	const encodedLimit = Math.max(0, Math.min(available, RPC_TRANSPORT_STRING_BYTES) - suffixEncoded);
+	if (utf8Limit === 0 || encodedLimit === 0) return RPC_TRANSPORT_OMITTED;
+
+	let prefix = "";
+	let prefixUtf8 = 0;
+	let prefixEncoded = 0;
+	for (const character of safe) {
+		const characterUtf8 = utf8ByteLength(character);
+		const characterEncoded = encodedStringContentBytes(character);
+		if (prefixUtf8 + characterUtf8 > utf8Limit || prefixEncoded + characterEncoded > encodedLimit) break;
+		prefix += character;
+		prefixUtf8 += characterUtf8;
+		prefixEncoded += characterEncoded;
+	}
+	const result = `${prefix}${RPC_TRANSPORT_TRUNCATED}`;
+	state.contentBytes += encodedStringContentBytes(result);
+	return result;
+}
+
+function projectedObjectKey(key: string, state: RpcProjectionState): string {
+	const safe = sanitizedUnicode(key, state);
+	if (utf8ByteLength(safe) <= RPC_TRANSPORT_KEY_BYTES) {
+		state.contentBytes += encodedStringContentBytes(safe);
+		return safe;
+	}
+	state.omissions.add("oversized_map_key");
+	let result = "";
+	for (const character of safe) {
+		if (utf8ByteLength(result + character) > RPC_TRANSPORT_KEY_BYTES - 16) break;
+		result += character;
+	}
+	result += "…[truncated]";
+	state.contentBytes += encodedStringContentBytes(result);
+	return result;
+}
+
+function transportProjectionMarker(state: RpcProjectionState, reason: string): string {
+	state.omissions.add(reason);
+	return RPC_TRANSPORT_OMITTED;
+}
+
+function projectRpcTransportValue(value: unknown, state: RpcProjectionState, depth: number, path: string): unknown {
+	state.nodes++;
+	if (state.nodes > RPC_TRANSPORT_MAX_NODES) return transportProjectionMarker(state, "json_node_limit");
+	if (depth > RPC_TRANSPORT_MAX_DEPTH) return transportProjectionMarker(state, "json_depth_limit");
+	if (typeof value === "string") {
+		if (/^data:image\/[a-z0-9.+-]+;base64,/iu.test(value)) {
+			state.omissions.add("inline_image_data");
+			return "[inline image data omitted]";
+		}
+		return truncateProjectedString(value, state);
+	}
+	if (value === null || typeof value === "boolean") return value;
+	if (typeof value === "number") {
+		if (Number.isFinite(value)) return value;
+		return transportProjectionMarker(state, "non_finite_number");
+	}
+	if (typeof value === "bigint") {
+		state.omissions.add("non_json_value");
+		return truncateProjectedString(value.toString(), state);
+	}
+	if (typeof value !== "object") return transportProjectionMarker(state, "non_json_value");
+	if (state.ancestors.has(value)) return transportProjectionMarker(state, "cyclic_value");
+	state.ancestors.add(value);
+	try {
+		if (Array.isArray(value)) {
+			const limit = Math.min(value.length, RPC_TRANSPORT_MAX_ARRAY_ITEMS);
+			if (limit < value.length) state.omissions.add("array_items");
+			const result: unknown[] = [];
+			for (let index = 0; index < limit; index++) {
+				if (state.nodes >= RPC_TRANSPORT_MAX_NODES) {
+					state.omissions.add("json_node_limit");
+					break;
+				}
+				result.push(projectRpcTransportValue(value[index], state, depth + 1, `${path}[${index}]`));
+			}
+			return result;
+		}
+
+		const source = value as Record<string, unknown>;
+		if (source.type === "image" && typeof source.data === "string" && source.data.length > 0) {
+			state.omissions.add("inline_image_data");
+			const image: Record<string, unknown> = {};
+			for (const [key, item] of Object.entries(source)) {
+				if (key === RPC_TRANSCRIPT_IMAGE_DIGEST_KEY) continue;
+				image[key] = key === "data" ? "" : projectRpcTransportValue(item, state, depth + 1, `${path}.${key}`);
+			}
+			const digest = transcriptImageDigest(source.data, source.mimeType);
+			if (digest) image[RPC_TRANSCRIPT_IMAGE_DIGEST_KEY] = digest;
+			return image;
+		}
+
+		const entries = Object.entries(source);
+		const ordered =
+			depth === 0
+				? [
+						...RPC_TRANSPORT_ENVELOPE_KEYS.flatMap(key =>
+							Object.hasOwn(source, key) ? ([[key, source[key]]] as Array<[string, unknown]>) : [],
+						),
+						...entries.filter(([key]) => !RPC_TRANSPORT_ENVELOPE_KEYS.includes(key as never)),
+					]
+				: entries;
+		const result: Record<string, unknown> = {};
+		let kept = 0;
+		for (const [rawKey, item] of ordered) {
+			if (RPC_TRANSPORT_MARKER_KEYS.has(rawKey)) continue;
+			if (kept >= RPC_TRANSPORT_MAX_MAP_KEYS || state.nodes >= RPC_TRANSPORT_MAX_NODES) {
+				state.omissions.add(kept >= RPC_TRANSPORT_MAX_MAP_KEYS ? "map_keys" : "json_node_limit");
+				break;
+			}
+			const key = projectedObjectKey(rawKey, state);
+			if (Object.hasOwn(result, key)) {
+				state.omissions.add("map_key_collision");
+				continue;
+			}
+			if (rawKey === "rawContent" || rawKey === "payload") {
+				result[key] = transportProjectionMarker(state, rawKey === "rawContent" ? "raw_content" : "payload");
+			} else result[key] = projectRpcTransportValue(item, state, depth + 1, `${path}.${rawKey}`);
+			kept++;
+		}
+		return result;
+	} finally {
+		state.ancestors.delete(value);
+	}
+}
+
+function withRpcTransportOmissions<T extends object>(value: T, state: RpcProjectionState): RpcTransportFrame<T> {
+	const reasons = [...state.omissions].sort().slice(0, 32);
+	if (reasons.length === 0) return value;
+	return {
+		...value,
+		...(state.omissions.has("inline_image_data") ? { inlineImageDataOmitted: true as const } : {}),
+		transportDataOmitted: true,
+		transportOmissionReasons: reasons,
+	};
+}
+
+function minimalRpcTransportFrame<T extends object>(frame: T, state: RpcProjectionState): RpcTransportFrame<T> {
+	state.omissions.add("frame_projection");
+	const source = frame as Record<string, unknown>;
+	const minimal: Record<string, unknown> = {};
+	const minimalState: RpcProjectionState = {
+		contentBytes: 0,
+		nodes: 0,
+		omissions: state.omissions,
+		ancestors: new WeakSet(),
+	};
+	for (const key of RPC_TRANSPORT_ENVELOPE_KEYS) {
+		if (!Object.hasOwn(source, key)) continue;
+		minimal[key] = projectRpcTransportValue(source[key], minimalState, 1, `frame.${key}`);
+	}
+	if (typeof minimal.type !== "string") minimal.type = "transport_projection";
+	return withRpcTransportOmissions(minimal as T, minimalState);
+}
+
+/**
+ * Prepare an internal appserver child frame without copying embedded image bytes
+ * onto stdout. The original event/entry remains untouched and SessionManager has
+ * already persisted it before a durable-entry notification is emitted.
+ */
+export function rpcTransportFrame<T extends object>(
+	frame: T,
+	managedAppserverTransport: boolean,
+): RpcTransportFrame<T> {
+	if (!managedAppserverTransport) return frame;
+	if (isBoundedRpcFrame(frame)) {
+		const projected = omitInlineImageData(frame);
+		if (!projected.omitted) return frame;
+		const candidate = { ...(projected.value as T), inlineImageDataOmitted: true as const };
+		if (isBoundedRpcFrame(candidate)) return candidate;
+	}
+
+	const state: RpcProjectionState = {
+		contentBytes: 0,
+		nodes: 0,
+		omissions: new Set(),
+		ancestors: new WeakSet(),
+	};
+	const projected = projectRpcTransportValue(frame, state, 0, "frame");
+	if (projected && typeof projected === "object" && !Array.isArray(projected)) {
+		const candidate = withRpcTransportOmissions(projected as T, state);
+		if (isBoundedRpcFrame(candidate)) return candidate;
+	}
+	const minimal = minimalRpcTransportFrame(frame, state);
+	if (isBoundedRpcFrame(minimal)) return minimal;
+	return {
+		type: "transport_projection",
+		transportDataOmitted: true,
+		transportOmissionReasons: ["frame_projection"],
+	} as unknown as RpcTransportFrame<T>;
+}
 type RpcAgentEndStatus = "completed" | "failed" | "cancelled";
 
 function serializedJsonBytes(value: object): number | undefined {

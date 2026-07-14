@@ -163,6 +163,8 @@ export interface AppserverOptions {
 	appserverBuild?: string;
 	supportedFeatures?: readonly string[];
 	supportedCapabilities?: readonly string[];
+	/** Absolute content-addressed blob root used for metadata-authorized transcript image reads. */
+	transcriptImageRoot?: string;
 	ringSize?: number;
 	/** Maximum time lifecycle mutations wait for terminal and child shutdown. */
 	lifecycleQuiesceTimeoutMs?: number;

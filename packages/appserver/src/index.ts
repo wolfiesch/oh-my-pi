@@ -28,4 +28,5 @@ export {
 	TokenBucketLimiter,
 } from "./security/index.ts";
 export * from "./server.ts";
+export * from "./transcript-image-reader.ts";
 export * from "./types.ts";

@@ -2,8 +2,16 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { chmod, mkdir, open, readdir, readFile, stat, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { DurableEntry, EntryId, HostId, ProjectId, SessionId } from "@oh-my-pi/app-wire";
-import { entryId, hostId, parseBounded, projectId, sessionId } from "@oh-my-pi/app-wire";
+import type { DurableEntry, EntryId, HostId, ProjectId, SessionId, TranscriptImageMetadata } from "@oh-my-pi/app-wire";
+import {
+	entryId,
+	hostId,
+	parseBounded,
+	projectId,
+	sessionId,
+	TRANSCRIPT_IMAGE_MAX_COUNT,
+	TRANSCRIPT_IMAGE_MIME_TYPES,
+} from "@oh-my-pi/app-wire";
 import { boundSnapshotEntries, uniqueEntryId } from "./snapshot-limits.ts";
 import type { FileSystem, SessionDiscovery, SessionRecord } from "./types.ts";
 
@@ -106,6 +114,27 @@ function contentText(content: unknown): string {
 	return cleanText(parts.join(""), MAX_TEXT_BYTES);
 }
 
+function contentImages(content: unknown, allowManagedMarker: boolean): TranscriptImageMetadata[] {
+	if (!Array.isArray(content)) return [];
+	const images: TranscriptImageMetadata[] = [];
+	for (const item of content) {
+		if (images.length >= TRANSCRIPT_IMAGE_MAX_COUNT) break;
+		const block = asObject(item);
+		if (
+			block?.type !== "image" ||
+			typeof block.mimeType !== "string" ||
+			!(TRANSCRIPT_IMAGE_MIME_TYPES as readonly string[]).includes(block.mimeType)
+		)
+			continue;
+		const marked = allowManagedMarker && typeof block.appImageSha256 === "string" ? block.appImageSha256 : undefined;
+		const stored = typeof block.data === "string" ? /^blob:sha256:([a-f0-9]{64})$/u.exec(block.data)?.[1] : undefined;
+		const sha256 = marked && /^[a-f0-9]{64}$/u.test(marked) ? marked : stored;
+		if (!sha256) continue;
+		images.push({ sha256, mimeType: block.mimeType as TranscriptImageMetadata["mimeType"] });
+	}
+	return images;
+}
+
 export function projectNameFromCwd(cwd: string): string {
 	const pieces = cwd.replace(/[\\/]+$/u, "").split(/[\\/]/u);
 	return cleanText(pieces.at(-1) ?? "", 256, true);
@@ -126,6 +155,7 @@ interface PendingToolCall {
 interface ProjectedToolResult {
 	ok: boolean;
 	text: string;
+	images: TranscriptImageMetadata[];
 	timestamp: string;
 }
 
@@ -231,6 +261,7 @@ export class SessionEntryProjector {
 				args: call.args,
 				ok: result.ok,
 				result: { output: boundUtf8(result.text, MAX_RESULT_BYTES) },
+				...(result.images.length > 0 ? { images: result.images } : {}),
 			},
 			call.parentId,
 			call.idBase,
@@ -259,6 +290,7 @@ export class SessionEntryProjector {
 		if (raw.type === "message" && (role === "user" || role === "assistant")) {
 			const content = message.content ?? message.text ?? (nested ? message.message : (raw.text ?? raw.message));
 			const text = contentText(content);
+			const images = contentImages(content, this.mode === "live");
 			const reasoningParts: string[] = [];
 			const toolCalls: PendingToolCall[] = [];
 			if (role === "assistant" && Array.isArray(message.content)) {
@@ -289,8 +321,13 @@ export class SessionEntryProjector {
 			}
 			const reasoning = cleanText(reasoningParts.join(""), MAX_TEXT_BYTES);
 			const messageEntry =
-				text || reasoning || role === "user"
-					? this.#add(raw, "message", { role, text, ...(reasoning ? { reasoning } : {}) }, parentId)
+				text || reasoning || images.length > 0 || role === "user"
+					? this.#add(
+							raw,
+							"message",
+							{ role, text, ...(reasoning ? { reasoning } : {}), ...(images.length > 0 ? { images } : {}) },
+							parentId,
+						)
 					: undefined;
 			this.#rememberUserText(role, text);
 			const alias = messageEntry?.id ?? parentId;
@@ -317,6 +354,7 @@ export class SessionEntryProjector {
 				const result: ProjectedToolResult = {
 					ok: message.isError !== true,
 					text: contentText(message.content ?? message.text ?? raw.text),
+					images: contentImages(message.content ?? message.text ?? raw.text, this.mode === "live"),
 					timestamp: String(raw.timestamp),
 				};
 				const call = this.#pendingCalls.get(callId);
@@ -330,9 +368,16 @@ export class SessionEntryProjector {
 			}
 			this.#aliases.set(String(raw.id), parentId);
 		} else if (raw.type === "custom_message" && raw.display === true) {
-			const text = contentText(raw.content ?? raw.text);
+			const content = raw.content ?? raw.text;
+			const text = contentText(content);
+			const images = contentImages(content, this.mode === "live");
 			const customRole = raw.attribution === "agent" ? "assistant" : "user";
-			const entry = this.#add(raw, "message", { role: customRole, text }, parentId);
+			const entry = this.#add(
+				raw,
+				"message",
+				{ role: customRole, text, ...(images.length > 0 ? { images } : {}) },
+				parentId,
+			);
 			this.#aliases.set(String(raw.id), entry.id);
 			this.#rememberUserText(customRole, text);
 		} else if (raw.type === "compaction" && typeof raw.summary === "string") {
@@ -370,6 +415,7 @@ export class SessionEntryProjector {
 				this.#tool({ id: call.idBase, timestamp: call.timestamp }, call, {
 					ok: false,
 					text: "",
+					images: [],
 					timestamp: call.timestamp,
 				});
 				this.#settledCalls.add(call.callId);

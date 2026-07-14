@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { decodeServerFrame, entryId, hostId, parseBounded } from "@oh-my-pi/app-wire";
-import { FileSessionDiscovery } from "../src/discovery.ts";
+import { decodeServerFrame, entryId, hostId, parseBounded, projectId, sessionId } from "@oh-my-pi/app-wire";
+import { FileSessionDiscovery, SessionEntryProjector } from "../src/discovery.ts";
 import { SessionProjection } from "../src/projection.ts";
 import type { FileSystem } from "../src/types.ts";
 
@@ -49,8 +49,74 @@ function sessionTranscript(id: string, cwd: string, title: string): string {
 }
 
 describe("current OMP JSONL projection", () => {
+	test("projects ordered transcript image metadata without image bytes or paths", () => {
+		const first = "a".repeat(64);
+		const second = "b".repeat(64);
+		const projector = new SessionEntryProjector(host, sessionId("session-images"), "live");
+		const projected = projector.project({
+			type: "message",
+			id: "image-message",
+			parentId: null,
+			timestamp: stamp,
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "image", mimeType: "image/png", data: `blob:sha256:${first}` },
+					{ type: "text", text: "two images" },
+					{ type: "image", mimeType: "image/webp", data: "", appImageSha256: second },
+				],
+			},
+		});
+		expect(projected).toHaveLength(1);
+		expect(projected[0]?.data).toEqual({
+			role: "assistant",
+			text: "two images",
+			images: [
+				{ sha256: first, mimeType: "image/png" },
+				{ sha256: second, mimeType: "image/webp" },
+			],
+		});
+		const serialized = JSON.stringify(projected[0]);
+		expect(serialized).not.toContain("blob:sha256:");
+		expect(serialized).not.toContain("appImageSha256");
+		expect(serialized).not.toContain("/home/");
+		const [batchEntry] = new SessionEntryProjector(host, sessionId("batch-images"), "batch").project({
+			type: "message",
+			id: "spoofed-marker",
+			parentId: null,
+			timestamp: stamp,
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "text", text: "untrusted persisted marker" },
+					{ type: "image", mimeType: "image/webp", data: "", appImageSha256: second },
+				],
+			},
+		});
+		expect(batchEntry?.data).toEqual({ role: "assistant", text: "untrusted persisted marker" });
+
+		const record = {
+			sessionId: sessionId("session-images"),
+			path: "/session.jsonl",
+			cwd: "/project",
+			projectId: projectId("project-images"),
+			title: "Images",
+			updatedAt: stamp,
+			status: "idle" as const,
+			entries: projected,
+		};
+		const projection = new SessionProjection(host, record, "epoch");
+		expect(projection.transcriptImage(entryId("image-message"), first)).toEqual({
+			sha256: first,
+			mimeType: "image/png",
+		});
+		expect(projection.transcriptImage(entryId("image-message"), "c".repeat(64))).toBeUndefined();
+		expect(projection.transcriptImage(entryId("other-entry"), first)).toBeUndefined();
+	});
+
 	test("normalizes nested messages, tools, hidden entries, and runtime settings", async () => {
 		const hugeArgs = Array.from({ length: 1000 }, () => "x".repeat(900));
+		const toolImage = "d".repeat(64);
 		const entries: Record<string, unknown>[] = [
 			{
 				type: "session_init",
@@ -97,7 +163,10 @@ describe("current OMP JSONL projection", () => {
 					role: "toolResult",
 					toolCallId: "call-1",
 					toolName: "read",
-					content: [{ type: "text", text: "file contents" }],
+					content: [
+						{ type: "text", text: "file contents" },
+						{ type: "image", mimeType: "image/jpeg", data: `blob:sha256:${toolImage}` },
+					],
 					isError: false,
 				},
 			},
@@ -136,7 +205,13 @@ describe("current OMP JSONL projection", () => {
 		const message = session?.entries[0];
 		expect(message?.data).toEqual({ role: "user", text: "Please inspect the project" });
 		const tool = session?.entries[2];
-		expect(tool?.data).toMatchObject({ tool: "read", title: "read", ok: true, result: { output: "file contents" } });
+		expect(tool?.data).toMatchObject({
+			tool: "read",
+			title: "read",
+			ok: true,
+			result: { output: "file contents" },
+			images: [{ sha256: toolImage, mimeType: "image/jpeg" }],
+		});
 		const toolArgs = tool?.data.args && typeof tool.data.args === "object" ? JSON.stringify(tool.data.args) : "";
 		expect(new TextEncoder().encode(toolArgs).byteLength).toBeLessThan(128 * 1024);
 		expect(JSON.stringify(session?.entries)).not.toContain("systemPrompt");

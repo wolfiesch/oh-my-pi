@@ -1,12 +1,15 @@
 import { createHash } from "node:crypto";
 import {
 	type DurableEntry,
+	decodeTranscriptImageMetadataList,
+	type EntryId,
 	type HostId,
 	revision,
 	type ServerFrame,
 	type SessionEvent,
 	type SessionRef,
 	type SessionStateResult,
+	type TranscriptImageMetadata,
 } from "@oh-my-pi/app-wire";
 import { boundSnapshotEntries } from "./snapshot-limits.ts";
 import type { Projection, SessionRecord } from "./types.ts";
@@ -85,6 +88,17 @@ export class SessionProjection {
 			indexCursor: { epoch, seq: 0 },
 			ring: [],
 		};
+	}
+	transcriptImage(entryId: EntryId, sha256: string): TranscriptImageMetadata | undefined {
+		const entry = this.#byId.get(entryId);
+		if (!entry || entry.data.images === undefined) return undefined;
+		try {
+			return decodeTranscriptImageMetadataList(entry.data.images, "entry.data.images").find(
+				image => image.sha256 === sha256,
+			);
+		} catch {
+			return undefined;
+		}
 	}
 	updateStatus(status: SessionRef["status"]): ServerFrame | undefined {
 		const current = this.value.ref;

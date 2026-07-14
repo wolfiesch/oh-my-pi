@@ -3,7 +3,7 @@ import { isIP } from "node:net";
 import { isAbsolute, join } from "node:path";
 import type { AppserverHandle } from "@oh-my-pi/appserver";
 import { createRemoteAppserver, defaultSocketPath } from "@oh-my-pi/appserver";
-import { getProfileRootDir, postmortem } from "@oh-my-pi/pi-utils";
+import { getBlobsDir, getProfileRootDir, postmortem } from "@oh-my-pi/pi-utils";
 import type { Settings as SettingsType } from "../config/settings";
 import { getCodingAgentAppserverIdentity } from "./appserver-identity";
 
@@ -319,6 +319,7 @@ async function defaultCreateAppserver(
 		operationsAuthority: runtime.operationsAuthority,
 		projectRootForProject: runtime.projectRootForProject,
 		lockCheck: runtime.lockCheck,
+		transcriptImageRoot: getBlobsDir(),
 	};
 	if (!config?.remoteMode) return createAppserver(base);
 	if (!config.remoteAddress || !config.remoteStateDir)

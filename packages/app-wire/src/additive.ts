@@ -49,6 +49,7 @@ export const ADDITIVE_FEATURES = [
 	"controller.lease",
 	"prompt.lease",
 	"prompt.images",
+	"transcript.images",
 	"agent.lifecycle",
 	"agent.progress",
 	"agent.event",

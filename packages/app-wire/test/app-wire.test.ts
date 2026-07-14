@@ -25,6 +25,8 @@ import {
 	PROTOCOL_FEATURES,
 	safeRelativePath,
 	sameSession,
+	TRANSCRIPT_IMAGE_CHUNK_BYTES,
+	TRANSCRIPT_IMAGE_MAX_BYTES,
 	validateCommandDescriptor,
 } from "../src/index.ts";
 
@@ -289,7 +291,7 @@ describe("app-wire authority", () => {
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
-		expect(APP_WIRE_VERSION).toBe("0.5.4");
+		expect(APP_WIRE_VERSION).toBe("0.5.5");
 	});
 	test("welcome identity requires every version and build field", async () => {
 		const welcome = (await fixture("welcome.json")) as Record<string, unknown>;
@@ -529,6 +531,7 @@ describe("app-wire authority", () => {
 			"session.image.begin": "none",
 			"session.image.chunk": "none",
 			"session.image.discard": "none",
+			"session.image.read": "none",
 			"session.cancel": "session",
 			"session.close": "session",
 			"agent.cancel": "session",
@@ -910,6 +913,73 @@ describe("app-wire authority", () => {
 		};
 		expect(() => decodeClientFrame(frame)).not.toThrow();
 		expect(() => decodeClientFrame({ ...frame, expectedRevision: "revision" })).toThrow(AppWireError);
+	});
+	test("transcript images expose ordered metadata and bounded read chunks", () => {
+		expect(ADDITIVE_FEATURES).toContain("transcript.images");
+		expect(PROTOCOL_FEATURES).toContain("transcript.images");
+		const digest = "a".repeat(64);
+		const entry = {
+			id: "entry-image",
+			parentId: null,
+			hostId: "host",
+			sessionId: "session",
+			kind: "message",
+			timestamp: "2026-07-14T12:00:00.000Z",
+			data: {
+				role: "user",
+				text: "look",
+				images: [
+					{ sha256: digest, mimeType: "image/png" },
+					{ sha256: "b".repeat(64), mimeType: "image/webp" },
+				],
+			},
+		};
+		expect(decodeEntry(entry).data.images).toEqual(entry.data.images);
+		for (const images of [
+			[{ sha256: digest.toUpperCase(), mimeType: "image/png" }],
+			[{ sha256: digest, mimeType: "image/svg+xml" }],
+			[{ sha256: digest, mimeType: "image/png", content: "AQ==" }],
+		])
+			expect(() => decodeEntry({ ...entry, data: { ...entry.data, images } })).toThrow(AppWireError);
+
+		expect(decodeCommandArguments("session.image.read", { entryId: entry.id, sha256: digest, offset: 0 })).toEqual({
+			entryId: entry.id,
+			sha256: digest,
+			offset: 0,
+		});
+		for (const args of [
+			{ entryId: entry.id, sha256: digest.toUpperCase(), offset: 0 },
+			{ entryId: "bad\nentry", sha256: digest, offset: 0 },
+			{ entryId: entry.id, sha256: digest, offset: TRANSCRIPT_IMAGE_MAX_BYTES },
+			{ entryId: entry.id, sha256: digest, offset: 0, path: "/tmp/image" },
+		])
+			expect(() => decodeCommandArguments("session.image.read", args)).toThrow(AppWireError);
+
+		const result = {
+			sha256: digest,
+			mimeType: "image/png",
+			size: 4,
+			offset: 0,
+			nextOffset: 3,
+			complete: false,
+			content: "AQID",
+		};
+		expect(decodeCommandResult("session.image.read", result)).toEqual(result);
+		for (const invalid of [
+			{ ...result, nextOffset: 2 },
+			{ ...result, complete: true },
+			{ ...result, content: "AQJ=" },
+			{ ...result, path: "/tmp/image" },
+		])
+			expect(() => decodeCommandResult("session.image.read", invalid)).toThrow(AppWireError);
+		expect(() =>
+			decodeCommandResult("session.image.read", {
+				...result,
+				size: TRANSCRIPT_IMAGE_CHUNK_BYTES + 1,
+				nextOffset: TRANSCRIPT_IMAGE_CHUNK_BYTES + 1,
+				content: Buffer.alloc(TRANSCRIPT_IMAGE_CHUNK_BYTES + 1).toString("base64"),
+			}),
+		).toThrow(AppWireError);
 	});
 	test("session identity remains host scoped", () => {
 		expect(

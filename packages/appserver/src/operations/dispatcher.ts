@@ -109,6 +109,7 @@ export const COMMAND_FEATURE_BY_COMMAND: Readonly<Record<string, string>> = {
 	"session.image.begin": "prompt.images",
 	"session.image.chunk": "prompt.images",
 	"session.image.discard": "prompt.images",
+	"session.image.read": "transcript.images",
 };
 
 export function commandFeature(command: string): string | undefined {

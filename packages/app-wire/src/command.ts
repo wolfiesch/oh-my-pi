@@ -18,6 +18,8 @@ import {
 	type ConfirmationId,
 	commandId,
 	confirmationId,
+	type EntryId,
+	entryId,
 	type HostId,
 	hostId,
 	type ImageId,
@@ -41,6 +43,9 @@ import {
 	MAX_STRING_BYTES,
 	PROMPT_IMAGE_MAX_COUNT,
 	PROTOCOL_VERSION,
+	TRANSCRIPT_IMAGE_CHUNK_BASE64_BYTES,
+	TRANSCRIPT_IMAGE_CHUNK_BYTES,
+	TRANSCRIPT_IMAGE_MAX_BYTES,
 } from "./limits.ts";
 import { decodeSessionListResult, decodeSessionRef, type SessionListResult } from "./session-index.ts";
 import { decodeSessionStateResult } from "./session-state.ts";
@@ -106,6 +111,13 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 	},
 	"session.image.discard": {
 		capability: "sessions.prompt",
+		scope: "session",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "none",
+	},
+	"session.image.read": {
+		capability: "sessions.read",
 		scope: "session",
 		revision: "none",
 		revisionOwner: "none",
@@ -479,6 +491,20 @@ export interface SessionImageChunkArguments {
 export interface SessionImageDiscardArguments {
 	readonly imageId: ImageId;
 }
+export interface SessionImageReadArguments {
+	readonly entryId: EntryId;
+	readonly sha256: string;
+	readonly offset: number;
+}
+export interface SessionImageReadResult {
+	readonly sha256: string;
+	readonly mimeType: PromptImageMimeType;
+	readonly size: number;
+	readonly offset: number;
+	readonly nextOffset: number;
+	readonly complete: boolean;
+	readonly content: string;
+}
 export function validateCommandDescriptor(command: string, descriptor: CommandDescriptor): void {
 	const validRevision =
 		descriptor.revision === "none" || descriptor.revision === "optional" || descriptor.revision === "required";
@@ -731,6 +757,49 @@ function decodeImageDiscard(value: unknown): SessionImageDiscardArguments {
 	const x = strictArgs(value, ["imageId"]);
 	return { imageId: imageId(x.imageId, "args.imageId") };
 }
+function decodeImageRead(value: unknown): SessionImageReadArguments {
+	const x = strictArgs(value, ["entryId", "sha256", "offset"]);
+	const offset = safeSeq(x.offset, "args.offset");
+	if (offset >= TRANSCRIPT_IMAGE_MAX_BYTES)
+		fail("BOUNDS", "transcript image offset exceeds the image limit", "args.offset");
+	return {
+		entryId: entryId(x.entryId, "args.entryId"),
+		sha256: decodeSha256(x.sha256, "args.sha256"),
+		offset,
+	};
+}
+
+function decodeImageReadResult(value: unknown): CommandResult {
+	const x = result(value);
+	const expected = ["sha256", "mimeType", "size", "offset", "nextOffset", "complete", "content"];
+	if (Object.keys(x).length !== expected.length || expected.some(key => !Object.hasOwn(x, key)))
+		fail("INVALID_FRAME", "invalid transcript image read result", "result");
+	decodeSha256(x.sha256, "result.sha256");
+	decodeImageMimeType(x.mimeType, "result.mimeType");
+	const size = safeSeq(x.size, "result.size");
+	if (size <= 0 || size > TRANSCRIPT_IMAGE_MAX_BYTES)
+		fail("BOUNDS", "transcript image size exceeds the image limit", "result.size");
+	const offset = safeSeq(x.offset, "result.offset");
+	const nextOffset = safeSeq(x.nextOffset, "result.nextOffset");
+	if (offset >= size || nextOffset <= offset || nextOffset > size)
+		fail("INVALID_FRAME", "transcript image result offsets are invalid", "result.nextOffset");
+	if (typeof x.complete !== "boolean" || x.complete !== (nextOffset === size))
+		fail("INVALID_FRAME", "transcript image completion does not match its offsets", "result.complete");
+	const content = boundedText(x.content, "result.content", TRANSCRIPT_IMAGE_CHUNK_BASE64_BYTES);
+	if (content.length === 0 || content.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(content))
+		fail("INVALID_FRAME", "transcript image content must be canonical base64", "result.content");
+	const padding = content.endsWith("==") ? 2 : content.endsWith("=") ? 1 : 0;
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	if (
+		(padding === 2 && (alphabet.indexOf(content[content.length - 3]!) & 0x0f) !== 0) ||
+		(padding === 1 && (alphabet.indexOf(content[content.length - 2]!) & 0x03) !== 0)
+	)
+		fail("INVALID_FRAME", "transcript image content has non-canonical padding bits", "result.content");
+	const decodedBytes = (content.length / 4) * 3 - padding;
+	if (decodedBytes <= 0 || decodedBytes > TRANSCRIPT_IMAGE_CHUNK_BYTES || nextOffset - offset !== decodedBytes)
+		fail("INVALID_FRAME", "transcript image content does not match its offsets", "result.content");
+	return x;
+}
 function decodeBooleanResult(value: unknown, key: string): CommandResult {
 	const x = result(value);
 	const keys = Object.keys(x);
@@ -769,6 +838,7 @@ export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown)
 	"session.image.begin": value => decodeImageBegin(value) as unknown as CommandArguments,
 	"session.image.chunk": value => decodeImageChunk(value) as unknown as CommandArguments,
 	"session.image.discard": value => decodeImageDiscard(value) as unknown as CommandArguments,
+	"session.image.read": value => decodeImageRead(value) as unknown as CommandArguments,
 	"session.state.get": noArgs,
 	"session.steer": decodeMessage,
 	"session.followUp": decodeMessage,
@@ -976,6 +1046,7 @@ export const COMMAND_RESULT_DECODERS: Readonly<Record<string, (value: unknown) =
 		return x;
 	},
 	"session.image.discard": value => decodeBooleanResult(value, "discarded"),
+	"session.image.read": decodeImageReadResult,
 	"session.state.get": decodeSessionState,
 	"session.steer": decodeAcceptedResult,
 	"session.followUp": decodeAcceptedResult,
