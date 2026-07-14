@@ -152,14 +152,19 @@ describe("AgentSession per-turn prune persistence", () => {
 		await sessionManager.flush();
 		const sessionFile = sessionManager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected a persisted session file");
+		await sessionManager.close();
 		const reloaded = await SessionManager.open(sessionFile, tempDir.path());
-		const rebuilt = reloaded
-			.buildSessionContext()
-			.messages.find(candidate => candidate.role === "toolResult" && candidate.toolCallId === BIG_CALL_ID);
-		if (rebuilt?.role !== "toolResult" || !Array.isArray(rebuilt.content)) {
-			throw new Error("Expected the seeded tool result in the from-disk rebuild");
+		try {
+			const rebuilt = reloaded
+				.buildSessionContext()
+				.messages.find(candidate => candidate.role === "toolResult" && candidate.toolCallId === BIG_CALL_ID);
+			if (rebuilt?.role !== "toolResult" || !Array.isArray(rebuilt.content)) {
+				throw new Error("Expected the seeded tool result in the from-disk rebuild");
+			}
+			const rebuiltText = rebuilt.content.find(block => block.type === "text");
+			expect(rebuiltText?.type === "text" ? rebuiltText.text : undefined).toBe(USELESS_NOTICE);
+		} finally {
+			await reloaded.close();
 		}
-		const rebuiltText = rebuilt.content.find(block => block.type === "text");
-		expect(rebuiltText?.type === "text" ? rebuiltText.text : undefined).toBe(USELESS_NOTICE);
 	});
 });
