@@ -1,5 +1,5 @@
-import { type Cursor, decodeCursor } from "./cursor.ts";
-import { fail } from "./errors.ts";
+import { type Cursor, decodeCursor } from "./cursor";
+import { fail } from "./errors";
 import {
 	boundedArray,
 	boundedMap,
@@ -9,7 +9,7 @@ import {
 	isSecretLikeKey,
 	optionalString,
 	safeSeq,
-} from "./guards.ts";
+} from "./guards";
 import {
 	type HostId,
 	hostId,
@@ -19,8 +19,8 @@ import {
 	revision,
 	type SessionId,
 	sessionId,
-} from "./ids.ts";
-import { PROTOCOL_VERSION } from "./limits.ts";
+} from "./ids";
+import { PROTOCOL_VERSION } from "./limits";
 export interface ProjectIdentity {
 	projectId: ProjectId;
 	name?: string;

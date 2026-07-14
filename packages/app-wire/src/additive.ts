@@ -1,6 +1,6 @@
-import { type Cursor, decodeCursor } from "./cursor.ts";
-import { type DurableEntry, decodeEntry } from "./entry.ts";
-import { fail } from "./errors.ts";
+import { type Cursor, decodeCursor } from "./cursor";
+import { type DurableEntry, decodeEntry } from "./entry";
+import { fail } from "./errors";
 import {
 	boundedArray,
 	boundedMap,
@@ -13,7 +13,7 @@ import {
 	isSecretLikeKey,
 	safeRelativePath,
 	safeSeq,
-} from "./guards.ts";
+} from "./guards";
 import {
 	type AgentId,
 	agentId,
@@ -37,9 +37,9 @@ import {
 	terminalId,
 	type WatchId,
 	watchId,
-} from "./ids.ts";
-import { MAX_FILE_BYTES, MAX_TERMINAL_OUTPUT_BYTES, PROTOCOL_VERSION } from "./limits.ts";
-import { decodeSessionRef, type SessionRef } from "./session-index.ts";
+} from "./ids";
+import { MAX_FILE_BYTES, MAX_TERMINAL_OUTPUT_BYTES, PROTOCOL_VERSION } from "./limits";
+import { decodeSessionRef, type SessionRef } from "./session-index";
 
 export const ADDITIVE_FEATURES = [
 	"host.watch",

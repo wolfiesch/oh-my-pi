@@ -1,6 +1,6 @@
-import { fail } from "./errors.ts";
-import { bool, boundedArray, boundedMap, boundedText, controlFree, inputObject, safeSeq } from "./guards.ts";
-import type { ContextUsage } from "./session-index.ts";
+import { fail } from "./errors";
+import { bool, boundedArray, boundedMap, boundedText, controlFree, inputObject, safeSeq } from "./guards";
+import type { ContextUsage } from "./session-index";
 
 export type SessionQueueMode = "all" | "one-at-a-time";
 export interface SessionModel {

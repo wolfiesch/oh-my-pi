@@ -3,21 +3,21 @@ import {
 	decodeAdditiveServerFrame,
 	decodeTerminalClient,
 	type TerminalClientFrame,
-} from "./additive.ts";
-import { type AgentFrame, decodeAgent } from "./agents.ts";
-import { type AuditFrame, decodeAudit } from "./audit.ts";
-import { type CommandFrame, decodeCommand } from "./command.ts";
-import { type Cursor, decodeCursor } from "./cursor.ts";
-import { type DurableEntry, decodeEntry } from "./entry.ts";
-import { fail } from "./errors.ts";
-import { decodeEvent, type LiveEventFrame } from "./event.ts";
-import { decodeFiles, decodeReview, type FileFrame, type ReviewFrame } from "./files-review.ts";
-import { decodeGap, type GapFrame } from "./gap.ts";
-import { controlFree, inputObject } from "./guards.ts";
-import { type ByeFrame, decodeBye, decodePing, decodePong, type PingFrame, type PongFrame } from "./heartbeat.ts";
-import { decodeHello, decodeWelcome, type HelloFrame, type WelcomeFrame } from "./hello.ts";
-import { type HostId, hostId, type Revision, revision, type SessionId, sessionId } from "./ids.ts";
-import { PROTOCOL_VERSION } from "./limits.ts";
+} from "./additive";
+import { type AgentFrame, decodeAgent } from "./agents";
+import { type AuditFrame, decodeAudit } from "./audit";
+import { type CommandFrame, decodeCommand } from "./command";
+import { type Cursor, decodeCursor } from "./cursor";
+import { type DurableEntry, decodeEntry } from "./entry";
+import { fail } from "./errors";
+import { decodeEvent, type LiveEventFrame } from "./event";
+import { decodeFiles, decodeReview, type FileFrame, type ReviewFrame } from "./files-review";
+import { decodeGap, type GapFrame } from "./gap";
+import { controlFree, inputObject } from "./guards";
+import { type ByeFrame, decodeBye, decodePing, decodePong, type PingFrame, type PongFrame } from "./heartbeat";
+import { decodeHello, decodeWelcome, type HelloFrame, type WelcomeFrame } from "./hello";
+import { type HostId, hostId, type Revision, revision, type SessionId, sessionId } from "./ids";
+import { PROTOCOL_VERSION } from "./limits";
 import {
 	type ConfirmationChallenge,
 	type ConfirmFrame,
@@ -26,11 +26,11 @@ import {
 	decodePairing,
 	type PairingFrame,
 	type PairStartFrame,
-} from "./pairing-confirm.ts";
-import { decodeResult, type ResultFrame } from "./result.ts";
-import { decodeSessions, type SessionsFrame } from "./session-index.ts";
-import { decodeSnapshot, type SessionSnapshotFrame } from "./snapshot.ts";
-import { decodeTerminal, type TerminalFrame } from "./terminal.ts";
+} from "./pairing-confirm";
+import { decodeResult, type ResultFrame } from "./result";
+import { decodeSessions, type SessionsFrame } from "./session-index";
+import { decodeSnapshot, type SessionSnapshotFrame } from "./snapshot";
+import { decodeTerminal, type TerminalFrame } from "./terminal";
 export interface ErrorFrame {
 	v: typeof PROTOCOL_VERSION;
 	type: "error";

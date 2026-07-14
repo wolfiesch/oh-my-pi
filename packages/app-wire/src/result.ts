@@ -1,6 +1,6 @@
-import { decodeCommandResult } from "./command.ts";
-import { fail } from "./errors.ts";
-import { boundedMap, controlFree, inputObject, string } from "./guards.ts";
+import { decodeCommandResult } from "./command";
+import { fail } from "./errors";
+import { boundedMap, controlFree, inputObject, string } from "./guards";
 import {
 	type CommandId,
 	commandId,
@@ -10,8 +10,8 @@ import {
 	requestId,
 	type SessionId,
 	sessionId,
-} from "./ids.ts";
-import { PROTOCOL_VERSION } from "./limits.ts";
+} from "./ids";
+import { PROTOCOL_VERSION } from "./limits";
 export interface ResultError {
 	code: string;
 	message: string;

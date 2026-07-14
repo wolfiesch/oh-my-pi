@@ -1,4 +1,4 @@
-import { AppWireError, fail } from "./errors.ts";
+import { AppWireError, fail } from "./errors";
 import {
 	MAX_ARRAY_ITEMS,
 	MAX_CAPABILITIES,
@@ -7,7 +7,7 @@ import {
 	MAX_JSON_NODES,
 	MAX_MAP_KEYS,
 	MAX_STRING_BYTES,
-} from "./limits.ts";
+} from "./limits";
 export type JsonObject = Record<string, unknown>;
 export function isSecretLikeKey(key: string): boolean {
 	const normalized = key

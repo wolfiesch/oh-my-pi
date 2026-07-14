@@ -1,5 +1,5 @@
-import { controlFree, inputObject, safeSeq } from "./guards.ts";
-import { MAX_EPOCH_BYTES } from "./limits.ts";
+import { controlFree, inputObject, safeSeq } from "./guards";
+import { MAX_EPOCH_BYTES } from "./limits";
 export interface Cursor {
 	epoch: string;
 	seq: number;

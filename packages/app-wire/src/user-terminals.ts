@@ -1,5 +1,5 @@
-import { boundedMap, controlFree, inputObject } from "./guards.ts";
-import { type HostId, hostId, type SessionId, sessionId, type TerminalId, terminalId } from "./ids.ts";
+import { boundedMap, controlFree, inputObject } from "./guards";
+import { type HostId, hostId, type SessionId, sessionId, type TerminalId, terminalId } from "./ids";
 export interface UserTerminal {
 	terminalId: TerminalId;
 	hostId: HostId;

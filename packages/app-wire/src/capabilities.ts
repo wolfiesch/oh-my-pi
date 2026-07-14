@@ -1,5 +1,5 @@
-import { fail } from "./errors.ts";
-import { capabilitiesArray, controlFree, inputObject } from "./guards.ts";
+import { fail } from "./errors";
+import { capabilitiesArray, controlFree, inputObject } from "./guards";
 export const DEVICE_CAPABILITIES = [
 	"sessions.read",
 	"sessions.prompt",

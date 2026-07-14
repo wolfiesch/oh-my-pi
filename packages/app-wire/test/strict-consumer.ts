@@ -9,7 +9,7 @@ import {
 	hostId,
 	type ResultFrame,
 	requestId,
-} from "../src/index.ts";
+} from "../src/index";
 
 const command: CommandFrame = {
 	v: "omp-app/1",
