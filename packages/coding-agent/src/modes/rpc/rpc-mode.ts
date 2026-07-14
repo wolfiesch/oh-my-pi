@@ -43,7 +43,6 @@ import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
-import { BLOB_EXTERNALIZE_THRESHOLD } from "../../session/session-persistence";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import type { EventBus } from "../../utils/event-bus";
@@ -144,7 +143,7 @@ interface RpcImageProjection {
 
 function transcriptImageDigest(data: string, mimeType: unknown): string | undefined {
 	if (
-		data.length < BLOB_EXTERNALIZE_THRESHOLD ||
+		data.length === 0 ||
 		data.length > Math.ceil(TRANSCRIPT_IMAGE_MAX_BYTES / 3) * 4 ||
 		!(TRANSCRIPT_IMAGE_MIME_TYPES as readonly unknown[]).includes(mimeType) ||
 		data.length % 4 !== 0 ||

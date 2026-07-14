@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { BlobStore, isBlobRef } from "@oh-my-pi/pi-coding-agent/session/blob-store";
@@ -26,6 +27,57 @@ function messageEntry(message: ToolResultMessage): ToolResultEntry {
 }
 
 describe("session image persistence", () => {
+	it("externalizes and resolves tiny canonical content images", async () => {
+		using tempDir = TempDir.createSync("@session-image-persistence-tiny-");
+		const blobStore = new BlobStore(tempDir.path());
+		const tinyImageData = Buffer.concat([
+			Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+			Buffer.alloc(64, 0x6a),
+		]).toString("base64");
+
+		const original = messageEntry({
+			role: "toolResult",
+			toolCallId: "tiny-image",
+			toolName: "generate_image",
+			content: [png(tinyImageData)],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		const persisted = prepareEntryForPersistence(original, blobStore) as ToolResultEntry;
+		const persistedImage = persisted.message.content.find((block): block is ImageContent => block.type === "image");
+		const expectedHash = createHash("sha256").update(Buffer.from(tinyImageData, "base64")).digest("hex");
+		expect(tinyImageData.length).toBeLessThan(1_024);
+		expect(isBlobRef(persistedImage?.data ?? "")).toBe(true);
+		expect(persistedImage?.data).toBe(`blob:sha256:${expectedHash}`);
+
+		const loaded: FileEntry[] = [structuredClone(persisted)];
+		await resolveBlobRefsInEntries(loaded, blobStore);
+		const resolved = loaded[0] as ToolResultEntry;
+		const resolvedImage = resolved.message.content.find((block): block is ImageContent => block.type === "image");
+		expect(resolvedImage?.data).toBe(tinyImageData);
+	});
+
+	it("leaves noncanonical tiny image content inline", () => {
+		using tempDir = TempDir.createSync("@session-image-persistence-tiny-invalid-");
+		const blobStore = new BlobStore(tempDir.path());
+
+		for (const imageData of ["not-base64", "YWJjZA"]) {
+			const original = messageEntry({
+				role: "toolResult",
+				toolCallId: "tiny-invalid-image",
+				toolName: "generate_image",
+				content: [png(imageData)],
+				isError: false,
+				timestamp: Date.now(),
+			});
+			const persisted = prepareEntryForPersistence(original, blobStore) as ToolResultEntry;
+			const persistedImage = persisted.message.content.find(
+				(block): block is ImageContent => block.type === "image",
+			);
+			expect(persistedImage?.data).toBe(imageData);
+		}
+	});
+
 	it("externalizes and resolves content images and tool detail image payloads", async () => {
 		using tempDir = TempDir.createSync("@session-image-persistence-");
 		const blobStore = new BlobStore(tempDir.path());

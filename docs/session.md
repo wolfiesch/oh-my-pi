@@ -452,7 +452,7 @@ Before persisting entries:
   - `"[Session persistence truncated large content]"`
 - Transient fields `partialJson` and `jsonlEvents` are removed.
 - If object has both `content` and `lineCount`, line count is recomputed after truncation.
-- Image blocks in `content` arrays with base64 length >= 1024 are externalized to blob refs:
+- Supported image blocks in `content` arrays and payloads under `images` are externalized to blob refs when base64 is at least 1024 characters; smaller non-empty canonical base64 is also externalized so tiny transcript images remain readable:
   - stored as `blob:sha256:<hash>`
   - raw bytes written to blob store (`BlobStore.put`)
 

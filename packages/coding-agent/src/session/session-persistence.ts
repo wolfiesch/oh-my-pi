@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import {
 	type BlobStore,
 	externalizeImageDataSync,
@@ -9,7 +10,7 @@ import type { FileEntry } from "./session-entries";
 
 const MAX_PERSIST_CHARS = 500_000;
 const TRUNCATION_NOTICE = "\n\n[Session persistence truncated large content]";
-/** Minimum base64 length to externalize to blob store (skip tiny inline images) */
+/** Minimum base64 length for unconditional externalization; smaller payloads are validated first. */
 export const BLOB_EXTERNALIZE_THRESHOLD = 1024;
 const TEXT_CONTENT_KEY = "content";
 
@@ -55,8 +56,14 @@ function shouldExternalizeImagePayload(
 	key: string | undefined,
 ): value is { data: string; mimeType?: string } {
 	if (!isImageDataPayload(value)) return false;
-	if (isBlobRef(value.data) || value.data.length < BLOB_EXTERNALIZE_THRESHOLD) return false;
-	return (key === TEXT_CONTENT_KEY && isImageBlock(value)) || key === "images";
+	if (isBlobRef(value.data)) return false;
+	const supportedCarrier = (key === TEXT_CONTENT_KEY && isImageBlock(value)) || key === "images";
+	if (!supportedCarrier) return false;
+	if (value.data.length >= BLOB_EXTERNALIZE_THRESHOLD) return true;
+	if (value.data.length === 0 || value.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(value.data))
+		return false;
+	const decoded = Buffer.from(value.data, "base64");
+	return decoded.byteLength > 0 && decoded.toString("base64") === value.data;
 }
 
 /** True for a non-empty string — marks signature/encrypted fields whose block must persist verbatim. */

@@ -6,7 +6,7 @@ This document describes how coding-agent stores large/binary payloads outside se
 
 The runtime uses two different persistence mechanisms for different data shapes:
 
-- **Content-addressed blobs** (`blob:sha256:<hash>`): global storage used to externalize large image base64 payloads and provider image data URLs from persisted session entries.
+- **Content-addressed blobs** (`blob:sha256:<hash>`): global storage used to externalize supported image base64 payloads and provider image data URLs from persisted session entries.
 - **Session-scoped artifacts** (files under `<sessionFile-without-.jsonl>/`): per-session text files used for full tool outputs and subagent outputs.
 
 They are intentionally separate:
@@ -90,7 +90,7 @@ Key behaviors:
 1. **Large string truncation**: oversized strings are cut and suffixed with `"[Session persistence truncated large content]"`; signature fields (`thinkingSignature`, `thoughtSignature`, `textSignature`) are cleared instead of truncated.
 2. **Transient field stripping**: `partialJson` and `jsonlEvents` are removed from persisted entries.
 3. **Image externalization to blobs**:
-   - image blocks in `content` arrays are externalized when `data` is not already a blob ref and base64 length is at least threshold (`BLOB_EXTERNALIZE_THRESHOLD = 1024`),
+   - image blocks in `content` arrays and image payloads under `images` are externalized when `data` is not already a blob ref and either its base64 length is at least `BLOB_EXTERNALIZE_THRESHOLD` (1024) or a smaller payload is non-empty canonical base64,
    - provider-style `image_url` data URLs are externalized when they start with `data:image/` and contain `;base64,`,
    - image block `data` is stored as decoded binary bytes,
    - provider data URLs are stored as the original UTF-8 data URL string,
