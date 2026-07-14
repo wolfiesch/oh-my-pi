@@ -634,7 +634,8 @@ export class SelectorController {
 				onPick: async (model, selector) => {
 					try {
 						// Session-only: update agent state but don't persist the model to settings.
-						await this.ctx.session.setModelTemporary(model);
+						const roleThinkingLevel = this.ctx.session.resolveTemporaryModelThinkingLevel(model);
+						await this.ctx.session.setModelTemporary(model, roleThinkingLevel);
 						this.ctx.statusLine.invalidate();
 						this.ctx.updateEditorBorderColor();
 						const roleSelectorHint = this.ctx.keybindings.getKeys("app.model.select")[0] ?? "Alt+M";
@@ -777,6 +778,7 @@ export class SelectorController {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
 					}
 				},
+
 				onLoginRequest: providerId => {
 					done();
 					void this.#loginThenReopenModelHub(providerId);
@@ -1291,7 +1293,7 @@ export class SelectorController {
 		this.ctx.ui.setFocus(dialog);
 		this.ctx.ui.requestRender();
 		try {
-			await this.ctx.session.modelRegistry.authStorage.login(providerId as OAuthProvider, {
+			const identity = await this.ctx.session.modelRegistry.authStorage.login(providerId as OAuthProvider, {
 				signal: dialog.signal,
 				onAuth: (info: { url: string; launchUrl?: string; instructions?: string }) => {
 					// The dialog renders the full URL (SSH-safe copy target) and
@@ -1310,8 +1312,18 @@ export class SelectorController {
 			});
 			this.ctx.session.modelRegistry.refreshInBackground();
 			const block = new TranscriptBlock();
+			// Name the account (and Anthropic organization) that was stored so a
+			// login that lands on an unintended account/subscription is visible
+			// immediately instead of silently replacing an existing registration.
+			const whoBase = identity?.type === "oauth" ? (identity.email ?? identity.accountId) : undefined;
+			const whoOrg = identity?.type === "oauth" ? (identity.orgName ?? identity.orgId) : undefined;
+			const who = whoBase ? ` as ${whoBase}${whoOrg ? ` (${whoOrg})` : ""}` : whoOrg ? ` as ${whoOrg}` : "";
 			block.addChild(
-				new Text(theme.fg("success", `${theme.status.success} Successfully logged in to ${providerId}`), 1, 0),
+				new Text(
+					theme.fg("success", `${theme.status.success} Successfully logged in to ${providerId}${who}`),
+					1,
+					0,
+				),
 			);
 			block.addChild(new Text(theme.fg("dim", `Credentials saved to ${getAgentDbPath()}`), 1, 0));
 			this.ctx.present(block);

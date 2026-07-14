@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [16.5.1] - 2026-07-14
+
+### Fixed
+
+- Fixed compatibility with Copilot gpt-5.6 models by correcting token escaping in compaction summaries.
+
 ## [16.5.0] - 2026-07-13
 
 ### Added

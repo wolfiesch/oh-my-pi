@@ -45,12 +45,12 @@ pub mod iso;
 pub mod prof;
 pub mod ps;
 pub mod pty;
+pub mod secure_fs;
 pub mod shell;
 pub mod summary;
 pub mod task;
 #[cfg(test)]
 pub(crate) mod testing;
-pub mod secure_fs;
 pub mod text;
 pub mod tokens;
 pub(crate) mod utils;
@@ -249,7 +249,7 @@ fn create_windows_napi_tokio_runtime() -> Option<tokio::runtime::Runtime> {
 /// MUST stay in sync with `VERSION_SENTINEL_EXPORT` in
 /// `packages/natives/native/index.js` (which derives the name from
 /// `package.json#version`).
-#[napi(js_name = "__piNativesV16_5_0")]
+#[napi(js_name = "__piNativesV16_5_1")]
 pub const fn pi_natives_version_sentinel() {}
 
 /// Native module entry point: install crash diagnostics before any tool can

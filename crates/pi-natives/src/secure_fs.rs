@@ -1,10 +1,10 @@
 //! Race-resistant file-jail operations for paired remote desktop sessions.
 //!
-//! Unix builds keep a directory fd for the root and every traversed parent. Every
-//! pathname operation is then relative to one of those stable fds; no
-//! realpath-then-use check is used. Windows deliberately exposes the API with an
-//! explicit `UNSUPPORTED` error until an equivalent handle-relative primitive
-//! exists there.
+//! Unix builds keep a directory fd for the root and every traversed parent.
+//! Every pathname operation is then relative to one of those stable fds; no
+//! realpath-then-use check is used. Windows deliberately exposes the API with
+//! an explicit `UNSUPPORTED` error until an equivalent handle-relative
+//! primitive exists there.
 //! Atomic replacements intentionally use mode `0600`; existing modes are not
 //! preserved because the temporary is a newly-created private inode.
 //! The process-wide writer mutex linearizes cooperating addon calls; external
@@ -21,12 +21,11 @@ const READ_CHUNK: usize = 8 * 1024;
 
 #[napi(object)]
 pub struct SecureReadFileResult {
-	pub data:             Buffer,
-	pub size:             u32,
-	pub revision_sha256:  String,
+	pub data:            Buffer,
+	pub size:            u32,
+	pub revision_sha256: String,
 }
 #[derive(Debug)]
-
 #[napi(object)]
 pub struct SecureDirectoryEntry {
 	pub name: String,
@@ -101,11 +100,14 @@ fn validate_revision(revision: Option<&str>) -> Result<()> {
 
 #[cfg(unix)]
 mod unix {
+	use std::{
+		ffi::{CStr, CString},
+		fmt::Write as _,
+		os::fd::RawFd,
+		sync::{LazyLock, Mutex},
+	};
+
 	use super::*;
-	use std::ffi::{CStr, CString};
-	use std::fmt::Write as _;
-	use std::os::fd::RawFd;
-	use std::sync::{LazyLock, Mutex};
 
 	struct Fd(RawFd);
 
@@ -125,8 +127,8 @@ mod unix {
 
 		fn duplicate(&self) -> Result<Self> {
 			// SAFETY: self.0 is an open fd owned by this guard.
-			let fd = retry_fd(|| unsafe { libc::dup(self.0) })
-				.map_err(|errno| errno_error(errno, false))?;
+			let fd =
+				retry_fd(|| unsafe { libc::dup(self.0) }).map_err(|errno| errno_error(errno, false))?;
 			Ok(Self(fd))
 		}
 	}
@@ -151,9 +153,9 @@ mod unix {
 	}
 
 	struct TempFile<'a> {
-		parent: RawFd,
-		name: CString,
-		fd: Option<Fd>,
+		parent:  RawFd,
+		name:    CString,
+		fd:      Option<Fd>,
 		renamed: bool,
 		_marker: std::marker::PhantomData<&'a ()>,
 	}
@@ -184,12 +186,12 @@ mod unix {
 
 	#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 	struct Signature {
-		dev: u64,
-		ino: u64,
-		size: u64,
-		mtime_sec: i64,
+		dev:        u64,
+		ino:        u64,
+		size:       u64,
+		mtime_sec:  i64,
 		mtime_nsec: i64,
-		ctime_sec: i64,
+		ctime_sec:  i64,
 		ctime_nsec: i64,
 	}
 
@@ -198,9 +200,10 @@ mod unix {
 	// serialization boundary and must use the revision protocol themselves.
 	static SECURE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-
 	fn errno() -> i32 {
-		std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+		std::io::Error::last_os_error()
+			.raw_os_error()
+			.unwrap_or(libc::EIO)
 	}
 
 	fn clear_errno() {
@@ -309,10 +312,7 @@ mod unix {
 				libc::openat(
 					current.0,
 					component.as_ptr(),
-					libc::O_RDONLY
-						| libc::O_DIRECTORY
-						| libc::O_CLOEXEC
-						| libc::O_NOFOLLOW,
+					libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
 				)
 			})
 			.map_err(|errno| errno_error(errno, false))?;
@@ -334,7 +334,9 @@ mod unix {
 		let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
 		loop {
 			// SAFETY: parent is an open directory fd and name is NUL terminated.
-			let rc = unsafe { libc::fstatat(parent, name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+			let rc = unsafe {
+				libc::fstatat(parent, name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+			};
 			if rc == 0 {
 				// SAFETY: fstatat initialized stat after returning zero.
 				return Ok(unsafe { stat.assume_init() });
@@ -351,24 +353,24 @@ mod unix {
 		#[cfg(any(target_os = "linux", target_os = "android"))]
 		{
 			Signature {
-				dev: stat.st_dev as u64,
-				ino: stat.st_ino as u64,
-				size: stat.st_size.max(0) as u64,
-				mtime_sec: stat.st_mtime,
+				dev:        stat.st_dev as u64,
+				ino:        stat.st_ino as u64,
+				size:       stat.st_size.max(0) as u64,
+				mtime_sec:  stat.st_mtime,
 				mtime_nsec: stat.st_mtime_nsec,
-				ctime_sec: stat.st_ctime,
+				ctime_sec:  stat.st_ctime,
 				ctime_nsec: stat.st_ctime_nsec,
 			}
 		}
 		#[cfg(target_os = "macos")]
 		{
 			Signature {
-				dev: stat.st_dev as u64,
-				ino: stat.st_ino as u64,
-				size: stat.st_size.max(0) as u64,
-				mtime_sec: stat.st_mtime as i64,
+				dev:        stat.st_dev as u64,
+				ino:        stat.st_ino as u64,
+				size:       stat.st_size.max(0) as u64,
+				mtime_sec:  stat.st_mtime as i64,
 				mtime_nsec: stat.st_mtime_nsec as i64,
-				ctime_sec: stat.st_ctime as i64,
+				ctime_sec:  stat.st_ctime as i64,
 				ctime_nsec: stat.st_ctime_nsec as i64,
 			}
 		}
@@ -381,7 +383,6 @@ mod unix {
 		(stat.st_mode & libc::S_IFMT) == libc::S_IFREG
 	}
 
-
 	const fn mode_kind(stat: &libc::stat) -> &'static str {
 		match stat.st_mode & libc::S_IFMT {
 			libc::S_IFREG => "file",
@@ -391,7 +392,12 @@ mod unix {
 		}
 	}
 
-	fn read_loop(fd: RawFd, output: &mut Vec<u8>, cap: Option<usize>, hash: &mut Sha256) -> Result<()> {
+	fn read_loop(
+		fd: RawFd,
+		output: &mut Vec<u8>,
+		cap: Option<usize>,
+		hash: &mut Sha256,
+	) -> Result<()> {
 		let mut chunk = [0u8; READ_CHUNK];
 		loop {
 			let read = loop {
@@ -455,7 +461,7 @@ mod unix {
 		Ok((hash.finish(), signature(&after)))
 	}
 
-		// SAFETY: name is NUL-terminated and parent is an open directory fd.
+	// SAFETY: name is NUL-terminated and parent is an open directory fd.
 	fn open_target(parent: RawFd, name: &CStr) -> Result<Fd> {
 		let fd = retry_fd(|| {
 			// SAFETY: name is NUL-terminated and parent is an open directory fd.
@@ -521,8 +527,7 @@ mod unix {
 						name.as_ptr(),
 						libc::O_WRONLY
 							| libc::O_CREAT
-							| libc::O_EXCL
-							| libc::O_CLOEXEC
+							| libc::O_EXCL | libc::O_CLOEXEC
 							| libc::O_NOFOLLOW,
 						0o600,
 					)
@@ -549,7 +554,8 @@ mod unix {
 		while offset < bytes.len() {
 			let count = loop {
 				// SAFETY: bytes range is valid for reading and fd is writable.
-				let count = unsafe { libc::write(fd, bytes[offset..].as_ptr().cast(), bytes.len() - offset) };
+				let count =
+					unsafe { libc::write(fd, bytes[offset..].as_ptr().cast(), bytes.len() - offset) };
 				if count >= 0 {
 					break count as usize;
 				}
@@ -608,7 +614,9 @@ mod unix {
 		{
 			return retry_rc(|| {
 				// SAFETY: all fds are open directories and names are NUL-terminated.
-				unsafe { libc::renameatx_np(parent, temp.as_ptr(), parent, leaf.as_ptr(), libc::RENAME_EXCL) }
+				unsafe {
+					libc::renameatx_np(parent, temp.as_ptr(), parent, leaf.as_ptr(), libc::RENAME_EXCL)
+				}
 			})
 			.map_err(|error| errno_error(error, true));
 		}
@@ -655,7 +663,11 @@ mod unix {
 		})
 	}
 
-	pub fn list(root: &str, path: Option<&str>, max_entries: u64) -> Result<SecureListDirectoryResult> {
+	pub fn list(
+		root: &str,
+		path: Option<&str>,
+		max_entries: u64,
+	) -> Result<SecureListDirectoryResult> {
 		let cap = validate_entries(max_entries)?;
 		let components = parse_path(path.unwrap_or(""), true)?;
 		let root = Fd::open_root(root)?;
@@ -695,7 +707,9 @@ mod unix {
 			}
 			let stat = fstatat(directory_fd.0, name).map_err(|error| errno_error(error, true))?;
 			let name_bytes = name.to_bytes();
-			let name_string = std::str::from_utf8(name_bytes).map_err(|_| native_error(ErrorCode::Io))?.to_owned();
+			let name_string = std::str::from_utf8(name_bytes)
+				.map_err(|_| native_error(ErrorCode::Io))?
+				.to_owned();
 			let entry_path = if prefix.is_empty() {
 				name_string.clone()
 			} else {
@@ -729,7 +743,9 @@ mod unix {
 		let root = Fd::open_root(root)?;
 		let parent = traverse_parent(&root, &components[..components.len() - 1])?;
 		let leaf = components.last().expect("non-empty path");
-		let _guard = SECURE_WRITE_LOCK.lock().map_err(|_| native_error(ErrorCode::Io))?;
+		let _guard = SECURE_WRITE_LOCK
+			.lock()
+			.map_err(|_| native_error(ErrorCode::Io))?;
 
 		if let Some(expected) = expected_revision {
 			let initial = revision_at(parent.0, leaf.as_c_str(), cap)?;
@@ -768,7 +784,7 @@ mod unix {
 		let mut hash = Sha256::new();
 		hash.update(data);
 		Ok(SecureWriteFileResult {
-			size: u32::try_from(data.len()).map_err(|_| native_error(ErrorCode::Bounds))?,
+			size:            u32::try_from(data.len()).map_err(|_| native_error(ErrorCode::Bounds))?,
 			revision_sha256: hash.finish(),
 		})
 	}
@@ -777,28 +793,22 @@ mod unix {
 	// does not need another package/lock dependency. State is updated per read
 	// chunk and only the final 32-byte digest is materialized.
 	pub(super) struct Sha256 {
-		state: [u32; 8],
-		buffer: [u8; 64],
+		state:      [u32; 8],
+		buffer:     [u8; 64],
 		buffer_len: usize,
-		length: u64,
+		length:     u64,
 	}
 
 	impl Sha256 {
 		pub(super) const fn new() -> Self {
 			Self {
-				state: [
-					0x6a09e667,
-					0xbb67ae85,
-					0x3c6ef372,
-					0xa54ff53a,
-					0x510e527f,
-					0x9b05688c,
-					0x1f83d9ab,
+				state:      [
+					0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
 					0x5be0cd19,
 				],
-				buffer: [0; 64],
+				buffer:     [0; 64],
 				buffer_len: 0,
-				length: 0,
+				length:     0,
 			}
 		}
 
@@ -846,20 +856,22 @@ mod unix {
 			output
 		}
 
-		#[allow(clippy::many_single_char_names, reason = "SHA-256 round notation follows the standard")]
+		#[allow(
+			clippy::many_single_char_names,
+			reason = "SHA-256 round notation follows the standard"
+		)]
 		fn compress(&mut self, block: &[u8]) {
 			const K: [u32; 64] = [
-				0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
-				0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-				0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-				0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-				0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
-				0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-				0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-				0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-				0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-				0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-				0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+				0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+				0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+				0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+				0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+				0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+				0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+				0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+				0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+				0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+				0xc67178f2,
 			];
 			let mut words = [0u32; 64];
 			for index in 0..16 {
@@ -871,9 +883,16 @@ mod unix {
 				]);
 			}
 			for index in 16..64 {
-				let x = words[index - 15].rotate_right(7) ^ words[index - 15].rotate_right(18) ^ (words[index - 15] >> 3);
-				let y = words[index - 2].rotate_right(17) ^ words[index - 2].rotate_right(19) ^ (words[index - 2] >> 10);
-				words[index] = words[index - 16].wrapping_add(x).wrapping_add(words[index - 7]).wrapping_add(y);
+				let x = words[index - 15].rotate_right(7)
+					^ words[index - 15].rotate_right(18)
+					^ (words[index - 15] >> 3);
+				let y = words[index - 2].rotate_right(17)
+					^ words[index - 2].rotate_right(19)
+					^ (words[index - 2] >> 10);
+				words[index] = words[index - 16]
+					.wrapping_add(x)
+					.wrapping_add(words[index - 7])
+					.wrapping_add(y);
 			}
 			let mut a = self.state[0];
 			let mut b = self.state[1];
@@ -886,7 +905,11 @@ mod unix {
 			for index in 0..64 {
 				let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
 				let choose = (e & f) ^ ((!e) & g);
-				let temp1 = h.wrapping_add(s1).wrapping_add(choose).wrapping_add(K[index]).wrapping_add(words[index]);
+				let temp1 = h
+					.wrapping_add(s1)
+					.wrapping_add(choose)
+					.wrapping_add(K[index])
+					.wrapping_add(words[index]);
 				let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
 				let majority = (a & b) ^ (a & c) ^ (b & c);
 				let temp2 = s0.wrapping_add(majority);
@@ -919,7 +942,11 @@ mod unix {
 		Err(native_error(ErrorCode::Unsupported))
 	}
 
-	pub fn list(_root: &str, _path: Option<&str>, _max_entries: u64) -> Result<SecureListDirectoryResult> {
+	pub fn list(
+		_root: &str,
+		_path: Option<&str>,
+		_max_entries: u64,
+	) -> Result<SecureListDirectoryResult> {
 		Err(native_error(ErrorCode::Unsupported))
 	}
 
@@ -936,13 +963,21 @@ mod unix {
 
 /// Read one regular file beneath `root` without following symlinks.
 #[napi(js_name = "secureReadFile")]
-pub fn secure_read_file(root: String, relative_path: String, max_bytes: u32) -> Result<SecureReadFileResult> {
+pub fn secure_read_file(
+	root: String,
+	relative_path: String,
+	max_bytes: u32,
+) -> Result<SecureReadFileResult> {
 	unix::read(&root, &relative_path, u64::from(max_bytes))
 }
 
 /// List a directory beneath `root`, sorted by entry name.
 #[napi(js_name = "secureListDirectory")]
-pub fn secure_list_directory(root: String, relative_path: Option<String>, max_entries: u32) -> Result<SecureListDirectoryResult> {
+pub fn secure_list_directory(
+	root: String,
+	relative_path: Option<String>,
+	max_entries: u32,
+) -> Result<SecureListDirectoryResult> {
 	unix::list(&root, relative_path.as_deref(), u64::from(max_entries))
 }
 
@@ -955,7 +990,13 @@ pub fn secure_write_file_atomic(
 	expected_revision: Option<String>,
 	max_bytes: u32,
 ) -> Result<SecureWriteFileResult> {
-	unix::write(&root, &relative_path, data.as_ref(), expected_revision.as_deref(), u64::from(max_bytes))
+	unix::write(
+		&root,
+		&relative_path,
+		data.as_ref(),
+		expected_revision.as_deref(),
+		u64::from(max_bytes),
+	)
 }
 
 #[cfg(test)]
@@ -974,9 +1015,11 @@ mod tests {
 	#[cfg(unix)]
 	#[test]
 	fn jail_read_list_and_atomic_revisions() {
-		use std::fs;
-		use std::os::unix::fs::PermissionsExt;
-		use std::time::{SystemTime, UNIX_EPOCH};
+		use std::{
+			fs,
+			os::unix::fs::PermissionsExt,
+			time::{SystemTime, UNIX_EPOCH},
+		};
 
 		let suffix = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
@@ -987,7 +1030,8 @@ mod tests {
 		fs::create_dir(root.join("nested")).expect("nested");
 		let root_string = root.to_str().expect("utf8 root");
 
-		let created = super::unix::write(root_string, "nested/blob", b"\0binary", None, 1024).expect("create");
+		let created =
+			super::unix::write(root_string, "nested/blob", b"\0binary", None, 1024).expect("create");
 		assert_eq!(created.size, 7);
 		let read = super::unix::read(root_string, "nested/blob", 1024).expect("read");
 		assert_eq!(read.data.as_ref(), b"\0binary");
@@ -997,12 +1041,34 @@ mod tests {
 		assert_eq!(listed.entries[0].name, "blob");
 		assert_eq!(listed.entries[0].path, "nested/blob");
 		assert_eq!(listed.entries[0].kind, "file");
-		assert_eq!(fs::metadata(root.join("nested/blob")).expect("metadata").permissions().mode() & 0o777, 0o600);
+		assert_eq!(
+			fs::metadata(root.join("nested/blob"))
+				.expect("metadata")
+				.permissions()
+				.mode() & 0o777,
+			0o600
+		);
 
 		assert!(super::unix::write(root_string, "nested/blob", b"new", None, 1024).is_err());
-		let replaced = super::unix::write(root_string, "nested/blob", b"new", Some(&created.revision_sha256), 1024).expect("replace");
+		let replaced = super::unix::write(
+			root_string,
+			"nested/blob",
+			b"new",
+			Some(&created.revision_sha256),
+			1024,
+		)
+		.expect("replace");
 		assert_eq!(replaced.size, 3);
-		assert!(super::unix::write(root_string, "nested/blob", b"stale", Some(&created.revision_sha256), 1024).is_err());
+		assert!(
+			super::unix::write(
+				root_string,
+				"nested/blob",
+				b"stale",
+				Some(&created.revision_sha256),
+				1024
+			)
+			.is_err()
+		);
 
 		#[cfg(target_os = "linux")]
 		std::os::unix::fs::symlink("nested/blob", root.join("link")).expect("symlink");
@@ -1014,9 +1080,14 @@ mod tests {
 	#[cfg(unix)]
 	#[test]
 	fn stale_errno_does_not_poison_list_eof() {
-		use std::fs;
-		use std::time::{SystemTime, UNIX_EPOCH};
-		let suffix = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+		use std::{
+			fs,
+			time::{SystemTime, UNIX_EPOCH},
+		};
+		let suffix = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("clock")
+			.as_nanos();
 		let root = std::env::temp_dir().join(format!("omp-secure-errno-{suffix}"));
 		fs::create_dir(&root).expect("root");
 		fs::write(root.join("notdir"), b"x").expect("file");
@@ -1029,11 +1100,16 @@ mod tests {
 	#[cfg(unix)]
 	#[test]
 	fn in_process_revision_race_has_one_winner() {
-		use std::fs;
-		use std::sync::{Arc, Barrier};
-		use std::thread;
-		use std::time::{SystemTime, UNIX_EPOCH};
-		let suffix = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+		use std::{
+			fs,
+			sync::{Arc, Barrier},
+			thread,
+			time::{SystemTime, UNIX_EPOCH},
+		};
+		let suffix = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("clock")
+			.as_nanos();
 		let root = std::env::temp_dir().join(format!("omp-secure-race-{suffix}"));
 		fs::create_dir(&root).expect("root");
 		let root_string = root.to_str().expect("utf8 root").to_owned();
@@ -1053,11 +1129,20 @@ mod tests {
 				})
 			})
 			.collect::<Vec<_>>();
-		#[allow(clippy::needless_collect, reason = "collect stores both outcomes for deterministic assertions")]
-		let outcomes = handles.into_iter().map(|handle| handle.join().expect("join")).collect::<Vec<_>>();
+		#[allow(
+			clippy::needless_collect,
+			reason = "collect stores both outcomes for deterministic assertions"
+		)]
+		let outcomes = handles
+			.into_iter()
+			.map(|handle| handle.join().expect("join"))
+			.collect::<Vec<_>>();
 		assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
 		assert_eq!(outcomes.iter().filter(|result| result.is_err()).count(), 1);
-		let winner = outcomes.iter().find_map(|result| result.as_ref().ok()).expect("winner");
+		let winner = outcomes
+			.iter()
+			.find_map(|result| result.as_ref().ok())
+			.expect("winner");
 		let read = super::unix::read(&root, "race", 1024).expect("read winner");
 		assert_eq!(read.revision_sha256, winner.revision_sha256);
 		fs::remove_dir_all(root.as_str()).expect("cleanup");
