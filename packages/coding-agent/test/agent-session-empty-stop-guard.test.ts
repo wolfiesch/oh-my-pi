@@ -447,17 +447,22 @@ describe("AgentSession empty stop guard", () => {
 		await session.sessionManager.flush();
 		const sessionFile = session.sessionManager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected persistent Auto-Learn test session");
+		await session.sessionManager.close();
 		const reloadedSession = await SessionManager.open(sessionFile, tempDir.path());
-		const reloadedBranchMessages = reloadedSession
-			.getBranch()
-			.filter(entry => entry.type === "message")
-			.map(entry => entry.message as AgentMessage);
-		expect(emptyAssistantStops(reloadedBranchMessages)).toHaveLength(0);
-		expect(
-			reloadedSession
+		try {
+			const reloadedBranchMessages = reloadedSession
 				.getBranch()
-				.some(entry => entry.type === "custom_message" && entry.customType === "autolearn-nudge"),
-		).toBe(false);
+				.filter(entry => entry.type === "message")
+				.map(entry => entry.message as AgentMessage);
+			expect(emptyAssistantStops(reloadedBranchMessages)).toHaveLength(0);
+			expect(
+				reloadedSession
+					.getBranch()
+					.some(entry => entry.type === "custom_message" && entry.customType === "autolearn-nudge"),
+			).toBe(false);
+		} finally {
+			await reloadedSession.close();
+		}
 
 		const captureCall = mock.calls[3];
 		if (!captureCall) throw new Error("Expected auto-learn capture turn to call the model");
