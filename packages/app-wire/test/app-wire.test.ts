@@ -862,15 +862,64 @@ describe("app-wire authority", () => {
 		expect(() => decodeCommandResult("files.list", { entries: [{ path: "src", kind: "future" }] })).toThrow(
 			AppWireError,
 		);
-		expect(
-			decodeCommandResult("files.list", {
-				entries: [
-					{ path: "src/file.ts", kind: "file" },
-					{ path: "src", kind: "directory" },
-					{ path: "link", kind: "symlink" },
-				],
-			}).entries,
-		).toHaveLength(3);
+		const fileEntries = decodeCommandResult("files.list", {
+			entries: [
+				{ path: "src/file.ts", kind: "file", size: 42, revision: "revision-1" },
+				{ path: "src", kind: "directory" },
+				{ path: "link", kind: "symlink" },
+			],
+		}).entries as Record<string, unknown>[];
+		expect(fileEntries).toHaveLength(3);
+		expect(fileEntries[0]).toMatchObject({ size: 42, revision: "revision-1" });
+		for (const entry of [
+			{ path: "src/file.ts", kind: "file", size: "42" },
+			{ path: "src/file.ts", kind: "file", size: -1 },
+			{ path: "src/file.ts", kind: "file", size: 1.5 },
+			{ path: "src/file.ts", kind: "file", size: MAX_FILE_BYTES * 1024 + 1 },
+			{ path: "src/file.ts", kind: "file", revision: 42 },
+		])
+			expect(() => decodeCommandResult("files.list", { entries: [entry] })).toThrow(AppWireError);
+		const auditEvent = {
+			eventId: "operation-1",
+			hostId: "host-1",
+			sessionId: "session-1",
+			action: "files.read",
+			actor: "desktop",
+			timestamp: "2026-07-14T00:00:00Z",
+			detail: { path: "src/file.ts" },
+		};
+		expect(decodeCommandResult("audit.read", { events: [auditEvent] }).events).toHaveLength(1);
+		for (const field of ["eventId", "hostId", "action", "actor", "timestamp"])
+			expect(() => decodeCommandResult("audit.read", { events: [{ ...auditEvent, [field]: undefined }] })).toThrow(
+				AppWireError,
+			);
+		for (const event of [
+			{ ...auditEvent, sessionId: 42 },
+			{ ...auditEvent, detail: { apiToken: "must-not-cross" } },
+		])
+			expect(() => decodeCommandResult("audit.tail", { events: [event] })).toThrow(AppWireError);
+		const catalogItem = {
+			id: "tool-shell",
+			kind: "tool",
+			name: "shell",
+			description: "Run a shell command",
+			capabilities: ["bash.run"],
+			supported: true,
+			reason: "available",
+			metadata: { category: "system" },
+		};
+		expect(decodeCommandResult("catalog.get", { items: [catalogItem] }).items).toHaveLength(1);
+		for (const item of [
+			{ ...catalogItem, id: undefined },
+			{ ...catalogItem, kind: "future" },
+			{ ...catalogItem, name: undefined },
+			{ ...catalogItem, description: 42 },
+			{ ...catalogItem, capabilities: [42] },
+			{ ...catalogItem, supported: "yes" },
+			{ ...catalogItem, reason: 42 },
+			{ ...catalogItem, metadata: { apiToken: "must-not-cross" } },
+		])
+			expect(() => decodeCommandResult("catalog.get", { items: [item] })).toThrow(AppWireError);
 		expect(
 			decodeCommandResult("controller.lease.renew", { leaseId: "l", cursor: { epoch: "e", seq: 1 } }).leaseId,
 		).toBe("l");

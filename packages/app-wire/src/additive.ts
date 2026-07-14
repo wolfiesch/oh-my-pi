@@ -546,7 +546,7 @@ export interface FilesDiffFrame {
 	[key: string]: unknown;
 }
 export type FilesAdditiveFrame = FilesListFrame | FilesReadFrame | FilesWriteFrame | FilesPatchFrame | FilesDiffFrame;
-function fileEntry(value: unknown, path: string): FileListEntry {
+export function decodeFileListEntry(value: unknown, path: string): FileListEntry {
 	const x = boundedMap(value, path),
 		result = {
 			...x,
@@ -572,7 +572,7 @@ export function decodeFilesAdditive(input: unknown): FilesAdditiveFrame {
 			type,
 			...ids,
 			path,
-			entries: boundedArray(x.entries, "entries").map((v, i) => fileEntry(v, `entries[${i}]`)),
+			entries: boundedArray(x.entries, "entries").map((v, i) => decodeFileListEntry(v, `entries[${i}]`)),
 		} as FilesListFrame;
 		if (x.cursor !== undefined) result.cursor = cur(x.cursor);
 		if (x.revision !== undefined) result.revision = revision(x.revision);
@@ -657,7 +657,7 @@ export interface AuditEventFrame {
 	cursor: Cursor;
 	[key: string]: unknown;
 }
-function auditEvent(value: unknown, path: string): AuditEvent {
+export function decodeAuditEvent(value: unknown, path: string): AuditEvent {
 	const x = boundedMap(value, path),
 		result = {
 			...x,
@@ -676,13 +676,13 @@ export function decodeAuditAdditive(input: unknown): AuditTailFrame | AuditEvent
 		type = x.type as string;
 	if (type === "audit.tail") {
 		const host = hostId(x.hostId),
-			events = boundedArray(x.events, "events").map((v, i) => auditEvent(v, `events[${i}]`));
+			events = boundedArray(x.events, "events").map((v, i) => decodeAuditEvent(v, `events[${i}]`));
 		for (const event of events)
 			if (event.hostId !== host) fail("INVALID_FRAME", "audit event belongs to another host", "events");
 		return { ...x, type, hostId: host, cursor: cur(x.cursor), events } as AuditTailFrame;
 	}
 	const host = hostId(x.hostId),
-		event = auditEvent(x.event, "event");
+		event = decodeAuditEvent(x.event, "event");
 	if (event.hostId !== host) fail("INVALID_FRAME", "audit event belongs to another host", "event.hostId");
 	return { ...x, type, hostId: host, event, cursor: cur(x.cursor) } as AuditEventFrame;
 }
@@ -718,7 +718,7 @@ export interface SettingsFrame {
 function metadata(value: unknown, path: string): Record<string, unknown> {
 	return boundedMetadata(value, path, isSecretLikeKey);
 }
-function catalogItem(value: unknown, path: string): CatalogItem {
+export function decodeCatalogItem(value: unknown, path: string): CatalogItem {
 	const x = boundedMap(value, path),
 		result = {
 			...x,
@@ -759,7 +759,7 @@ export function decodeCatalog(input: unknown): CatalogFrame | SettingsFrame {
 			type,
 			hostId: host,
 			revision: rev,
-			items: boundedArray(x.items, "items").map((v, i) => catalogItem(v, `items[${i}]`)),
+			items: boundedArray(x.items, "items").map((v, i) => decodeCatalogItem(v, `items[${i}]`)),
 		} as CatalogFrame;
 	return {
 		...x,

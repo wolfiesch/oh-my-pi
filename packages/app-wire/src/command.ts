@@ -1,3 +1,4 @@
+import { decodeAuditEvent, decodeCatalogItem, decodeFileListEntry } from "./additive.js";
 import type { DeviceCapability } from "./capabilities.js";
 import { decodeCursor } from "./cursor.js";
 import { fail } from "./errors.js";
@@ -637,29 +638,24 @@ function boolField(value: unknown, key: string): CommandResult {
 }
 function decodeEntries(value: unknown): CommandResult {
 	const x = result(value),
-		values = boundedArray(x.entries, "result.entries");
-	for (const [i, v] of values.entries()) {
-		const item = boundedMap(v, `result.entries[${i}]`);
-		safeRelativePath(item.path, `result.entries[${i}].path`);
-		const kind = controlFree(item.kind, `result.entries[${i}].kind`, 32);
-		if (kind !== "file" && kind !== "directory" && kind !== "symlink")
-			fail("INVALID_FRAME", "unknown file entry kind", `result.entries[${i}].kind`);
-	}
+		values = boundedArray(x.entries, "result.entries").map((value, i) =>
+			decodeFileListEntry(value, `result.entries[${i}]`),
+		);
 	return { ...x, entries: values };
 }
 function decodeAuditResult(value: unknown): CommandResult {
 	const x = result(value),
-		events = boundedArray(x.events, "result.events");
-	for (const [i, v] of events.entries()) {
-		const event = boundedMap(v, `result.events[${i}]`);
-		controlFree(event.action, `result.events[${i}].action`, 128);
-		controlFree(event.actor, `result.events[${i}].actor`, 256);
-	}
+		events = boundedArray(x.events, "result.events").map((event, i) =>
+			decodeAuditEvent(event, `result.events[${i}]`),
+		);
 	return { ...x, events };
 }
 function decodeCatalogResult(value: unknown): CommandResult {
 	const x = result(value);
-	return { ...x, items: boundedArray(x.items, "result.items").map((v, i) => metadata(v, `result.items[${i}]`)) };
+	return {
+		...x,
+		items: boundedArray(x.items, "result.items").map((item, i) => decodeCatalogItem(item, `result.items[${i}]`)),
+	};
 }
 function decodeTerminalResult(value: unknown): CommandResult {
 	const x = result(value);

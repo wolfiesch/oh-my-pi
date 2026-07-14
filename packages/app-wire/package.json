@@ -11,6 +11,10 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts"
     },
+    "./*.js": {
+      "types": "./src/*.ts",
+      "import": "./src/*.ts"
+    },
     "./*": {
       "types": "./src/*.ts",
       "import": "./src/*.ts"
