@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Fixed large appserver turns losing their terminal event when the redundant aggregate `agent_end` exceeded the RPC child's line or bounded-JSON structural limits. RPC now keeps a valid newest-message suffix with the original count and terminal status after durable entries; reader failures reap their child; crashes remain closed until child exit, then become restartable without a state probe; confirmed close settles transient state, waits for child exit, and is idempotent; and the desktop catalog exposes that close command.
 - Fixed the desktop catalog omitting implemented session creation and lifecycle commands, which caused catalog-driven clients to hide working create, rename, archive, restore, and delete controls.
 - Fixed RPC mode exiting on process termination, extension shutdown, or stdin EOF without disposing its session, which left a fresh writer lock behind and caused appserver lifecycle operations to report `session_locked` after quiescing an idle child.
 - Fixed appserver sessions briefly returning to idle at intermediate turn boundaries during tool-driven runs; the active prompt now remains owned until final `agent.end`, a correlated local-only result or failure, successful cancellation, closure, or child termination.

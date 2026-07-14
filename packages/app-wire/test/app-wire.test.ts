@@ -285,7 +285,7 @@ describe("app-wire authority", () => {
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
-		expect(APP_WIRE_VERSION).toBe("0.5.2");
+		expect(APP_WIRE_VERSION).toBe("0.5.3");
 	});
 	test("welcome identity requires every version and build field", async () => {
 		const welcome = (await fixture("welcome.json")) as Record<string, unknown>;
@@ -313,13 +313,25 @@ describe("app-wire authority", () => {
 			confirmation: "challenge",
 			desktopCatalog: true,
 		});
+		expect(COMMAND_DESCRIPTORS["session.close"]).toEqual({
+			capability: "sessions.manage",
+			scope: "session",
+			revision: "required",
+			revisionOwner: "session",
+			confirmation: "challenge",
+			desktopCatalog: true,
+		});
 		for (const name of ["session.archive", "session.restore", "session.delete"] as const) {
 			expect(decodeCommandArguments(name, {})).toEqual({});
 			expect(() => decodeCommandArguments(name, { leaseId: "lease" })).toThrow(AppWireError);
 		}
+		expect(decodeCommandArguments("session.close", {})).toEqual({});
+		expect(decodeCommandArguments("session.close", { leaseId: "lease" })).toEqual({ leaseId: "lease" });
+		expect(() => decodeCommandArguments("session.close", { extra: true })).toThrow(AppWireError);
 		expect(decodeCommandResult("session.archive", { archived: true })).toEqual({ archived: true });
 		expect(decodeCommandResult("session.restore", { restored: true })).toEqual({ restored: true });
 		expect(decodeCommandResult("session.delete", { deleted: true })).toEqual({ deleted: true });
+		expect(decodeCommandResult("session.close", { closed: true })).toEqual({ closed: true });
 		expect(() => decodeCommandResult("session.delete", { deleted: true, sessionId: "s" })).toThrow(AppWireError);
 		const base = {
 			v: "omp-app/1",
@@ -573,6 +585,7 @@ describe("app-wire authority", () => {
 			"session.archive",
 			"session.restore",
 			"session.delete",
+			"session.close",
 			"session.model.set",
 			"session.thinking.set",
 			"session.fast.set",

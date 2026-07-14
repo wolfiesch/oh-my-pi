@@ -617,6 +617,29 @@ describe("appserver transcript event translator", () => {
 		expect(Date.parse(end?.at ?? "")).toBeGreaterThan(Date.parse(start?.at ?? ""));
 	});
 
+	test("prefers bounded agent-end metadata while retaining legacy message fallback", () => {
+		const translator = new TranscriptEventTranslator(() => 99);
+		const completed = {
+			role: "assistant",
+			content: [{ type: "text", text: "suffix" }],
+			stopReason: "stop",
+			timestamp: 10,
+		};
+		const explicit = translator.translate({
+			type: "agent_end",
+			messages: [completed],
+			messageCount: 37,
+			status: "cancelled",
+		});
+		expect(explicit).toMatchObject([{ type: "agent.end", messageCount: 37, status: "cancelled" }]);
+
+		const legacy = translator.translate({
+			type: "agent_end",
+			messages: [{ ...completed, stopReason: "error" }],
+		});
+		expect(legacy).toMatchObject([{ type: "agent.end", messageCount: 1, status: "failed" }]);
+	});
+
 	test("derives turn.error only from an authoritative assistant error and redacts diagnostic text", () => {
 		const translator = new TranscriptEventTranslator(() => 99);
 		const error = translator.translate({

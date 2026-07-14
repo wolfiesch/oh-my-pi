@@ -30,6 +30,26 @@ function placeholderTitle(title: string): boolean {
 	return title === "Session" || title === "Untitled" || title.trim() === "";
 }
 
+function settledRuntimeRef(current: SessionRef, status: SessionRef["status"]): SessionRef {
+	const next: SessionRef = { ...current, status };
+	delete next.pendingApproval;
+	delete next.pendingUserInput;
+	if (current.liveState) {
+		const liveState: Record<string, unknown> = {
+			...current.liveState,
+			isStreaming: false,
+			isCompacting: false,
+			queuedMessageCount: 0,
+		};
+		delete liveState.queuedMessages;
+		delete liveState.pendingApproval;
+		delete liveState.pendingUserInput;
+		delete liveState.runtimeCrashed;
+		next.liveState = liveState;
+	}
+	return next;
+}
+
 export class SessionProjection {
 	readonly value: Projection;
 	#byId = new Map<string, DurableEntry>();
@@ -67,27 +87,31 @@ export class SessionProjection {
 		};
 	}
 	updateStatus(status: SessionRef["status"]): ServerFrame | undefined {
-		const clearsStreaming =
-			(status === "idle" || status === "closed") && this.value.ref.liveState?.isStreaming === true;
-		if (this.value.ref.status === status && !clearsStreaming) return undefined;
-		this.#revisionHash.update(`status:${status}${clearsStreaming ? ":non-streaming" : ""}\n`);
-		const nextRevision = revision(`r-${this.#revisionHash.copy().digest("hex").slice(0, 24)}`);
-		this.value.revision = nextRevision;
-		this.value.ref = {
-			...this.value.ref,
-			status,
-			revision: nextRevision,
-			...(clearsStreaming ? { liveState: { ...this.value.ref.liveState, isStreaming: false } } : {}),
-		};
-		return {
-			v: "omp-app/1",
-			type: "session.delta",
-			cursor: this.nextIndexCursor(),
-			revision: nextRevision,
-			hostId: this.value.hostId,
-			sessionId: this.value.sessionId,
-			upsert: this.value.ref,
-		};
+		const current = this.value.ref;
+		const next: SessionRef = status === "closed" ? settledRuntimeRef(current, status) : { ...current, status };
+		if (status === "idle" && current.liveState?.isStreaming === true) {
+			next.liveState = { ...current.liveState, isStreaming: false };
+		} else if (status === "active" && current.liveState?.runtimeCrashed === true) {
+			const liveState = { ...current.liveState };
+			delete liveState.runtimeCrashed;
+			next.liveState = liveState;
+		}
+		if (JSON.stringify(next) === JSON.stringify(current)) return undefined;
+		return this.updateRef(next, `status:${status}`);
+	}
+	markRuntimeCrashed(): ServerFrame | undefined {
+		const current = this.value.ref;
+		const next = settledRuntimeRef(current, "closed");
+		next.liveState = { ...(next.liveState ?? {}), runtimeCrashed: true };
+		if (JSON.stringify(next) === JSON.stringify(current)) return undefined;
+		return this.updateRef(next, "runtime:crashed");
+	}
+	markRuntimeRestartable(): ServerFrame | undefined {
+		const current = this.value.ref;
+		if (current.liveState?.runtimeCrashed !== true) return undefined;
+		const next: SessionRef = { ...current, status: "idle" };
+		if (JSON.stringify(next) === JSON.stringify(current)) return undefined;
+		return this.updateRef(next, "runtime:restartable");
 	}
 	updateTitle(title: string): ServerFrame | undefined {
 		if (!title || this.value.ref.title === title) return undefined;
@@ -163,12 +187,17 @@ export class SessionProjection {
 			entry,
 		});
 	}
-	updateState(state: SessionStateResult, statusOverride?: SessionRef["status"]): ServerFrame | undefined {
+	updateState(
+		state: SessionStateResult,
+		statusOverride?: SessionRef["status"],
+		recoverClosedStatus = false,
+	): ServerFrame | undefined {
 		const next: SessionRef = { ...this.value.ref };
 		const liveState = { ...(next.liveState ?? {}) };
 		delete liveState.modelId;
 		delete liveState.modelProvider;
 		delete liveState.modelDisplayName;
+		delete liveState.runtimeCrashed;
 		if (state.queuedMessages) liveState.queuedMessages = state.queuedMessages;
 		else delete liveState.queuedMessages;
 		if (state.sessionName !== undefined) next.title = state.sessionName;
@@ -182,7 +211,8 @@ export class SessionProjection {
 		else delete next.thinking;
 		if (state.contextUsage !== undefined) next.contextUsage = state.contextUsage;
 		else delete next.contextUsage;
-		if (next.status !== "closed") next.status = statusOverride ?? (state.isStreaming ? "active" : "idle");
+		if (next.status !== "closed" || recoverClosedStatus)
+			next.status = statusOverride ?? (state.isStreaming ? "active" : "idle");
 		next.liveState = {
 			...liveState,
 			isStreaming: state.isStreaming,

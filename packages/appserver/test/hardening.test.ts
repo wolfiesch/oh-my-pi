@@ -376,6 +376,57 @@ describe("projection, replay, and idempotency", () => {
 			});
 		}
 	});
+	test("closed status settles compacting, queued, and pending state while preserving durable metadata", () => {
+		const projection = new SessionProjection(host, record("working-close"), "epoch-a", 3);
+		projection.updateState({
+			isStreaming: true,
+			isCompacting: true,
+			isPaused: true,
+			messageCount: 7,
+			queuedMessageCount: 2,
+			queuedMessages: { steering: ["steer"], followUp: ["follow"] },
+			steeringMode: "one-at-a-time",
+			followUpMode: "all",
+			interruptMode: "wait",
+			model: { id: "gpt-5.6", provider: "openai-codex", displayName: "GPT 5.6" },
+			thinking: "high",
+			contextUsage: { used: 12, limit: 100 },
+		});
+		projection.value.ref = {
+			...projection.value.ref,
+			pendingApproval: true,
+			pendingUserInput: true,
+			liveState: {
+				...projection.value.ref.liveState,
+				pendingApproval: true,
+				pendingUserInput: true,
+			},
+		};
+
+		const delta = projection.updateStatus("closed");
+		expect(delta).toMatchObject({
+			type: "session.delta",
+			upsert: {
+				status: "closed",
+				model: "openai-codex/gpt-5.6",
+				thinking: "high",
+				contextUsage: { used: 12, limit: 100 },
+				liveState: {
+					isStreaming: false,
+					isCompacting: false,
+					isPaused: true,
+					messageCount: 7,
+					queuedMessageCount: 0,
+				},
+			},
+		});
+		expect(projection.value.ref).not.toHaveProperty("pendingApproval");
+		expect(projection.value.ref).not.toHaveProperty("pendingUserInput");
+		expect(projection.value.ref.liveState).not.toHaveProperty("queuedMessages");
+		expect(projection.value.ref.liveState).not.toHaveProperty("pendingApproval");
+		expect(projection.value.ref.liveState).not.toHaveProperty("pendingUserInput");
+		expect(projection.updateStatus("closed")).toBeUndefined();
+	});
 	test("old epoch returns gap and snapshot", () => {
 		const projection = new SessionProjection(host, record("s"), "epoch-new", 3);
 		projection.appendEvent({ type: "live" });
@@ -531,6 +582,39 @@ describe("child supervision", () => {
 			{ entry: () => {}, event: () => {}, crashed: () => {} },
 		);
 		await expect(supervisor.start()).rejects.toThrow("exceeds 1MiB");
+	});
+	test("reader failure after ready terminates and reaps a signal-resistant child", async () => {
+		const emitMalformed = Promise.withResolvers<void>();
+		const exited = Promise.withResolvers<number>();
+		const crashed = Promise.withResolvers<Error>();
+		const killSignals: string[] = [];
+		const child: ChildHandle = {
+			stdin: { write: () => {} },
+			stdout: (async function* () {
+				yield `${JSON.stringify({ type: "ready" })}\n`;
+				await emitMalformed.promise;
+				yield "not-json\n";
+			})(),
+			stderr: (async function* () {})(),
+			exited: exited.promise,
+			kill: signal => {
+				killSignals.push(signal ?? "SIGTERM");
+				if (signal === "SIGKILL") exited.resolve(1);
+			},
+		};
+		const supervisor = new RpcChildSupervisor(
+			{ spawn: () => child, argv: path => ["omp", "--mode", "rpc", "--session", path] },
+			record("s"),
+			{ entry: () => {}, event: () => {}, crashed: crashed.resolve },
+			["omp", "--mode", "rpc"],
+			1,
+		);
+
+		await supervisor.start();
+		emitMalformed.resolve();
+		expect((await crashed.promise).message).toBe("malformed rpc stdout");
+		expect(await child.exited).toBe(1);
+		expect(killSignals).toEqual(["SIGTERM", "SIGKILL"]);
 	});
 	test("unknown string-typed child frames do not crash the supervisor", async () => {
 		const gate = Promise.withResolvers<void>();

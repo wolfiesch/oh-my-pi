@@ -5,6 +5,7 @@ import type { ChildHandle, RpcChildFactory, SessionRecord } from "./types.ts";
 
 const MAX_LINE_BYTES = 1024 * 1024;
 const STDERR_BYTES = 64 * 1024;
+const FAILURE_STOP_GRACE_MS = 2_000;
 
 export interface ChildCallbacks {
 	entry(frame: RpcSessionEntryFrame): void;
@@ -132,12 +133,17 @@ export class RpcChildSupervisor {
 	#counter = 0;
 	#stderr = "";
 	#ready = false;
+	#termination?: Promise<void>;
 	constructor(
 		private readonly factory: RpcChildFactory,
 		private readonly session: SessionRecord,
 		private readonly callbacks: ChildCallbacks,
 		private readonly argv = ["omp", "--mode", "rpc"],
-	) {}
+		private readonly failureStopGraceMs = FAILURE_STOP_GRACE_MS,
+	) {
+		if (!Number.isSafeInteger(failureStopGraceMs) || failureStopGraceMs <= 0 || failureStopGraceMs > 60_000)
+			throw new Error("failureStopGraceMs must be between 1 and 60000");
+	}
 	hasPendingCalls(): boolean {
 		return this.#pending.size > 0;
 	}
@@ -227,7 +233,9 @@ export class RpcChildSupervisor {
 	stop(signal: "SIGTERM" | "SIGKILL" = "SIGTERM"): void {
 		const child = this.#child;
 		this.#closed = true;
-		child?.kill(signal);
+		try {
+			child?.kill(signal);
+		} catch {}
 		this.fail(new Error("rpc child stopped"));
 		// The owner must retain this handle until `exited` settles. Clearing it
 		// here would let lifecycle retries lose track of a signal-resistant child.
@@ -256,11 +264,11 @@ export class RpcChildSupervisor {
 				}
 				this.dispatch(frame);
 			}
-			if (!this.#closed) this.fail(new Error("rpc child stdout EOF"));
+			if (!this.#closed) this.fail(new Error("rpc child stdout EOF"), true);
 		} catch (error) {
 			const failure = error instanceof Error ? error : new Error(String(error));
 			ready.reject(failure);
-			this.fail(failure);
+			this.fail(failure, true);
 		}
 	}
 	private async readStderr(): Promise<void> {
@@ -303,13 +311,35 @@ export class RpcChildSupervisor {
 		if (typeof value.type !== "string") throw new Error("rpc frame type is missing");
 		this.callbacks.event(value);
 	}
-	private fail(error: Error): void {
+	private terminateAfterReaderFailure(): void {
+		if (this.#termination || !this.#child) return;
+		const child = this.#child;
+		this.#termination = (async () => {
+			try {
+				child.kill("SIGTERM");
+			} catch {}
+			const exited = await Promise.race([
+				child.exited.then(
+					() => true,
+					() => true,
+				),
+				Bun.sleep(this.failureStopGraceMs).then(() => false),
+			]);
+			if (exited) return;
+			try {
+				child.kill("SIGKILL");
+			} catch {}
+			await child.exited.catch(() => undefined);
+		})();
+	}
+	private fail(error: Error, terminateChild = false): void {
 		this.#readyReject?.(error);
 		this.#readyReject = undefined;
 		for (const pending of this.#pending.values()) pending.reject(error);
 		this.#pending.clear();
 		if (!this.#closed) {
 			this.#closed = true;
+			if (terminateChild) this.terminateAfterReaderFailure();
 			this.callbacks.crashed(error);
 		}
 	}

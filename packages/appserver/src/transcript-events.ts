@@ -358,6 +358,7 @@ function isAgentSessionEventType(value: string): value is AgentSessionEventType 
 	return Object.hasOwn(AGENT_SESSION_EVENT_DISPOSITIONS, value);
 }
 function agentEndStatus(frame: Record<string, unknown>): "completed" | "failed" | "cancelled" {
+	if (frame.status === "completed" || frame.status === "failed" || frame.status === "cancelled") return frame.status;
 	if (!Array.isArray(frame.messages)) return "completed";
 	for (let index = frame.messages.length - 1; index >= 0; index--) {
 		const message = asFrame(frame.messages[index]);
@@ -367,6 +368,11 @@ function agentEndStatus(frame: Record<string, unknown>): "completed" | "failed" 
 		return "completed";
 	}
 	return "completed";
+}
+function agentEndMessageCount(frame: Record<string, unknown>): number {
+	if (Number.isSafeInteger(frame.messageCount) && Number(frame.messageCount) >= 0)
+		return Math.min(Number(frame.messageCount), MAX_EVENT_COUNT);
+	return Array.isArray(frame.messages) ? Math.min(frame.messages.length, MAX_EVENT_COUNT) : 0;
 }
 function turnErrorEvent(
 	frame: Record<string, unknown>,
@@ -676,7 +682,7 @@ export class TranscriptEventTranslator {
 					{
 						type: "agent.end",
 						status: agentEndStatus(frame),
-						messageCount: Array.isArray(frame.messages) ? Math.min(frame.messages.length, MAX_EVENT_COUNT) : 0,
+						messageCount: agentEndMessageCount(frame),
 						at: this.#nowIso(),
 					},
 				];

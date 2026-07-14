@@ -394,6 +394,20 @@ Extension runner errors are emitted separately as:
 
 `message_update` includes streaming deltas in `assistantMessageEvent` (text/thinking/toolcall deltas).
 
+RPC stdout frames remain below the host's 1 MiB line ceiling and satisfy the
+app-wire bounded-JSON structural limits for depth, collection size, and total
+nodes. When an `agent_end` aggregate would exceed any of those limits,
+`messages` contains the newest contiguous suffix that fits and the event adds
+the original `messageCount` plus a terminal `status` of `completed`, `failed`,
+or `cancelled`. Durable messages still arrive individually as `session_entry`
+frames before this terminal event.
+
+When an appserver RPC child crashes, the session is projected as `closed` with
+`liveState.runtimeCrashed: true` while that child is being reaped. Only after it
+exits does the projection become restartable `idle`; the next prompt can then
+spawn a fresh child, and successful activity clears the crash marker. An
+explicit `session.close` remains `closed` and does not become restartable.
+
 ## Prompt/Queue Concurrency and Ordering
 
 This is the most important operational behavior.

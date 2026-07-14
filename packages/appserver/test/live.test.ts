@@ -140,7 +140,7 @@ class Gate {
 		await this.opened.promise;
 	}
 }
-type LiveChildExitMode = "graceful" | "forced" | "manual";
+type LiveChildExitMode = "graceful" | "forced" | "manual" | "throwing";
 class LiveChild implements ChildHandle {
 	readonly writes: string[] = [];
 	readonly killed = Promise.withResolvers<void>();
@@ -183,6 +183,7 @@ class LiveChild implements ChildHandle {
 	kill(signal = "SIGTERM"): void {
 		this.killSignals.push(signal);
 		this.killed.resolve();
+		if (this.exitMode === "throwing") throw new Error("synthetic kill failure");
 		if (this.exitMode === "manual" || (this.exitMode === "forced" && signal !== "SIGKILL")) return;
 		this.release();
 	}
@@ -213,6 +214,10 @@ class LiveFactory implements RpcChildFactory {
 	}
 	async child(): Promise<LiveChild> {
 		return this.children[0] ?? this.#spawned.promise;
+	}
+	async childAt(index: number): Promise<LiveChild> {
+		while (!this.children[index]) await Bun.sleep(1);
+		return this.children[index]!;
 	}
 }
 function responseFor(child: LiveChild, command: string, success = true): void {
@@ -2471,6 +2476,296 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		await appserver.stop();
 	});
 
+	test("a crashed runtime becomes restartable before prompt while explicit close stays closed", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory, [record("s1")]);
+		const client = await readyClient(path, ["sessions.read", "sessions.manage", "sessions.prompt"]);
+		const crashed = await startIdleSessionRuntime(client.client, factory, "state-before-crash-recovery");
+
+		crashed.push({ invalid: true });
+		const crashDelta = await client.client.nextServer();
+		expect(crashDelta).toMatchObject({
+			type: "session.delta",
+			upsert: expect.objectContaining({
+				status: "closed",
+				liveState: expect.objectContaining({ runtimeCrashed: true }),
+			}),
+		});
+		expect(await crashed.exited).toBe(0);
+		const restartableDelta = await client.client.nextServer();
+		expect(restartableDelta).toMatchObject({
+			type: "session.delta",
+			upsert: expect.objectContaining({
+				status: "idle",
+				liveState: expect.objectContaining({ runtimeCrashed: true }),
+			}),
+		});
+		while (appserver.childFor(sid("s1"))) await Bun.sleep(1);
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
+
+		client.client.sendJson(
+			command("prompt-after-crash", "prompt-after-crash", "session.prompt", "s1", { message: "retry" }),
+		);
+		const respawned = await factory.childAt(1);
+		await respawned.waitForWrites(1);
+		const promptCall = JSON.parse(respawned.writes[0] ?? "{}") as { id?: string; type?: string };
+		expect(promptCall.type).toBe("prompt");
+		if (!promptCall.id) throw new Error("respawned prompt RPC id missing");
+		respawned.push({
+			type: "response",
+			id: promptCall.id,
+			command: "prompt",
+			success: true,
+			data: { agentInvoked: false },
+		});
+		const recovered = await untilResponse(client.client, "prompt-after-crash");
+		expect(recovered.response.ok).toBe(true);
+		expect(recovered.frames).toContainEqual(
+			expect.objectContaining({
+				type: "session.delta",
+				upsert: expect.objectContaining({ status: "active" }),
+			}),
+		);
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
+		expect(appserver.snapshot(sid("s1"))?.ref.liveState).not.toHaveProperty("runtimeCrashed");
+
+		client.client.sendJson({
+			...command("explicit-close", "explicit-close", "session.close", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const challenge = await client.client.nextServer();
+		expect(challenge.type).toBe("confirmation");
+		if (challenge.type !== "confirmation") throw new Error("missing explicit close confirmation");
+		client.client.sendJson(
+			confirmFrame("explicit-close-confirm", String(challenge.confirmationId), "explicit-close", "approve", "s1"),
+		);
+		expect((await untilResponse(client.client, "explicit-close")).response.ok).toBe(true);
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("closed");
+
+		client.client.sendJson(
+			command("state-after-explicit-close", "state-after-explicit-close", "session.state.get", "s1", {}),
+		);
+		expect((await untilResponse(client.client, "state-after-explicit-close")).response.ok).toBe(false);
+		expect(factory.children).toHaveLength(2);
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("closed");
+
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
+	test("confirmed close reaps a forced busy child, settles working state, and permits archive", async () => {
+		const values = [record("s1")];
+		const authority = new FakeAuthority(values);
+		const factory = new LiveFactory("forced");
+		const root = await mkdtemp(join(tmpdir(), "omp-close-supervisor-force-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			childFactory: factory,
+			lifecycleQuiesceTimeoutMs: 20,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]);
+		client.client.sendJson(
+			command("state-before-close-force", "state-before-close-force", "session.state.get", "s1", {}),
+		);
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		const stateCall = JSON.parse(child.writes[0] ?? "{}") as { id?: string };
+		if (!stateCall.id) throw new Error("state RPC id missing");
+		child.push({
+			type: "response",
+			id: stateCall.id,
+			command: "get_state",
+			success: true,
+			data: {
+				isStreaming: true,
+				isCompacting: true,
+				isPaused: false,
+				messageCount: 3,
+				queuedMessageCount: 2,
+				queuedMessages: { steering: ["steer"], followUp: ["follow"] },
+				steeringMode: "one-at-a-time",
+				followUpMode: "all",
+				interruptMode: "wait",
+			},
+		});
+		expect((await untilResponse(client.client, "state-before-close-force")).response.ok).toBe(true);
+		const working = appserver.snapshot(sid("s1"));
+		if (!working) throw new Error("working projection missing");
+		working.ref = {
+			...working.ref,
+			pendingApproval: true,
+			pendingUserInput: true,
+			liveState: {
+				...working.ref.liveState,
+				pendingApproval: true,
+				pendingUserInput: true,
+			},
+		};
+
+		client.client.sendJson({
+			...command("close-force", "close-force", "session.close", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const challenge = await client.client.nextServer();
+		expect(challenge.type).toBe("confirmation");
+		if (challenge.type !== "confirmation") throw new Error("missing close confirmation");
+		client.client.sendJson(
+			confirmFrame("close-force-confirm", String(challenge.confirmationId), "close-force", "approve", "s1"),
+		);
+		const closed = await untilResponse(client.client, "close-force");
+		expect(closed.response).toMatchObject({ ok: true, result: { closed: true } });
+		expect(await child.exited).toBe(0);
+		expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(appserver.childFor(sid("s1"))).toBeUndefined();
+		expect(appserver.snapshot(sid("s1"))?.ref).toMatchObject({
+			status: "closed",
+			liveState: { isStreaming: false, isCompacting: false, queuedMessageCount: 0 },
+		});
+		expect(appserver.snapshot(sid("s1"))?.ref).not.toHaveProperty("pendingApproval");
+		expect(appserver.snapshot(sid("s1"))?.ref).not.toHaveProperty("pendingUserInput");
+		expect(appserver.snapshot(sid("s1"))?.ref.liveState).not.toHaveProperty("queuedMessages");
+		expect(appserver.snapshot(sid("s1"))?.ref.liveState).not.toHaveProperty("pendingApproval");
+		expect(appserver.snapshot(sid("s1"))?.ref.liveState).not.toHaveProperty("pendingUserInput");
+		const closedOnce = appserver.snapshot(sid("s1"))!;
+		const closedRevision = closedOnce.revision;
+		const closedCursor = closedOnce.cursor.seq;
+		const closedEventCount = closedOnce.ring.filter(
+			frame => frame.type === "event" && frame.event.type === "session_closed",
+		).length;
+
+		client.client.sendJson({
+			...command("close-force-again", "close-force-again", "session.close", "s1", {}),
+			expectedRevision: closedRevision,
+		});
+		const secondChallenge = await client.client.nextServer();
+		expect(secondChallenge.type).toBe("confirmation");
+		if (secondChallenge.type !== "confirmation") throw new Error("missing second close confirmation");
+		client.client.sendJson(
+			confirmFrame(
+				"close-force-again-confirm",
+				String(secondChallenge.confirmationId),
+				"close-force-again",
+				"approve",
+				"s1",
+			),
+		);
+		expect((await untilResponse(client.client, "close-force-again")).response).toMatchObject({
+			ok: true,
+			result: { closed: true },
+		});
+		const closedTwice = appserver.snapshot(sid("s1"))!;
+		expect(closedTwice.revision).toBe(closedRevision);
+		expect(closedTwice.cursor.seq).toBe(closedCursor);
+		expect(
+			closedTwice.ring.filter(frame => frame.type === "event" && frame.event.type === "session_closed"),
+		).toHaveLength(closedEventCount);
+
+		client.client.sendJson({
+			...command("archive-after-close", "archive-after-close", "session.archive", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const archived = await untilResponse(client.client, "archive-after-close");
+		expect(archived.response).toMatchObject({ ok: true, result: { archived: true } });
+		expect(authority.lifecycle).toEqual(["archive:s1"]);
+
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
+	test("a throwing child kill rolls back explicit close and becomes restartable after exit", async () => {
+		const factory = new LiveFactory("throwing");
+		const root = await mkdtemp(join(tmpdir(), "omp-close-kill-throw-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: new FakeAuthority([record("s1")]),
+			childFactory: factory,
+			lifecycleQuiesceTimeoutMs: 5,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]);
+		const child = await startIdleSessionRuntime(client.client, factory, "state-before-kill-throw");
+
+		client.client.sendJson({
+			...command("close-kill-throw", "close-kill-throw", "session.close", "s1", {}),
+			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
+		});
+		const challenge = await client.client.nextServer();
+		expect(challenge.type).toBe("confirmation");
+		if (challenge.type !== "confirmation") throw new Error("missing close confirmation");
+		client.client.sendJson(
+			confirmFrame(
+				"close-kill-throw-confirm",
+				String(challenge.confirmationId),
+				"close-kill-throw",
+				"approve",
+				"s1",
+			),
+		);
+		const refused = await untilResponse(client.client, "close-kill-throw");
+		expect(refused.response).toMatchObject({ ok: false, error: { code: "session_busy" } });
+		expect(refused.frames).toContainEqual(
+			expect.objectContaining({
+				type: "session.delta",
+				upsert: expect.objectContaining({
+					status: "closed",
+					liveState: expect.objectContaining({ runtimeCrashed: true }),
+				}),
+			}),
+		);
+		expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(appserver.childFor(sid("s1"))).toBe(child);
+
+		child.release();
+		expect(await child.exited).toBe(0);
+		const restartable = await client.client.nextServer();
+		expect(restartable).toMatchObject({
+			type: "session.delta",
+			upsert: expect.objectContaining({
+				status: "idle",
+				liveState: expect.objectContaining({ runtimeCrashed: true }),
+			}),
+		});
+		expect(appserver.childFor(sid("s1"))).toBeUndefined();
+
+		client.client.sendJson(
+			command("state-after-kill-throw", "state-after-kill-throw", "session.state.get", "s1", {}),
+		);
+		const respawned = await factory.childAt(1);
+		await respawned.waitForWrites(1);
+		const stateCall = JSON.parse(respawned.writes[0] ?? "{}") as { id?: string };
+		if (!stateCall.id) throw new Error("respawned state RPC id missing");
+		respawned.push({
+			type: "response",
+			id: stateCall.id,
+			command: "get_state",
+			success: true,
+			data: {
+				isStreaming: false,
+				isCompacting: false,
+				isPaused: false,
+				messageCount: 0,
+				queuedMessageCount: 0,
+				steeringMode: "one-at-a-time",
+				followUpMode: "all",
+				interruptMode: "wait",
+			},
+		});
+		expect((await untilResponse(client.client, "state-after-kill-throw")).response.ok).toBe(true);
+		expect(appserver.snapshot(sid("s1"))?.ref).toMatchObject({ status: "idle" });
+		expect(appserver.snapshot(sid("s1"))?.ref.liveState).not.toHaveProperty("runtimeCrashed");
+
+		respawned.release();
+		await respawned.exited;
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
 	test("archive observes a real RPC child's lock release after lifecycle quiesce", async () => {
 		const root = await mkdtemp(join(tmpdir(), "omp-lifecycle-real-lock-live-"));
 		const sessionPath = join(root, "session.jsonl");
@@ -2627,6 +2922,83 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 			result: { archived: true },
 		});
 		expect(appserver.snapshot(sid("s1"))?.ref.archivedAt).toBeDefined();
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
+	test("confirmed close fences a second close and archive while quiescing the runtime", async () => {
+		const values = [record("s1")];
+		const authority = new FakeAuthority(values);
+		const factory = new LiveFactory("manual");
+		const root = await mkdtemp(join(tmpdir(), "omp-close-lifecycle-fence-live-"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			childFactory: factory,
+			lifecycleQuiesceTimeoutMs: 500,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]);
+		const child = await startIdleSessionRuntime(client.client, factory, "state-before-close-fence");
+		const revision = appserver.snapshot(sid("s1"))!.revision;
+
+		client.client.sendJson({
+			...command("close-fence-first", "close-fence-first", "session.close", "s1", {}),
+			expectedRevision: revision,
+		});
+		const firstChallenge = await client.client.nextServer();
+		expect(firstChallenge.type).toBe("confirmation");
+		if (firstChallenge.type !== "confirmation") throw new Error("missing first close confirmation");
+		client.client.sendJson({
+			...command("close-fence-second", "close-fence-second", "session.close", "s1", {}),
+			expectedRevision: revision,
+		});
+		const secondChallenge = await client.client.nextServer();
+		expect(secondChallenge.type).toBe("confirmation");
+		if (secondChallenge.type !== "confirmation") throw new Error("missing second close confirmation");
+
+		client.client.sendJson(
+			confirmFrame(
+				"close-fence-first-confirm",
+				String(firstChallenge.confirmationId),
+				"close-fence-first",
+				"approve",
+				"s1",
+			),
+		);
+		await child.killed.promise;
+		client.client.sendJson({
+			...command("archive-during-close", "archive-during-close", "session.archive", "s1", {}),
+			expectedRevision: revision,
+		});
+		expect((await untilResponse(client.client, "archive-during-close")).response).toMatchObject({
+			ok: false,
+			error: { code: "session_busy" },
+		});
+		client.client.sendJson(
+			confirmFrame(
+				"close-fence-second-confirm",
+				String(secondChallenge.confirmationId),
+				"close-fence-second",
+				"approve",
+				"s1",
+			),
+		);
+		expect((await untilResponse(client.client, "close-fence-second")).response).toMatchObject({
+			ok: false,
+			error: { code: "session_busy" },
+		});
+
+		child.release();
+		expect((await untilResponse(client.client, "close-fence-first")).response).toMatchObject({
+			ok: true,
+			result: { closed: true },
+		});
+		expect(authority.lifecycle).toEqual([]);
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("closed");
+
 		await closeClients([client.client]);
 		await appserver.stop();
 	});

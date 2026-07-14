@@ -84,7 +84,7 @@ const ARCHIVED_SESSION_COMMANDS = new Set([
 	"files.diff",
 	"review.read",
 ]);
-const SESSION_LIFECYCLE_COMMANDS = new Set(["session.archive", "session.restore", "session.delete"]);
+const SESSION_LIFECYCLE_COMMANDS = new Set(["session.close", "session.archive", "session.restore", "session.delete"]);
 const DIRECT_SESSION_RPC_COMMANDS: ReadonlySet<string> = new Set([
 	"session.retry",
 	"session.pause",
@@ -959,9 +959,14 @@ export class LocalAppserver implements AppserverHandle {
 				};
 			} else if (command.command === "session.state.get") {
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
-				const result = await supervisor.call({ type: "get_state" }, command.requestId, controller.signal);
-				if (!result.success || !("data" in result)) throw new Error("rpc state query failed");
-				outcome = { frame: response(this.hostId, command, true, safeSessionState(result.data)) };
+				const state = await this.refreshState(
+					command.sessionId!,
+					supervisor,
+					command.requestId,
+					false,
+					controller.signal,
+				);
+				outcome = { frame: response(this.hostId, command, true, state) };
 			} else if (command.command === "session.steer" || command.command === "session.followUp") {
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
 				const type = command.command === "session.steer" ? "steer" : "follow_up";
@@ -1220,19 +1225,43 @@ export class LocalAppserver implements AppserverHandle {
 	}
 	private async handleClose(command: CommandFrame): Promise<CommandOutcome> {
 		const sessionId = command.sessionId!;
-		const projection = this.#projections.get(sessionId)!;
-		this.#closedSessions.add(sessionId);
-		const pending = this.#startPromises.get(sessionId);
-		if (pending) await pending.catch(() => undefined);
-		this.#supervisors.get(sessionId)?.stop();
-		this.#supervisors.delete(sessionId);
-		this.#promptLifecycles.delete(sessionId);
-		this.#stateRefreshGenerations.delete(sessionId);
-		this.#transcripts.delete(sessionId);
-		this.#subagents.delete(sessionId);
-		this.updateStatus(sessionId, "closed");
-		this.broadcast(sessionId, projection.appendEvent({ type: "session_closed" }));
-		return { frame: response(this.hostId, command, true, { closed: true, sessionId }) };
+		if (this.#lifecycleMutations.has(sessionId))
+			return this.lifecycleBusyOutcome(command, "session lifecycle mutation is already in progress");
+		this.#lifecycleMutations.add(sessionId);
+		let supervisor: RpcChildSupervisor | undefined;
+		let alreadyExplicitlyClosed = false;
+		try {
+			const projection = this.#projections.get(sessionId)!;
+			alreadyExplicitlyClosed = this.#closedSessions.has(sessionId) && projection.value.ref.status === "closed";
+			this.#closedSessions.add(sessionId);
+			const pending = this.#startPromises.get(sessionId);
+			if (pending) await pending.catch(() => undefined);
+			supervisor = this.#supervisors.get(sessionId);
+			if (!(await this.quiesceSupervisor(sessionId))) {
+				if (!alreadyExplicitlyClosed) {
+					this.#closedSessions.delete(sessionId);
+					if (supervisor) this.markSupervisorCrashed(sessionId, supervisor);
+				}
+				return this.lifecycleBusyOutcome(command, "session runtime did not stop cleanly");
+			}
+			this.#promptLifecycles.delete(sessionId);
+			this.#stateRefreshGenerations.delete(sessionId);
+			this.#transcripts.delete(sessionId);
+			this.#subagents.delete(sessionId);
+			if (alreadyExplicitlyClosed)
+				return { frame: response(this.hostId, command, true, { closed: true, sessionId }) };
+			this.updateStatus(sessionId, "closed");
+			this.broadcast(sessionId, projection.appendEvent({ type: "session_closed" }));
+			return { frame: response(this.hostId, command, true, { closed: true, sessionId }) };
+		} catch (error) {
+			if (!alreadyExplicitlyClosed) {
+				this.#closedSessions.delete(sessionId);
+				if (supervisor) this.markSupervisorCrashed(sessionId, supervisor);
+			}
+			throw error;
+		} finally {
+			this.#lifecycleMutations.delete(sessionId);
+		}
 	}
 	private async deletePreflight(
 		command: CommandFrame,
@@ -1330,13 +1359,37 @@ export class LocalAppserver implements AppserverHandle {
 			supervisor.stop("SIGKILL");
 			if (!(await this.childExitedWithinLifecycleTimeout(child))) return false;
 		}
-		if (this.#supervisors.get(sessionId) !== supervisor) return false;
+		const current = this.#supervisors.get(sessionId);
+		if (current && current !== supervisor) return false;
 		this.#supervisors.delete(sessionId);
 		this.#promptLifecycles.delete(sessionId);
 		this.#stateRefreshGenerations.delete(sessionId);
 		this.#transcripts.delete(sessionId);
 		this.#subagents.delete(sessionId);
 		return true;
+	}
+	private releaseSupervisorAfterExit(sessionId: SessionId, supervisor: RpcChildSupervisor): void {
+		const release = () => {
+			if (this.#supervisors.get(sessionId) !== supervisor) return;
+			this.#supervisors.delete(sessionId);
+			if (this.#stopping || this.#closedSessions.has(sessionId)) return;
+			const restartable = this.#projections.get(sessionId)?.markRuntimeRestartable();
+			if (restartable) this.broadcast(sessionId, restartable);
+		};
+		const child = supervisor.child();
+		if (child) void child.exited.then(release, release);
+		else release();
+	}
+	private markSupervisorCrashed(sessionId: SessionId, supervisor: RpcChildSupervisor): void {
+		if (this.#supervisors.get(sessionId) !== supervisor) return;
+		this.advanceStateRefreshGeneration(sessionId);
+		this.#promptLifecycles.delete(sessionId);
+		const crashed = this.#projections.get(sessionId)?.markRuntimeCrashed();
+		if (crashed) this.broadcast(sessionId, crashed);
+		this.#stateRefreshGenerations.delete(sessionId);
+		this.#transcripts.delete(sessionId);
+		this.#subagents.delete(sessionId);
+		this.releaseSupervisorAfterExit(sessionId, supervisor);
 	}
 	private async quiesceSessionRuntime(sessionId: SessionId): Promise<boolean> {
 		if (this.#operations?.hasOpenTerminals(sessionId)) {
@@ -1516,9 +1569,10 @@ export class LocalAppserver implements AppserverHandle {
 		supervisor: RpcChildSupervisor,
 		requestId: string,
 		preserveProjectedStatus = false,
+		signal?: AbortSignal,
 	): Promise<SessionStateResult> {
 		const generation = this.advanceStateRefreshGeneration(sessionId);
-		const result = await supervisor.call({ type: "get_state" }, `${requestId}:state`);
+		const result = await supervisor.call({ type: "get_state" }, `${requestId}:state`, signal);
 		if (!result.success || !("data" in result)) throw new Error("rpc state query failed");
 		const state = safeSessionState(result.data);
 		const projection = this.#projections.get(sessionId);
@@ -1529,7 +1583,7 @@ export class LocalAppserver implements AppserverHandle {
 			: this.#promptLifecycles.has(sessionId)
 				? "active"
 				: undefined;
-		const frame = projection.updateState(state, statusOverride);
+		const frame = projection.updateState(state, statusOverride, !this.#closedSessions.has(sessionId));
 		if (frame) await this.broadcastIndex(frame);
 		return state;
 	}
@@ -1630,13 +1684,7 @@ export class LocalAppserver implements AppserverHandle {
 					}
 				},
 				crashed: () => {
-					this.advanceStateRefreshGeneration(sessionId);
-					this.#promptLifecycles.delete(sessionId);
-					this.updateStatus(sessionId, "closed");
-					this.#supervisors.delete(sessionId);
-					this.#stateRefreshGenerations.delete(sessionId);
-					this.#transcripts.delete(sessionId);
-					this.#subagents.delete(sessionId);
+					this.markSupervisorCrashed(sessionId, supervisor);
 				},
 			},
 			this.#factory.argv(record.path),

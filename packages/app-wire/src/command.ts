@@ -206,6 +206,7 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		revision: "required",
 		revisionOwner: "session",
 		confirmation: "challenge",
+		desktopCatalog: true,
 	},
 	"files.read": {
 		capability: "files.read",

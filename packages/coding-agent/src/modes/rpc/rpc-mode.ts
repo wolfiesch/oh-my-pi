@@ -11,6 +11,7 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 
+import { MAX_ARRAY_ITEMS, MAX_INPUT_BYTES, MAX_STRING_BYTES, parseBounded } from "@oh-my-pi/app-wire";
 import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
@@ -27,7 +28,7 @@ import {
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
-import type { AgentSession } from "../../session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
@@ -75,6 +76,91 @@ type RpcOutput = (
 		| object,
 ) => void;
 type RpcSessionEntryManager = Pick<AgentSession["sessionManager"], "subscribeEntryAppended">;
+
+/** Leave one maximum-sized app-wire string of headroom below the supervisor's line ceiling. */
+export const RPC_AGENT_END_MAX_BYTES = MAX_INPUT_BYTES - MAX_STRING_BYTES;
+
+const rpcTextEncoder = new TextEncoder();
+
+type RpcAgentEndStatus = "completed" | "failed" | "cancelled";
+
+function serializedJsonBytes(value: object): number | undefined {
+	try {
+		const encoded = JSON.stringify(value);
+		if (encoded === undefined) return undefined;
+		return rpcTextEncoder.encode(encoded).byteLength;
+	} catch {
+		return undefined;
+	}
+}
+
+function isBoundedRpcFrame(value: object): boolean {
+	let encoded: string | undefined;
+	try {
+		encoded = JSON.stringify(value);
+	} catch {
+		return false;
+	}
+	if (encoded === undefined || rpcTextEncoder.encode(encoded).byteLength > RPC_AGENT_END_MAX_BYTES) return false;
+	try {
+		parseBounded(encoded);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function rpcAgentEndStatus(messages: Extract<AgentSessionEvent, { type: "agent_end" }>["messages"]): RpcAgentEndStatus {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (!message || typeof message !== "object" || !("role" in message) || message.role !== "assistant") continue;
+		if ("stopReason" in message && message.stopReason === "error") return "failed";
+		if ("stopReason" in message && message.stopReason === "aborted") return "cancelled";
+		return "completed";
+	}
+	return "completed";
+}
+
+/**
+ * Keep RPC terminal events below the appserver's one-line transport ceiling.
+ *
+ * Every durable message has already crossed this channel as a `session_entry`.
+ * `agent_end.messages` is a redundant run aggregate, so retain the newest
+ * contiguous suffix that fits while preserving the terminal event itself.
+ */
+export function boundedRpcSessionEvent(event: AgentSessionEvent): AgentSessionEvent {
+	if (event.type !== "agent_end" || isBoundedRpcFrame(event)) return event;
+
+	const terminal = {
+		messageCount: event.messages.length,
+		status: rpcAgentEndStatus(event.messages),
+	};
+	const empty = { ...event, messages: [], ...terminal };
+	const minimal = { type: "agent_end" as const, messages: [], ...terminal };
+	const emptyEvent = isBoundedRpcFrame(empty) ? empty : minimal;
+	let bytes = serializedJsonBytes(emptyEvent);
+	if (bytes === undefined) return minimal;
+
+	let maxSuffixLength = 0;
+	for (let index = event.messages.length - 1; index >= 0 && maxSuffixLength < MAX_ARRAY_ITEMS; index--) {
+		const messageBytes = serializedJsonBytes(event.messages[index]!);
+		if (messageBytes === undefined) break;
+		const separatorBytes = maxSuffixLength === 0 ? 0 : 1;
+		if (bytes + separatorBytes + messageBytes > RPC_AGENT_END_MAX_BYTES) break;
+		bytes += separatorBytes + messageBytes;
+		maxSuffixLength++;
+	}
+
+	let low = 0;
+	let high = maxSuffixLength;
+	while (low < high) {
+		const candidateLength = Math.ceil((low + high) / 2);
+		const candidate = { ...event, messages: event.messages.slice(-candidateLength), ...terminal };
+		if (isBoundedRpcFrame(candidate)) low = candidateLength;
+		else high = candidateLength - 1;
+	}
+	return low === 0 ? emptyEvent : { ...event, messages: event.messages.slice(-low), ...terminal };
+}
 
 export interface RpcSessionEntrySubscription {
 	bind(sessionManager: RpcSessionEntryManager): void;
@@ -919,7 +1005,7 @@ export async function runRpcMode(
 
 	// Output all agent events as JSON
 	session.subscribe(event => {
-		output(event);
+		output(boundedRpcSessionEvent(event));
 	});
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);

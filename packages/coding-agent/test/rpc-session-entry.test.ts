@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { MAX_ARRAY_ITEMS, parseBounded } from "@oh-my-pi/app-wire";
 import {
+	boundedRpcSessionEvent,
 	createRpcSessionEntrySubscription,
+	RPC_AGENT_END_MAX_BYTES,
 	type RpcSessionEntryFrame,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
+import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 
 type EntryListener = (entry: SessionEntry) => void;
@@ -155,5 +159,105 @@ describe("RPC durable session-entry frames", () => {
 		expect(frames).toHaveLength(1);
 		expect(stdoutWrites).toBe(0);
 		subscription.dispose();
+	});
+});
+
+describe("RPC terminal event bounds", () => {
+	const encodedBytes = (value: object): number => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+	test("preserves ordinary agent_end events exactly", () => {
+		const event: Extract<AgentSessionEvent, { type: "agent_end" }> = {
+			type: "agent_end",
+			messages: [{ role: "user", content: "done", timestamp: 1 }],
+		};
+
+		expect(boundedRpcSessionEvent(event)).toBe(event);
+	});
+
+	test("keeps the newest message suffix when an aggregate agent_end exceeds the child line ceiling", () => {
+		const messages = Array.from({ length: 20 }, (_, index) => ({
+			role: "user" as const,
+			content: `${index}:${"x".repeat(60_000)}`,
+			timestamp: index,
+		}));
+		const event: Extract<AgentSessionEvent, { type: "agent_end" }> = { type: "agent_end", messages };
+		expect(encodedBytes(event)).toBeGreaterThan(1_048_576);
+
+		const bounded = boundedRpcSessionEvent(event);
+		expect(bounded.type).toBe("agent_end");
+		if (bounded.type !== "agent_end") throw new Error("expected terminal event");
+		const terminal = bounded as unknown as Record<string, unknown>;
+		expect(encodedBytes(bounded)).toBeLessThanOrEqual(RPC_AGENT_END_MAX_BYTES);
+		expect(bounded.messages.length).toBeGreaterThan(0);
+		expect(bounded.messages.length).toBeLessThan(messages.length);
+		expect(bounded.messages.at(-1)).toEqual(event.messages.at(-1));
+		expect(terminal.messageCount).toBe(messages.length);
+		expect(terminal.status).toBe("completed");
+		expect(event.messages).toHaveLength(20);
+	});
+
+	test("preserves failure metadata when the final assistant message cannot fit", () => {
+		const event = {
+			type: "agent_end",
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "x".repeat(1_000_000) }],
+					stopReason: "error",
+					timestamp: 1,
+				},
+			],
+		} as unknown as Extract<AgentSessionEvent, { type: "agent_end" }>;
+
+		const bounded = boundedRpcSessionEvent(event);
+		expect(bounded.type).toBe("agent_end");
+		if (bounded.type !== "agent_end") throw new Error("expected terminal event");
+		const terminal = bounded as unknown as Record<string, unknown>;
+		expect(encodedBytes(bounded)).toBeLessThanOrEqual(RPC_AGENT_END_MAX_BYTES);
+		expect(bounded.messages).toEqual([]);
+		expect(terminal.messageCount).toBe(1);
+		expect(terminal.status).toBe("failed");
+	});
+
+	test("bounds compact aggregates that exceed the app-wire array item limit", () => {
+		const messages = Array.from({ length: MAX_ARRAY_ITEMS + 1 }, (_, index) => ({
+			role: "user" as const,
+			content: String(index),
+			timestamp: index,
+		}));
+		const event: Extract<AgentSessionEvent, { type: "agent_end" }> = { type: "agent_end", messages };
+		expect(encodedBytes(event)).toBeLessThan(RPC_AGENT_END_MAX_BYTES);
+		expect(() => parseBounded(JSON.stringify(event))).toThrow();
+
+		const bounded = boundedRpcSessionEvent(event);
+		expect(bounded.type).toBe("agent_end");
+		if (bounded.type !== "agent_end") throw new Error("expected terminal event");
+		const terminal = bounded as unknown as Record<string, unknown>;
+		expect(() => parseBounded(JSON.stringify(bounded))).not.toThrow();
+		expect(bounded.messages).toHaveLength(MAX_ARRAY_ITEMS);
+		expect(bounded.messages.at(-1)).toEqual(messages.at(-1));
+		expect(terminal.messageCount).toBe(messages.length);
+	});
+
+	test("bounds compact aggregates that exceed the app-wire JSON node limit", () => {
+		const messages = Array.from({ length: 200 }, (_, index) => ({
+			role: "assistant" as const,
+			content: Array.from({ length: 40 }, () => ({ type: "text" as const, text: "x" })),
+			stopReason: "stop" as const,
+			timestamp: index,
+		}));
+		const event = { type: "agent_end", messages } as Extract<AgentSessionEvent, { type: "agent_end" }>;
+		expect(encodedBytes(event)).toBeLessThan(RPC_AGENT_END_MAX_BYTES);
+		expect(() => parseBounded(JSON.stringify(event))).toThrow();
+
+		const bounded = boundedRpcSessionEvent(event);
+		expect(bounded.type).toBe("agent_end");
+		if (bounded.type !== "agent_end") throw new Error("expected terminal event");
+		const terminal = bounded as unknown as Record<string, unknown>;
+		expect(() => parseBounded(JSON.stringify(bounded))).not.toThrow();
+		expect(bounded.messages.length).toBeGreaterThan(0);
+		expect(bounded.messages.length).toBeLessThan(messages.length);
+		expect(bounded.messages.at(-1)).toEqual(event.messages.at(-1));
+		expect(terminal.messageCount).toBe(messages.length);
 	});
 });
