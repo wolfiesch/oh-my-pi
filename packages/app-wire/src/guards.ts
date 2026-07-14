@@ -64,6 +64,19 @@ export function boundedText(value: unknown, path: string, max = MAX_STRING_BYTES
 	if (typeof value !== "string" || utf8ByteLength(value) > max) fail("BOUNDS", "expected bounded UTF-8 text", path);
 	return value;
 }
+export function boundedBase64(value: unknown, path: string, maxDecodedBytes: number): string {
+	const text = boundedText(value, path, Math.ceil((maxDecodedBytes * 4) / 3) + 4);
+	if (text.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(text))
+		fail("BOUNDS", "invalid base64 payload", path);
+	let decoded: string;
+	try {
+		decoded = atob(text);
+	} catch {
+		fail("BOUNDS", "invalid base64 payload", path);
+	}
+	if (decoded.length > maxDecodedBytes) fail("BOUNDS", "decoded payload exceeds protocol limit", path);
+	return text;
+}
 export function controlFree(value: unknown, path: string, max = MAX_STRING_BYTES): string {
 	const result = string(value, path, max);
 	if (/[\u0000-\u001f\u007f]/u.test(result)) fail("BOUNDS", "control characters are not allowed", path);

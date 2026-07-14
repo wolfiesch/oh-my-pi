@@ -37,8 +37,9 @@ export interface DurableEntry {
 	timestamp: string;
 	data: Record<string, unknown>;
 }
-export function decodeEntry(input: unknown, path = "entry"): DurableEntry {
-	const value = path === "entry" ? inputObject(input) : boundedMap(input, path);
+export function decodeEntry(input: unknown): DurableEntry {
+	const path = "entry";
+	const value = inputObject(input);
 	entryId(value.id, `${path}.id`);
 	if (value.parentId === undefined) fail("INVALID_FRAME", "parentId is required", `${path}.parentId`);
 	if (value.parentId !== null) entryId(value.parentId, `${path}.parentId`);

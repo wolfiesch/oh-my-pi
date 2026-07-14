@@ -210,6 +210,10 @@ describe("app-wire authority", () => {
 		expect(() => decodeEntry({ ...entry, id: undefined })).toThrow(AppWireError);
 		expect(() => decodeEntry({ ...entry, parentId: 1 })).toThrow(AppWireError);
 		expect(() => decodeEntry({ ...entry, parentId: "" })).toThrow(AppWireError);
+		const cyclicData: Record<string, unknown> = {};
+		cyclicData.self = cyclicData;
+		const legacyPathCall = decodeEntry as unknown as (value: unknown, path: string) => unknown;
+		expect(() => legacyPathCall({ ...entry, data: cyclicData }, "entries[0]")).toThrow(AppWireError);
 		expect(
 			decodeServerFrame({ v: "omp-app/1", type: "files", hostId: "h", sessionId: "s", path: "empty", content: "" }),
 		).toMatchObject({ path: "empty" });
@@ -328,7 +332,6 @@ describe("app-wire authority", () => {
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
-		expect(APP_WIRE_VERSION).toBe("0.5.5");
 	});
 	test("welcome identity requires every version and build field", async () => {
 		const welcome = (await fixture("welcome.json")) as Record<string, unknown>;
@@ -752,6 +755,16 @@ describe("app-wire authority", () => {
 				data: "x",
 			}),
 		).toThrow(AppWireError);
+		expect(decodeServerFrame({ ...base, type: "terminal", stream: "stderr", data: "x" }).type).toBe("terminal");
+		expect(decodeServerFrame({ ...base, type: "terminal", stream: "exit", exitCode: 0 }).type).toBe("terminal");
+		for (const malformed of [
+			{ ...base, type: "terminal", stream: "future", data: "x" },
+			{ ...base, type: "terminal", stream: "stdout" },
+			{ ...base, type: "terminal", stream: "stdout", data: "x", exitCode: 0 },
+			{ ...base, type: "terminal", stream: "exit" },
+			{ ...base, type: "terminal", stream: "exit", data: "x", exitCode: 0 },
+		])
+			expect(() => decodeServerFrame(malformed)).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("session.prompt", { prompt: "wrong" })).toThrow(AppWireError);
 		expect(decodeCommandArguments("session.prompt", { message: "hello" }).message).toBe("hello");
 		expect(decodeCommandArguments("session.prompt", { message: "hello", leaseId: "lease-1" })).toMatchObject({
@@ -843,6 +856,21 @@ describe("app-wire authority", () => {
 		expect(decodeCommandResult("term.open", { terminalId: "t" }).terminalId).toBe("t");
 		expect(() => decodeCommandResult("term.open", { terminalId: 1 })).toThrow(AppWireError);
 		expect(() => decodeCommandResult("preview.capture", { content: "not-base64" })).toThrow(AppWireError);
+		const maximumCapture = "A".repeat((MAX_FILE_BYTES / 3) * 4);
+		expect(decodeCommandResult("preview.capture", { content: maximumCapture }).content).toBe(maximumCapture);
+		expect(() => decodeCommandResult("preview.capture", { content: `${maximumCapture}AAAA` })).toThrow(AppWireError);
+		expect(() => decodeCommandResult("files.list", { entries: [{ path: "src", kind: "future" }] })).toThrow(
+			AppWireError,
+		);
+		expect(
+			decodeCommandResult("files.list", {
+				entries: [
+					{ path: "src/file.ts", kind: "file" },
+					{ path: "src", kind: "directory" },
+					{ path: "link", kind: "symlink" },
+				],
+			}).entries,
+		).toHaveLength(3);
 		expect(
 			decodeCommandResult("controller.lease.renew", { leaseId: "l", cursor: { epoch: "e", seq: 1 } }).leaseId,
 		).toBe("l");
@@ -1100,6 +1128,16 @@ describe("app-wire authority", () => {
 				}) as Record<string, unknown>
 			).result,
 		).toEqual({ cancelled: true });
+		expect(() =>
+			decodeServerFrame({
+				v: "omp-app/1",
+				type: "response",
+				requestId: "r",
+				hostId: "h",
+				ok: true,
+				result: { cancelled: true },
+			}),
+		).toThrow(AppWireError);
 		expect(sameSession({ hostId: "h", sessionId: "s" }, { hostId: "other", sessionId: "s" })).toBe(false);
 	});
 });

@@ -4,7 +4,7 @@
 
 Cursor sequence numbers are scoped by frame domain. A session's `snapshot`, `entry`, and `event` frames share the transcript cursor used by `session.attach` replay. Host-wide `session.delta` frames use a separate per-session index cursor and never advance or enter the transcript replay ring. Clients must not compare or merge sequence numbers across those two domains, even when their opaque epoch strings match.
 
-Use `decodeClientFrame` or `decodeServerFrame` at every JSON boundary. Every decoder accepts encoded JSON (`string` or `Uint8Array`) and already-parsed JSON. Known frames preserve additive fields; unknown top-level families fail with typed `AppWireError`; unknown leaf event subtypes are accepted. Hello declares a protocol range, client identity, requested features, and saved cursors. Welcome records selected protocol, host/appserver identity, restart epoch, capabilities, negotiated limits, and resume status.
+Use `decodeClientFrame` or `decodeServerFrame` at every JSON boundary. These top-level wire decoders accept encoded JSON (`string` or `Uint8Array`) and already-parsed JSON. Known frames preserve additive fields; unknown top-level families fail with typed `AppWireError`; unknown leaf event subtypes are accepted. Hello declares a protocol range, client identity, requested features, and saved cursors. Welcome records selected protocol, host/appserver identity, restart epoch, capabilities, negotiated limits, and resume status.
 
 ```ts
 import { decodeServerFrame } from "@oh-my-pi/app-wire";

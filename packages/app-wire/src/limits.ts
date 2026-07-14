@@ -1,5 +1,7 @@
+import packageManifest from "../package.json" with { type: "json" };
+
 export const PROTOCOL_VERSION = "omp-app/1" as const;
-export const APP_WIRE_VERSION = "0.5.5" as const;
+export const APP_WIRE_VERSION = packageManifest.version;
 export const MAX_INPUT_BYTES = 1_048_576;
 export const MAX_STRING_BYTES = 65_536;
 export const MAX_ID_BYTES = 256;

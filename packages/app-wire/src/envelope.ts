@@ -85,7 +85,7 @@ export function decodeDurableEntryFrame(input: unknown): DurableEntryFrame {
 	const currentRevision = revision(frame.revision);
 	const host = hostId(frame.hostId);
 	const session = sessionId(frame.sessionId);
-	const entry = decodeEntry(frame.entry, "entry");
+	const entry = decodeEntry(frame.entry);
 	if (entry.hostId !== host || entry.sessionId !== session)
 		fail("INVALID_FRAME", "entry belongs to another session", "entry");
 	return { ...frame, cursor, revision: currentRevision, entry } as unknown as DurableEntryFrame;

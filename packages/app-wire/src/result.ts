@@ -60,5 +60,7 @@ export function decodeResult(input: unknown): ResultFrame {
 		if (frame.ok)
 			return { ...frame, command, result: decodeCommandResult(command, frame.result) } as unknown as ResultFrame;
 	}
+	if (frame.ok && frame.result !== undefined)
+		fail("INVALID_FRAME", "successful response result requires a typed command", "command");
 	return frame as unknown as ResultFrame;
 }

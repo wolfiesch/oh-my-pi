@@ -22,7 +22,7 @@ export function decodeSnapshot(input: unknown): SessionSnapshotFrame {
 	const host = hostId(frame.hostId);
 	const session = sessionId(frame.sessionId);
 	const entries = boundedArray(frame.entries, "entries").map((value, i) => {
-		const entry = decodeEntry(value, `entries[${i}]`);
+		const entry = decodeEntry(value);
 		if (entry.hostId !== host || entry.sessionId !== session)
 			fail("INVALID_FRAME", "entry belongs to another session", `entries[${i}]`);
 		return entry;
