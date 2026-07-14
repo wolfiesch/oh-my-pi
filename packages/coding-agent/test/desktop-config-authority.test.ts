@@ -113,6 +113,7 @@ describe("DesktopConfigAuthority", () => {
 		expect(frame.items.some(item => item.id === "model:provider-a/model-a")).toBe(true);
 		const expectedCommands = [
 			["session.create", "sessions.manage"],
+			["session.close", "sessions.manage"],
 			["session.rename", "sessions.manage"],
 			["session.archive", "sessions.manage"],
 			["session.restore", "sessions.manage"],
