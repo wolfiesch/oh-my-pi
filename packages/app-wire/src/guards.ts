@@ -10,7 +10,10 @@ import {
 } from "./limits.ts";
 export type JsonObject = Record<string, unknown>;
 export function isSecretLikeKey(key: string): boolean {
-	const normalized = key.toLowerCase().replace(/[_-]/gu, "");
+	const normalized = key
+		.normalize("NFKC")
+		.toLowerCase()
+		.replace(/[^\p{L}\p{N}]+/gu, "");
 	return [
 		"password",
 		"passwd",
