@@ -5,14 +5,16 @@
  */
 
 import { isPromise } from "node:util/types";
-import type { AgentEvent, AgentMessage, AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { AgentMessage, AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
-import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type { SessionStats } from "../../session/agent-session";
 import type {
+	RpcAgentEvent,
+	RpcAgentSessionEvent,
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
 	RpcCommand,
@@ -61,8 +63,8 @@ export interface RpcClientOptions {
 
 export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;
 
-export type RpcEventListener = (event: AgentEvent) => void;
-export type RpcSessionEventListener = (event: AgentSessionEvent) => void;
+export type RpcEventListener = (event: RpcAgentEvent) => void;
+export type RpcSessionEventListener = (event: RpcAgentSessionEvent) => void;
 export type RpcSubagentLifecycleListener = (payload: RpcSubagentLifecycleFrame["payload"]) => void;
 export type RpcSubagentProgressListener = (payload: RpcSubagentProgressFrame["payload"]) => void;
 export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"]) => void;
@@ -94,7 +96,7 @@ export function defineRpcClientTool<
 	return tool;
 }
 
-const agentEventTypes = new Set<AgentEvent["type"]>([
+const agentEventTypes = new Set<RpcAgentEvent["type"]>([
 	"agent_start",
 	"agent_end",
 	"turn_start",
@@ -107,7 +109,7 @@ const agentEventTypes = new Set<AgentEvent["type"]>([
 	"tool_execution_end",
 ]);
 
-const sessionEventTypes = new Set<AgentSessionEvent["type"]>([
+const sessionEventTypes = new Set<RpcAgentSessionEvent["type"]>([
 	...agentEventTypes,
 	"auto_compaction_start",
 	"auto_compaction_end",
@@ -136,18 +138,18 @@ function isRpcResponse(value: unknown): value is RpcResponse {
 	return true;
 }
 
-function isAgentEvent(value: unknown): value is AgentEvent {
+function isAgentEvent(value: unknown): value is RpcAgentEvent {
 	if (!isRecord(value)) return false;
 	const type = value.type;
 	if (typeof type !== "string") return false;
-	return agentEventTypes.has(type as AgentEvent["type"]);
+	return agentEventTypes.has(type as RpcAgentEvent["type"]);
 }
 
-function isAgentSessionEvent(value: unknown): value is AgentSessionEvent {
+function isAgentSessionEvent(value: unknown): value is RpcAgentSessionEvent {
 	if (!isRecord(value)) return false;
 	const type = value.type;
 	if (typeof type !== "string") return false;
-	return sessionEventTypes.has(type as AgentSessionEvent["type"]);
+	return sessionEventTypes.has(type as RpcAgentSessionEvent["type"]);
 }
 
 function isRpcSubagentLifecycleFrame(value: unknown): value is RpcSubagentLifecycleFrame {
@@ -828,9 +830,9 @@ export class RpcClient {
 	/**
 	 * Collect events until agent becomes idle.
 	 */
-	collectEvents(timeout = 60000): Promise<AgentEvent[]> {
-		const { promise, resolve, reject } = Promise.withResolvers<AgentEvent[]>();
-		const events: AgentEvent[] = [];
+	collectEvents(timeout = 60000): Promise<RpcAgentEvent[]> {
+		const { promise, resolve, reject } = Promise.withResolvers<RpcAgentEvent[]>();
+		const events: RpcAgentEvent[] = [];
 		let settled = false;
 		const unsubscribe = this.onEvent(event => {
 			events.push(event);
@@ -854,7 +856,7 @@ export class RpcClient {
 	/**
 	 * Send prompt and wait for completion, returning all events.
 	 */
-	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentEvent[]> {
+	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<RpcAgentEvent[]> {
 		const eventsPromise = this.collectEvents(timeout);
 		await this.prompt(message, images);
 		return eventsPromise;

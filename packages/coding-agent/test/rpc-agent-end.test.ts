@@ -30,13 +30,12 @@ describe("RPC terminal event bounds", () => {
 		const bounded = boundedRpcSessionEvent(event);
 		expect(bounded.type).toBe("agent_end");
 		if (bounded.type !== "agent_end") throw new Error("expected agent_end");
-		const terminal = bounded as unknown as Record<string, unknown>;
 		expect(encodedBytes(bounded)).toBeLessThanOrEqual(RPC_AGENT_END_MAX_BYTES);
 		expect(bounded.messages.length).toBeGreaterThan(0);
 		expect(bounded.messages.length).toBeLessThan(messages.length);
 		expect(bounded.messages.at(-1)).toEqual(messages.at(-1));
-		expect(terminal.messageCount).toBe(messages.length);
-		expect(terminal.status).toBe("completed");
+		expect(bounded.messageCount).toBe(messages.length);
+		expect(bounded.status).toBe("completed");
 		expect(event.messages).toHaveLength(20);
 	});
 
@@ -72,11 +71,32 @@ describe("RPC terminal event bounds", () => {
 		const bounded = boundedRpcSessionEvent(event);
 		expect(bounded.type).toBe("agent_end");
 		if (bounded.type !== "agent_end") throw new Error("expected agent_end");
-		const terminal = bounded as unknown as Record<string, unknown>;
 		expect(encodedBytes(bounded)).toBeLessThanOrEqual(RPC_AGENT_END_MAX_BYTES);
 		expect(bounded.messages).toEqual([]);
-		expect(terminal.messageCount).toBe(1);
-		expect(terminal.status).toBe("failed");
+		expect(bounded.messageCount).toBe(1);
+		expect(bounded.status).toBe("failed");
+	});
+
+	test("preserves cancellation metadata when an oversized assistant response was aborted", () => {
+		const event = {
+			type: "agent_end",
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "x".repeat(1_000_000) }],
+					stopReason: "aborted",
+					timestamp: 1,
+				},
+			],
+		} as unknown as Extract<AgentSessionEvent, { type: "agent_end" }>;
+
+		const bounded = boundedRpcSessionEvent(event);
+		expect(bounded.type).toBe("agent_end");
+		if (bounded.type !== "agent_end") throw new Error("expected agent_end");
+		expect(encodedBytes(bounded)).toBeLessThanOrEqual(RPC_AGENT_END_MAX_BYTES);
+		expect(bounded.messages).toEqual([]);
+		expect(bounded.messageCount).toBe(1);
+		expect(bounded.status).toBe("cancelled");
 	});
 
 	test("bounds agent_end events nested in streamed subagent frames", () => {
@@ -101,5 +121,7 @@ describe("RPC terminal event bounds", () => {
 		}
 		expect(bounded.payload.event.messages.length).toBeLessThan(messages.length);
 		expect(bounded.payload.event.messages.at(-1)).toEqual(messages.at(-1));
+		expect(bounded.payload.event.messageCount).toBe(messages.length);
+		expect(bounded.payload.event.status).toBe("completed");
 	});
 });

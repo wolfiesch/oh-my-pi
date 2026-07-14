@@ -31,9 +31,6 @@
 - Fixed remote fast-mode changes bypassing the controller-lease checks used by other session mutations.
 - Fixed desktop session lifecycle races by fencing mutations before asynchronous work, refusing active or queued sessions, closing owned terminals and RPC children before removal, and keeping host-wide session indexes in sync with external transcript changes.
 - Fixed remote frame transforms reordering lifecycle deltas and responses; each connection now preserves send order and fails closed when a transform stalls.
-### Fixed
-
-- Fixed long RPC turns emitting an oversized terminal `agent_end` JSONL frame by retaining the newest message suffix that fits and preserving the original message count and completion status.
 
 ## [16.5.1] - 2026-07-14
 

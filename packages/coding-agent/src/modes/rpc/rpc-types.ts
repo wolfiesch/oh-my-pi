@@ -4,7 +4,7 @@
  * Commands are sent as JSON lines on stdin.
  * Responses and events are emitted as JSON lines on stdout.
  */
-import type { AgentMessage, AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { AgentEvent, AgentMessage, AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
 import type { BashResult } from "../../exec/bash-executor";
@@ -208,6 +208,24 @@ export interface RpcSubagentMessagesResult {
 	messages: AgentMessage[];
 }
 
+export type RpcAgentEndStatus = "completed" | "failed" | "cancelled";
+
+/** RPC terminal metadata is emitted as a pair only when an oversized aggregate is compacted. */
+export type RpcAgentEndEvent = Extract<AgentEvent, { type: "agent_end" }> &
+	(
+		| { messageCount?: never; status?: never }
+		| {
+				messageCount: number;
+				status: RpcAgentEndStatus;
+		  }
+	);
+
+/** Core agent events after applying the RPC terminal-frame bound. */
+export type RpcAgentEvent = Exclude<AgentEvent, { type: "agent_end" }> | RpcAgentEndEvent;
+
+/** Session events as emitted on the RPC wire. */
+export type RpcAgentSessionEvent = Exclude<AgentSessionEvent, { type: "agent_end" }> | RpcAgentEndEvent;
+
 // ============================================================================
 // RPC Responses (stdout)
 // ============================================================================
@@ -367,14 +385,16 @@ export interface RpcSubagentProgressFrame {
 	payload: RpcSubagentProgressPayload;
 }
 
+export type RpcSubagentEventPayload = Omit<SubagentEventPayload, "event"> & { event: RpcAgentSessionEvent };
+
 export interface RpcSubagentEventFrame {
 	type: "subagent_event";
-	payload: SubagentEventPayload;
+	payload: RpcSubagentEventPayload;
 }
 
 export type RpcSubagentFrame = RpcSubagentLifecycleFrame | RpcSubagentProgressFrame | RpcSubagentEventFrame;
 
-export type RpcSessionEventFrame = AgentSessionEvent | RpcSessionEntryFrame | RpcSubagentFrame;
+export type RpcSessionEventFrame = RpcAgentSessionEvent | RpcSessionEntryFrame | RpcSubagentFrame;
 
 // ============================================================================
 // Extension UI Events (stdout)
