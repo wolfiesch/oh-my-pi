@@ -1,4 +1,4 @@
-import { AppWireError, fail } from "./errors";
+import { AppWireError, fail } from "./errors.js";
 import {
 	MAX_ARRAY_ITEMS,
 	MAX_CAPABILITIES,
@@ -7,7 +7,7 @@ import {
 	MAX_JSON_NODES,
 	MAX_MAP_KEYS,
 	MAX_STRING_BYTES,
-} from "./limits";
+} from "./limits.js";
 export type JsonObject = Record<string, unknown>;
 export function isSecretLikeKey(key: string): boolean {
 	const normalized = key
@@ -129,7 +129,12 @@ function scanValue(text: string, start: number, depth: number): number {
 		while (true) {
 			if (text.charCodeAt(p) !== 34) fail("INVALID_JSON", "object key must be string");
 			const end = jsonString(text, p);
-			const key = JSON.parse(text.slice(p, end)) as string;
+			let key: string;
+			try {
+				key = JSON.parse(text.slice(p, end)) as string;
+			} catch {
+				fail("INVALID_JSON", "invalid JSON object key");
+			}
 			if (seen.has(key)) fail("INVALID_JSON", "duplicate JSON object key");
 			seen.add(key);
 			if (++keys > MAX_MAP_KEYS) fail("BOUNDS", "too many object keys");
@@ -274,7 +279,12 @@ export function boundedSettings(value: unknown, path = "settings"): JsonObject {
 		const item = boundedMetadata(rawMetadata, `${path}.${settingPath}`, isSecretLikeKey);
 		if (item.sensitive === true && (Object.hasOwn(item, "default") || Object.hasOwn(item, "effective")))
 			fail("INVALID_FRAME", "sensitive setting metadata must omit values", `${path}.${settingPath}`);
-		settings[settingPath] = item;
+		Object.defineProperty(settings, settingPath, {
+			value: item,
+			enumerable: true,
+			configurable: true,
+			writable: true,
+		});
 	}
 	return settings;
 }

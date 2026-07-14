@@ -1,7 +1,7 @@
-import { fail } from "./errors";
-import { boundedArray, boundedMap, controlFree, inputObject } from "./guards";
-import { type EntryId, entryId, type HostId, hostId, type SessionId, sessionId } from "./ids";
-import { TRANSCRIPT_IMAGE_MAX_COUNT } from "./limits";
+import { fail } from "./errors.js";
+import { boundedArray, boundedMap, controlFree, inputObject } from "./guards.js";
+import { type EntryId, entryId, type HostId, hostId, type SessionId, sessionId } from "./ids.js";
+import { TRANSCRIPT_IMAGE_MAX_COUNT } from "./limits.js";
 
 export const TRANSCRIPT_IMAGE_MIME_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"] as const;
 export type TranscriptImageMimeType = (typeof TRANSCRIPT_IMAGE_MIME_TYPES)[number];

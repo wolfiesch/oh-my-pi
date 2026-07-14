@@ -1,6 +1,6 @@
-import type { DeviceCapability } from "./capabilities";
-import { decodeCursor } from "./cursor";
-import { fail } from "./errors";
+import type { DeviceCapability } from "./capabilities.js";
+import { decodeCursor } from "./cursor.js";
+import { fail } from "./errors.js";
 import {
 	boundedArray,
 	boundedMap,
@@ -12,7 +12,7 @@ import {
 	isSecretLikeKey,
 	safeRelativePath,
 	safeSeq,
-} from "./guards";
+} from "./guards.js";
 import {
 	type CommandId,
 	type ConfirmationId,
@@ -34,7 +34,7 @@ import {
 	type SessionId,
 	sessionId,
 	terminalId,
-} from "./ids";
+} from "./ids.js";
 import {
 	IMAGE_UPLOAD_CHUNK_BASE64_BYTES,
 	IMAGE_UPLOAD_CHUNK_BYTES,
@@ -46,9 +46,9 @@ import {
 	TRANSCRIPT_IMAGE_CHUNK_BASE64_BYTES,
 	TRANSCRIPT_IMAGE_CHUNK_BYTES,
 	TRANSCRIPT_IMAGE_MAX_BYTES,
-} from "./limits";
-import { decodeSessionListResult, decodeSessionRef, type SessionListResult } from "./session-index";
-import { decodeSessionStateResult } from "./session-state";
+} from "./limits.js";
+import { decodeSessionListResult, decodeSessionRef, type SessionListResult } from "./session-index.js";
+import { decodeSessionStateResult } from "./session-state.js";
 export type RevisionOwner = "none" | "session" | "authority";
 export interface CommandDescriptor {
 	capability: DeviceCapability;

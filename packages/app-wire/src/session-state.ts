@@ -1,6 +1,6 @@
-import { fail } from "./errors";
-import { bool, boundedArray, boundedMap, boundedText, controlFree, inputObject, safeSeq } from "./guards";
-import type { ContextUsage } from "./session-index";
+import { fail } from "./errors.js";
+import { bool, boundedArray, boundedMap, boundedText, controlFree, inputObject, safeSeq } from "./guards.js";
+import type { ContextUsage } from "./session-index.js";
 
 export type SessionQueueMode = "all" | "one-at-a-time";
 export interface SessionModel {

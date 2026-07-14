@@ -1,7 +1,7 @@
-import { fail } from "./errors";
-import { boundedArray, boundedMap, boundedText, controlFree, inputObject, safeRelativePath } from "./guards";
-import { type HostId, hostId, type SessionId, sessionId } from "./ids";
-import { MAX_FILE_BYTES, PROTOCOL_VERSION } from "./limits";
+import { fail } from "./errors.js";
+import { boundedArray, boundedMap, boundedText, controlFree, inputObject, safeRelativePath } from "./guards.js";
+import { type HostId, hostId, type SessionId, sessionId } from "./ids.js";
+import { MAX_FILE_BYTES, PROTOCOL_VERSION } from "./limits.js";
 export interface FileFrame {
 	v: typeof PROTOCOL_VERSION;
 	type: "files";

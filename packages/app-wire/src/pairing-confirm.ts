@@ -1,6 +1,6 @@
-import { decodeCapabilities, decodeFeatureList } from "./capabilities";
-import { fail } from "./errors";
-import { controlFree, deviceToken, inputObject, string } from "./guards";
+import { decodeCapabilities, decodeFeatureList } from "./capabilities.js";
+import { fail } from "./errors.js";
+import { controlFree, deviceToken, inputObject, string } from "./guards.js";
 import {
 	type CommandId,
 	type ConfirmationId,
@@ -16,8 +16,8 @@ import {
 	revision,
 	type SessionId,
 	sessionId,
-} from "./ids";
-import { PROTOCOL_VERSION } from "./limits";
+} from "./ids.js";
+import { PROTOCOL_VERSION } from "./limits.js";
 export interface ConfirmationChallenge {
 	v: typeof PROTOCOL_VERSION;
 	type: "confirmation";

@@ -1,6 +1,6 @@
-import { fail } from "./errors";
-import { controlFree, inputObject } from "./guards";
-import { PROTOCOL_VERSION } from "./limits";
+import { fail } from "./errors.js";
+import { controlFree, inputObject } from "./guards.js";
+import { PROTOCOL_VERSION } from "./limits.js";
 export interface PingFrame {
 	v: typeof PROTOCOL_VERSION;
 	type: "ping";

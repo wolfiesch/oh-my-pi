@@ -1,9 +1,9 @@
-import { type Cursor, decodeCursor } from "./cursor";
-import { type DurableEntry, decodeEntry } from "./entry";
-import { fail } from "./errors";
-import { boundedArray, inputObject } from "./guards";
-import { type HostId, hostId, type Revision, revision, type SessionId, sessionId } from "./ids";
-import { PROTOCOL_VERSION } from "./limits";
+import { type Cursor, decodeCursor } from "./cursor.js";
+import { type DurableEntry, decodeEntry } from "./entry.js";
+import { fail } from "./errors.js";
+import { boundedArray, inputObject } from "./guards.js";
+import { type HostId, hostId, type Revision, revision, type SessionId, sessionId } from "./ids.js";
+import { PROTOCOL_VERSION } from "./limits.js";
 export interface SessionSnapshotFrame {
 	v: typeof PROTOCOL_VERSION;
 	type: "snapshot";

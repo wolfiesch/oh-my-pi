@@ -1,7 +1,7 @@
-import { fail } from "./errors";
-import { boundedMap, controlFree, inputObject } from "./guards";
-import { type AgentId, agentId, type HostId, hostId, type SessionId, sessionId } from "./ids";
-import { PROTOCOL_VERSION } from "./limits";
+import { fail } from "./errors.js";
+import { boundedMap, controlFree, inputObject } from "./guards.js";
+import { type AgentId, agentId, type HostId, hostId, type SessionId, sessionId } from "./ids.js";
+import { PROTOCOL_VERSION } from "./limits.js";
 export type AgentState = "started" | "running" | "completed" | "failed" | "cancelled" | (string & {});
 export interface AgentFrame {
 	v: typeof PROTOCOL_VERSION;

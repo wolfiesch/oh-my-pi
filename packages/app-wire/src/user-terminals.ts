@@ -1,5 +1,5 @@
-import { boundedMap, controlFree, inputObject } from "./guards";
-import { type HostId, hostId, type SessionId, sessionId, type TerminalId, terminalId } from "./ids";
+import { boundedMap, controlFree, inputObject } from "./guards.js";
+import { type HostId, hostId, type SessionId, sessionId, type TerminalId, terminalId } from "./ids.js";
 export interface UserTerminal {
 	terminalId: TerminalId;
 	hostId: HostId;

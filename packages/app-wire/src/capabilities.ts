@@ -1,5 +1,5 @@
-import { fail } from "./errors";
-import { capabilitiesArray, controlFree, inputObject } from "./guards";
+import { fail } from "./errors.js";
+import { capabilitiesArray, controlFree, inputObject } from "./guards.js";
 export const DEVICE_CAPABILITIES = [
 	"sessions.read",
 	"sessions.prompt",

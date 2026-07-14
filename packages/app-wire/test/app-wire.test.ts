@@ -29,7 +29,7 @@ import {
 	TRANSCRIPT_IMAGE_CHUNK_BYTES,
 	TRANSCRIPT_IMAGE_MAX_BYTES,
 	validateCommandDescriptor,
-} from "../src/index.ts";
+} from "../src/index.js";
 
 const root = new URL("../fixtures/v1/", import.meta.url);
 async function fixture(name: string): Promise<unknown> {
@@ -138,6 +138,32 @@ describe("app-wire authority", () => {
 		const cycle: Record<string, unknown> = {};
 		cycle.self = cycle;
 		expect(() => inputObject(cycle)).toThrow(AppWireError);
+	});
+	test("malformed object-key escapes surface as protocol errors", () => {
+		let caught: unknown;
+		try {
+			inputObject(String.raw`{"\uZZZZ":1}`);
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(AppWireError);
+		if (!(caught instanceof AppWireError)) throw new Error("expected an AppWireError");
+		expect(caught.code).toBe("INVALID_JSON");
+	});
+	test("settings preserve __proto__ as an own data property", () => {
+		const metadata = { configured: true, sensitive: false };
+		const result = decodeCommandResult("settings.read", {
+			revision: "revision-1",
+			settings: Object.fromEntries([["__proto__", metadata]]),
+		});
+		const settings = result.settings as Record<string, unknown>;
+		expect(Object.getOwnPropertyDescriptor(settings, "__proto__")).toEqual({
+			value: metadata,
+			enumerable: true,
+			configurable: true,
+			writable: true,
+		});
+		expect(Object.getPrototypeOf(settings)).toBe(Object.prototype);
 	});
 	test("paths and protocol controls are safe", () => {
 		expect(safeRelativePath("src/a.ts")).toBe("src/a.ts");

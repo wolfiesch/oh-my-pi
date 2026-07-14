@@ -86,6 +86,7 @@ const codingAgentBucketPlans: Record<CodingAgentBucket, { label: string; paralle
 // fastembed model absent from CI runners, so they flake/time out under the parallel
 // bucket; run `bun --cwd=packages/mnemopi test` locally instead.
 const fastWorkspacePackages = [
+	"packages/app-wire",
 	"packages/hashline",
 	"packages/wire",
 	"packages/utils",

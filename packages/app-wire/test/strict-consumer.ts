@@ -9,7 +9,7 @@ import {
 	hostId,
 	type ResultFrame,
 	requestId,
-} from "../src/index";
+} from "../src/index.js";
 
 const command: CommandFrame = {
 	v: "omp-app/1",
@@ -18,7 +18,7 @@ const command: CommandFrame = {
 	commandId: commandId("command"),
 	hostId: hostId("host"),
 	command: "session.create",
-	args: {},
+	args: { projectId: "project" },
 };
 const decoded: AppFrame = decodeClientFrame(command);
 const result: ResultFrame = {

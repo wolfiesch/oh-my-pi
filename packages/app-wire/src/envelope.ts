@@ -3,21 +3,21 @@ import {
 	decodeAdditiveServerFrame,
 	decodeTerminalClient,
 	type TerminalClientFrame,
-} from "./additive";
-import { type AgentFrame, decodeAgent } from "./agents";
-import { type AuditFrame, decodeAudit } from "./audit";
-import { type CommandFrame, decodeCommand } from "./command";
-import { type Cursor, decodeCursor } from "./cursor";
-import { type DurableEntry, decodeEntry } from "./entry";
-import { fail } from "./errors";
-import { decodeEvent, type LiveEventFrame } from "./event";
-import { decodeFiles, decodeReview, type FileFrame, type ReviewFrame } from "./files-review";
-import { decodeGap, type GapFrame } from "./gap";
-import { controlFree, inputObject } from "./guards";
-import { type ByeFrame, decodeBye, decodePing, decodePong, type PingFrame, type PongFrame } from "./heartbeat";
-import { decodeHello, decodeWelcome, type HelloFrame, type WelcomeFrame } from "./hello";
-import { type HostId, hostId, type Revision, revision, type SessionId, sessionId } from "./ids";
-import { PROTOCOL_VERSION } from "./limits";
+} from "./additive.js";
+import { type AgentFrame, decodeAgent } from "./agents.js";
+import { type AuditFrame, decodeAudit } from "./audit.js";
+import { type CommandFrame, decodeCommand } from "./command.js";
+import { type Cursor, decodeCursor } from "./cursor.js";
+import { type DurableEntry, decodeEntry } from "./entry.js";
+import { fail } from "./errors.js";
+import { decodeEvent, type LiveEventFrame } from "./event.js";
+import { decodeFiles, decodeReview, type FileFrame, type ReviewFrame } from "./files-review.js";
+import { decodeGap, type GapFrame } from "./gap.js";
+import { controlFree, inputObject } from "./guards.js";
+import { type ByeFrame, decodeBye, decodePing, decodePong, type PingFrame, type PongFrame } from "./heartbeat.js";
+import { decodeHello, decodeWelcome, type HelloFrame, type WelcomeFrame } from "./hello.js";
+import { type HostId, hostId, type Revision, revision, type SessionId, sessionId } from "./ids.js";
+import { PROTOCOL_VERSION } from "./limits.js";
 import {
 	type ConfirmationChallenge,
 	type ConfirmFrame,
@@ -26,11 +26,11 @@ import {
 	decodePairing,
 	type PairingFrame,
 	type PairStartFrame,
-} from "./pairing-confirm";
-import { decodeResult, type ResultFrame } from "./result";
-import { decodeSessions, type SessionsFrame } from "./session-index";
-import { decodeSnapshot, type SessionSnapshotFrame } from "./snapshot";
-import { decodeTerminal, type TerminalFrame } from "./terminal";
+} from "./pairing-confirm.js";
+import { decodeResult, type ResultFrame } from "./result.js";
+import { decodeSessions, type SessionsFrame } from "./session-index.js";
+import { decodeSnapshot, type SessionSnapshotFrame } from "./snapshot.js";
+import { decodeTerminal, type TerminalFrame } from "./terminal.js";
 export interface ErrorFrame {
 	v: typeof PROTOCOL_VERSION;
 	type: "error";

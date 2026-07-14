@@ -1,6 +1,6 @@
-import { fail } from "./errors";
-import { controlFree } from "./guards";
-import { MAX_ID_BYTES } from "./limits";
+import { fail } from "./errors.js";
+import { controlFree } from "./guards.js";
+import { MAX_ID_BYTES } from "./limits.js";
 
 export type HostId = string & { readonly __hostId: unique symbol };
 export type SessionId = string & { readonly __sessionId: unique symbol };

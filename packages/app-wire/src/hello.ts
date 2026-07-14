@@ -1,6 +1,6 @@
-import { type Capabilities, decodeCapabilities, decodeNegotiatedFeatureList } from "./capabilities";
-import { type Cursor, decodeCursor } from "./cursor";
-import { fail } from "./errors";
+import { type Capabilities, decodeCapabilities, decodeNegotiatedFeatureList } from "./capabilities.js";
+import { type Cursor, decodeCursor } from "./cursor.js";
+import { fail } from "./errors.js";
 import {
 	boundedArray,
 	boundedMap,
@@ -8,9 +8,9 @@ import {
 	type DeviceAuthentication,
 	decodeAuthentication,
 	inputObject,
-} from "./guards";
-import { type HostId, hostId, type SessionId, sessionId } from "./ids";
-import { MAX_SAVED_CURSORS, PROTOCOL_VERSION } from "./limits";
+} from "./guards.js";
+import { type HostId, hostId, type SessionId, sessionId } from "./ids.js";
+import { MAX_SAVED_CURSORS, PROTOCOL_VERSION } from "./limits.js";
 export interface ProtocolRange {
 	min: string;
 	max: string;
