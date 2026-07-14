@@ -30,6 +30,7 @@ export const PROTOCOL_FEATURES = [
 	"session.delta",
 	"controller.lease",
 	"prompt.lease",
+	"prompt.images",
 	"agent.lifecycle",
 	"agent.progress",
 	"agent.event",

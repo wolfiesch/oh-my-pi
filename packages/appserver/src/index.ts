@@ -1,6 +1,7 @@
 export * from "./discovery.ts";
 export * from "./idempotency.ts";
 export * from "./identity.ts";
+export * from "./image-upload-store.ts";
 export * from "./operations/index.ts";
 export * from "./projection.ts";
 export * from "./remote/index.ts";

@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
 import { chmod, stat as fsStat, lstat, open, readlink, rename, symlink, unlink } from "node:fs/promises";
@@ -8,11 +9,15 @@ import {
 	type ConfirmationChallenge,
 	type ConfirmFrame,
 	decodeClientFrame,
+	decodeCommandArguments,
 	decodeCursor,
 	decodeSessionPromptArguments,
 	decodeSessionStateResult,
 	type HelloFrame,
 	type HostId,
+	IMAGE_UPLOAD_CHUNK_BYTES,
+	type ImageId,
+	type PromptImageMimeType,
 	parseBounded,
 	projectId,
 	type ResultFrame,
@@ -23,6 +28,7 @@ import {
 	type SessionStateResult,
 	utf8ByteLength,
 } from "@oh-my-pi/app-wire";
+import type { RpcResponse } from "../../coding-agent/src/modes/rpc/rpc-types.ts";
 import { completeAttachOutput, prepareAttachOutput } from "./attach-output.ts";
 import { AppserverCommandHandlers } from "./command-handler.ts";
 import {
@@ -34,6 +40,7 @@ import {
 } from "./discovery.ts";
 import { IdempotencyStore } from "./idempotency.ts";
 import { createEpoch, createHostId, defaultSocketPath, loadPersistentHostId, unixSocketActive } from "./identity.ts";
+import { ImageUploadError, ImageUploadStore } from "./image-upload-store.ts";
 import {
 	commandFeature,
 	DesktopOperationDispatcher,
@@ -85,6 +92,7 @@ const ARCHIVED_SESSION_COMMANDS = new Set([
 	"review.read",
 ]);
 const SESSION_LIFECYCLE_COMMANDS = new Set(["session.close", "session.archive", "session.restore", "session.delete"]);
+const IMAGE_UPLOAD_COMMANDS = new Set(["session.image.begin", "session.image.chunk", "session.image.discard"]);
 const DIRECT_SESSION_RPC_COMMANDS: ReadonlySet<string> = new Set([
 	"session.retry",
 	"session.pause",
@@ -326,7 +334,7 @@ export function appserverSupportedFeatures(
 	includeRemotePolicy = false,
 ): string[] {
 	const unsupportedAdditiveFeatures = new Set(["host.watch", "session.watch"]);
-	const implementedFeatures = new Set<string>(["resume"]);
+	const implementedFeatures = new Set<string>(["resume", "prompt.images"]);
 	if (includeRemotePolicy) {
 		implementedFeatures.add("controller.lease");
 		implementedFeatures.add("prompt.lease");
@@ -365,6 +373,7 @@ export class LocalAppserver implements AppserverHandle {
 	#authority?: SessionAuthority;
 	#operations?: DesktopOperationDispatcher;
 	#factory: RpcChildFactory;
+	#imageUploads: ImageUploadStore;
 	#lockCheck: LockCheckHook;
 	#ringSize: number;
 	#lifecycleQuiesceTimeoutMs: number;
@@ -383,10 +392,12 @@ export class LocalAppserver implements AppserverHandle {
 	#inflightSessionOperations = new Map<SessionId, number>();
 	#closedSessions = new Set<SessionId>();
 	#idempotency = new IdempotencyStore();
+	#connectionIdempotency = new Map<AppWs, IdempotencyStore>();
 	#server?: Bun.Server<ServerWebSocketData>;
 	#clients = new Set<AppWs>();
 	#hello = new Set<AppWs>();
 	#clientCapabilities = new Map<AppWs, Set<string>>();
+	#clientFeatures = new Map<AppWs, Set<string>>();
 	#attached = new Map<AppWs, Set<SessionId>>();
 	#deviceIds = new Map<AppWs, string>();
 	#abortControllers = new Map<AppWs, Set<AbortController>>();
@@ -439,7 +450,8 @@ export class LocalAppserver implements AppserverHandle {
 			: undefined;
 		this.#projectRootForProject = options.projectRootForProject;
 		this.#discovery = options.discovery ?? options.sessionAuthority ?? { list: async () => [] };
-		this.#factory = options.childFactory ?? new BunRpcChildFactory();
+		this.#imageUploads = new ImageUploadStore({ root: `${this.socketPath}.images` });
+		this.#factory = options.childFactory ?? new BunRpcChildFactory(undefined, this.#imageUploads.root);
 		this.#lockCheck = options.lockCheck ?? (() => undefined);
 		this.#ringSize = options.ringSize ?? 256;
 		this.#lifecycleQuiesceTimeoutMs = options.lifecycleQuiesceTimeoutMs ?? 2_000;
@@ -516,6 +528,7 @@ export class LocalAppserver implements AppserverHandle {
 		this.#ownerId = ownerId;
 		this.#ownerPaths = paths;
 		try {
+			await this.#imageUploads.start();
 			await this.preparePublic(paths);
 			this.#server = Bun.serve<ServerWebSocketData>({
 				unix: paths.backingPath,
@@ -529,9 +542,11 @@ export class LocalAppserver implements AppserverHandle {
 						this.#localTransports.set(ws, transport);
 						this.#clients.add(transport);
 						this.#clientCapabilities.set(transport, new Set());
+						this.#clientFeatures.set(transport, new Set());
 						this.#attached.set(transport, new Set());
 						this.#deviceIds.set(transport, transport.deviceId);
 						this.#abortControllers.set(transport, new Set());
+						this.#connectionIdempotency.set(transport, new IdempotencyStore());
 					},
 					message: (ws, message) => {
 						const transport = this.#localTransports.get(ws);
@@ -592,61 +607,69 @@ export class LocalAppserver implements AppserverHandle {
 				}
 			}
 		} catch (error) {
-			await this.cleanupPartial();
+			try {
+				await this.cleanupPartial();
+			} finally {
+				await this.#imageUploads.stop().catch(() => undefined);
+			}
 			throw error;
 		}
 	}
 	async stop(): Promise<void> {
 		if (!this.#started && !this.#server && !this.#ownerLock && this.#startPromises.size === 0) return;
 		this.#stopping = true;
-		await this.#remoteListener?.stop();
-		this.#remoteListener = undefined;
-		await Promise.all(
-			[...this.#clients].map(async ws => {
-				for (const controller of this.#abortControllers.get(ws) ?? []) controller.abort();
-				await this.disconnectClient(ws);
-				ws.close(1001, "server stopping");
-			}),
-		);
-		const server = this.#server;
-		this.#server = undefined;
-		let displaced: string | undefined;
-		if (this.#runIdentity) {
-			const current = await statIdentity(this.#runIdentity.paths.backingPath);
-			if (current && !sameIdentity(current, this.#runIdentity.record)) {
-				displaced = join(
-					this.#runIdentity.paths.directory,
-					`.appserver-displaced-${this.#runIdentity.record.ownerId}-${randomUUID()}`,
-				);
-				await rename(this.#runIdentity.paths.backingPath, displaced);
+		try {
+			await this.#remoteListener?.stop();
+			this.#remoteListener = undefined;
+			await Promise.all(
+				[...this.#clients].map(async ws => {
+					for (const controller of this.#abortControllers.get(ws) ?? []) controller.abort();
+					await this.disconnectClient(ws);
+					ws.close(1001, "server stopping");
+				}),
+			);
+			const server = this.#server;
+			this.#server = undefined;
+			let displaced: string | undefined;
+			if (this.#runIdentity) {
+				const current = await statIdentity(this.#runIdentity.paths.backingPath);
+				if (current && !sameIdentity(current, this.#runIdentity.record)) {
+					displaced = join(
+						this.#runIdentity.paths.directory,
+						`.appserver-displaced-${this.#runIdentity.record.ownerId}-${randomUUID()}`,
+					);
+					await rename(this.#runIdentity.paths.backingPath, displaced);
+				}
 			}
-		}
-		server?.stop(true);
-		if (displaced) {
-			try {
-				await rename(displaced, this.#runIdentity?.paths.backingPath ?? "");
-			} catch (error) {
-				process.emitWarning(error instanceof Error ? error.message : String(error));
+			server?.stop(true);
+			if (displaced) {
+				try {
+					await rename(displaced, this.#runIdentity?.paths.backingPath ?? "");
+				} catch (error) {
+					process.emitWarning(error instanceof Error ? error.message : String(error));
+				}
 			}
+			for (const supervisor of this.#supervisors.values()) supervisor.stop();
+			this.#supervisors.clear();
+			this.#promptLifecycles.clear();
+			this.#stateRefreshGenerations.clear();
+			this.#transcripts.clear();
+			this.#subagents.clear();
+			await Promise.allSettled([...this.#startPromises.values()]);
+			this.#startPromises.clear();
+			this.#started = false;
+			const identity = this.#runIdentity;
+			if (identity) await this.cleanupOwned(identity);
+			else await this.cleanupPartial();
+			this.#runIdentity = undefined;
+			this.#ownerLock = false;
+			this.#ownerId = undefined;
+			this.#ownerPaths = undefined;
+			await this.#ownerHandle?.close();
+			this.#ownerHandle = undefined;
+		} finally {
+			await this.#imageUploads.stop();
 		}
-		for (const supervisor of this.#supervisors.values()) supervisor.stop();
-		this.#supervisors.clear();
-		this.#promptLifecycles.clear();
-		this.#stateRefreshGenerations.clear();
-		this.#transcripts.clear();
-		this.#subagents.clear();
-		await Promise.allSettled([...this.#startPromises.values()]);
-		this.#startPromises.clear();
-		this.#started = false;
-		const identity = this.#runIdentity;
-		if (identity) await this.cleanupOwned(identity);
-		else await this.cleanupPartial();
-		this.#runIdentity = undefined;
-		this.#ownerLock = false;
-		this.#ownerId = undefined;
-		this.#ownerPaths = undefined;
-		await this.#ownerHandle?.close();
-		this.#ownerHandle = undefined;
 	}
 	private async recoverStale(
 		paths: OwnerPaths,
@@ -823,8 +846,14 @@ export class LocalAppserver implements AppserverHandle {
 					message: "unknown command",
 				}),
 			};
-		const requiredFeature = commandFeature(command.command);
-		if (requiredFeature)
+		const promptHasImages =
+			command.command === "session.prompt" &&
+			command.args !== null &&
+			typeof command.args === "object" &&
+			!Array.isArray(command.args) &&
+			Object.hasOwn(command.args, "images");
+		const requiredFeature = commandFeature(command.command) ?? (promptHasImages ? "prompt.images" : undefined);
+		if (requiredFeature && (!ws || !this.#clientFeatures.get(ws)?.has(requiredFeature)))
 			return {
 				frame: response(this.hostId, command, false, undefined, {
 					code: "UNSUPPORTED_FEATURE",
@@ -858,7 +887,16 @@ export class LocalAppserver implements AppserverHandle {
 					message: "session is not indexed",
 				}),
 			};
-		const check = this.#idempotency.begin(command.commandId, command);
+		const idempotency =
+			ws && IMAGE_UPLOAD_COMMANDS.has(command.command) ? this.#connectionIdempotency.get(ws) : this.#idempotency;
+		if (!idempotency)
+			return {
+				frame: response(this.hostId, command, false, undefined, {
+					code: "connection_closed",
+					message: "image upload connection is closed",
+				}),
+			};
+		const check = idempotency.begin(command.commandId, command);
 		if (check.kind === "replay")
 			return {
 				frame: { ...check.outcome.frame, requestId: command.requestId } as ServerFrame,
@@ -877,68 +915,101 @@ export class LocalAppserver implements AppserverHandle {
 			};
 		const invalidArgs = argumentError(command);
 		if (invalidArgs)
-			return this.finish(command, {
-				frame: response(this.hostId, command, false, undefined, { code: "invalid_frame", message: invalidArgs }),
-			});
+			return this.finish(
+				command,
+				{
+					frame: response(this.hostId, command, false, undefined, { code: "invalid_frame", message: invalidArgs }),
+				},
+				idempotency,
+			);
+		const promptArguments =
+			command.command === "session.prompt" ? decodeSessionPromptArguments(command.args) : undefined;
 		if (descriptor.revision === "required" && command.expectedRevision === undefined)
-			return this.finish(command, {
-				frame: response(this.hostId, command, false, undefined, {
-					code: "stale_revision",
-					message: "expectedRevision is required",
-				}),
-			});
+			return this.finish(
+				command,
+				{
+					frame: response(this.hostId, command, false, undefined, {
+						code: "stale_revision",
+						message: "expectedRevision is required",
+					}),
+				},
+				idempotency,
+			);
 		if (descriptor.revision === "none" && command.expectedRevision !== undefined)
-			return this.finish(command, {
-				frame: response(this.hostId, command, false, undefined, {
-					code: "stale_revision",
-					message: "expectedRevision is forbidden",
-				}),
-			});
+			return this.finish(
+				command,
+				{
+					frame: response(this.hostId, command, false, undefined, {
+						code: "stale_revision",
+						message: "expectedRevision is forbidden",
+					}),
+				},
+				idempotency,
+			);
 		if (descriptor.scope === "session" && !projection)
-			return this.finish(command, {
-				frame: response(this.hostId, command, false, undefined, {
-					code: "unknown_session",
-					message: "session is not indexed",
-				}),
-			});
+			return this.finish(
+				command,
+				{
+					frame: response(this.hostId, command, false, undefined, {
+						code: "unknown_session",
+						message: "session is not indexed",
+					}),
+				},
+				idempotency,
+			);
 		if (
 			descriptor.revisionOwner === "session" &&
 			command.expectedRevision !== undefined &&
 			projection &&
 			command.expectedRevision !== projection.value.revision
 		)
-			return this.finish(command, {
-				frame: response(this.hostId, command, false, undefined, {
-					code: "stale_revision",
-					message: "session revision is stale",
-					details: { expectedRevision: command.expectedRevision, actualRevision: projection.value.revision },
-				}),
-			});
+			return this.finish(
+				command,
+				{
+					frame: response(this.hostId, command, false, undefined, {
+						code: "stale_revision",
+						message: "session revision is stale",
+						details: { expectedRevision: command.expectedRevision, actualRevision: projection.value.revision },
+					}),
+				},
+				idempotency,
+			);
 		if (
 			command.sessionId &&
 			this.sessionArchived(command.sessionId) &&
 			!ARCHIVED_SESSION_COMMANDS.has(command.command)
 		)
-			return this.finish(command, {
-				frame: response(this.hostId, command, false, undefined, {
-					code: "session_archived",
-					message: "archived sessions are read-only; restore the session to continue work",
-				}),
-			});
+			return this.finish(
+				command,
+				{
+					frame: response(this.hostId, command, false, undefined, {
+						code: "session_archived",
+						message: "archived sessions are read-only; restore the session to continue work",
+					}),
+				},
+				idempotency,
+			);
 		const trackSessionOperation = Boolean(command.sessionId && !SESSION_LIFECYCLE_COMMANDS.has(command.command));
 		if (trackSessionOperation && !this.beginSessionOperation(command.sessionId!))
-			return this.finish(command, {
-				frame: response(this.hostId, command, false, undefined, {
-					code: "session_busy",
-					message: "session lifecycle mutation is in progress",
-				}),
-			});
+			return this.finish(
+				command,
+				{
+					frame: response(this.hostId, command, false, undefined, {
+						code: "session_busy",
+						message: "session lifecycle mutation is in progress",
+					}),
+				},
+				idempotency,
+			);
 		const controller = new AbortController();
 		if (ws) this.#abortControllers.get(ws)?.add(controller);
 		let outcome: CommandOutcome;
 		let promptLifecycle: PromptLifecycle | undefined;
 		try {
-			const registered = await this.#handlers.dispatch(command);
+			// Upload commands are connection-owned. Avoid yielding before their
+			// spool operation is queued so disconnect cleanup cannot run first and
+			// leave a late upload behind for a dead connection.
+			const registered = this.#handlers.has(command.command) ? await this.#handlers.dispatch(command) : undefined;
 			if (registered) outcome = registered;
 			else if (command.command === "host.list" || command.command === "session.list")
 				outcome = {
@@ -957,6 +1028,52 @@ export class LocalAppserver implements AppserverHandle {
 					frame: response(this.hostId, command, true, { attached: true, cursor: attachOutput.baseline }),
 					attachOutput,
 				};
+			} else if (command.command === "session.image.begin") {
+				if (!ws) throw new ImageUploadError("image_invalid", "image upload requires a live connection");
+				if (controller.signal.aborted)
+					throw new ImageUploadError("connection_closed", "image upload connection is closed");
+				const args = decodeCommandArguments(command.command, command.args);
+				const begun = await this.#imageUploads.begin({
+					connectionId: ws.connectionId,
+					sessionId: command.sessionId!,
+					mimeType: args.mimeType as PromptImageMimeType,
+					size: args.size as number,
+					sha256: args.sha256 as string,
+				});
+				outcome = {
+					frame: response(this.hostId, command, true, {
+						imageId: begun.imageId,
+						chunkBytes: IMAGE_UPLOAD_CHUNK_BYTES,
+					}),
+				};
+			} else if (command.command === "session.image.chunk") {
+				if (!ws) throw new ImageUploadError("image_invalid", "image upload requires a live connection");
+				if (controller.signal.aborted)
+					throw new ImageUploadError("connection_closed", "image upload connection is closed");
+				const args = decodeCommandArguments(command.command, command.args);
+				const content = args.content as string;
+				const data = Buffer.from(content, "base64");
+				if (data.toString("base64") !== content)
+					throw new ImageUploadError("image_invalid", "image chunk content is not canonical base64");
+				const progress = await this.#imageUploads.chunk({
+					connectionId: ws.connectionId,
+					sessionId: command.sessionId!,
+					imageId: args.imageId as ImageId,
+					offset: args.offset as number,
+					data,
+				});
+				outcome = { frame: response(this.hostId, command, true, progress) };
+			} else if (command.command === "session.image.discard") {
+				if (!ws) throw new ImageUploadError("image_invalid", "image upload requires a live connection");
+				if (controller.signal.aborted)
+					throw new ImageUploadError("connection_closed", "image upload connection is closed");
+				const args = decodeCommandArguments(command.command, command.args);
+				const discarded = await this.#imageUploads.discard(
+					ws.connectionId,
+					command.sessionId!,
+					args.imageId as ImageId,
+				);
+				outcome = { frame: response(this.hostId, command, true, { discarded }) };
 			} else if (command.command === "session.state.get") {
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
 				const state = await this.refreshState(
@@ -1089,15 +1206,26 @@ export class LocalAppserver implements AppserverHandle {
 					promptLifecycle = lifecycle;
 					this.#promptLifecycles.set(command.sessionId!, lifecycle);
 					this.updateStatus(command.sessionId!, "active");
-					const result = await supervisor.prompt(
-						command.requestId,
-						decodeSessionPromptArguments(command.args).message,
-						controller.signal,
-						internalId => {
-							if (this.#promptLifecycles.get(command.sessionId!) === lifecycle)
-								lifecycle.internalId = internalId;
-						},
-					);
+					const managedImages = promptArguments?.images
+						? await this.#imageUploads.consume(ws!.connectionId, command.sessionId!, promptArguments.images)
+						: undefined;
+					let result: RpcResponse;
+					try {
+						result = await supervisor.prompt(
+							command.requestId,
+							promptArguments!.message,
+							// A managed spool is released only after the child response proves
+							// the child opened and validated it. Disconnect must not short-circuit that acknowledgement.
+							managedImages ? undefined : controller.signal,
+							internalId => {
+								if (this.#promptLifecycles.get(command.sessionId!) === lifecycle)
+									lifecycle.internalId = internalId;
+							},
+							managedImages,
+						);
+					} finally {
+						if (managedImages) await this.#imageUploads.release(managedImages);
+					}
 					if (!result.success || childAgentInvoked(result) === false) {
 						if (this.releasePromptLifecycle(command.sessionId!, lifecycle))
 							this.updateStatus(command.sessionId!, "idle");
@@ -1155,6 +1283,7 @@ export class LocalAppserver implements AppserverHandle {
 				!this.#closedSessions.has(command.sessionId!)
 			)
 				this.updateStatus(command.sessionId!, "idle");
+			const imageError = error instanceof ImageUploadError ? error : undefined;
 			const operation =
 				this.#operations &&
 				ws &&
@@ -1167,8 +1296,9 @@ export class LocalAppserver implements AppserverHandle {
 					"session.list",
 					"host.list",
 				].includes(command.command);
-			const code =
-				command.command === "session.ui.respond"
+			const code = imageError
+				? imageError.code
+				: command.command === "session.ui.respond"
 					? "ui_request_invalid"
 					: operation && error && typeof error === "object" && "code" in error && typeof error.code === "string"
 						? error.code
@@ -1176,15 +1306,15 @@ export class LocalAppserver implements AppserverHandle {
 			outcome = {
 				frame: response(this.hostId, command, false, undefined, {
 					code,
-					message: operation ? "operation failed" : "command failed",
+					message: imageError?.message ?? (operation ? "operation failed" : "command failed"),
 				}),
-				unknown: !operation,
+				unknown: !operation && !imageError,
 			};
 		} finally {
 			if (ws) this.#abortControllers.get(ws)?.delete(controller);
 			if (trackSessionOperation) this.endSessionOperation(command.sessionId!);
 		}
-		return this.finish(command, outcome);
+		return this.finish(command, outcome, idempotency);
 	}
 	private async createSession(args: Record<string, unknown>): Promise<Record<string, unknown>> {
 		if (!this.#authority) throw new Error("session creation is unavailable");
@@ -1234,6 +1364,7 @@ export class LocalAppserver implements AppserverHandle {
 			const projection = this.#projections.get(sessionId)!;
 			alreadyExplicitlyClosed = this.#closedSessions.has(sessionId) && projection.value.ref.status === "closed";
 			this.#closedSessions.add(sessionId);
+			await this.#imageUploads.cleanupSession(sessionId);
 			const pending = this.#startPromises.get(sessionId);
 			if (pending) await pending.catch(() => undefined);
 			supervisor = this.#supervisors.get(sessionId);
@@ -1446,6 +1577,7 @@ export class LocalAppserver implements AppserverHandle {
 				};
 			}
 			const archivedAt = this.#clock.now().toISOString();
+			await this.#imageUploads.cleanupSession(sessionId);
 			await this.#authority.archive(record, archivedAt);
 			record.archivedAt = archivedAt;
 			await this.broadcastAttachedOrdered(
@@ -1482,6 +1614,7 @@ export class LocalAppserver implements AppserverHandle {
 			const projection = this.#projections.get(sessionId)!;
 			const record = this.#records.get(sessionId)!;
 			if (!record.archivedAt) return { frame: response(this.hostId, command, true, { restored: true }) };
+			await this.#imageUploads.cleanupSession(sessionId);
 			await this.#authority.restore(record);
 			delete record.archivedAt;
 			await this.broadcastAttachedOrdered(sessionId, projection.appendEvent({ type: "session_restored" }));
@@ -1520,6 +1653,7 @@ export class LocalAppserver implements AppserverHandle {
 				return this.lifecycleBusyOutcome(command, "session runtime did not stop cleanly");
 			const finalGuard = await this.deletePreflight(command, true);
 			if (finalGuard) return this.lifecycleFailureOutcome(command, finalGuard);
+			await this.#imageUploads.cleanupSession(sessionId);
 			await this.#authority!.delete(record);
 			await this.broadcastAttachedOrdered(sessionId, projection.appendEvent({ type: "session_deleted" }));
 			await this.broadcastIndex(projection.remove());
@@ -1543,10 +1677,10 @@ export class LocalAppserver implements AppserverHandle {
 			this.#lifecycleMutations.delete(sessionId);
 		}
 	}
-	private finish(command: CommandFrame, outcome: CommandOutcome): CommandOutcome {
+	private finish(command: CommandFrame, outcome: CommandOutcome, idempotency: IdempotencyStore): CommandOutcome {
 		const cached: CommandOutcome = { ...outcome };
 		delete cached.attachOutput;
-		this.#idempotency.complete(command.commandId, command, cached);
+		idempotency.complete(command.commandId, command, cached);
 		return outcome;
 	}
 	private releasePromptLifecycle(sessionId: SessionId, lifecycle?: PromptLifecycle): boolean {
@@ -1995,15 +2129,18 @@ export class LocalAppserver implements AppserverHandle {
 				/* owner cleanup is best effort; registry always releases */
 			}
 		}
+		await this.#imageUploads.cleanupConnection(ws.connectionId);
 		this.#clients.delete(ws);
 		this.#hello.delete(ws);
 		this.#clientCapabilities.delete(ws);
+		this.#clientFeatures.delete(ws);
 		this.#attached.delete(ws);
 		this.#deviceIds.delete(ws);
 		this.#abortControllers.delete(ws);
 		this.#remoteDecisions.delete(ws);
 		this.#remoteConnections.delete(ws);
 		this.#remoteTransports.delete(ws.connectionId);
+		this.#connectionIdempotency.delete(ws);
 		for (const [socket, transport] of this.#localTransports)
 			if (transport === ws) this.#localTransports.delete(socket);
 	}
@@ -2017,9 +2154,13 @@ export class LocalAppserver implements AppserverHandle {
 		const grantedCapabilities = [...this.#supportedCapabilities].filter(
 			capability => requestedCapabilities.has(capability) && capabilityCeiling.has(capability),
 		);
-		this.#clientCapabilities.set(ws, new Set(grantedCapabilities));
 		const supportedFeatures = ws.remote ? this.#remoteSupportedFeatures : this.#supportedFeatures;
 		const featureCeiling = decision?.grantedFeatures ? new Set(decision.grantedFeatures) : supportedFeatures;
+		const grantedFeatures = frame.requestedFeatures.filter(
+			feature => supportedFeatures.has(feature) && featureCeiling.has(feature),
+		);
+		this.#clientCapabilities.set(ws, new Set(grantedCapabilities));
+		this.#clientFeatures.set(ws, new Set(grantedFeatures));
 		const welcome = {
 			v: "omp-app/1",
 			type: "welcome",
@@ -2031,9 +2172,7 @@ export class LocalAppserver implements AppserverHandle {
 			appserverBuild: this.#appserverBuild,
 			epoch: this.epoch,
 			grantedCapabilities,
-			grantedFeatures: frame.requestedFeatures.filter(
-				feature => supportedFeatures.has(feature) && featureCeiling.has(feature),
-			),
+			grantedFeatures,
 			negotiatedLimits: { maxPayloadLength: 1024 * 1024, ringSize: this.#ringSize },
 			authentication: decision?.authentication ?? (ws.remote ? "remote" : "local"),
 			resumed: frame.savedCursors.some(
@@ -2086,9 +2225,11 @@ export class LocalAppserver implements AppserverHandle {
 		this.#remoteTransports.set(transport.connectionId, transport);
 		this.#clients.add(transport);
 		this.#clientCapabilities.set(transport, new Set());
+		this.#clientFeatures.set(transport, new Set());
 		this.#attached.set(transport, new Set());
 		this.#deviceIds.set(transport, transport.deviceId);
 		this.#abortControllers.set(transport, new Set());
+		this.#connectionIdempotency.set(transport, new IdempotencyStore());
 	}
 	async #remoteMessage(connection: RemoteConnection, message: string | Uint8Array): Promise<void> {
 		const transport = this.#remoteTransports.get(connection.connectionId);
@@ -2169,6 +2310,7 @@ export class LocalAppserver implements AppserverHandle {
 				this.#createdPending.delete(sessionId);
 				const projection = this.#projections.get(sessionId);
 				if (projection) await this.broadcastIndex(projection.remove());
+				await this.#imageUploads.cleanupSession(sessionId);
 				this.#records.delete(sessionId);
 				this.#projections.delete(sessionId);
 				this.#stateRefreshGenerations.delete(sessionId);
@@ -2182,6 +2324,7 @@ export class LocalAppserver implements AppserverHandle {
 				if (!(await this.quiesceSessionRuntime(sessionId))) continue;
 				const projection = this.#projections.get(sessionId);
 				if (projection) await this.broadcastIndex(projection.remove());
+				await this.#imageUploads.cleanupSession(sessionId);
 				this.#records.delete(sessionId);
 				this.#projections.delete(sessionId);
 				this.#closedSessions.delete(sessionId);

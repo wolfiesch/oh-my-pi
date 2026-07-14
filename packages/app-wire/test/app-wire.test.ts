@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	ADDITIVE_FEATURES,
 	APP_WIRE_VERSION,
 	AppWireError,
 	COMMAND_ARGUMENT_DECODERS,
@@ -14,11 +15,14 @@ import {
 	decodeEntry,
 	decodeServerFrame,
 	decodeSessionListResult,
+	IMAGE_UPLOAD_CHUNK_BYTES,
 	inputObject,
 	isServerFrame,
 	MAX_FILE_BYTES,
 	MAX_INPUT_BYTES,
 	MAX_MAP_KEYS,
+	PROMPT_IMAGE_MAX_COUNT,
+	PROTOCOL_FEATURES,
 	safeRelativePath,
 	sameSession,
 	validateCommandDescriptor,
@@ -285,7 +289,7 @@ describe("app-wire authority", () => {
 			true,
 		);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
-		expect(APP_WIRE_VERSION).toBe("0.5.3");
+		expect(APP_WIRE_VERSION).toBe("0.5.4");
 	});
 	test("welcome identity requires every version and build field", async () => {
 		const welcome = (await fixture("welcome.json")) as Record<string, unknown>;
@@ -522,6 +526,9 @@ describe("app-wire authority", () => {
 	test("every descriptor declares an exhaustive revision owner", () => {
 		const expected: Record<string, string> = {
 			"session.prompt": "session",
+			"session.image.begin": "none",
+			"session.image.chunk": "none",
+			"session.image.discard": "none",
 			"session.cancel": "session",
 			"session.close": "session",
 			"agent.cancel": "session",
@@ -816,6 +823,93 @@ describe("app-wire authority", () => {
 		expect(() =>
 			decodeCommandArguments("settings.write", { values: Array.from({ length: 1001 }, () => true) }),
 		).toThrow(AppWireError);
+	});
+	test("managed prompt images have strict bounded upload contracts", () => {
+		expect(ADDITIVE_FEATURES).toContain("prompt.images");
+		expect(PROTOCOL_FEATURES).toContain("prompt.images");
+		const id = "123e4567-e89b-42d3-a456-426614174000";
+		const digest = "a".repeat(64);
+		expect(decodeCommandArguments("session.prompt", { message: "", images: [{ imageId: id }] })).toMatchObject({
+			message: "",
+			images: [{ imageId: id }],
+		});
+		expect(() => decodeCommandArguments("session.prompt", { message: "", images: [] })).toThrow(AppWireError);
+		expect(() =>
+			decodeCommandArguments("session.prompt", {
+				message: "images",
+				images: Array.from({ length: PROMPT_IMAGE_MAX_COUNT + 1 }, () => ({ imageId: id })),
+			}),
+		).toThrow(AppWireError);
+		for (const invalid of ["../secret", id.toUpperCase(), "123e4567-e89b-12d3-a456-426614174000"])
+			expect(() =>
+				decodeCommandArguments("session.prompt", { message: "image", images: [{ imageId: invalid }] }),
+			).toThrow(AppWireError);
+
+		expect(
+			decodeCommandArguments("session.image.begin", {
+				mimeType: "image/png",
+				size: 8,
+				sha256: digest,
+			}),
+		).toEqual({ mimeType: "image/png", size: 8, sha256: digest });
+		for (const value of [
+			{ mimeType: "image/svg+xml", size: 8, sha256: digest },
+			{ mimeType: "image/png", size: 0, sha256: digest },
+			{ mimeType: "image/png", size: 8, sha256: digest.toUpperCase() },
+		])
+			expect(() => decodeCommandArguments("session.image.begin", value)).toThrow(AppWireError);
+
+		expect(decodeCommandArguments("session.image.chunk", { imageId: id, offset: 0, content: "AQ==" })).toEqual({
+			imageId: id,
+			offset: 0,
+			content: "AQ==",
+		});
+		for (const content of ["AR==", "AQJ=", "AQ", "%%%%"])
+			expect(() => decodeCommandArguments("session.image.chunk", { imageId: id, offset: 0, content })).toThrow(
+				AppWireError,
+			);
+		expect(() =>
+			decodeCommandArguments("session.image.chunk", {
+				imageId: id,
+				offset: 0,
+				content: Buffer.alloc(IMAGE_UPLOAD_CHUNK_BYTES + 1).toString("base64"),
+			}),
+		).toThrow(AppWireError);
+		expect(decodeCommandArguments("session.image.discard", { imageId: id })).toEqual({ imageId: id });
+		expect(() => decodeCommandArguments("session.image.discard", { imageId: id, extra: true })).toThrow(AppWireError);
+
+		expect(decodeCommandResult("session.image.begin", { imageId: id, chunkBytes: IMAGE_UPLOAD_CHUNK_BYTES })).toEqual(
+			{ imageId: id, chunkBytes: IMAGE_UPLOAD_CHUNK_BYTES },
+		);
+		expect(decodeCommandResult("session.image.chunk", { imageId: id, received: 1, complete: true })).toEqual({
+			imageId: id,
+			received: 1,
+			complete: true,
+		});
+		expect(decodeCommandResult("session.image.discard", { discarded: true })).toEqual({ discarded: true });
+		expect(() => decodeCommandResult("session.image.discard", { discarded: true, extra: true })).toThrow(
+			AppWireError,
+		);
+		expect(() =>
+			decodeCommandResult("session.image.begin", {
+				imageId: id,
+				chunkBytes: IMAGE_UPLOAD_CHUNK_BYTES,
+				extra: true,
+			}),
+		).toThrow(AppWireError);
+
+		const frame = {
+			v: "omp-app/1",
+			type: "command",
+			requestId: "request",
+			commandId: "command",
+			hostId: "host",
+			sessionId: "session",
+			command: "session.image.begin",
+			args: { mimeType: "image/png", size: 8, sha256: digest },
+		};
+		expect(() => decodeClientFrame(frame)).not.toThrow();
+		expect(() => decodeClientFrame({ ...frame, expectedRevision: "revision" })).toThrow(AppWireError);
 	});
 	test("session identity remains host scoped", () => {
 		expect(

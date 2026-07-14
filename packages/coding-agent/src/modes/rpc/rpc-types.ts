@@ -26,7 +26,15 @@ import type { TodoPhase } from "../../tools/todo";
 
 export type RpcCommand =
 	// Prompting
-	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
+	| {
+			id?: string;
+			type: "prompt";
+			message: string;
+			images?: ImageContent[];
+			/** Managed appserver-only image handles rooted by OMP_APP_RPC_IMAGE_ROOT. */
+			appImageRefs?: RpcManagedImageRef[];
+			streamingBehavior?: "steer" | "followUp";
+	  }
 	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "abort" }
@@ -95,6 +103,13 @@ export type RpcCommand =
 	// Login
 	| { id?: string; type: "get_login_providers" }
 	| { id?: string; type: "login"; providerId: string };
+
+export interface RpcManagedImageRef {
+	readonly imageId: string;
+	readonly mimeType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+	readonly size: number;
+	readonly sha256: string;
+}
 
 // ============================================================================
 // RPC State

@@ -1,6 +1,7 @@
 import { dirname, resolve } from "node:path";
 import { parseBounded } from "@oh-my-pi/app-wire";
 import type { RpcResponse, RpcSessionEntryFrame } from "../../coding-agent/src/modes/rpc/rpc-types.ts";
+import type { ManagedRpcImageRef } from "./image-upload-store.ts";
 import type { ChildHandle, RpcChildFactory, SessionRecord } from "./types.ts";
 
 const MAX_LINE_BYTES = 1024 * 1024;
@@ -40,8 +41,9 @@ export function resolveRpcChildInvocation(overrides: RpcChildInvocationOverrides
 export class BunRpcChildFactory implements RpcChildFactory {
 	#executable: string;
 	#prefixArgv: readonly string[];
+	#imageRoot: string | undefined;
 
-	constructor(invocation: string | RpcChildInvocation = resolveRpcChildInvocation()) {
+	constructor(invocation: string | RpcChildInvocation = resolveRpcChildInvocation(), imageRoot?: string) {
 		const resolved = typeof invocation === "string" ? { executable: invocation, prefixArgv: [] } : invocation;
 		if (typeof resolved.executable !== "string" || resolved.executable.trim().length === 0) {
 			throw new Error("rpc child executable is empty");
@@ -54,12 +56,19 @@ export class BunRpcChildFactory implements RpcChildFactory {
 		}
 		this.#executable = resolved.executable;
 		this.#prefixArgv = Object.freeze([...resolved.prefixArgv]);
+		this.#imageRoot = imageRoot;
 	}
 
 	spawn(spec: { session: SessionRecord; argv: string[]; cwd: string }): ChildHandle {
 		const child = Bun.spawn(spec.argv, {
 			cwd: spec.cwd,
-			env: { ...process.env, OMP_APP_SUBAGENT_SUBSCRIPTION: "progress" },
+			env: {
+				...process.env,
+				OMP_APP_RPC_INLINE_IMAGE_DATA: "omit",
+				OMP_APP_RPC_SESSION_ENTRIES: "1",
+				OMP_APP_SUBAGENT_SUBSCRIPTION: "progress",
+				...(this.#imageRoot ? { OMP_APP_RPC_IMAGE_ROOT: this.#imageRoot } : {}),
+			},
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -215,8 +224,14 @@ export class RpcChildSupervisor {
 		message: string,
 		signal?: AbortSignal,
 		onDispatched?: (internalId: string) => void,
+		appImageRefs?: readonly ManagedRpcImageRef[],
 	): Promise<RpcResponse> {
-		return this.call({ type: "prompt", message }, id, signal, onDispatched);
+		return this.call(
+			{ type: "prompt", message, ...(appImageRefs ? { appImageRefs } : {}) },
+			id,
+			signal,
+			onDispatched,
+		);
 	}
 	async cancel(id: string): Promise<RpcResponse> {
 		return this.call({ type: "abort" }, id);

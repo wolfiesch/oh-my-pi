@@ -20,6 +20,8 @@ import {
 	confirmationId,
 	type HostId,
 	hostId,
+	type ImageId,
+	imageId,
 	type LeaseId,
 	leaseId,
 	projectId,
@@ -31,7 +33,15 @@ import {
 	sessionId,
 	terminalId,
 } from "./ids.ts";
-import { MAX_FILE_BYTES, MAX_STRING_BYTES, PROTOCOL_VERSION } from "./limits.ts";
+import {
+	IMAGE_UPLOAD_CHUNK_BASE64_BYTES,
+	IMAGE_UPLOAD_CHUNK_BYTES,
+	IMAGE_UPLOAD_MAX_BYTES,
+	MAX_FILE_BYTES,
+	MAX_STRING_BYTES,
+	PROMPT_IMAGE_MAX_COUNT,
+	PROTOCOL_VERSION,
+} from "./limits.ts";
 import { decodeSessionListResult, decodeSessionRef, type SessionListResult } from "./session-index.ts";
 import { decodeSessionStateResult } from "./session-state.ts";
 export type RevisionOwner = "none" | "session" | "authority";
@@ -78,6 +88,27 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		scope: "session",
 		revision: "optional",
 		revisionOwner: "session",
+		confirmation: "none",
+	},
+	"session.image.begin": {
+		capability: "sessions.prompt",
+		scope: "session",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "none",
+	},
+	"session.image.chunk": {
+		capability: "sessions.prompt",
+		scope: "session",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "none",
+	},
+	"session.image.discard": {
+		capability: "sessions.prompt",
+		scope: "session",
+		revision: "none",
+		revisionOwner: "none",
 		confirmation: "none",
 	},
 	"session.state.get": {
@@ -428,6 +459,25 @@ export interface CommandFrame {
 export interface SessionPromptArguments {
 	readonly message: string;
 	readonly leaseId?: LeaseId;
+	readonly images?: readonly PromptImageReference[];
+}
+export const PROMPT_IMAGE_MIME_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"] as const;
+export type PromptImageMimeType = (typeof PROMPT_IMAGE_MIME_TYPES)[number];
+export interface PromptImageReference {
+	readonly imageId: ImageId;
+}
+export interface SessionImageBeginArguments {
+	readonly mimeType: PromptImageMimeType;
+	readonly size: number;
+	readonly sha256: string;
+}
+export interface SessionImageChunkArguments {
+	readonly imageId: ImageId;
+	readonly offset: number;
+	readonly content: string;
+}
+export interface SessionImageDiscardArguments {
+	readonly imageId: ImageId;
 }
 export function validateCommandDescriptor(command: string, descriptor: CommandDescriptor): void {
 	const validRevision =
@@ -614,12 +664,72 @@ function decodeSettingsResult(value: unknown): CommandResult {
 export function decodeSessionPromptArguments(value: unknown): SessionPromptArguments {
 	const x = args(value);
 	const keys = Object.keys(x);
-	if (!Object.hasOwn(x, "message") || keys.some(key => key !== "message" && key !== "leaseId"))
-		fail("INVALID_FRAME", "session.prompt accepts only message and optional leaseId", "args");
+	if (!Object.hasOwn(x, "message") || keys.some(key => key !== "message" && key !== "leaseId" && key !== "images"))
+		fail("INVALID_FRAME", "session.prompt accepts only message, leaseId, and images", "args");
 	const message = boundedText(x.message, "args.message", MAX_STRING_BYTES);
-	if (message.length === 0) fail("BOUNDS", "prompt message must be non-empty", "args.message");
+	const images =
+		x.images === undefined
+			? undefined
+			: boundedArray(x.images, "args.images", PROMPT_IMAGE_MAX_COUNT).map((value, index) => {
+					const ref = boundedMap(value, `args.images[${index}]`);
+					if (Object.keys(ref).length !== 1 || !Object.hasOwn(ref, "imageId"))
+						fail("INVALID_FRAME", "image reference must contain only imageId", `args.images[${index}]`);
+					return { imageId: imageId(ref.imageId, `args.images[${index}].imageId`) };
+				});
+	if (images?.length === 0) fail("BOUNDS", "prompt images must not be empty", "args.images");
+	if (message.length === 0 && images === undefined)
+		fail("BOUNDS", "prompt message must be non-empty without images", "args.message");
 	const lease = x.leaseId === undefined ? undefined : leaseId(x.leaseId, "args.leaseId");
-	return lease === undefined ? { message } : { message, leaseId: lease };
+	return {
+		message,
+		...(lease === undefined ? {} : { leaseId: lease }),
+		...(images === undefined ? {} : { images }),
+	};
+}
+function decodeImageMimeType(value: unknown, path: string): PromptImageMimeType {
+	const mimeType = controlFree(value, path, 32);
+	if (!(PROMPT_IMAGE_MIME_TYPES as readonly string[]).includes(mimeType))
+		fail("INVALID_FRAME", "unsupported prompt image MIME type", path);
+	return mimeType as PromptImageMimeType;
+}
+function decodeSha256(value: unknown, path: string): string {
+	const sha256 = controlFree(value, path, 64);
+	if (!/^[a-f0-9]{64}$/u.test(sha256)) fail("INVALID_FRAME", "sha256 must be lowercase hexadecimal", path);
+	return sha256;
+}
+function decodeImageBegin(value: unknown): SessionImageBeginArguments {
+	const x = strictArgs(value, ["mimeType", "size", "sha256"]);
+	const size = x.size;
+	if (typeof size !== "number" || !Number.isSafeInteger(size) || size <= 0 || size > IMAGE_UPLOAD_MAX_BYTES)
+		fail("BOUNDS", "image size exceeds the upload limit", "args.size");
+	return {
+		mimeType: decodeImageMimeType(x.mimeType, "args.mimeType"),
+		size,
+		sha256: decodeSha256(x.sha256, "args.sha256"),
+	};
+}
+function decodeImageChunk(value: unknown): SessionImageChunkArguments {
+	const x = strictArgs(value, ["imageId", "offset", "content"]);
+	const offset = safeSeq(x.offset, "args.offset");
+	if (offset > IMAGE_UPLOAD_MAX_BYTES) fail("BOUNDS", "image chunk offset exceeds the upload limit", "args.offset");
+	const content = boundedText(x.content, "args.content", IMAGE_UPLOAD_CHUNK_BASE64_BYTES);
+	if (content.length === 0 || content.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(content))
+		fail("INVALID_FRAME", "image chunk content must be canonical base64", "args.content");
+	const padding = content.endsWith("==") ? 2 : content.endsWith("=") ? 1 : 0;
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	if (
+		(padding === 2 && (alphabet.indexOf(content[content.length - 3]!) & 0x0f) !== 0) ||
+		(padding === 1 && (alphabet.indexOf(content[content.length - 2]!) & 0x03) !== 0)
+	)
+		fail("INVALID_FRAME", "image chunk content has non-canonical padding bits", "args.content");
+	const decodedBytes = (content.length / 4) * 3 - padding;
+	if (decodedBytes <= 0 || decodedBytes > IMAGE_UPLOAD_CHUNK_BYTES)
+		fail("BOUNDS", "decoded image chunk exceeds the raw chunk limit", "args.content");
+	return { imageId: imageId(x.imageId, "args.imageId"), offset, content };
+}
+function decodeImageDiscard(value: unknown): SessionImageDiscardArguments {
+	const x = strictArgs(value, ["imageId"]);
+	return { imageId: imageId(x.imageId, "args.imageId") };
 }
 function decodeBooleanResult(value: unknown, key: string): CommandResult {
 	const x = result(value);
@@ -656,6 +766,9 @@ export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown)
 		return x;
 	},
 	"session.prompt": value => decodeSessionPromptArguments(value) as unknown as CommandArguments,
+	"session.image.begin": value => decodeImageBegin(value) as unknown as CommandArguments,
+	"session.image.chunk": value => decodeImageChunk(value) as unknown as CommandArguments,
+	"session.image.discard": value => decodeImageDiscard(value) as unknown as CommandArguments,
 	"session.state.get": noArgs,
 	"session.steer": decodeMessage,
 	"session.followUp": decodeMessage,
@@ -838,6 +951,31 @@ export const COMMAND_RESULT_DECODERS: Readonly<Record<string, (value: unknown) =
 	"session.create": decodeCreate,
 	"session.attach": decodeAttach,
 	"session.prompt": value => boolField(value, "accepted"),
+	"session.image.begin": value => {
+		const x = result(value);
+		if (Object.keys(x).length !== 2 || !Object.hasOwn(x, "imageId") || !Object.hasOwn(x, "chunkBytes"))
+			fail("INVALID_FRAME", "invalid image begin result", "result");
+		imageId(x.imageId, "result.imageId");
+		if (x.chunkBytes !== IMAGE_UPLOAD_CHUNK_BYTES)
+			fail("INVALID_FRAME", "image begin result has an invalid chunk size", "result.chunkBytes");
+		return x;
+	},
+	"session.image.chunk": value => {
+		const x = result(value);
+		if (
+			Object.keys(x).length !== 3 ||
+			!Object.hasOwn(x, "imageId") ||
+			!Object.hasOwn(x, "received") ||
+			!Object.hasOwn(x, "complete")
+		)
+			fail("INVALID_FRAME", "invalid image chunk result", "result");
+		imageId(x.imageId, "result.imageId");
+		const received = safeSeq(x.received, "result.received");
+		if (received > IMAGE_UPLOAD_MAX_BYTES) fail("BOUNDS", "received exceeds the upload limit", "result.received");
+		if (typeof x.complete !== "boolean") fail("INVALID_FRAME", "complete must be boolean", "result.complete");
+		return x;
+	},
+	"session.image.discard": value => decodeBooleanResult(value, "discarded"),
 	"session.state.get": decodeSessionState,
 	"session.steer": decodeAcceptedResult,
 	"session.followUp": decodeAcceptedResult,

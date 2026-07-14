@@ -106,6 +106,9 @@ export const COMMAND_FEATURE_BY_COMMAND: Readonly<Record<string, string>> = {
 	"prompt.lease.acquire": "prompt.lease",
 	"prompt.lease.renew": "prompt.lease",
 	"prompt.lease.release": "prompt.lease",
+	"session.image.begin": "prompt.images",
+	"session.image.chunk": "prompt.images",
+	"session.image.discard": "prompt.images",
 };
 
 export function commandFeature(command: string): string | undefined {

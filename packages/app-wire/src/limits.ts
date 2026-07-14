@@ -1,5 +1,5 @@
 export const PROTOCOL_VERSION = "omp-app/1" as const;
-export const APP_WIRE_VERSION = "0.5.3" as const;
+export const APP_WIRE_VERSION = "0.5.4" as const;
 export const MAX_INPUT_BYTES = 1_048_576;
 export const MAX_STRING_BYTES = 65_536;
 export const MAX_ID_BYTES = 256;
@@ -10,5 +10,10 @@ export const MAX_JSON_NODES = 20_000;
 export const MAX_CAPABILITIES = 128;
 export const MAX_TERMINAL_OUTPUT_BYTES = 256_000;
 export const MAX_FILE_BYTES = 768 * 1024;
+/** Raw bytes carried by one base64 image-upload command. */
+export const IMAGE_UPLOAD_CHUNK_BYTES = 256 * 1024;
+export const IMAGE_UPLOAD_CHUNK_BASE64_BYTES = Math.ceil(IMAGE_UPLOAD_CHUNK_BYTES / 3) * 4;
+export const IMAGE_UPLOAD_MAX_BYTES = 20 * 1024 * 1024;
+export const PROMPT_IMAGE_MAX_COUNT = 8;
 export const MAX_SAVED_CURSORS = 128;
 export const MAX_EPOCH_BYTES = 128;

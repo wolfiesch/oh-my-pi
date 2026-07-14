@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decodeServerFrame, entryId, hostId, projectId, type ServerFrame, sessionId } from "@oh-my-pi/app-wire";
@@ -29,13 +30,17 @@ function record(id: string): SessionRecord {
 		entries: [],
 	};
 }
-function hello(capabilities?: string[], authentication = false): Record<string, unknown> {
+function hello(
+	capabilities?: string[],
+	authentication = false,
+	requestedFeatures: string[] = ["resume"],
+): Record<string, unknown> {
 	return {
 		v: "omp-app/1",
 		type: "hello",
 		protocol: { min: "omp-app/1", max: "omp-app/1" },
 		client: { name: "raw-test", version: "1", build: "test", platform: "linux" },
-		requestedFeatures: ["resume"],
+		requestedFeatures,
 		savedCursors: [],
 		...(capabilities ? { capabilities: { client: capabilities } } : {}),
 		...(authentication
@@ -233,13 +238,14 @@ function responseFor(child: LiveChild, command: string, success = true): void {
 async function readyClient(
 	path: string,
 	capabilities?: string[],
+	requestedFeatures?: string[],
 ): Promise<{
 	client: RawUdsWebSocket;
 	welcome: Extract<ServerFrame, { type: "welcome" }>;
 	sessions: Extract<ServerFrame, { type: "sessions" }>;
 }> {
 	const client = await RawUdsWebSocket.connect(path);
-	client.sendJson(hello(capabilities));
+	client.sendJson(hello(capabilities, false, requestedFeatures));
 	const welcome = await client.nextServer();
 	expect(welcome.type).toBe("welcome");
 	const sessions = await client.nextServer();
@@ -328,6 +334,190 @@ async function liveServer(
 }
 
 describe("live Unix websocket protocol", () => {
+	test("keeps managed image spools through disconnect until the child acknowledges reading them", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path, root } = await liveServer(factory, [record("s1")]);
+		const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02]);
+		const sha256 = createHash("sha256").update(png).digest("hex");
+		const unnegotiated = await readyClient(path, ["sessions.read", "sessions.prompt"], ["resume"]);
+		unnegotiated.client.sendJson(
+			command("image-denied", "image-denied", "session.image.begin", "s1", {
+				mimeType: "image/png",
+				size: png.byteLength,
+				sha256,
+			}),
+		);
+		expect((await untilResponse(unnegotiated.client, "image-denied")).response).toMatchObject({
+			ok: false,
+			error: { code: "UNSUPPORTED_FEATURE", details: { feature: "prompt.images" } },
+		});
+		unnegotiated.client.sendJson(
+			command("image-prompt-denied", "image-prompt-denied", "session.prompt", "s1", {
+				message: "image",
+				images: [{ imageId: "123e4567-e89b-42d3-a456-426614174000" }],
+			}),
+		);
+		expect((await untilResponse(unnegotiated.client, "image-prompt-denied")).response).toMatchObject({
+			ok: false,
+			error: { code: "UNSUPPORTED_FEATURE", details: { feature: "prompt.images" } },
+		});
+		await closeClients([unnegotiated.client]);
+
+		const connected = await readyClient(path, ["sessions.read", "sessions.prompt"], ["resume", "prompt.images"]);
+		expect(connected.welcome.grantedFeatures).toContain("prompt.images");
+		connected.client.sendJson(
+			command("image-begin", "image-begin", "session.image.begin", "s1", {
+				mimeType: "image/png",
+				size: png.byteLength,
+				sha256,
+			}),
+		);
+		const begin = (await untilResponse(connected.client, "image-begin")).response;
+		expect(begin.ok).toBe(true);
+		const imageId = (begin.result as { imageId?: string } | undefined)?.imageId;
+		if (!imageId) throw new Error("image begin response omitted imageId");
+		const spool = join(`${path}.images`, imageId);
+		expect((await stat(spool)).mode & 0o777).toBe(0o600);
+
+		connected.client.sendJson(
+			command("image-chunk", "image-chunk", "session.image.chunk", "s1", {
+				imageId,
+				offset: 0,
+				content: png.toString("base64"),
+			}),
+		);
+		expect((await untilResponse(connected.client, "image-chunk")).response).toMatchObject({
+			ok: true,
+			result: { imageId, received: png.byteLength, complete: true },
+		});
+		connected.client.sendJson(
+			command("discard-begin", "discard-begin", "session.image.begin", "s1", {
+				mimeType: "image/png",
+				size: png.byteLength,
+				sha256,
+			}),
+		);
+		const discardBegin = (await untilResponse(connected.client, "discard-begin")).response;
+		const discardId = (discardBegin.result as { imageId?: string } | undefined)?.imageId;
+		if (!discardId) throw new Error("discard fixture omitted imageId");
+		connected.client.sendJson(
+			command("image-discard", "image-discard", "session.image.discard", "s1", { imageId: discardId }),
+		);
+		expect((await untilResponse(connected.client, "image-discard")).response).toMatchObject({
+			ok: true,
+			result: { discarded: true },
+		});
+		connected.client.sendJson(
+			command("image-discard-again", "image-discard-again", "session.image.discard", "s1", {
+				imageId: discardId,
+			}),
+		);
+		expect((await untilResponse(connected.client, "image-discard-again")).response).toMatchObject({
+			ok: true,
+			result: { discarded: false },
+		});
+
+		connected.client.sendJson(
+			command("image-prompt", "image-prompt", "session.prompt", "s1", {
+				message: "",
+				images: [{ imageId }],
+			}),
+		);
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		const childPrompt = JSON.parse(child.writes[0] ?? "{}") as Record<string, unknown>;
+		expect(childPrompt).toMatchObject({
+			type: "prompt",
+			message: "",
+			appImageRefs: [{ imageId, mimeType: "image/png", size: png.byteLength, sha256 }],
+		});
+		expect(JSON.stringify(childPrompt)).not.toContain(png.toString("base64"));
+		expect(await readFile(spool)).toEqual(png);
+
+		connected.client.destroy();
+		await connected.client.closed();
+		await Bun.sleep(5);
+		expect(await readFile(spool)).toEqual(png);
+		responseFor(child, "prompt");
+		let removed = false;
+		for (let attempt = 0; attempt < 100; attempt++) {
+			try {
+				await stat(spool);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+					removed = true;
+					break;
+				}
+				throw error;
+			}
+			await Bun.sleep(5);
+		}
+		expect(removed).toBe(true);
+		await appserver.stop();
+		await rm(root, { recursive: true, force: true });
+	});
+	test("scopes image command idempotency to each connection across reconnects", async () => {
+		const { appserver, path, root } = await liveServer(new LiveFactory(), [record("s1")]);
+		const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02]);
+		const sha256 = createHash("sha256").update(png).digest("hex");
+		const args = { mimeType: "image/png", size: png.byteLength, sha256 };
+		try {
+			const first = await readyClient(path, ["sessions.read", "sessions.prompt"], ["resume", "prompt.images"]);
+			first.client.sendJson(command("first-begin", "reused-begin", "session.image.begin", "s1", args));
+			const firstBegin = (await untilResponse(first.client, "first-begin")).response;
+			const firstImageId = (firstBegin.result as { imageId?: string } | undefined)?.imageId;
+			if (!firstImageId) throw new Error("first image begin response omitted imageId");
+			first.client.sendJson(
+				command("first-chunk", "reused-chunk", "session.image.chunk", "s1", {
+					imageId: firstImageId,
+					offset: 0,
+					content: png.toString("base64"),
+				}),
+			);
+			expect((await untilResponse(first.client, "first-chunk")).response).toMatchObject({ ok: true });
+			first.client.sendJson(
+				command("first-discard", "reused-discard", "session.image.discard", "s1", {
+					imageId: firstImageId,
+				}),
+			);
+			expect((await untilResponse(first.client, "first-discard")).response).toMatchObject({
+				ok: true,
+				result: { discarded: true },
+			});
+			await closeClients([first.client]);
+
+			const second = await readyClient(path, ["sessions.read", "sessions.prompt"], ["resume", "prompt.images"]);
+			second.client.sendJson(command("second-begin", "reused-begin", "session.image.begin", "s1", args));
+			const secondBegin = (await untilResponse(second.client, "second-begin")).response;
+			const secondImageId = (secondBegin.result as { imageId?: string } | undefined)?.imageId;
+			if (!secondImageId) throw new Error("second image begin response omitted imageId");
+			expect(secondImageId).not.toBe(firstImageId);
+			second.client.sendJson(
+				command("second-chunk", "reused-chunk", "session.image.chunk", "s1", {
+					imageId: secondImageId,
+					offset: 0,
+					content: png.toString("base64"),
+				}),
+			);
+			expect((await untilResponse(second.client, "second-chunk")).response).toMatchObject({
+				ok: true,
+				result: { imageId: secondImageId, complete: true },
+			});
+			second.client.sendJson(
+				command("second-discard", "reused-discard", "session.image.discard", "s1", {
+					imageId: secondImageId,
+				}),
+			);
+			expect((await untilResponse(second.client, "second-discard")).response).toMatchObject({
+				ok: true,
+				result: { discarded: true },
+			});
+			await closeClients([second.client]);
+		} finally {
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 	test("local transport rejects device authentication without echoing the token", async () => {
 		const { appserver, path } = await liveServer(new LiveFactory(), []);
 		const client = await RawUdsWebSocket.connect(path);

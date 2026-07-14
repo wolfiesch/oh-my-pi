@@ -1,3 +1,4 @@
+import { fail } from "./errors.ts";
 import { controlFree } from "./guards.ts";
 import { MAX_ID_BYTES } from "./limits.ts";
 
@@ -18,6 +19,7 @@ export type OperationId = string & { readonly __operationId: unique symbol };
 export type PreviewId = string & { readonly __previewId: unique symbol };
 export type CatalogId = string & { readonly __catalogId: unique symbol };
 export type DeviceId = string & { readonly __deviceId: unique symbol };
+export type ImageId = string & { readonly __imageId: unique symbol };
 
 export function id<T extends string>(value: unknown, path: string): T {
 	return controlFree(value, path, MAX_ID_BYTES) as T;
@@ -38,6 +40,12 @@ export const operationId = (v: unknown, p = "operationId"): OperationId => id<Op
 export const previewId = (v: unknown, p = "previewId"): PreviewId => id<PreviewId>(v, p);
 export const catalogId = (v: unknown, p = "catalogId"): CatalogId => id<CatalogId>(v, p);
 export const deviceId = (v: unknown, p = "deviceId"): DeviceId => id<DeviceId>(v, p);
+export const imageId = (value: unknown, path = "imageId"): ImageId => {
+	const result = controlFree(value, path, 36);
+	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(result))
+		fail("INVALID_FRAME", "expected an opaque image identifier", path);
+	return result as ImageId;
+};
 export const revision = (v: unknown, p = "revision"): Revision => id<Revision>(v, p);
 export interface SessionKey {
 	readonly hostId: HostId;
