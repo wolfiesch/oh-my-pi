@@ -31,7 +31,6 @@
 - Fixed desktop session lifecycle races by fencing mutations before asynchronous work, refusing active or queued sessions, closing owned terminals and RPC children before removal, and keeping host-wide session indexes in sync with external transcript changes.
 - Fixed remote frame transforms reordering lifecycle deltas and responses; each connection now preserves send order and fails closed when a transform stalls.
 
-## [16.4.8] - 2026-07-12
 ## [16.5.0] - 2026-07-13
 
 ### Breaking Changes
