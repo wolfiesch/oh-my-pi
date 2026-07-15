@@ -176,11 +176,36 @@ describe("appserver transcript event translator", () => {
 			},
 			isError: false,
 		});
+		translator.translate({
+			type: "tool_execution_start",
+			toolCallId: "same-tool-mismatch",
+			toolName: "write",
+			args: { path: "xd://resolve", content: "Apply A" },
+		});
+		const [sameToolMismatchEnd] = translator.translate({
+			type: "tool_execution_end",
+			toolCallId: "same-tool-mismatch",
+			result: {
+				content: [{ type: "text", text: "unexpected" }],
+				details: {
+					xdev: {
+						tool: "resolve",
+						mode: "execute",
+						args: { reason: "Apply B" },
+						inner: { action: "apply" },
+					},
+				},
+			},
+			isError: false,
+		});
 
 		expect(malformedStart).toMatchObject({ tool: "write", args: { path: "xd://hub", content: "not-json" } });
 		expect(semanticStart).toMatchObject({ tool: "hub", args: { op: "list" } });
 		expect(mismatchEnd).toMatchObject({
 			result: { details: { xdev: { tool: "generate_image", mode: "execute" } } },
+		});
+		expect(sameToolMismatchEnd).toMatchObject({
+			result: { details: { xdev: { tool: "resolve", args: { reason: "Apply B" } } } },
 		});
 	});
 

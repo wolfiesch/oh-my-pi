@@ -14,7 +14,7 @@ import {
 } from "@oh-my-pi/app-wire";
 import { boundSnapshotEntries, uniqueEntryId } from "./snapshot-limits.ts";
 import type { FileSystem, SessionDiscovery, SessionRecord } from "./types.ts";
-import { xdevResultEnvelope, xdevWriteCall } from "./xdev-envelope.ts";
+import { type XdevWriteCall, xdevExecutionMatches, xdevResultEnvelope, xdevWriteCall } from "./xdev-envelope.ts";
 
 const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 const MAX_METADATA_BYTES = 128 * 1024;
@@ -239,12 +239,13 @@ interface PendingToolCall {
 	parentId: EntryId | null;
 	idBase: string;
 	timestamp: string;
-	xdevTool?: string;
+	xdevCall?: XdevWriteCall;
 }
 
 interface ProjectedXdevResult {
 	tool: string;
 	args: unknown;
+	correlationArgs: Record<string, unknown>;
 	details?: unknown;
 	images: TranscriptImageMetadata[];
 }
@@ -366,7 +367,19 @@ export class SessionEntryProjector {
 
 	#tool(raw: Record<string, unknown>, call: PendingToolCall, result: ProjectedToolResult): DurableEntry {
 		const output = result.content.map(block => block.text).join("");
-		const xdev = call.xdevTool && call.xdevTool === result.xdev?.tool ? result.xdev : undefined;
+		const xdev = xdevExecutionMatches(
+			call.xdevCall,
+			result.xdev
+				? {
+						tool: result.xdev.tool,
+						mode: "execute",
+						args: result.xdev.correlationArgs,
+						inner: undefined,
+					}
+				: undefined,
+		)
+			? result.xdev
+			: undefined;
 		const tool = xdev?.tool ?? call.tool;
 		const details = xdev ? xdev.details : result.details;
 		const images = xdev ? mergeImages(result.images, xdev.images) : result.images;
@@ -437,7 +450,7 @@ export class SessionEntryProjector {
 							parentId: null,
 							idBase: `${raw.id}:tool:${block.id}`,
 							timestamp: String(raw.timestamp),
-							...(xdev ? { xdevTool: xdev.tool } : {}),
+							...(xdev ? { xdevCall: xdev } : {}),
 						});
 					}
 				}
@@ -487,6 +500,7 @@ export class SessionEntryProjector {
 								xdev: {
 									tool: xdev.tool,
 									args: projectToolArguments(xdev.args),
+									correlationArgs: xdev.args,
 									details: projectToolResultDetails(xdev.inner),
 									images: toolResultImages([], xdev.inner, this.mode === "live"),
 								},

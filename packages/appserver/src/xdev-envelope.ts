@@ -21,6 +21,35 @@ function xdevTarget(value: unknown): string | undefined {
 	return xdevToolName(path.slice(XD_URL_PREFIX.length));
 }
 
+function plainTextXdevArgs(tool: string, content: string): Record<string, unknown> | undefined {
+	const text = content.trim();
+	switch (tool) {
+		case "resolve":
+		case "reject":
+			return { reason: text };
+		case "propose":
+			return { title: text };
+		case "report_issue":
+			return { report: text };
+		default:
+			return undefined;
+	}
+}
+
+function plainTextArgKey(tool: string): "reason" | "title" | "report" | undefined {
+	switch (tool) {
+		case "resolve":
+		case "reject":
+			return "reason";
+		case "propose":
+			return "title";
+		case "report_issue":
+			return "report";
+		default:
+			return undefined;
+	}
+}
+
 export interface XdevWriteCall {
 	tool: string;
 	args: Record<string, unknown>;
@@ -35,6 +64,8 @@ export function xdevWriteCall(tool: unknown, value: unknown): XdevWriteCall | un
 	const target = xdevTarget(value.path);
 	if (!target || typeof value.content !== "string") return undefined;
 	if (encoder.encode(value.content).byteLength > MAX_XDEV_CONTENT_BYTES) return undefined;
+	const plainTextArgs = plainTextXdevArgs(target, value.content);
+	if (plainTextArgs) return { tool: target, args: plainTextArgs };
 	try {
 		const args: unknown = JSON.parse(value.content);
 		return isRecord(args) ? { tool: target, args } : undefined;
@@ -48,6 +79,30 @@ export interface XdevResultEnvelope {
 	mode: "execute";
 	args: Record<string, unknown>;
 	inner: unknown;
+}
+
+/**
+ * Correlate an executable result to its original device write. JSON devices
+ * may apply schema defaults, but the four plain-text devices are deterministic:
+ * their one derived argument must match exactly before semantic promotion.
+ */
+export function xdevExecutionMatches(
+	call: Pick<XdevWriteCall, "tool" | "args"> | undefined,
+	result: XdevResultEnvelope | undefined,
+): boolean {
+	if (!call || !result || call.tool !== result.tool) return false;
+	const key = plainTextArgKey(call.tool);
+	if (!key) return true;
+	const callKeys = Object.keys(call.args);
+	const resultKeys = Object.keys(result.args);
+	return (
+		callKeys.length === 1 &&
+		callKeys[0] === key &&
+		resultKeys.length === 1 &&
+		resultKeys[0] === key &&
+		typeof call.args[key] === "string" &&
+		call.args[key] === result.args[key]
+	);
 }
 
 /** Parse only executable v17 envelopes. Help/documentation writes remain write results. */

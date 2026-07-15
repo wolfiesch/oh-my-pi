@@ -2,7 +2,7 @@ import type { DurableEntry, SessionEvent } from "@oh-my-pi/app-wire";
 import type { RpcSessionEventFrame, RpcSubagentEventFrame } from "../../coding-agent/src/modes/rpc/rpc-types.ts";
 import type { AgentSessionEvent } from "../../coding-agent/src/session/agent-session.ts";
 import { cleanText, projectToolArguments, projectToolResultDetails } from "./discovery.ts";
-import { xdevResultEnvelope, xdevWriteCall } from "./xdev-envelope.ts";
+import { type XdevWriteCall, xdevExecutionMatches, xdevResultEnvelope, xdevWriteCall } from "./xdev-envelope.ts";
 
 export type TranscriptMessageEvent = {
 	type: "message.update";
@@ -197,7 +197,7 @@ interface ActiveAssistant {
 interface ToolState {
 	state: "open" | "closed";
 	at: string;
-	xdevTool?: string;
+	xdevCall?: XdevWriteCall;
 }
 interface UiState {
 	kind: "ask" | "approval";
@@ -958,7 +958,7 @@ export class TranscriptEventTranslator {
 		const outerTool = asString(frame.toolName) ?? "tool";
 		const xdev = xdevWriteCall(outerTool, frame.args);
 		const tool = xdev?.tool ?? outerTool;
-		this.#toolStates.set(callId, { state: "open", at, ...(xdev ? { xdevTool: xdev.tool } : {}) });
+		this.#toolStates.set(callId, { state: "open", at, ...(xdev ? { xdevCall: xdev } : {}) });
 		return [
 			{
 				type: "tool.start",
@@ -996,7 +996,7 @@ export class TranscriptEventTranslator {
 		const resultRecord = isRecord(rawResult) ? rawResult : undefined;
 		const xdev = xdevResultEnvelope(resultRecord?.details);
 		let result = rawResult;
-		if (resultRecord && state.xdevTool && state.xdevTool === xdev?.tool) {
+		if (resultRecord && xdev && xdevExecutionMatches(state.xdevCall, xdev)) {
 			const { details: _details, ...rest } = resultRecord;
 			const inner = projectToolResultDetails(xdev.inner);
 			result = inner === undefined ? rest : { ...rest, details: inner };

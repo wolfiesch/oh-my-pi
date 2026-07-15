@@ -528,6 +528,12 @@ describe("current OMP JSONL projection", () => {
 						name: "write",
 						arguments: { path: "xd://hub", content: "not-json" },
 					},
+					{
+						type: "toolCall",
+						id: "xdev-same-tool-mismatch",
+						name: "write",
+						arguments: { path: "xd://resolve", content: "Apply A" },
+					},
 				],
 			},
 		});
@@ -562,6 +568,25 @@ describe("current OMP JSONL projection", () => {
 				isError: true,
 			},
 		});
+		const [sameToolMismatch] = projector.project({
+			type: "message",
+			id: "xdev-same-tool-mismatch-result",
+			parentId: "xdev-malformed-result",
+			timestamp: stamp,
+			message: {
+				role: "toolResult",
+				toolCallId: "xdev-same-tool-mismatch",
+				content: [{ type: "text", text: "unexpected" }],
+				details: {
+					xdev: {
+						tool: "resolve",
+						mode: "execute",
+						args: { reason: "Apply B" },
+						inner: { action: "apply" },
+					},
+				},
+			},
+		});
 
 		expect(mismatch?.data).toMatchObject({
 			tool: "write",
@@ -572,6 +597,11 @@ describe("current OMP JSONL projection", () => {
 			tool: "write",
 			args: { path: "xd://hub", content: "not-json" },
 			ok: false,
+		});
+		expect(sameToolMismatch?.data).toMatchObject({
+			tool: "write",
+			args: { path: "xd://resolve", content: "Apply A" },
+			result: { details: { xdev: { tool: "resolve", args: { reason: "Apply B" } } } },
 		});
 	});
 
