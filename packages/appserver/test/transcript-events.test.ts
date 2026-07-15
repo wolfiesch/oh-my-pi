@@ -96,6 +96,94 @@ describe("appserver transcript event translator", () => {
 		expect(events.filter(event => event.type === "tool.result")).toHaveLength(1);
 	});
 
+	test("projects v17 xdev execution frames as the semantic live tool", () => {
+		const translator = new TranscriptEventTranslator(() => 99);
+		const [start] = translator.translate({
+			type: "tool_execution_start",
+			toolCallId: "xdev-call",
+			toolName: "write",
+			args: {
+				path: "xd://hub",
+				content: JSON.stringify({ op: "send", to: "reviewer", message: "Please verify." }),
+			},
+		});
+		const [end] = translator.translate({
+			type: "tool_execution_end",
+			toolCallId: "xdev-call",
+			toolName: "write",
+			result: {
+				content: [{ type: "text", text: "delivered" }],
+				details: {
+					xdev: {
+						tool: "hub",
+						mode: "execute",
+						args: { op: "send", to: "reviewer", message: "Please verify." },
+						inner: {
+							receipts: [{ to: "reviewer", outcome: "woken" }],
+							logPath: "/home/tester/private/hub.log",
+						},
+					},
+				},
+			},
+			isError: false,
+		});
+
+		expect(start).toEqual({
+			type: "tool.start",
+			callId: "xdev-call",
+			tool: "hub",
+			title: "hub",
+			args: { op: "send", to: "reviewer", message: "Please verify." },
+			at: "1970-01-01T00:00:00.099Z",
+		});
+		expect(end).toMatchObject({
+			type: "tool.result",
+			callId: "xdev-call",
+			ok: true,
+			result: {
+				content: [{ type: "text", text: "delivered" }],
+				details: {
+					receipts: [{ to: "reviewer", outcome: "woken" }],
+					logPath: "[path]",
+				},
+			},
+		});
+		expect(JSON.stringify(end)).not.toContain('"xdev"');
+	});
+
+	test("leaves non-executable and mismatched xdev live frames safely wrapped", () => {
+		const translator = new TranscriptEventTranslator(() => 99);
+		const [malformedStart] = translator.translate({
+			type: "tool_execution_start",
+			toolCallId: "malformed",
+			toolName: "write",
+			args: { path: "xd://hub", content: "not-json" },
+		});
+		const [semanticStart] = translator.translate({
+			type: "tool_execution_start",
+			toolCallId: "mismatch",
+			toolName: "write",
+			args: { path: "xd://hub", content: JSON.stringify({ op: "list" }) },
+		});
+		const [mismatchEnd] = translator.translate({
+			type: "tool_execution_end",
+			toolCallId: "mismatch",
+			result: {
+				content: [{ type: "text", text: "unexpected" }],
+				details: {
+					xdev: { tool: "generate_image", mode: "execute", args: { prompt: "spoof" }, inner: {} },
+				},
+			},
+			isError: false,
+		});
+
+		expect(malformedStart).toMatchObject({ tool: "write", args: { path: "xd://hub", content: "not-json" } });
+		expect(semanticStart).toMatchObject({ tool: "hub", args: { op: "list" } });
+		expect(mismatchEnd).toMatchObject({
+			result: { details: { xdev: { tool: "generate_image", mode: "execute" } } },
+		});
+	});
+
 	test("settles a correlated assistant stream onto the authoritative durable entry exactly once", () => {
 		const translator = new TranscriptEventTranslator(() => 99);
 		translator.translate({ type: "turn_start" });

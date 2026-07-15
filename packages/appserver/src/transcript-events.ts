@@ -1,7 +1,8 @@
 import type { DurableEntry, SessionEvent } from "@oh-my-pi/app-wire";
 import type { RpcSessionEventFrame, RpcSubagentEventFrame } from "../../coding-agent/src/modes/rpc/rpc-types.ts";
 import type { AgentSessionEvent } from "../../coding-agent/src/session/agent-session.ts";
-import { cleanText } from "./discovery.ts";
+import { cleanText, projectToolArguments, projectToolResultDetails } from "./discovery.ts";
+import { xdevResultEnvelope, xdevWriteCall } from "./xdev-envelope.ts";
 
 export type TranscriptMessageEvent = {
 	type: "message.update";
@@ -196,6 +197,7 @@ interface ActiveAssistant {
 interface ToolState {
 	state: "open" | "closed";
 	at: string;
+	xdevTool?: string;
 }
 interface UiState {
 	kind: "ask" | "approval";
@@ -953,9 +955,20 @@ export class TranscriptEventTranslator {
 		const callId = asString(frame.toolCallId);
 		if (!callId || this.#toolStates.has(callId)) return [];
 		const at = valueAt(frame, this.#nowIso.bind(this));
-		const tool = asString(frame.toolName) ?? "tool";
-		this.#toolStates.set(callId, { state: "open", at });
-		return [{ type: "tool.start", callId, tool, title: tool, args: frame.args, at }];
+		const outerTool = asString(frame.toolName) ?? "tool";
+		const xdev = xdevWriteCall(outerTool, frame.args);
+		const tool = xdev?.tool ?? outerTool;
+		this.#toolStates.set(callId, { state: "open", at, ...(xdev ? { xdevTool: xdev.tool } : {}) });
+		return [
+			{
+				type: "tool.start",
+				callId,
+				tool,
+				title: tool,
+				args: xdev ? projectToolArguments(xdev.args) : frame.args,
+				at,
+			},
+		];
 	}
 	private toolProgress(frame: Record<string, unknown>): TranscriptEvent[] {
 		const callId = asString(frame.toolCallId);
@@ -979,12 +992,21 @@ export class TranscriptEventTranslator {
 		const state = callId ? this.#toolStates.get(callId) : undefined;
 		if (!callId || !state || state.state === "closed") return [];
 		state.state = "closed";
+		const rawResult = frame.result;
+		const resultRecord = isRecord(rawResult) ? rawResult : undefined;
+		const xdev = xdevResultEnvelope(resultRecord?.details);
+		let result = rawResult;
+		if (resultRecord && state.xdevTool && state.xdevTool === xdev?.tool) {
+			const { details: _details, ...rest } = resultRecord;
+			const inner = projectToolResultDetails(xdev.inner);
+			result = inner === undefined ? rest : { ...rest, details: inner };
+		}
 		return [
 			{
 				type: "tool.result",
 				callId,
 				ok: frame.isError !== true,
-				result: frame.result,
+				result,
 				at: valueAt(frame, () => state.at),
 			},
 		];

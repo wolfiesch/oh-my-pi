@@ -14,6 +14,7 @@ import {
 } from "@oh-my-pi/app-wire";
 import { boundSnapshotEntries, uniqueEntryId } from "./snapshot-limits.ts";
 import type { FileSystem, SessionDiscovery, SessionRecord } from "./types.ts";
+import { xdevResultEnvelope, xdevWriteCall } from "./xdev-envelope.ts";
 
 const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 const MAX_METADATA_BYTES = 128 * 1024;
@@ -163,13 +164,21 @@ function toolResultContent(content: unknown): ProjectedToolResultText[] {
 	return blocks;
 }
 
-function toolResultDetails(details: unknown): unknown {
+export function projectToolResultDetails(details: unknown): unknown {
 	if (details === undefined) return undefined;
 	const projected = safeValue(details, "", 0, true);
 	if (projected === undefined) return undefined;
 	const serialized = JSON.stringify(projected);
 	if (serialized !== undefined && encoder.encode(serialized).byteLength <= MAX_RESULT_DETAILS_BYTES) return projected;
 	return { omitted: "Tool result details exceeded the app-wire display budget." };
+}
+
+export function projectToolArguments(value: unknown): unknown {
+	const args = safeValue(value, "", 0, true);
+	const serialized = JSON.stringify(args) ?? "";
+	return encoder.encode(serialized).byteLength <= MAX_ARGUMENT_BYTES
+		? args
+		: { omitted: "Tool arguments exceeded the app-wire display budget." };
 }
 
 function contentImages(
@@ -230,6 +239,14 @@ interface PendingToolCall {
 	parentId: EntryId | null;
 	idBase: string;
 	timestamp: string;
+	xdevTool?: string;
+}
+
+interface ProjectedXdevResult {
+	tool: string;
+	args: unknown;
+	details?: unknown;
+	images: TranscriptImageMetadata[];
 }
 
 interface ProjectedToolResult {
@@ -238,6 +255,22 @@ interface ProjectedToolResult {
 	details?: unknown;
 	images: TranscriptImageMetadata[];
 	timestamp: string;
+	xdev?: ProjectedXdevResult;
+}
+
+function mergeImages(
+	first: readonly TranscriptImageMetadata[],
+	second: readonly TranscriptImageMetadata[],
+): TranscriptImageMetadata[] {
+	const images: TranscriptImageMetadata[] = [];
+	const seen = new Set<string>();
+	for (const image of [...first, ...second]) {
+		if (seen.has(image.sha256)) continue;
+		seen.add(image.sha256);
+		images.push(image);
+		if (images.length >= TRANSCRIPT_IMAGE_MAX_COUNT) break;
+	}
+	return images;
 }
 
 function validRawEntry(raw: Record<string, unknown>): boolean {
@@ -333,22 +366,26 @@ export class SessionEntryProjector {
 
 	#tool(raw: Record<string, unknown>, call: PendingToolCall, result: ProjectedToolResult): DurableEntry {
 		const output = result.content.map(block => block.text).join("");
+		const xdev = call.xdevTool && call.xdevTool === result.xdev?.tool ? result.xdev : undefined;
+		const tool = xdev?.tool ?? call.tool;
+		const details = xdev ? xdev.details : result.details;
+		const images = xdev ? mergeImages(result.images, xdev.images) : result.images;
 		return this.#add(
 			{ ...raw, timestamp: result.timestamp },
 			"tool-use",
 			{
 				toolCallId: call.callId,
-				tool: call.tool,
-				title: call.title,
-				args: call.args,
+				tool,
+				title: xdev ? tool : call.title,
+				args: xdev?.args ?? call.args,
 				ok: result.ok,
 				result: {
 					output: boundUtf8(output, MAX_RESULT_BYTES),
 					content: result.content,
-					...(result.details === undefined ? {} : { details: result.details }),
+					...(details === undefined ? {} : { details }),
 					isError: !result.ok,
 				},
-				...(result.images.length > 0 ? { images: result.images } : {}),
+				...(images.length > 0 ? { images } : {}),
 			},
 			call.parentId,
 			call.idBase,
@@ -386,8 +423,9 @@ export class SessionEntryProjector {
 					if (block?.type === "thinking" && typeof block.thinking === "string")
 						reasoningParts.push(block.thinking);
 					if (block?.type === "toolCall" && typeof block.id === "string" && typeof block.name === "string") {
-						const args = safeValue(block.arguments ?? block.args ?? {}, "", 0, true);
-						const argsBytes = encoder.encode(JSON.stringify(args) ?? "").byteLength;
+						const rawArgs = block.arguments ?? block.args ?? {};
+						const args = projectToolArguments(rawArgs);
+						const xdev = xdevWriteCall(block.name, rawArgs);
 						toolCalls.push({
 							callId: block.id,
 							tool: cleanText(block.name, 256, true),
@@ -395,13 +433,11 @@ export class SessionEntryProjector {
 								typeof block.title === "string"
 									? cleanText(block.title, 256, true)
 									: cleanText(block.name, 256, true),
-							args:
-								argsBytes <= MAX_ARGUMENT_BYTES
-									? args
-									: { omitted: "Tool arguments exceeded the app-wire display budget." },
+							args,
 							parentId: null,
 							idBase: `${raw.id}:tool:${block.id}`,
 							timestamp: String(raw.timestamp),
+							...(xdev ? { xdevTool: xdev.tool } : {}),
 						});
 					}
 				}
@@ -439,12 +475,23 @@ export class SessionEntryProjector {
 						: undefined;
 			if (callId && !this.#settledCalls.has(callId)) {
 				const rawContent = message.content ?? message.text ?? raw.text;
+				const xdev = xdevResultEnvelope(message.details);
 				const result: ProjectedToolResult = {
 					ok: message.isError !== true,
 					content: toolResultContent(rawContent),
-					details: toolResultDetails(message.details),
+					details: projectToolResultDetails(message.details),
 					images: toolResultImages(rawContent, message.details, this.mode === "live"),
 					timestamp: String(raw.timestamp),
+					...(xdev
+						? {
+								xdev: {
+									tool: xdev.tool,
+									args: projectToolArguments(xdev.args),
+									details: projectToolResultDetails(xdev.inner),
+									images: toolResultImages([], xdev.inner, this.mode === "live"),
+								},
+							}
+						: {}),
 				};
 				const call = this.#pendingCalls.get(callId);
 				if (call) {
@@ -463,7 +510,7 @@ export class SessionEntryProjector {
 			const customRole = raw.attribution === "agent" ? "assistant" : "user";
 			const customType =
 				typeof raw.customType === "string" ? cleanText(raw.customType, MAX_CUSTOM_TYPE_BYTES, true) : "";
-			const customDetails = customType ? toolResultDetails(raw.details) : undefined;
+			const customDetails = customType ? projectToolResultDetails(raw.details) : undefined;
 			const entry = this.#add(
 				raw,
 				"message",

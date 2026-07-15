@@ -429,6 +429,152 @@ describe("current OMP JSONL projection", () => {
 		expect(serialized).not.toContain("/home/tester");
 	});
 
+	test("unwraps a matching v17 xdev result into a semantic durable tool entry", () => {
+		const projector = new SessionEntryProjector(host, sessionId("session-xdev-image"), "live");
+		const imageSha = "c".repeat(64);
+		projector.project({
+			type: "message",
+			id: "xdev-result",
+			parentId: null,
+			timestamp: stamp,
+			message: {
+				role: "toolResult",
+				toolCallId: "xdev-call",
+				content: [{ type: "text", text: "generated image" }],
+				details: {
+					xdev: {
+						tool: "generate_image",
+						mode: "execute",
+						args: { prompt: "a geometric fox", output_format: "png" },
+						inner: {
+							provider: "test-provider",
+							sourcePath: "/home/tester/private/generated.png",
+							images: [
+								{
+									mimeType: "image/png",
+									data: "",
+									appImageSha256: imageSha,
+								},
+							],
+						},
+					},
+				},
+				isError: false,
+			},
+		});
+		const [entry] = projector.project({
+			type: "message",
+			id: "xdev-call-message",
+			parentId: null,
+			timestamp: stamp,
+			message: {
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "xdev-call",
+						name: "write",
+						arguments: {
+							path: "xd://generate_image",
+							content: JSON.stringify({ prompt: "a geometric fox", output_format: "png" }),
+						},
+					},
+				],
+			},
+		});
+
+		expect(entry?.data).toMatchObject({
+			toolCallId: "xdev-call",
+			tool: "generate_image",
+			title: "generate_image",
+			args: { prompt: "a geometric fox", output_format: "png" },
+			ok: true,
+			result: {
+				output: "generated image",
+				content: [{ type: "text", text: "generated image" }],
+				details: {
+					provider: "test-provider",
+					sourcePath: "[path]",
+				},
+				isError: false,
+			},
+			images: [{ sha256: imageSha, mimeType: "image/png" }],
+		});
+		const serialized = JSON.stringify(entry);
+		expect(serialized).not.toContain("appImageSha256");
+		expect(serialized).not.toContain('"xdev"');
+		expect(serialized).not.toContain("/home/tester");
+	});
+
+	test("keeps mismatched or malformed xdev envelopes on the outer write path", () => {
+		const projector = new SessionEntryProjector(host, sessionId("session-xdev-mismatch"), "live");
+		projector.project({
+			type: "message",
+			id: "xdev-call-message",
+			parentId: null,
+			timestamp: stamp,
+			message: {
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "xdev-mismatch",
+						name: "write",
+						arguments: { path: "xd://generate_image", content: JSON.stringify({ prompt: "fox" }) },
+					},
+					{
+						type: "toolCall",
+						id: "xdev-malformed",
+						name: "write",
+						arguments: { path: "xd://hub", content: "not-json" },
+					},
+				],
+			},
+		});
+		const [mismatch] = projector.project({
+			type: "message",
+			id: "xdev-mismatch-result",
+			parentId: "xdev-call-message",
+			timestamp: stamp,
+			message: {
+				role: "toolResult",
+				toolCallId: "xdev-mismatch",
+				content: [{ type: "text", text: "unexpected" }],
+				details: {
+					xdev: {
+						tool: "hub",
+						mode: "execute",
+						args: { op: "list" },
+						inner: { note: "do not promote" },
+					},
+				},
+			},
+		});
+		const [malformed] = projector.project({
+			type: "message",
+			id: "xdev-malformed-result",
+			parentId: "xdev-mismatch-result",
+			timestamp: stamp,
+			message: {
+				role: "toolResult",
+				toolCallId: "xdev-malformed",
+				content: [{ type: "text", text: "invalid arguments" }],
+				isError: true,
+			},
+		});
+
+		expect(mismatch?.data).toMatchObject({
+			tool: "write",
+			args: { path: "xd://generate_image", content: '{"prompt":"fox"}' },
+			result: { details: { xdev: { tool: "hub", mode: "execute" } } },
+		});
+		expect(malformed?.data).toMatchObject({
+			tool: "write",
+			args: { path: "xd://hub", content: "not-json" },
+			ok: false,
+		});
+	});
+
 	test("bounds aggregate tool result content and details", () => {
 		const projector = new SessionEntryProjector(host, sessionId("session-tool-result-bounds"), "batch");
 		projector.project({
