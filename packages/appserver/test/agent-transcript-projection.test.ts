@@ -385,7 +385,7 @@ describe("AgentTranscriptProjection", () => {
 		expect(baseline).toBeDefined();
 		expect(baseline?.entries.length).toBeLessThanOrEqual(512);
 		expect(entriesBytes(baseline?.entries ?? [])).toBeLessThanOrEqual(384 * 1_024);
-		expect(baseline?.cursor).toEqual(emitted.at(-1)?.cursor);
+		expect(baseline?.cursor).toEqual(emitted.at(-1)!.cursor);
 		const serialized = JSON.stringify([...emitted, baseline]);
 		expect(serialized).not.toContain(embeddedImage);
 		expect(serialized).not.toContain("/home/tester");
