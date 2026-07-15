@@ -230,8 +230,8 @@ runs:
       # cargo-zigbuild (needs zig); MSVC targets (e.g. x86_64-pc-windows-msvc)
       # build with cargo-xwin (needs clang/lld/llvm). The napi CLI's
       # --cross-compile flag picks the backend; we just install what it needs.
-      # Cross builds only run on push/main + release (omp-kata), so the
-      # GitHub-hosted cross branches exist for portability and never fire here.
+      # Canonical main/release runs use omp-kata; fork product releases exercise
+      # these GitHub-hosted cross branches because forks have no private runner.
       - name: Ensure baked zig (omp-kata, non-MSVC cross)
         if: steps.detect.outputs.on_infra == 'true' && steps.resolve.outputs.cross_target != '' && !endsWith(steps.resolve.outputs.cross_target, '-msvc')
         uses: ./.github/actions/ensure-zig

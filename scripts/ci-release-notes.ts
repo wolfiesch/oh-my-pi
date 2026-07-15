@@ -16,6 +16,7 @@
  *   bun scripts/ci-release-notes.ts                     # writes release-notes.md
  *   bun scripts/ci-release-notes.ts v15.4.3             # explicit tag/version
  *   bun scripts/ci-release-notes.ts 15.4.3 notes.md     # custom output path
+ *   bun scripts/ci-release-notes.ts 15.4.3 --include-unreleased
  *
  * The lower bound is resolved by `gh release list`. Set
  * `OMP_RELEASE_NOTES_FLOOR=v15.12.4` to override (empty string forces
@@ -61,6 +62,11 @@ export interface ChangelogVersionSpan {
 	end: number;
 }
 
+export interface MergePackageSectionOptions {
+	/** Include the current `## [Unreleased]` body before finalized versions. */
+	includeUnreleased?: boolean;
+}
+
 /**
  * Locate every `## [X.Y.Z]` heading in a changelog and compute the line span
  * up to (but not including) the next `## [` heading. `## [Unreleased]` and
@@ -94,14 +100,28 @@ export function enumerateChangelogVersions(content: string): ChangelogVersionSpa
  * `floorExclusive === null` → take only the target version (legacy behavior).
  * Returns "" when no in-range version contributes any bullet.
  */
-export function mergePackageSection(content: string, floorExclusive: string | null, targetInclusive: string): string {
-	const spans = enumerateChangelogVersions(content)
+export function mergePackageSection(
+	content: string,
+	floorExclusive: string | null,
+	targetInclusive: string,
+	options: MergePackageSectionOptions = {},
+): string {
+	const versionSpans = enumerateChangelogVersions(content)
 		.filter(v => {
 			if (compareVersions(v.version, targetInclusive) > 0) return false;
 			if (floorExclusive === null) return compareVersions(v.version, targetInclusive) === 0;
 			return compareVersions(v.version, floorExclusive) > 0;
 		})
 		.sort((a, b) => compareVersions(b.version, a.version));
+	const spans = [...versionSpans];
+	if (options.includeUnreleased) {
+		const lines = content.split("\n");
+		const start = lines.findIndex(line => /^## \[Unreleased\]\s*$/.test(line));
+		if (start !== -1) {
+			const nextHeading = lines.findIndex((line, index) => index > start && line.startsWith("## ["));
+			spans.unshift({ version: "Unreleased", start, end: nextHeading === -1 ? lines.length : nextHeading });
+		}
+	}
 	if (spans.length === 0) return "";
 
 	const lines = content.split("\n");
@@ -240,13 +260,25 @@ async function resolvePublishedFloorTag(targetVersion: string): Promise<string |
 }
 
 async function main(): Promise<void> {
-	const tagInput = process.argv[2] ?? process.env.GITHUB_REF_NAME ?? "";
+	const args = process.argv.slice(2);
+	const includeUnreleased = args.includes("--include-unreleased");
+	const unknownOptions = args.filter(arg => arg.startsWith("--") && arg !== "--include-unreleased");
+	if (unknownOptions.length > 0) {
+		console.error(`Error: unknown option(s): ${unknownOptions.join(", ")}`);
+		process.exit(1);
+	}
+	const positional = args.filter(arg => !arg.startsWith("--"));
+	if (positional.length > 2) {
+		console.error("Error: expected at most a version and output path.");
+		process.exit(1);
+	}
+	const tagInput = positional[0] ?? process.env.GITHUB_REF_NAME ?? "";
 	if (!tagInput) {
 		console.error("Error: version not provided. Pass as argv (e.g. `v15.4.3`) or set GITHUB_REF_NAME.");
 		process.exit(1);
 	}
 	const version = tagInput.replace(/^v/, "").trim();
-	const outputPath = process.argv[3] ?? "release-notes.md";
+	const outputPath = positional[1] ?? "release-notes.md";
 	const floor = await resolvePublishedFloorTag(version);
 	if (floor) {
 		console.log(`Aggregating CHANGELOG sections in (${floor}, ${version}].`);
@@ -259,7 +291,7 @@ async function main(): Promise<void> {
 	changelogPaths.sort();
 	for (const changelogPath of changelogPaths) {
 		const content = await Bun.file(changelogPath).text();
-		const merged = mergePackageSection(content, floor, version);
+		const merged = mergePackageSection(content, floor, version, { includeUnreleased });
 		if (merged === "") continue;
 		const pkgDir = changelogPath.replace(/\/CHANGELOG\.md$/, "");
 		const name = await loadPackageName(pkgDir);
@@ -275,7 +307,7 @@ async function main(): Promise<void> {
 	const body = `${sections.join("\n\n")}\n`;
 	await Bun.write(outputPath, body);
 	console.log(
-		`Wrote ${sections.length} package section(s) to ${outputPath} (version ${version}${floor ? `, floor ${floor}` : ""}).`,
+		`Wrote ${sections.length} package section(s) to ${outputPath} (version ${version}${floor ? `, floor ${floor}` : ""}${includeUnreleased ? ", including Unreleased" : ""}).`,
 	);
 }
 

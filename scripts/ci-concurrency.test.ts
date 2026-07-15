@@ -283,6 +283,27 @@ describe("ci.yml concurrency", () => {
 		expect(GhaEval.template(cancelTemplate, ctx)).toBe("false");
 	});
 
+	it("t4code/main push: per-sha group, no cancellation while tag detection waits for checkout", () => {
+		const ctx = baseCtx({
+			ref: "refs/heads/t4code/main",
+			sha: "t4code123",
+			event: { head_commit: { message: "merge: update T4 product line to OMP 16.5.2" } },
+		});
+		expect(GhaEval.template(groupTemplate, ctx)).toBe("CI-release-t4code123");
+		expect(GhaEval.template(cancelTemplate, ctx)).toBe("false");
+	});
+
+	it("workflow_dispatch from a T4 integration tag: per-sha group, no cancellation", () => {
+		const ctx = baseCtx({
+			ref: "refs/tags/t4code-16.5.2-appserver-1",
+			event_name: "workflow_dispatch",
+			sha: "t4tag123",
+			event: {},
+		});
+		expect(GhaEval.template(groupTemplate, ctx)).toBe("CI-release-t4tag123");
+		expect(GhaEval.template(cancelTemplate, ctx)).toBe("false");
+	});
+
 	it("workflow_dispatch from tagged main HEAD is isolated before release_metadata can inspect tags", () => {
 		const ctx = baseCtx({
 			event_name: "workflow_dispatch",

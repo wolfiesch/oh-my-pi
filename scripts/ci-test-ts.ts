@@ -112,19 +112,22 @@ const nativeAndIntegrationPackages = [
 // and is outside every CI TS bucket.
 const localOnlyWorkspacePackages = ["packages/mnemopi", "python/robomp/web"];
 
-// Repo-level script tests. CI's `workspace` bucket only runs the merge gates:
-// the concurrency regression (the GHA-config guard) and the .d.ts extension
-// rewrite (guards published-type resolution; hermetic temp-dir suite). A local
-// full run also exercises the release-notes and link-omp tests. (A
-// `ci-test-ts.test.ts` entry used to sit here but the file never existed — bun
-// silently ignores unmatched filters when at least one other filter matches.)
-const repoScriptTests = [
+// Repo-level merge/release gates that run in CI's `workspace` bucket. Keep
+// workflow metadata, cancellation, publication routing, release-note content,
+// native build orchestration, and published type resolution covered there.
+const ciRepoScriptTests = [
 	"scripts/ci-concurrency.test.ts",
 	"scripts/ci-build-native.test.ts",
+	"scripts/ci-release-metadata.test.ts",
 	"scripts/ci-release-notes.test.ts",
+	"scripts/ci-workflow-contract.test.ts",
 	"scripts/fix-dts-extensions.test.ts",
-	"scripts/link-omp.test.ts",
 ];
+
+// Local full runs add link-omp coverage. (A `ci-test-ts.test.ts` entry used to
+// sit here but the file never existed — bun silently ignores unmatched filters
+// when at least one other filter matches.)
+const repoScriptTests = [...ciRepoScriptTests, "scripts/link-omp.test.ts"];
 
 const codingAgentNativePathPatterns = [
 	/(^|\/)[^/]*(bash|native|browser|cmux|mnemopi|hindsight|memory)[^/]*\.test\.ts$/i,
@@ -349,15 +352,7 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 				{
 					label: "scripts",
 					cwd: ".",
-					command: [
-						"bun",
-						"test",
-						"--parallel=4",
-						...onlyFailuresArgs,
-						"scripts/ci-concurrency.test.ts",
-						"scripts/ci-build-native.test.ts",
-						"scripts/fix-dts-extensions.test.ts",
-					],
+					command: ["bun", "test", "--parallel=4", ...onlyFailuresArgs, ...ciRepoScriptTests],
 				},
 			];
 		case "native":

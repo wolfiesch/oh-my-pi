@@ -113,6 +113,45 @@ describe("mergePackageSection", () => {
 		expect(merged).not.toContain("Added package-level exports");
 	});
 
+	it("optionally includes Unreleased product entries before the finalized target", () => {
+		const merged = mergePackageSection(FIXTURE, null, "15.13.0", { includeUnreleased: true });
+		expect(merged).toContain("Unreleased entry not in any tag yet.");
+		expect(merged).toContain("Fixed something only in 15.13.0.");
+	});
+
+	it("emits an Unreleased-only package for a product release", () => {
+		const unreleasedOnly = [
+			"# Changelog",
+			"",
+			"## [Unreleased]",
+			"",
+			"### Added",
+			"",
+			"- Added the T4 appserver maintenance drain.",
+		].join("\n");
+		expect(mergePackageSection(unreleasedOnly, null, "16.5.2")).toBe("");
+		expect(mergePackageSection(unreleasedOnly, null, "16.5.2", { includeUnreleased: true })).toContain(
+			"Added the T4 appserver maintenance drain.",
+		);
+	});
+
+	it("ignores an empty Unreleased section while retaining finalized entries", () => {
+		const emptyUnreleased = [
+			"# Changelog",
+			"",
+			"## [Unreleased]",
+			"",
+			"## [16.5.2]",
+			"",
+			"### Fixed",
+			"",
+			"- Fixed the finalized release behavior.",
+		].join("\n");
+		expect(mergePackageSection(emptyUnreleased, null, "16.5.2", { includeUnreleased: true })).toBe(
+			"### Fixed\n\n- Fixed the finalized release behavior.",
+		);
+	});
+
 	it("returns empty string when no version in the requested range carries body content", () => {
 		const empty = ["# Changelog", "", "## [15.13.0] - 2026-06-14", "", "## [15.12.6] - 2026-06-14"].join("\n");
 		expect(mergePackageSection(empty, "15.12.5", "15.13.0")).toBe("");
