@@ -10715,24 +10715,37 @@ export class AgentSession {
 
 			// Strategy honored on manual /compact too. Custom instructions (public
 			// user focus OR internal plan-mode guidance) imply a directed LLM
-			// summary; a text-only model cannot read snapcompact frames. When
-			// snapcompact itself was requested, fail locally instead of silently
-			// converting the "no LLM call" path into a provider-backed summary.
+			// summary; a text-only model cannot read snapcompact frames.
 			const wantsSnapcompact =
 				compactionPrep.kind !== "fromHook" &&
 				effectiveSettings.strategy === "snapcompact" &&
 				!customInstructions &&
 				!options?.internalGuidance;
-			const snapcompactReady = wantsSnapcompact;
+			// `/compact snapcompact` is an explicit no-LLM archive request: honor
+			// its contract by failing locally rather than silently shipping the
+			// transcript to a provider. The default-configured snapcompact
+			// strategy, in contrast, falls back to LLM compaction (mirroring the
+			// auto-compaction path) so a routine /compact still completes on a
+			// text-only model (issue #5064).
+			const explicitSnapcompact = compactMode?.name === "snapcompact";
+			let snapcompactReady = wantsSnapcompact;
 			const snapcompactShapeSetting = this.settings.get("snapcompact.shape");
 			let snapcompactShape: snapcompact.Shape | undefined;
 			if (wantsSnapcompact && !this.model.input.includes("image")) {
+				if (explicitSnapcompact) {
+					this.emitNotice(
+						"warning",
+						`snapcompact needs a vision-capable model (${this.model.id} is text-only)`,
+						"compaction",
+					);
+					throw new Error(`snapcompact cannot run locally: ${this.model.id} is text-only.`);
+				}
 				this.emitNotice(
 					"warning",
-					`snapcompact needs a vision-capable model (${this.model.id} is text-only)`,
+					`snapcompact needs a vision-capable model (${this.model.id} is text-only); falling back to LLM compaction`,
 					"compaction",
 				);
-				throw new Error(`snapcompact cannot run locally: ${this.model.id} is text-only.`);
+				snapcompactReady = false;
 			} else if (snapcompactReady) {
 				const text = snapcompact.serializeConversation(
 					convertToLlm(preparation.messagesToSummarize.concat(preparation.turnPrefixMessages)),
@@ -14321,19 +14334,23 @@ export class AgentSession {
 	}
 
 	/**
-	 * Retry an empty, reason-less provider abort: a turn that ended `aborted`
-	 * with no content and the generic sentinel (bare `abort()`), but only while
-	 * the session is neither aborting nor tearing down. A user/lifecycle abort
-	 * (`#abortInProgress`), a dispose-driven abort (`#isDisposed`), or a
-	 * session-induced streaming-edit guard abort (`#streamingEditAbortTriggered` —
-	 * auto-generated-file guard or failed-patch preview) is deliberate and MUST
-	 * settle the turn instead: routing it through retry would orphan
-	 * `#retryPromise` on a continuation the guard skips (hanging the in-flight
-	 * `prompt()`) or silently undo the guard's intended abort.
+	 * Retry an empty, reason-less provider abort: a turn with no content that
+	 * carries the generic sentinel (bare `abort()`), whether the provider
+	 * finalized it as `stopReason: "aborted"` or leaked it as `stopReason:
+	 * "error"` (a stalled/dropped stream reported as an error rather than an
+	 * abort — issue #5375). Only fires while the session is neither aborting nor
+	 * tearing down. A user/lifecycle abort (`#abortInProgress`), a dispose-driven
+	 * abort (`#isDisposed`), or a session-induced streaming-edit guard abort
+	 * (`#streamingEditAbortTriggered` — auto-generated-file guard or failed-patch
+	 * preview) is deliberate and MUST settle the turn instead: routing it through
+	 * retry would orphan `#retryPromise` on a continuation the guard skips
+	 * (hanging the in-flight `prompt()`) or silently undo the guard's intended
+	 * abort. Deliberate user interrupts (`UserInterrupt`) and silent aborts carry
+	 * their own marker, not the generic sentinel, so they never match here.
 	 */
 	#isRetryableReasonlessAbort(message: AssistantMessage): boolean {
 		if (
-			message.stopReason !== "aborted" ||
+			(message.stopReason !== "aborted" && message.stopReason !== "error") ||
 			message.content.length !== 0 ||
 			this.#abortInProgress ||
 			this.#isDisposed ||
@@ -14343,7 +14360,7 @@ export class AgentSession {
 		}
 
 		const id = this.#classifyRetryMessage(message);
-		if (AIError.is(id, AIError.Flag.Abort)) return true;
+		if (message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) return true;
 		if (!this.#isGenericAbortSentinel(message)) return false;
 
 		message.errorId = AIError.create(AIError.Flag.Abort);
@@ -16499,7 +16516,7 @@ export class AgentSession {
 			// User message: leaf = parent (null if root), text goes to editor
 			newLeafId = targetEntry.parentId;
 			editorText = this.#extractUserMessageText(targetEntry.message.content);
-		} else if (targetEntry.type === "custom_message") {
+		} else if (targetEntry.type === "custom_message" && targetEntry.customType !== SKILL_PROMPT_MESSAGE_TYPE) {
 			// Custom message: leaf = parent (null if root), text goes to editor
 			newLeafId = targetEntry.parentId;
 			editorText =
@@ -16510,7 +16527,10 @@ export class AgentSession {
 							.map(c => c.text)
 							.join("");
 		} else {
-			// Non-user message: leaf = selected node
+			// Non-user message (or a user-invoked skill-prompt injection): land the
+			// leaf on the selected node so it stays on the active branch. Skill
+			// prompts are custom_message entries but must not be re-editable — their
+			// content is a large expanded body, not a user turn (issue #5374).
 			newLeafId = targetId;
 		}
 
@@ -16863,10 +16883,12 @@ export class AgentSession {
 	}
 
 	#ingestProviderUsageHeaders(response: ProviderResponseMetadata, model?: Model): void {
-		if (model?.provider !== "anthropic") return;
-		this.#modelRegistry.authStorage.ingestUsageHeaders("anthropic", response.headers, {
+		const provider = model?.provider;
+		if (!provider) return;
+		// No-op for providers whose usage strategy lacks a header parser.
+		this.#modelRegistry.authStorage.ingestUsageHeaders(provider, response.headers, {
 			sessionId: this.agent.sessionId,
-			baseUrl: this.#modelRegistry.getProviderBaseUrl?.("anthropic"),
+			baseUrl: this.#modelRegistry.getProviderBaseUrl?.(provider),
 		});
 	}
 

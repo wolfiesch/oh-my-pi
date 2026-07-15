@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [16.5.2] - 2026-07-14
+
+### Fixed
+
+- Improved CLI argument and flag validation error output to display a concise error message and command usage instead of a minified code frame.
+- Corrected required variadic positionals to render as `MODELS...` instead of `[MODELS]` in usage help.
+
 ## [16.5.1] - 2026-07-14
 
 ### Added
