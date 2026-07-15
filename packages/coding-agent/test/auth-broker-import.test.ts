@@ -5,9 +5,19 @@ import * as path from "node:path";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import { type AuthBrokerServerHandle, startAuthBroker } from "@oh-my-pi/pi-ai/auth-broker";
 import { runAuthBrokerCommand } from "@oh-my-pi/pi-coding-agent/cli/auth-broker-cli";
-import { getAgentDbPath, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { getAgentDbPath, getAgentDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 
 const ORIGINAL_STDOUT_WRITE = process.stdout.write.bind(process.stdout);
+
+function restoreEnv(key: "OMP_AUTH_BROKER_URL" | "OMP_AUTH_BROKER_TOKEN", value: string | undefined): void {
+	if (value === undefined) delete process.env[key];
+	else process.env[key] = value;
+}
+
+function restoreAgentDir(originalEnv: string | undefined, fallback: string): void {
+	setAgentDir(originalEnv ?? fallback);
+	if (originalEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
+}
 
 function silenceStdout(): () => string {
 	let captured = "";
@@ -21,10 +31,20 @@ function silenceStdout(): () => string {
 describe("auth-broker import (CLIProxyAPI)", () => {
 	let agentDir = "";
 	let cliproxyDir = "";
-	let originalAgentDir: string | undefined;
+	let originalAgentDirEnv: string | undefined;
+	let fallbackAgentDir = "";
+	const savedBrokerEnv: Record<"OMP_AUTH_BROKER_URL" | "OMP_AUTH_BROKER_TOKEN", string | undefined> = {
+		OMP_AUTH_BROKER_URL: undefined,
+		OMP_AUTH_BROKER_TOKEN: undefined,
+	};
 
 	beforeEach(async () => {
-		originalAgentDir = process.env.OMP_AGENT_DIR;
+		originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
+		fallbackAgentDir = getAgentDir();
+		savedBrokerEnv.OMP_AUTH_BROKER_URL = process.env.OMP_AUTH_BROKER_URL;
+		savedBrokerEnv.OMP_AUTH_BROKER_TOKEN = process.env.OMP_AUTH_BROKER_TOKEN;
+		delete process.env.OMP_AUTH_BROKER_URL;
+		delete process.env.OMP_AUTH_BROKER_TOKEN;
 		agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-import-agent-"));
 		cliproxyDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-import-cliproxy-"));
 		setAgentDir(agentDir);
@@ -32,8 +52,9 @@ describe("auth-broker import (CLIProxyAPI)", () => {
 
 	afterEach(async () => {
 		process.stdout.write = ORIGINAL_STDOUT_WRITE;
-		if (originalAgentDir === undefined) delete process.env.OMP_AGENT_DIR;
-		else process.env.OMP_AGENT_DIR = originalAgentDir;
+		restoreEnv("OMP_AUTH_BROKER_URL", savedBrokerEnv.OMP_AUTH_BROKER_URL);
+		restoreEnv("OMP_AUTH_BROKER_TOKEN", savedBrokerEnv.OMP_AUTH_BROKER_TOKEN);
+		restoreAgentDir(originalAgentDirEnv, fallbackAgentDir);
 		await removeWithRetries(agentDir);
 		await removeWithRetries(cliproxyDir);
 	});
@@ -196,8 +217,12 @@ describe("auth-broker import (broker-routed)", () => {
 	let handle: AuthBrokerServerHandle | undefined;
 	const token = "broker-import-bearer";
 	const savedEnv: Record<string, string | undefined> = {};
+	let originalAgentDirEnv: string | undefined;
+	let fallbackAgentDir = "";
 
 	beforeEach(async () => {
+		originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
+		fallbackAgentDir = getAgentDir();
 		savedEnv.OMP_AUTH_BROKER_URL = process.env.OMP_AUTH_BROKER_URL;
 		savedEnv.OMP_AUTH_BROKER_TOKEN = process.env.OMP_AUTH_BROKER_TOKEN;
 		agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-import-client-"));
@@ -229,6 +254,7 @@ describe("auth-broker import (broker-routed)", () => {
 			if (savedEnv[key] === undefined) delete process.env[key];
 			else process.env[key] = savedEnv[key];
 		}
+		restoreAgentDir(originalAgentDirEnv, fallbackAgentDir);
 	});
 
 	test("uploads CLIProxyAPI JSONs to the broker when configured, not the local store", async () => {

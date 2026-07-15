@@ -422,6 +422,7 @@ describe("LSP diagnostics freshness", () => {
 			const client = createClient(tempDir.path(), server);
 			client.openFiles.set(uri, { version: 1, languageId: "typescript" });
 
+			vi.spyOn(lspConfig, "hasRootMarkerAncestor").mockReturnValue(false);
 			vi.spyOn(lspConfig, "loadConfig").mockReturnValue({
 				servers: { "typescript-language-server": server },
 				idleTimeoutMs: undefined,
