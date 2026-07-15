@@ -1751,6 +1751,386 @@ describe("live Unix websocket protocol", () => {
 		await closeClients([first.client, second.client]);
 		await appserver.stop();
 	});
+
+	test("gates live and attached agent transcripts by negotiated feature", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path, root } = await liveServer(factory, [record("s1")]);
+		const clients: RawUdsWebSocket[] = [];
+		try {
+			const negotiated = await readyClient(path, ["sessions.read"], ["resume", "agent.transcript"]);
+			const unnegotiated = await readyClient(path, ["sessions.read"], ["resume"]);
+			clients.push(negotiated.client, unnegotiated.client);
+			expect(negotiated.welcome.grantedFeatures).toEqual(["resume", "agent.transcript"]);
+			expect(unnegotiated.welcome.grantedFeatures).toEqual(["resume"]);
+
+			negotiated.client.sendJson(command("attach-transcript", "attach-transcript", "session.attach", "s1", {}));
+			await responseAndSnapshot(negotiated.client, "attach-transcript");
+			unnegotiated.client.sendJson(
+				command("attach-no-transcript", "attach-no-transcript", "session.attach", "s1", {}),
+			);
+			await responseAndSnapshot(unnegotiated.client, "attach-no-transcript");
+
+			const child = await startIdleSessionRuntime(negotiated.client, factory, "start-agent-transcript");
+			expect(await unnegotiated.client.nextServer()).toMatchObject({
+				type: "session.delta",
+				sessionId: "s1",
+				upsert: { liveState: { isStreaming: false } },
+			});
+			child.push({
+				type: "subagent_lifecycle",
+				payload: {
+					id: "WorkerA",
+					index: 0,
+					agent: "task",
+					agentSource: "bundled",
+					description: "Worker",
+					status: "started",
+					lastUpdate: 100,
+				},
+			});
+			await child.waitForWrites(2);
+			const firstRead = JSON.parse(child.writes[1] ?? "{}") as Record<string, unknown>;
+			expect(firstRead).toMatchObject({
+				type: "get_subagent_messages",
+				subagentId: "WorkerA",
+				fromByte: 0,
+				maxBytes: 384 * 1_024,
+				includeMessages: false,
+			});
+			if (typeof firstRead.id !== "string") throw new Error("first transcript read id missing");
+			child.push({
+				type: "response",
+				id: firstRead.id,
+				command: "get_subagent_messages",
+				success: true,
+				data: {
+					sessionFile: "/home/tester/private/worker.jsonl",
+					fromByte: 0,
+					nextByte: 100,
+					reset: false,
+					entries: [
+						{
+							type: "message",
+							id: "worker-message",
+							parentId: null,
+							timestamp: stamp,
+							message: {
+								role: "assistant",
+								content: [{ type: "text", text: "child says /home/tester/private/source.ts" }],
+							},
+						},
+					],
+					messages: [],
+				},
+			});
+			await child.waitForWrites(3);
+			const secondRead = JSON.parse(child.writes[2] ?? "{}") as Record<string, unknown>;
+			expect(secondRead).toMatchObject({
+				type: "get_subagent_messages",
+				subagentId: "WorkerA",
+				fromByte: 100,
+				maxBytes: 384 * 1_024,
+				includeMessages: false,
+			});
+			if (typeof secondRead.id !== "string") throw new Error("second transcript read id missing");
+			child.push({
+				type: "response",
+				id: secondRead.id,
+				command: "get_subagent_messages",
+				success: true,
+				data: {
+					sessionFile: "/home/tester/private/worker.jsonl",
+					fromByte: 100,
+					nextByte: 100,
+					reset: false,
+					entries: [],
+					messages: [],
+				},
+			});
+
+			expect(await negotiated.client.nextServer()).toMatchObject({
+				type: "agent",
+				agentId: "WorkerA",
+				state: "started",
+			});
+			const transcript = await negotiated.client.nextServer();
+			expect(transcript).toMatchObject({
+				type: "agent.transcript",
+				agentId: "WorkerA",
+				entries: [{ kind: "message", data: { role: "assistant", text: "child says [path]" } }],
+			});
+			expect(JSON.stringify(transcript)).not.toContain("/home/tester");
+			expect(await unnegotiated.client.nextServer()).toMatchObject({
+				type: "agent",
+				agentId: "WorkerA",
+				state: "started",
+			});
+			unnegotiated.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "no-live-transcript", timestamp: stamp });
+			expect(await unnegotiated.client.nextServer()).toMatchObject({ type: "pong", nonce: "no-live-transcript" });
+
+			const attachedNegotiated = await readyClient(path, ["sessions.read"], ["resume", "agent.transcript"]);
+			clients.push(attachedNegotiated.client);
+			attachedNegotiated.client.sendJson(
+				command("attach-transcript-baseline", "attach-transcript-baseline", "session.attach", "s1", {}),
+			);
+			await responseAndSnapshot(attachedNegotiated.client, "attach-transcript-baseline");
+			expect(await attachedNegotiated.client.nextServer()).toMatchObject({ type: "agent", agentId: "WorkerA" });
+			expect(await attachedNegotiated.client.nextServer()).toMatchObject({
+				type: "agent.transcript",
+				agentId: "WorkerA",
+				entries: [{ kind: "message", data: { text: "child says [path]" } }],
+			});
+
+			const attachedUnnegotiated = await readyClient(path, ["sessions.read"], ["resume"]);
+			clients.push(attachedUnnegotiated.client);
+			attachedUnnegotiated.client.sendJson(
+				command("attach-no-transcript-baseline", "attach-no-transcript-baseline", "session.attach", "s1", {}),
+			);
+			await responseAndSnapshot(attachedUnnegotiated.client, "attach-no-transcript-baseline");
+			expect(await attachedUnnegotiated.client.nextServer()).toMatchObject({ type: "agent", agentId: "WorkerA" });
+			attachedUnnegotiated.client.sendJson({
+				v: "omp-app/1",
+				type: "ping",
+				nonce: "no-attached-transcript",
+				timestamp: stamp,
+			});
+			expect(await attachedUnnegotiated.client.nextServer()).toMatchObject({
+				type: "pong",
+				nonce: "no-attached-transcript",
+			});
+		} finally {
+			await closeClients(clients);
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("reads only negotiated image metadata retained by a child transcript", async () => {
+		const blobRoot = await mkdtemp(join(tmpdir(), "omp-appserver-child-blobs-"));
+		await chmod(blobRoot, 0o700);
+		const png = Buffer.concat([
+			Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+			Buffer.from("child-transcript-image"),
+		]);
+		const sha256 = createHash("sha256").update(png).digest("hex");
+		await writeFile(join(blobRoot, sha256), png, { mode: 0o600 });
+		const factory = new LiveFactory();
+		const { appserver, path, root } = await liveServer(factory, [record("s1")], 256, blobRoot);
+		const clients: RawUdsWebSocket[] = [];
+		try {
+			const connected = await readyClient(
+				path,
+				["sessions.read"],
+				["resume", "agent.transcript", "transcript.images"],
+			);
+			clients.push(connected.client);
+			expect(connected.welcome.grantedFeatures).toEqual(["resume", "agent.transcript", "transcript.images"]);
+			connected.client.sendJson(command("attach-child-image", "attach-child-image", "session.attach", "s1", {}));
+			await responseAndSnapshot(connected.client, "attach-child-image");
+
+			const child = await startIdleSessionRuntime(connected.client, factory, "start-child-image");
+			child.push({
+				type: "subagent_lifecycle",
+				payload: {
+					id: "WorkerImage",
+					index: 0,
+					agent: "task",
+					agentSource: "bundled",
+					description: "Image worker",
+					status: "started",
+					lastUpdate: 100,
+				},
+			});
+			await child.waitForWrites(2);
+			const firstRead = JSON.parse(child.writes[1] ?? "{}") as Record<string, unknown>;
+			expect(firstRead).toMatchObject({
+				type: "get_subagent_messages",
+				subagentId: "WorkerImage",
+				fromByte: 0,
+			});
+			if (typeof firstRead.id !== "string") throw new Error("child image transcript read id missing");
+			child.push({
+				type: "response",
+				id: firstRead.id,
+				command: "get_subagent_messages",
+				success: true,
+				data: {
+					sessionFile: "/home/tester/private/image-worker.jsonl",
+					fromByte: 0,
+					nextByte: 100,
+					reset: false,
+					entries: [
+						{
+							type: "message",
+							id: "child-image-entry",
+							parentId: null,
+							timestamp: stamp,
+							message: {
+								role: "assistant",
+								content: [
+									{ type: "text", text: "child image" },
+									{
+										type: "image",
+										mimeType: "image/png",
+										data: `blob:sha256:${sha256}`,
+										appImageSha256: sha256,
+									},
+								],
+							},
+						},
+					],
+					messages: [],
+				},
+			});
+			await child.waitForWrites(3);
+			const secondRead = JSON.parse(child.writes[2] ?? "{}") as Record<string, unknown>;
+			expect(secondRead).toMatchObject({
+				type: "get_subagent_messages",
+				subagentId: "WorkerImage",
+				fromByte: 100,
+			});
+			if (typeof secondRead.id !== "string") throw new Error("child image transcript completion id missing");
+			child.push({
+				type: "response",
+				id: secondRead.id,
+				command: "get_subagent_messages",
+				success: true,
+				data: {
+					sessionFile: "/home/tester/private/image-worker.jsonl",
+					fromByte: 100,
+					nextByte: 100,
+					reset: false,
+					entries: [],
+					messages: [],
+				},
+			});
+
+			expect(await connected.client.nextServer()).toMatchObject({
+				type: "agent",
+				agentId: "WorkerImage",
+				state: "started",
+			});
+			expect(await connected.client.nextServer()).toMatchObject({
+				type: "agent.transcript",
+				agentId: "WorkerImage",
+				entries: [
+					{
+						id: "child-image-entry",
+						data: { images: [{ sha256, mimeType: "image/png" }] },
+					},
+				],
+			});
+
+			const readArgs = { entryId: "child-image-entry", sha256, offset: 0 };
+			const imageOnly = await readyClient(path, ["sessions.read"], ["resume", "transcript.images"]);
+			clients.push(imageOnly.client);
+			imageOnly.client.sendJson(
+				command("attach-child-image-only", "attach-child-image-only", "session.attach", "s1", {}),
+			);
+			await responseAndSnapshot(imageOnly.client, "attach-child-image-only");
+			expect(await imageOnly.client.nextServer()).toMatchObject({ type: "agent", agentId: "WorkerImage" });
+			imageOnly.client.sendJson(
+				command("read-child-image-only", "read-child-image-only", "session.image.read", "s1", readArgs),
+			);
+			expect((await untilResponse(imageOnly.client, "read-child-image-only")).response).toMatchObject({
+				ok: false,
+				error: { code: "image_not_found" },
+			});
+
+			connected.client.sendJson(
+				command("read-child-image", "read-child-image", "session.image.read", "s1", readArgs),
+			);
+			const read = (await untilResponse(connected.client, "read-child-image")).response;
+			expect(read).toMatchObject({
+				ok: true,
+				result: { sha256, mimeType: "image/png", offset: 0, complete: true },
+			});
+			expect(Buffer.from((read.result as { content: string }).content, "base64")).toEqual(png);
+
+			connected.client.sendJson(
+				command("read-child-mismatch", "read-child-mismatch", "session.image.read", "s1", {
+					...readArgs,
+					sha256: "f".repeat(64),
+				}),
+			);
+			expect((await untilResponse(connected.client, "read-child-mismatch")).response).toMatchObject({
+				ok: false,
+				error: { code: "image_not_found" },
+			});
+
+			child.push({
+				type: "subagent_lifecycle",
+				payload: {
+					id: "WorkerImage",
+					index: 0,
+					agent: "task",
+					agentSource: "bundled",
+					status: "parked",
+					resumable: true,
+				},
+			});
+			await child.waitForWrites(4);
+			const resetRead = JSON.parse(child.writes[3] ?? "{}") as Record<string, unknown>;
+			expect(resetRead).toMatchObject({
+				type: "get_subagent_messages",
+				subagentId: "WorkerImage",
+				fromByte: 100,
+			});
+			if (typeof resetRead.id !== "string") throw new Error("child image transcript reset id missing");
+			child.push({
+				type: "response",
+				id: resetRead.id,
+				command: "get_subagent_messages",
+				success: true,
+				data: {
+					sessionFile: "/home/tester/private/image-worker.jsonl",
+					fromByte: 0,
+					nextByte: 0,
+					reset: true,
+					entries: [],
+					messages: [],
+				},
+			});
+			expect(await connected.client.nextServer()).toMatchObject({
+				type: "agent",
+				agentId: "WorkerImage",
+				state: "parked",
+			});
+			expect(await connected.client.nextServer()).toMatchObject({
+				type: "agent.transcript",
+				agentId: "WorkerImage",
+				entries: [],
+			});
+
+			connected.client.sendJson(
+				command("read-child-unretained", "read-child-unretained", "session.image.read", "s1", readArgs),
+			);
+			expect((await untilResponse(connected.client, "read-child-unretained")).response).toMatchObject({
+				ok: false,
+				error: { code: "image_not_found" },
+			});
+
+			const unnegotiated = await readyClient(path, ["sessions.read"], ["resume"]);
+			clients.push(unnegotiated.client);
+			unnegotiated.client.sendJson(
+				command("attach-child-image-unnegotiated", "attach-child-image-unnegotiated", "session.attach", "s1", {}),
+			);
+			await responseAndSnapshot(unnegotiated.client, "attach-child-image-unnegotiated");
+			expect(await unnegotiated.client.nextServer()).toMatchObject({ type: "agent", agentId: "WorkerImage" });
+			unnegotiated.client.sendJson(
+				command("read-child-unnegotiated", "read-child-unnegotiated", "session.image.read", "s1", readArgs),
+			);
+			expect((await untilResponse(unnegotiated.client, "read-child-unnegotiated")).response).toMatchObject({
+				ok: false,
+				error: { code: "UNSUPPORTED_FEATURE", details: { feature: "transcript.images" } },
+			});
+		} finally {
+			await closeClients(clients);
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+			await rm(blobRoot, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("raw RFC6455 boundary and lifecycle", () => {

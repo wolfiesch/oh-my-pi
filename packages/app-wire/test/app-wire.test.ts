@@ -20,6 +20,7 @@ import {
 	inputObject,
 	isSecretLikeKey,
 	isServerFrame,
+	MAX_ARRAY_ITEMS,
 	MAX_FILE_BYTES,
 	MAX_INPUT_BYTES,
 	MAX_MAP_KEYS,
@@ -126,6 +127,14 @@ describe("app-wire authority", () => {
 		if (futureHello.type !== "hello") throw new Error("expected hello frame");
 		expect(futureHello.requestedFeatures).toEqual(["resume", "future.client.feature"]);
 		const welcome = (await fixture("welcome.json")) as Record<string, unknown>;
+		const transcriptWelcome = decodeServerFrame({
+			...welcome,
+			grantedFeatures: ["resume", "agent.transcript"],
+		});
+		expect(transcriptWelcome).toMatchObject({
+			type: "welcome",
+			grantedFeatures: ["resume", "agent.transcript"],
+		});
 		expect(() => decodeServerFrame({ ...welcome, grantedFeatures: ["resume", "future.server.feature"] })).toThrow(
 			AppWireError,
 		);
@@ -631,6 +640,45 @@ describe("app-wire authority", () => {
 		expect(() => decodeAdditiveServerFrame({ ...frames[6], event: { ...frames[6].event, hostId: "other" } })).toThrow(
 			AppWireError,
 		);
+	});
+	test("agent transcript is a bounded negotiated additive frame with same-session durable entries", () => {
+		expect(ADDITIVE_FEATURES).toContain("agent.transcript");
+		expect(PROTOCOL_FEATURES).toContain("agent.transcript");
+		const entry = {
+			id: "worker-entry",
+			parentId: null,
+			hostId: "h",
+			sessionId: "s",
+			kind: "tool-use",
+			timestamp: "2026-07-15T00:00:00.000Z",
+			data: {
+				tool: "read",
+				result: { content: [{ type: "text", text: "contents" }], details: { lines: 1 }, isError: false },
+			},
+		};
+		const frame = {
+			v: "omp-app/1",
+			type: "agent.transcript",
+			hostId: "h",
+			sessionId: "s",
+			agentId: "WorkerA",
+			cursor: { epoch: "agent-epoch", seq: 1 },
+			entries: [entry],
+			revision: "r",
+		};
+		expect(decodeAdditiveServerFrame(frame)).toMatchObject(frame);
+		expect(() =>
+			decodeAdditiveServerFrame({
+				...frame,
+				entries: [{ ...entry, sessionId: "other" }],
+			}),
+		).toThrow(AppWireError);
+		expect(() =>
+			decodeAdditiveServerFrame({
+				...frame,
+				entries: Array.from({ length: MAX_ARRAY_ITEMS + 1 }, (_, index) => ({ ...entry, id: `entry-${index}` })),
+			}),
+		).toThrow(AppWireError);
 	});
 	test("every command has typed bounded argument and result decoders", () => {
 		for (const command of Object.keys(COMMAND_DESCRIPTORS)) {

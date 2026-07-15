@@ -29,7 +29,8 @@ import {
 	type SessionStateResult,
 	utf8ByteLength,
 } from "@oh-my-pi/app-wire";
-import type { RpcResponse } from "../../coding-agent/src/modes/rpc/rpc-types.ts";
+import type { RpcResponse, RpcSubagentMessagesResult } from "../../coding-agent/src/modes/rpc/rpc-types.ts";
+import { AgentTranscriptProjection } from "./agent-transcript-projection.ts";
 import { completeAttachOutput, prepareAttachOutput } from "./attach-output.ts";
 import { AppserverCommandHandlers } from "./command-handler.ts";
 import {
@@ -63,7 +64,7 @@ import { SessionProjection } from "./projection.ts";
 import { BunRemoteListener, createListenerPlan, createServeProxyPlan } from "./remote/listener.ts";
 import type { RemoteConnection, RemoteListenerConfig } from "./remote/types.ts";
 import { BunRpcChildFactory, RpcChildSupervisor } from "./rpc-child.ts";
-import { SubagentProjection } from "./subagent-projection.ts";
+import { SubagentProjection, subagentIdFromFrame } from "./subagent-projection.ts";
 import { asAppWireEvent, TranscriptEventTranslator } from "./transcript-events.ts";
 import { TranscriptImageError, TranscriptImageReader } from "./transcript-image-reader.ts";
 import type {
@@ -109,6 +110,7 @@ const DIRECT_SESSION_RPC_COMMANDS: ReadonlySet<string> = new Set([
 	"session.fast.set",
 ]);
 const SESSION_CANCEL_COMMAND = "session.cancel";
+const SUBAGENT_TRANSCRIPT_RPC_BYTES = 384 * 1024;
 const REMOTE_OUTBOUND_TRANSFORM_TIMEOUT_MS = 10_000;
 
 async function boundedRemoteTransform<T>(operation: Promise<T> | T): Promise<T> {
@@ -339,7 +341,7 @@ export function appserverSupportedFeatures(
 	includeRemotePolicy = false,
 ): string[] {
 	const unsupportedAdditiveFeatures = new Set(["host.watch", "session.watch"]);
-	const implementedFeatures = new Set<string>(["resume", "prompt.images"]);
+	const implementedFeatures = new Set<string>(["resume", "prompt.images", "agent.transcript"]);
 	if (includeRemotePolicy) {
 		implementedFeatures.add("controller.lease");
 		implementedFeatures.add("prompt.lease");
@@ -394,6 +396,7 @@ export class LocalAppserver implements AppserverHandle {
 	#stateRefreshGenerations = new Map<SessionId, number>();
 	#transcripts = new Map<SessionId, TranscriptEventTranslator>();
 	#subagents = new Map<SessionId, SubagentProjection>();
+	#agentTranscripts = new Map<SessionId, AgentTranscriptProjection>();
 	#startPromises = new Map<SessionId, Promise<RpcChildSupervisor>>();
 	#lifecycleMutations = new Set<SessionId>();
 	#inflightSessionOperations = new Map<SessionId, number>();
@@ -673,6 +676,8 @@ export class LocalAppserver implements AppserverHandle {
 			this.#stateRefreshGenerations.clear();
 			this.#transcripts.clear();
 			this.#subagents.clear();
+			for (const transcript of this.#agentTranscripts.values()) transcript.dispose();
+			this.#agentTranscripts.clear();
 			await Promise.allSettled([...this.#startPromises.values()]);
 			this.#startPromises.clear();
 			this.#started = false;
@@ -1064,7 +1069,9 @@ export class LocalAppserver implements AppserverHandle {
 				if (!this.#transcriptImages)
 					throw new TranscriptImageError("image_not_found", "transcript image reading is unavailable");
 				const args = decodeCommandArguments(command.command, command.args) as unknown as SessionImageReadArguments;
-				const metadata = projection!.transcriptImage(args.entryId, args.sha256);
+				let metadata = projection!.transcriptImage(args.entryId, args.sha256);
+				if (!metadata && this.#clientFeatures.get(ws)?.has("agent.transcript"))
+					metadata = this.#agentTranscripts.get(command.sessionId!)?.transcriptImage(args.entryId, args.sha256);
 				if (!metadata)
 					throw new TranscriptImageError(
 						"image_not_found",
@@ -1428,7 +1435,7 @@ export class LocalAppserver implements AppserverHandle {
 			this.#promptLifecycles.delete(sessionId);
 			this.#stateRefreshGenerations.delete(sessionId);
 			this.#transcripts.delete(sessionId);
-			this.#subagents.delete(sessionId);
+			this.disposeSubagentState(sessionId);
 			if (alreadyExplicitlyClosed)
 				return { frame: response(this.hostId, command, true, { closed: true, sessionId }) };
 			this.updateStatus(sessionId, "closed");
@@ -1546,7 +1553,7 @@ export class LocalAppserver implements AppserverHandle {
 		this.#promptLifecycles.delete(sessionId);
 		this.#stateRefreshGenerations.delete(sessionId);
 		this.#transcripts.delete(sessionId);
-		this.#subagents.delete(sessionId);
+		this.disposeSubagentState(sessionId);
 		return true;
 	}
 	private releaseSupervisorAfterExit(sessionId: SessionId, supervisor: RpcChildSupervisor): void {
@@ -1569,8 +1576,13 @@ export class LocalAppserver implements AppserverHandle {
 		if (crashed) this.broadcast(sessionId, crashed);
 		this.#stateRefreshGenerations.delete(sessionId);
 		this.#transcripts.delete(sessionId);
-		this.#subagents.delete(sessionId);
+		this.disposeSubagentState(sessionId);
 		this.releaseSupervisorAfterExit(sessionId, supervisor);
+	}
+	private disposeSubagentState(sessionId: SessionId): void {
+		this.#subagents.delete(sessionId);
+		this.#agentTranscripts.get(sessionId)?.dispose();
+		this.#agentTranscripts.delete(sessionId);
 	}
 	private async quiesceSessionRuntime(sessionId: SessionId): Promise<boolean> {
 		if (this.#operations?.hasOpenTerminals(sessionId)) {
@@ -1713,7 +1725,7 @@ export class LocalAppserver implements AppserverHandle {
 			this.#promptLifecycles.delete(sessionId);
 			this.#stateRefreshGenerations.delete(sessionId);
 			this.#transcripts.delete(sessionId);
-			this.#subagents.delete(sessionId);
+			this.disposeSubagentState(sessionId);
 			for (const sessions of this.#attached.values()) sessions.delete(sessionId);
 			return { frame: response(this.hostId, command, true, { deleted: true }) };
 		} catch {
@@ -1821,7 +1833,31 @@ export class LocalAppserver implements AppserverHandle {
 		const subagents = new SubagentProjection(this.hostId, sessionId);
 		this.#subagents.set(sessionId, subagents);
 		const projector = new SessionEntryProjector(this.hostId, sessionId, "live", projection.value.entries);
-		const supervisor = new RpcChildSupervisor(
+		let supervisor: RpcChildSupervisor;
+		const agentTranscripts = new AgentTranscriptProjection({
+			hostId: this.hostId,
+			sessionId,
+			epoch: this.epoch,
+			read: async (agent, fromByte): Promise<RpcSubagentMessagesResult> => {
+				const result = await supervisor.call(
+					{
+						type: "get_subagent_messages",
+						subagentId: agent,
+						fromByte,
+						maxBytes: SUBAGENT_TRANSCRIPT_RPC_BYTES,
+						includeMessages: false,
+					},
+					`agent-transcript:${agent}`,
+				);
+				if (!result.success || result.command !== "get_subagent_messages")
+					throw new Error(result.success ? "subagent transcript response mismatch" : result.error);
+				return result.data;
+			},
+			revision: () => projection.value.revision,
+			emit: frame => this.broadcast(sessionId, frame),
+		});
+		this.#agentTranscripts.set(sessionId, agentTranscripts);
+		supervisor = new RpcChildSupervisor(
 			this.#factory,
 			record,
 			{
@@ -1854,6 +1890,8 @@ export class LocalAppserver implements AppserverHandle {
 				event: frame => {
 					const agentFrame = subagents.applyFrame(frame);
 					if (agentFrame) this.broadcast(sessionId, agentFrame);
+					const transcriptAgentId = subagentIdFromFrame(frame);
+					if (transcriptAgentId) agentTranscripts.refresh(transcriptAgentId);
 					if (frame.type === "agent_end") this.advanceStateRefreshGeneration(sessionId);
 					const promptLifecycle = this.#promptLifecycles.get(sessionId);
 					const terminalPromptResult =
@@ -1887,7 +1925,7 @@ export class LocalAppserver implements AppserverHandle {
 			this.#supervisors.delete(sessionId);
 			this.#promptLifecycles.delete(sessionId);
 			this.#transcripts.delete(sessionId);
-			this.#subagents.delete(sessionId);
+			this.disposeSubagentState(sessionId);
 			supervisor.stop();
 			throw error;
 		}
@@ -2102,6 +2140,8 @@ export class LocalAppserver implements AppserverHandle {
 				attached.add(frame.sessionId);
 				try {
 					outputFrames.push(...completeAttachOutput(prepared, projection, this.#subagents.get(frame.sessionId)));
+					if (this.#clientFeatures.get(ws)?.has("agent.transcript"))
+						outputFrames.push(...(this.#agentTranscripts.get(frame.sessionId)?.frames() ?? []));
 				} catch (error) {
 					attached.delete(frame.sessionId);
 					throw error;
@@ -2405,7 +2445,7 @@ export class LocalAppserver implements AppserverHandle {
 				this.#promptLifecycles.delete(sessionId);
 				this.#stateRefreshGenerations.delete(sessionId);
 				this.#transcripts.delete(sessionId);
-				this.#subagents.delete(sessionId);
+				this.disposeSubagentState(sessionId);
 				for (const sessions of this.#attached.values()) sessions.delete(sessionId);
 			} finally {
 				this.#lifecycleMutations.delete(sessionId);
@@ -2438,7 +2478,11 @@ export class LocalAppserver implements AppserverHandle {
 			void this.broadcastIndex(frame);
 			return;
 		}
-		for (const [client, sessions] of this.#attached) if (sessions.has(sessionId)) void this.#sendFrame(client, frame);
+		for (const [client, sessions] of this.#attached) {
+			if (!sessions.has(sessionId)) continue;
+			if (frame.type === "agent.transcript" && !this.#clientFeatures.get(client)?.has("agent.transcript")) continue;
+			void this.#sendFrame(client, frame);
+		}
 	}
 	private async broadcastAttachedOrdered(sessionId: SessionId, frame: ServerFrame): Promise<void> {
 		for (const [client, sessions] of this.#attached)

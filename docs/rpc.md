@@ -118,7 +118,20 @@ Important edge behavior from runtime:
 - `{ id?, type: "set_host_uri_schemes", schemes: RpcHostUriSchemeDefinition[] }`
 - `{ id?, type: "set_subagent_subscription", level: "off" | "progress" | "events" }`
 - `{ id?, type: "get_subagents" }`
-- `{ id?, type: "get_subagent_messages", subagentId?: string, sessionFile?: string, fromByte?: number }`
+- `{ id?, type: "get_subagent_messages", subagentId?: string, sessionFile?: string, fromByte?: number, maxBytes?: number, includeMessages?: boolean }`
+
+Subagent transcript reads use byte cursors. `maxBytes` must be an integer from 1
+through 393,216 and defaults to 393,216. A response contains complete JSONL
+records only, with at most 256 physical records per call. It can stop earlier
+to keep the RPC response inside the app-wire structural limits. Continue from
+`nextByte` until it no longer advances.
+
+`includeMessages` defaults to `true` for compatibility. Set it to `false` when
+the `entries` array is sufficient; this avoids returning the same message data
+twice. An incomplete final JSONL record does not advance `nextByte`. If the file
+was truncated or `fromByte` is not on a record boundary, the response sets
+`reset: true` and restarts at byte zero. A single record that exceeds the byte
+or structural limit returns an error instead of skipping data.
 
 ### Model
 

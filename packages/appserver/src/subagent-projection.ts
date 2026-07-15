@@ -149,6 +149,15 @@ function asAgentState(value: string): AgentState {
 	return value as AgentState;
 }
 
+/** Agent identity carried by an RPC lifecycle/progress frame, when valid. */
+export function subagentIdFromFrame(frame: Record<string, unknown>): string | undefined {
+	const payload = record(frame.payload);
+	if (!payload) return undefined;
+	if (frame.type === "subagent_lifecycle") return text(payload.id, 128);
+	if (frame.type !== "subagent_progress") return undefined;
+	return text(record(payload.progress)?.id, 128);
+}
+
 export class SubagentProjection {
 	#states = new Map<string, ProjectedAgentState>();
 

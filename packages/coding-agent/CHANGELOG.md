@@ -10,6 +10,7 @@
 
 ### Changed
 
+- Bounded incremental subagent transcript RPC reads to complete 384 KiB JSONL chunks, with byte cursors and an option to omit the redundant message view.
 - Appserver now admits one unresolved `session.prompt` per session and returns `session_busy` before a second prompt reaches the RPC child; active clients can use `session.steer` or `session.followUp` to add work to the running agent.
 - Bounded completed appserver command outcomes to a five-minute replay window and a 1,024-entry least-recently-used cache. Replays do not extend expiry, and pending commands are never evicted.
 - Appserver remote listener mode, bind address, port, and browser origins now persist in host-local `agent/local/config.yml` instead of synchronized profile config.
@@ -17,6 +18,7 @@
 
 ### Fixed
 
+- Fixed appserver durable tool results dropping structured content, renderer details, and error state. Bounded, redacted canonical fields now survive transcript projection without embedding image bytes, while legacy text output remains available.
 - Fixed image-bearing appserver sessions losing their RPC child when inline image payloads made a lifecycle or durable-entry notification exceed the one MiB line ceiling. Managed children now omit only redundant image bytes from their internal stdout notifications and mark the frame, while the full images remain unchanged in OMP's session and model context; even tiny canonical image payloads are externalized for transcript reads.
 - Fixed large appserver turns losing their terminal event when the redundant aggregate `agent_end` exceeded the RPC child's line or bounded-JSON structural limits. RPC now keeps a valid newest-message suffix with the original count and terminal status after durable entries; reader failures reap their child; crashes remain closed until child exit, then become restartable without a state probe; confirmed close settles transient state, waits for child exit, and is idempotent; and the desktop catalog exposes that close command.
 - Fixed the desktop catalog omitting implemented session creation and lifecycle commands, which caused catalog-driven clients to hide working create, rename, archive, restore, and delete controls.

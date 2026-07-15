@@ -51,7 +51,7 @@ import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./h
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import { resolveRpcPromptImages } from "./rpc-prompt-images";
 import { registerRpcSessionTeardown } from "./rpc-session-teardown";
-import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
+import { RPC_SUBAGENT_TRANSCRIPT_MAX_BYTES, RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
 	RpcAgentEndStatus,
 	RpcAgentSessionEvent,
@@ -1714,8 +1714,24 @@ export async function runRpcMode(
 				try {
 					if (command.fromByte !== undefined && !Number.isFinite(command.fromByte))
 						return error(id, "get_subagent_messages", "fromByte must be a finite number");
+					if (
+						command.maxBytes !== undefined &&
+						(!Number.isSafeInteger(command.maxBytes) ||
+							command.maxBytes <= 0 ||
+							command.maxBytes > RPC_SUBAGENT_TRANSCRIPT_MAX_BYTES)
+					)
+						return error(
+							id,
+							"get_subagent_messages",
+							`maxBytes must be an integer between 1 and ${RPC_SUBAGENT_TRANSCRIPT_MAX_BYTES}`,
+						);
+					if (command.includeMessages !== undefined && typeof command.includeMessages !== "boolean")
+						return error(id, "get_subagent_messages", "includeMessages must be a boolean");
 					const sessionFile = subagentRegistry.resolveSessionFile(command);
-					const transcript = await readRpcSubagentTranscript(sessionFile, command.fromByte);
+					const transcript = await readRpcSubagentTranscript(sessionFile, command.fromByte, {
+						maxBytes: command.maxBytes,
+						includeMessages: command.includeMessages,
+					});
 					return success(id, "get_subagent_messages", transcript);
 				} catch (err) {
 					return error(id, "get_subagent_messages", err instanceof Error ? err.message : String(err));

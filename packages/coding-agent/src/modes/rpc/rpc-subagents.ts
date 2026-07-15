@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { parseBounded } from "@oh-my-pi/app-wire";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { AgentRegistry, type RegistryEvent } from "../../registry/agent-registry";
 import type { FileEntry, SessionMessageEntry } from "../../session/session-entries";
@@ -20,17 +21,22 @@ import type {
 	RpcSubagentSnapshot,
 	RpcSubagentStatus,
 	RpcSubagentSubscriptionLevel,
+	RpcSubagentTranscriptSelector,
 } from "./rpc-types";
 
-export interface RpcSubagentTranscriptSelector {
-	subagentId?: string;
-	sessionFile?: string;
-	fromByte?: number;
-}
+export type { RpcSubagentTranscriptSelector } from "./rpc-types";
 
 type RpcSubagentOutput = (frame: RpcSubagentFrame) => void;
 
 const MAX_RETAINED_TRANSCRIPT_REFERENCES = 256;
+export const RPC_SUBAGENT_TRANSCRIPT_MAX_BYTES = 384 * 1024;
+export const RPC_SUBAGENT_TRANSCRIPT_MAX_RECORDS = 256;
+const RPC_SUBAGENT_TRANSCRIPT_PROBE_ID = "x".repeat(256);
+
+export interface RpcSubagentTranscriptReadOptions {
+	maxBytes?: number;
+	includeMessages?: boolean;
+}
 
 function isSessionMessageEntry(entry: FileEntry): entry is SessionMessageEntry {
 	return entry.type === "message";
@@ -71,8 +77,63 @@ function addPruned(set: Set<string>, value: string, maxSize: number): void {
 	}
 }
 
-export async function readRpcSubagentTranscript(sessionFile: string, fromByte = 0): Promise<RpcSubagentMessagesResult> {
+function transcriptReadMaxBytes(value: number | undefined): number {
+	if (value === undefined) return RPC_SUBAGENT_TRANSCRIPT_MAX_BYTES;
+	if (!Number.isSafeInteger(value) || value <= 0 || value > RPC_SUBAGENT_TRANSCRIPT_MAX_BYTES) {
+		throw new Error(`maxBytes must be an integer between 1 and ${RPC_SUBAGENT_TRANSCRIPT_MAX_BYTES}`);
+	}
+	return value;
+}
+
+interface RpcSubagentTranscriptRecord {
+	endByte: number;
+	entries: FileEntry[];
+}
+
+function transcriptResultForRecords(
+	sessionFile: string,
+	startByte: number,
+	reset: boolean,
+	records: readonly RpcSubagentTranscriptRecord[],
+	recordCount: number,
+	includeMessages: boolean,
+): RpcSubagentMessagesResult {
+	const entries = records.slice(0, recordCount).flatMap(record => record.entries);
+	return {
+		sessionFile,
+		fromByte: startByte,
+		nextByte: startByte + (recordCount > 0 ? records[recordCount - 1]!.endByte : 0),
+		reset,
+		entries,
+		messages: includeMessages ? entries.filter(isSessionMessageEntry).map(entry => entry.message) : [],
+	};
+}
+
+function isBoundedTranscriptResult(result: RpcSubagentMessagesResult): boolean {
+	try {
+		parseBounded(
+			JSON.stringify({
+				id: RPC_SUBAGENT_TRANSCRIPT_PROBE_ID,
+				type: "response",
+				command: "get_subagent_messages",
+				success: true,
+				data: result,
+			}),
+		);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+export async function readRpcSubagentTranscript(
+	sessionFile: string,
+	fromByte = 0,
+	options: RpcSubagentTranscriptReadOptions = {},
+): Promise<RpcSubagentMessagesResult> {
 	let startByte = Number.isFinite(fromByte) ? Math.max(0, Math.trunc(fromByte)) : 0;
+	const maxBytes = transcriptReadMaxBytes(options.maxBytes);
+	const includeMessages = options.includeMessages !== false;
 	const file = Bun.file(sessionFile);
 	let size: number;
 	try {
@@ -93,21 +154,49 @@ export async function readRpcSubagentTranscript(sessionFile: string, fromByte = 
 		startByte = 0;
 		reset = true;
 	}
+	if (startByte > 0) {
+		const previous = await file.slice(startByte - 1, startByte).bytes();
+		if (previous.byteLength !== 1 || previous[0] !== 0x0a) {
+			startByte = 0;
+			reset = true;
+		}
+	}
 
-	const text = startByte >= size ? "" : await file.slice(startByte).text();
-	const lastNewline = text.lastIndexOf("\n");
-	const completeText = lastNewline >= 0 ? text.slice(0, lastNewline + 1) : "";
-	const entries = completeText.length > 0 ? parseSessionEntries(completeText) : [];
-	const nextByte = startByte + Buffer.byteLength(completeText, "utf8");
+	const available = Math.max(0, size - startByte);
+	const readBytes = Math.min(maxBytes, available);
+	const bytes = readBytes === 0 ? new Uint8Array() : await file.slice(startByte, startByte + readBytes).bytes();
+	const lastNewline = bytes.lastIndexOf(0x0a);
+	if (lastNewline < 0 && bytes.byteLength === maxBytes) {
+		throw new Error(`subagent transcript entry exceeds maxBytes (${maxBytes})`);
+	}
+	const completeBytes = lastNewline < 0 ? new Uint8Array() : bytes.subarray(0, lastNewline + 1);
+	const records: RpcSubagentTranscriptRecord[] = [];
+	let recordStart = 0;
+	for (let index = 0; index < completeBytes.byteLength; index++) {
+		if (completeBytes[index] !== 0x0a) continue;
+		let text: string;
+		try {
+			text = new TextDecoder("utf-8", { fatal: true }).decode(completeBytes.subarray(recordStart, index + 1));
+		} catch {
+			throw new Error("subagent transcript contains invalid UTF-8");
+		}
+		records.push({ endByte: index + 1, entries: parseSessionEntries(text) });
+		recordStart = index + 1;
+		if (records.length >= RPC_SUBAGENT_TRANSCRIPT_MAX_RECORDS) break;
+	}
 
-	return {
-		sessionFile,
-		fromByte: startByte,
-		nextByte,
-		reset,
-		entries,
-		messages: entries.filter(isSessionMessageEntry).map(entry => entry.message),
-	};
+	let low = 0;
+	let high = records.length;
+	while (low < high) {
+		const candidate = Math.ceil((low + high) / 2);
+		const result = transcriptResultForRecords(sessionFile, startByte, reset, records, candidate, includeMessages);
+		if (isBoundedTranscriptResult(result)) low = candidate;
+		else high = candidate - 1;
+	}
+	if (records.length > 0 && low === 0) {
+		throw new Error("subagent transcript entry exceeds RPC structural bounds");
+	}
+	return transcriptResultForRecords(sessionFile, startByte, reset, records, low, includeMessages);
 }
 
 export class RpcSubagentRegistry {

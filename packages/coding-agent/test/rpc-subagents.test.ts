@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { parseBounded } from "@oh-my-pi/app-wire";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import {
 	handleRpcSessionChange,
@@ -9,7 +10,12 @@ import {
 	type RpcSessionChangeResult,
 	type RpcSessionChangeSession,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
-import { RpcSubagentRegistry, readRpcSubagentTranscript } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
+import {
+	RPC_SUBAGENT_TRANSCRIPT_MAX_BYTES,
+	RPC_SUBAGENT_TRANSCRIPT_MAX_RECORDS,
+	RpcSubagentRegistry,
+	readRpcSubagentTranscript,
+} from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import {
@@ -379,6 +385,211 @@ describe("readRpcSubagentTranscript", () => {
 		expect(result.messages).toHaveLength(1);
 		expect(result.nextByte).toBe(Buffer.byteLength(`${headerLine}${messageLine}`, "utf8"));
 		expect(result.reset).toBe(false);
+
+		const incomplete = await readRpcSubagentTranscript(sessionFile, result.nextByte, { maxBytes: 128 });
+		expect(incomplete).toMatchObject({
+			fromByte: result.nextByte,
+			nextByte: result.nextByte,
+			reset: false,
+			entries: [],
+			messages: [],
+		});
+	});
+
+	test("chunks only complete UTF-8 JSONL records and can omit the redundant message view", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-subagent-transcript-chunks-"));
+		tempPaths.push(dir);
+		const sessionFile = path.join(dir, "session.jsonl");
+		const headerLine = `${JSON.stringify({ type: "session", id: "s1", timestamp: "2026-06-09T00:00:00.000Z", cwd: dir })}\n`;
+		const text = "grüg 🐗 ".repeat(24);
+		const messageLine = `${JSON.stringify({
+			type: "message",
+			id: "m1",
+			parentId: null,
+			timestamp: "2026-06-09T00:00:01.000Z",
+			message: { role: "assistant", content: [{ type: "text", text }] },
+		})}\n`;
+		const finalLine = `${JSON.stringify({
+			type: "message",
+			id: "m2",
+			parentId: "m1",
+			timestamp: "2026-06-09T00:00:02.000Z",
+			message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+		})}\n`;
+		await Bun.write(sessionFile, `${headerLine}${messageLine}${finalLine}`);
+		const maxBytes = Buffer.byteLength(messageLine, "utf8");
+
+		const first = await readRpcSubagentTranscript(sessionFile, 0, { maxBytes, includeMessages: false });
+		expect(first.entries.map(entry => entry.type)).toEqual(["session"]);
+		expect(first.messages).toEqual([]);
+		expect(first.nextByte).toBe(Buffer.byteLength(headerLine, "utf8"));
+
+		const second = await readRpcSubagentTranscript(sessionFile, first.nextByte, {
+			maxBytes,
+			includeMessages: false,
+		});
+		expect(second.entries).toMatchObject([
+			{ type: "message", id: "m1", message: { content: [{ type: "text", text }] } },
+		]);
+		expect(second.messages).toEqual([]);
+		expect(second.nextByte).toBe(Buffer.byteLength(`${headerLine}${messageLine}`, "utf8"));
+	});
+
+	test("rejects an entry that cannot fit in one bounded chunk", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-subagent-transcript-oversized-"));
+		tempPaths.push(dir);
+		const sessionFile = path.join(dir, "session.jsonl");
+		await Bun.write(
+			sessionFile,
+			`${JSON.stringify({
+				type: "message",
+				id: "m1",
+				parentId: null,
+				timestamp: "2026-06-09T00:00:00.000Z",
+				message: { role: "user", content: [{ type: "text", text: "x".repeat(512) }] },
+			})}\n`,
+		);
+
+		await expect(readRpcSubagentTranscript(sessionFile, 0, { maxBytes: 128 })).rejects.toThrow(
+			"subagent transcript entry exceeds maxBytes (128)",
+		);
+		await expect(readRpcSubagentTranscript(sessionFile, 0, { maxBytes: 0 })).rejects.toThrow(
+			`maxBytes must be an integer between 1 and ${RPC_SUBAGENT_TRANSCRIPT_MAX_BYTES}`,
+		);
+	});
+
+	test("resets a stale cursor after transcript truncation", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-subagent-transcript-reset-"));
+		tempPaths.push(dir);
+		const sessionFile = path.join(dir, "session.jsonl");
+		const original = `${JSON.stringify({ type: "session", id: "old", timestamp: "2026-06-09T00:00:00.000Z", cwd: dir })}\n${JSON.stringify({ type: "custom", id: "old-entry", parentId: null, timestamp: "2026-06-09T00:00:01.000Z" })}\n`;
+		await Bun.write(sessionFile, original);
+		const cursor = (await readRpcSubagentTranscript(sessionFile)).nextByte;
+		const replacement = `${JSON.stringify({ type: "session", id: "new", timestamp: "2026-06-09T00:00:02.000Z", cwd: dir })}\n`;
+		await Bun.write(sessionFile, replacement);
+
+		const result = await readRpcSubagentTranscript(sessionFile, cursor);
+
+		expect(result).toMatchObject({
+			fromByte: 0,
+			nextByte: Buffer.byteLength(replacement, "utf8"),
+			reset: true,
+			entries: [{ type: "session", id: "new" }],
+		});
+	});
+
+	test("keeps an entries-only maximum chunk below the appserver RPC line ceiling", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-subagent-transcript-line-bound-"));
+		tempPaths.push(dir);
+		const sessionFile = path.join(dir, "session.jsonl");
+		const headerLine = `${JSON.stringify({ type: "session", id: "s1", timestamp: "2026-06-09T00:00:00.000Z", cwd: dir })}\n`;
+		const messageLines = Array.from(
+			{ length: 8 },
+			(_, index) =>
+				`${JSON.stringify({
+					type: "message",
+					id: `m${index}`,
+					parentId: index === 0 ? null : `m${index - 1}`,
+					timestamp: "2026-06-09T00:00:01.000Z",
+					message: { role: "assistant", content: [{ type: "text", text: `${index}:${"x".repeat(47_000)}` }] },
+				})}\n`,
+		);
+		await Bun.write(sessionFile, `${headerLine}${messageLines.join("")}`);
+
+		const result = await readRpcSubagentTranscript(sessionFile, 0, {
+			maxBytes: RPC_SUBAGENT_TRANSCRIPT_MAX_BYTES,
+			includeMessages: false,
+		});
+		const responseLine = JSON.stringify({
+			id: "read-1",
+			type: "response",
+			command: "get_subagent_messages",
+			success: true,
+			data: result,
+		});
+
+		expect(result.nextByte).toBeLessThanOrEqual(RPC_SUBAGENT_TRANSCRIPT_MAX_BYTES);
+		expect(result.messages).toEqual([]);
+		expect(Buffer.byteLength(responseLine, "utf8")).toBeLessThan(1024 * 1024);
+		expect(() => parseBounded(responseLine)).not.toThrow();
+
+		const compatibleDefault = await readRpcSubagentTranscript(sessionFile);
+		const compatibleResponseLine = JSON.stringify({
+			id: "read-2",
+			type: "response",
+			command: "get_subagent_messages",
+			success: true,
+			data: compatibleDefault,
+		});
+		expect(compatibleDefault.messages.length).toBeGreaterThan(0);
+		expect(Buffer.byteLength(compatibleResponseLine, "utf8")).toBeLessThan(1024 * 1024);
+		expect(() => parseBounded(compatibleResponseLine)).not.toThrow();
+	});
+
+	test("caps complete records without letting transport projection skip cursor data", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-subagent-transcript-record-bound-"));
+		tempPaths.push(dir);
+		const sessionFile = path.join(dir, "session.jsonl");
+		const lines = Array.from(
+			{ length: RPC_SUBAGENT_TRANSCRIPT_MAX_RECORDS + 17 },
+			(_, index) =>
+				`${JSON.stringify({
+					type: "message",
+					id: `m${index}`,
+					parentId: index === 0 ? null : `m${index - 1}`,
+					timestamp: "2026-06-09T00:00:01.000Z",
+					message: { role: "assistant", content: [{ type: "text", text: String(index) }] },
+				})}\n`,
+		);
+		await Bun.write(sessionFile, lines.join(""));
+
+		const first = await readRpcSubagentTranscript(sessionFile, 0, { includeMessages: false });
+		const second = await readRpcSubagentTranscript(sessionFile, first.nextByte, { includeMessages: false });
+		const firstResponse = JSON.stringify({
+			id: "read-records-1",
+			type: "response",
+			command: "get_subagent_messages",
+			success: true,
+			data: first,
+		});
+		const secondResponse = JSON.stringify({
+			id: "read-records-2",
+			type: "response",
+			command: "get_subagent_messages",
+			success: true,
+			data: second,
+		});
+
+		expect(first.entries).toHaveLength(RPC_SUBAGENT_TRANSCRIPT_MAX_RECORDS);
+		expect(first.nextByte).toBe(Buffer.byteLength(lines.slice(0, RPC_SUBAGENT_TRANSCRIPT_MAX_RECORDS).join("")));
+		expect([...first.entries, ...second.entries].map(entry => ("id" in entry ? entry.id : undefined))).toEqual(
+			lines.map((_, index) => `m${index}`),
+		);
+		expect(() => parseBounded(firstResponse)).not.toThrow();
+		expect(() => parseBounded(secondResponse)).not.toThrow();
+	});
+
+	test("rejects a single structurally unbounded record before advancing its cursor", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-subagent-transcript-structure-bound-"));
+		tempPaths.push(dir);
+		const sessionFile = path.join(dir, "session.jsonl");
+		await Bun.write(
+			sessionFile,
+			`${JSON.stringify({
+				type: "message",
+				id: "m1",
+				parentId: null,
+				timestamp: "2026-06-09T00:00:01.000Z",
+				message: {
+					role: "assistant",
+					content: Array.from({ length: 1_001 }, () => ({ type: "text", text: "x" })),
+				},
+			})}\n`,
+		);
+
+		await expect(readRpcSubagentTranscript(sessionFile, 0, { includeMessages: false })).rejects.toThrow(
+			"subagent transcript entry exceeds RPC structural bounds",
+		);
 	});
 
 	test("returns empty cursor result for missing transcript files", async () => {
@@ -446,7 +657,7 @@ function handle(frame) {
 		return;
 	}
 	if (frame.type === "get_subagent_messages") {
-		write({ id: frame.id, type: "response", command: "get_subagent_messages", success: true, data: { sessionFile: frame.sessionFile || "/tmp/subagent.jsonl", fromByte: frame.fromByte || 0, nextByte: 0, reset: false, entries: [], messages: [] } });
+		write({ id: frame.id, type: "response", command: "get_subagent_messages", success: true, data: { sessionFile: frame.sessionFile || "/tmp/subagent.jsonl", fromByte: frame.fromByte || 0, nextByte: frame.maxBytes || 0, reset: false, entries: [], messages: frame.includeMessages === false ? [] : [{ role: "user", content: "included" }] } });
 		return;
 	}
 	if (frame.type === "prompt") {
@@ -475,8 +686,16 @@ function handle(frame) {
 		await expect(client.setSubagentSubscription("events")).resolves.toBe("events");
 		await client.promptAndWait("Trigger subagent frames");
 		expect(await client.getSubagents()).toHaveLength(1);
-		expect(await client.getSubagentMessages({ sessionFile: "/tmp/subagent.jsonl" })).toMatchObject({
+		expect(
+			await client.getSubagentMessages({
+				sessionFile: "/tmp/subagent.jsonl",
+				maxBytes: 128,
+				includeMessages: false,
+			}),
+		).toMatchObject({
 			sessionFile: "/tmp/subagent.jsonl",
+			nextByte: 128,
+			messages: [],
 		});
 
 		expect(lifecycleIds).toEqual(["SubagentA"]);

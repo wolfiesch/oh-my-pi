@@ -114,6 +114,255 @@ describe("current OMP JSONL projection", () => {
 		expect(projection.transcriptImage(entryId("other-entry"), first)).toBeUndefined();
 	});
 
+	test("preserves structured read, edit, and task results without exposing image payloads", () => {
+		const projector = new SessionEntryProjector(host, sessionId("session-tool-details"), "live");
+		projector.project({
+			type: "message",
+			id: "tool-calls",
+			parentId: null,
+			timestamp: stamp,
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "read-call", name: "read", arguments: { path: "src/app.ts" } },
+					{ type: "toolCall", id: "edit-call", name: "edit", arguments: { input: "[src/app.ts]\nreplace" } },
+					{
+						type: "toolCall",
+						id: "task-call",
+						name: "task",
+						arguments: {
+							agent: "worker",
+							preview: `iVBORw0KGgo${"Q".repeat(4_096)}`,
+							image: { mimeType: "image/png", data: `iVBORw0KGgo${"R".repeat(4_096)}` },
+						},
+					},
+				],
+			},
+		});
+
+		const imageSha = "e".repeat(64);
+		const embeddedImage = `iVBORw0KGgo${"A".repeat(4096)}`;
+		const [readEntry] = projector.project({
+			type: "message",
+			id: "read-result",
+			parentId: "tool-calls",
+			timestamp: stamp,
+			message: {
+				role: "toolResult",
+				toolCallId: "read-call",
+				toolName: "read",
+				content: [
+					{ type: "text", text: "first line\n" },
+					{ type: "image", mimeType: "image/png", data: embeddedImage, appImageSha256: imageSha },
+					{ type: "text", text: "second line" },
+				],
+				details: {
+					resolvedPath: "/home/tester/project/src/app.ts",
+					summary: { lines: 2, elidedSpans: 0 },
+					note: "token=read-secret",
+					authorization: "Bearer should-not-survive",
+					detachedPreview: embeddedImage,
+					thumbnail: { type: "image", mimeType: "image/png", data: embeddedImage },
+				},
+				isError: false,
+			},
+		});
+		const [editEntry] = projector.project({
+			type: "message",
+			id: "edit-result",
+			parentId: "read-result",
+			timestamp: stamp,
+			message: {
+				role: "toolResult",
+				toolCallId: "edit-call",
+				toolName: "edit",
+				content: [{ type: "text", text: "Patch did not apply" }],
+				details: {
+					diff: "--- a/src/app.ts\n+++ b/src/app.ts\n-old\n+new",
+					perFileResults: [{ path: "src/app.ts", isError: true, displayErrorText: "match failed" }],
+				},
+				isError: true,
+			},
+		});
+		const [taskEntry] = projector.project({
+			type: "message",
+			id: "task-result",
+			parentId: "edit-result",
+			timestamp: stamp,
+			message: {
+				role: "toolResult",
+				toolCallId: "task-call",
+				toolName: "task",
+				content: [{ type: "text", text: "worker finished" }],
+				details: {
+					results: [{ id: "worker", output: "done", exitCode: 0, patchPath: "/tmp/private/worker.patch" }],
+					totalDurationMs: 1250,
+				},
+				isError: false,
+			},
+		});
+
+		expect(readEntry?.data).toMatchObject({
+			tool: "read",
+			ok: true,
+			result: {
+				output: "first line\nsecond line",
+				content: [
+					{ type: "text", text: "first line\n" },
+					{ type: "text", text: "second line" },
+				],
+				details: {
+					resolvedPath: "[path]",
+					summary: { lines: 2, elidedSpans: 0 },
+					note: "token=[redacted]",
+					detachedPreview: "[image omitted]",
+					thumbnail: { type: "image", mimeType: "image/png" },
+				},
+				isError: false,
+			},
+			images: [{ sha256: imageSha, mimeType: "image/png" }],
+		});
+		expect(editEntry?.data).toMatchObject({
+			tool: "edit",
+			ok: false,
+			result: {
+				content: [{ type: "text", text: "Patch did not apply" }],
+				details: {
+					diff: "--- a/src/app.ts\n+++ b/src/app.ts\n-old\n+new",
+					perFileResults: [{ path: "src/app.ts", isError: true, displayErrorText: "match failed" }],
+				},
+				isError: true,
+			},
+		});
+		expect(taskEntry?.data).toMatchObject({
+			tool: "task",
+			args: { agent: "worker", preview: "[image omitted]", image: { mimeType: "image/png" } },
+			ok: true,
+			result: {
+				content: [{ type: "text", text: "worker finished" }],
+				details: {
+					results: [{ id: "worker", output: "done", exitCode: 0, patchPath: "[path]" }],
+					totalDurationMs: 1250,
+				},
+				isError: false,
+			},
+		});
+		const serializedResult = JSON.stringify(readEntry?.data.result);
+		expect(serializedResult).not.toContain(embeddedImage);
+		expect(serializedResult).not.toContain("authorization");
+		expect(serializedResult).not.toContain("/home/tester");
+		const serializedTask = JSON.stringify(taskEntry);
+		expect(serializedTask).not.toContain("QQQQ");
+		expect(serializedTask).not.toContain("RRRR");
+	});
+
+	test("deduplicates managed tool images from content and details without retaining renderer payloads", () => {
+		const projector = new SessionEntryProjector(host, sessionId("session-tool-detail-images"), "live");
+		projector.project({
+			type: "message",
+			id: "image-call",
+			parentId: null,
+			timestamp: stamp,
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "generate-call", name: "generate_image", arguments: {} }],
+			},
+		});
+		const contentSha = "a".repeat(64);
+		const detailOnlySha = "b".repeat(64);
+		const contentBytes = `iVBORw0KGgo${"C".repeat(4_096)}`;
+		const detailBytes = `blob:sha256:${detailOnlySha}`;
+		const [entry] = projector.project({
+			type: "message",
+			id: "image-result",
+			parentId: "image-call",
+			timestamp: stamp,
+			message: {
+				role: "toolResult",
+				toolCallId: "generate-call",
+				toolName: "generate_image",
+				content: [
+					{ type: "text", text: "generated image" },
+					{ type: "image", mimeType: "image/png", data: contentBytes, appImageSha256: contentSha },
+				],
+				details: {
+					images: [
+						{ type: "image", mimeType: "image/png", data: contentBytes, appImageSha256: contentSha },
+						{ mimeType: "image/png", data: detailBytes },
+					],
+					sourcePath: "/home/tester/private/generated.png",
+					note: "ready",
+				},
+				isError: false,
+			},
+		});
+
+		expect(entry?.data).toMatchObject({
+			tool: "generate_image",
+			result: {
+				content: [{ type: "text", text: "generated image" }],
+				details: { sourcePath: "[path]", note: "ready" },
+				isError: false,
+			},
+			images: [
+				{ sha256: contentSha, mimeType: "image/png" },
+				{ sha256: detailOnlySha, mimeType: "image/png" },
+			],
+		});
+		const result = entry?.data.result as Record<string, unknown> | undefined;
+		const details = result?.details as Record<string, unknown> | undefined;
+		expect(details).not.toHaveProperty("images");
+		const serialized = JSON.stringify(entry);
+		expect(serialized).not.toContain(contentBytes);
+		expect(serialized).not.toContain(detailBytes);
+		expect(serialized).not.toContain("appImageSha256");
+		expect(serialized).not.toContain("/home/tester");
+	});
+
+	test("bounds aggregate tool result content and details", () => {
+		const projector = new SessionEntryProjector(host, sessionId("session-tool-result-bounds"), "batch");
+		projector.project({
+			type: "message",
+			id: "tool-call",
+			parentId: null,
+			timestamp: stamp,
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "call", name: "edit", arguments: {} }],
+			},
+		});
+		const [entry] = projector.project({
+			type: "message",
+			id: "tool-result",
+			parentId: "tool-call",
+			timestamp: stamp,
+			message: {
+				role: "toolResult",
+				toolCallId: "call",
+				toolName: "edit",
+				content: [
+					{ type: "text", text: "界".repeat(30_000) },
+					{ type: "text", text: "this block is beyond the result budget" },
+				],
+				details: {
+					first: "a".repeat(70_000),
+					second: "b".repeat(70_000),
+					third: "c".repeat(70_000),
+				},
+				isError: false,
+			},
+		});
+		const result = entry?.data.result as Record<string, unknown> | undefined;
+		const content = result?.content as Array<{ type: string; text: string }> | undefined;
+		const text = content?.map(block => block.text).join("") ?? "";
+		expect(new TextEncoder().encode(text).byteLength).toBeLessThanOrEqual(64 * 1024);
+		expect(result?.output).toBe(text);
+		expect(result?.details).toEqual({
+			omitted: "Tool result details exceeded the app-wire display budget.",
+		});
+		expect(new TextEncoder().encode(JSON.stringify(result)).byteLength).toBeLessThan(132 * 1024);
+	});
+
 	test("normalizes nested messages, tools, hidden entries, and runtime settings", async () => {
 		const hugeArgs = Array.from({ length: 1000 }, () => "x".repeat(900));
 		const toolImage = "d".repeat(64);

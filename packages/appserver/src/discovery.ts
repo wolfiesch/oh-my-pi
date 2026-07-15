@@ -20,6 +20,7 @@ const MAX_METADATA_BYTES = 128 * 1024;
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_TEXT_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 64 * 1024;
+const MAX_RESULT_DETAILS_BYTES = 128 * 1024;
 const MAX_ARGUMENT_BYTES = 128 * 1024;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -83,17 +84,43 @@ function isSensitiveKey(key: string): boolean {
 	return /(?:secret|token|password|api[_-]?key|authorization|cookie|credential|auth)/iu.test(key);
 }
 
-function safeValue(value: unknown, key = "", depth = 0): unknown {
+function isEmbeddedImageData(value: string): boolean {
+	if (/^data:image\//iu.test(value)) return true;
+	return value.length >= 32 && /^(?:iVBORw0KGgo|\/9j\/|R0lGOD|UklGR)/u.test(value);
+}
+
+function safeValue(value: unknown, key = "", depth = 0, omitImagePayloads = false): unknown {
 	if (isSensitiveKey(key)) return "[redacted]";
 	if (depth >= 8) return "[omitted]";
-	if (typeof value === "string") return cleanText(value, MAX_TEXT_BYTES);
+	if (typeof value === "string") {
+		if (omitImagePayloads && isEmbeddedImageData(value)) return "[image omitted]";
+		return cleanText(value, MAX_TEXT_BYTES);
+	}
 	if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
-	if (Array.isArray(value)) return value.slice(0, 64).map(item => safeValue(item, "", depth + 1));
+	if (Array.isArray(value)) return value.slice(0, 64).map(item => safeValue(item, "", depth + 1, omitImagePayloads));
 	if (typeof value === "object") {
 		const output: Record<string, unknown> = {};
+		const record = value as Record<string, unknown>;
+		const imageObject =
+			omitImagePayloads &&
+			(record.type === "image" || (typeof record.mimeType === "string" && record.mimeType.startsWith("image/")));
 		for (const [name, item] of Object.entries(value).slice(0, 64)) {
 			if (isSensitiveKey(name)) continue;
-			output[name] = safeValue(item, name, depth + 1);
+			if (
+				omitImagePayloads &&
+				name === "images" &&
+				Array.isArray(item) &&
+				item.some(image => {
+					const candidate = asObject(image);
+					return (
+						candidate?.type === "image" ||
+						(typeof candidate?.mimeType === "string" && candidate.mimeType.startsWith("image/"))
+					);
+				})
+			)
+				continue;
+			if (imageObject && ["appImageSha256", "base64", "bytes", "content", "data"].includes(name)) continue;
+			output[name] = safeValue(item, name, depth + 1, omitImagePayloads);
 		}
 		return output;
 	}
@@ -114,14 +141,49 @@ function contentText(content: unknown): string {
 	return cleanText(parts.join(""), MAX_TEXT_BYTES);
 }
 
-function contentImages(content: unknown, allowManagedMarker: boolean): TranscriptImageMetadata[] {
+interface ProjectedToolResultText {
+	type: "text";
+	text: string;
+}
+
+function toolResultContent(content: unknown): ProjectedToolResultText[] {
+	const values = typeof content === "string" ? [{ type: "text", text: content }] : content;
+	if (!Array.isArray(values)) return [];
+	const blocks: ProjectedToolResultText[] = [];
+	let remainingBytes = MAX_RESULT_BYTES;
+	for (const value of values) {
+		const block = asObject(value);
+		if (block?.type !== "text" || typeof block.text !== "string") continue;
+		const text = cleanText(block.text, remainingBytes);
+		if (text) blocks.push({ type: "text", text });
+		remainingBytes -= encoder.encode(text).byteLength;
+		if (remainingBytes <= 0) break;
+	}
+	return blocks;
+}
+
+function toolResultDetails(details: unknown): unknown {
+	if (details === undefined) return undefined;
+	const projected = safeValue(details, "", 0, true);
+	if (projected === undefined) return undefined;
+	const serialized = JSON.stringify(projected);
+	if (serialized !== undefined && encoder.encode(serialized).byteLength <= MAX_RESULT_DETAILS_BYTES) return projected;
+	return { omitted: "Tool result details exceeded the app-wire display budget." };
+}
+
+function contentImages(
+	content: unknown,
+	allowManagedMarker: boolean,
+	allowUntypedImagePayloads = false,
+): TranscriptImageMetadata[] {
 	if (!Array.isArray(content)) return [];
 	const images: TranscriptImageMetadata[] = [];
 	for (const item of content) {
 		if (images.length >= TRANSCRIPT_IMAGE_MAX_COUNT) break;
 		const block = asObject(item);
+		if (!block) continue;
 		if (
-			block?.type !== "image" ||
+			(block.type !== "image" && !(allowUntypedImagePayloads && block.type === undefined)) ||
 			typeof block.mimeType !== "string" ||
 			!(TRANSCRIPT_IMAGE_MIME_TYPES as readonly string[]).includes(block.mimeType)
 		)
@@ -131,6 +193,23 @@ function contentImages(content: unknown, allowManagedMarker: boolean): Transcrip
 		const sha256 = marked && /^[a-f0-9]{64}$/u.test(marked) ? marked : stored;
 		if (!sha256) continue;
 		images.push({ sha256, mimeType: block.mimeType as TranscriptImageMetadata["mimeType"] });
+	}
+	return images;
+}
+
+function toolResultImages(content: unknown, details: unknown, allowManagedMarker: boolean): TranscriptImageMetadata[] {
+	const images: TranscriptImageMetadata[] = [];
+	const seen = new Set<string>();
+	for (const [source, allowUntypedImagePayloads] of [
+		[content, false],
+		[asObject(details)?.images, true],
+	] as const) {
+		for (const image of contentImages(source, allowManagedMarker, allowUntypedImagePayloads)) {
+			if (seen.has(image.sha256)) continue;
+			seen.add(image.sha256);
+			images.push(image);
+			if (images.length >= TRANSCRIPT_IMAGE_MAX_COUNT) return images;
+		}
 	}
 	return images;
 }
@@ -154,7 +233,8 @@ interface PendingToolCall {
 
 interface ProjectedToolResult {
 	ok: boolean;
-	text: string;
+	content: ProjectedToolResultText[];
+	details?: unknown;
 	images: TranscriptImageMetadata[];
 	timestamp: string;
 }
@@ -251,6 +331,7 @@ export class SessionEntryProjector {
 	}
 
 	#tool(raw: Record<string, unknown>, call: PendingToolCall, result: ProjectedToolResult): DurableEntry {
+		const output = result.content.map(block => block.text).join("");
 		return this.#add(
 			{ ...raw, timestamp: result.timestamp },
 			"tool-use",
@@ -260,7 +341,12 @@ export class SessionEntryProjector {
 				title: call.title,
 				args: call.args,
 				ok: result.ok,
-				result: { output: boundUtf8(result.text, MAX_RESULT_BYTES) },
+				result: {
+					output: boundUtf8(output, MAX_RESULT_BYTES),
+					content: result.content,
+					...(result.details === undefined ? {} : { details: result.details }),
+					isError: !result.ok,
+				},
 				...(result.images.length > 0 ? { images: result.images } : {}),
 			},
 			call.parentId,
@@ -299,7 +385,7 @@ export class SessionEntryProjector {
 					if (block?.type === "thinking" && typeof block.thinking === "string")
 						reasoningParts.push(block.thinking);
 					if (block?.type === "toolCall" && typeof block.id === "string" && typeof block.name === "string") {
-						const args = safeValue(block.arguments ?? block.args ?? {});
+						const args = safeValue(block.arguments ?? block.args ?? {}, "", 0, true);
 						const argsBytes = encoder.encode(JSON.stringify(args) ?? "").byteLength;
 						toolCalls.push({
 							callId: block.id,
@@ -351,10 +437,12 @@ export class SessionEntryProjector {
 						? raw.toolCallId
 						: undefined;
 			if (callId && !this.#settledCalls.has(callId)) {
+				const rawContent = message.content ?? message.text ?? raw.text;
 				const result: ProjectedToolResult = {
 					ok: message.isError !== true,
-					text: contentText(message.content ?? message.text ?? raw.text),
-					images: contentImages(message.content ?? message.text ?? raw.text, this.mode === "live"),
+					content: toolResultContent(rawContent),
+					details: toolResultDetails(message.details),
+					images: toolResultImages(rawContent, message.details, this.mode === "live"),
 					timestamp: String(raw.timestamp),
 				};
 				const call = this.#pendingCalls.get(callId);
@@ -414,7 +502,7 @@ export class SessionEntryProjector {
 			for (const call of this.#pendingCalls.values()) {
 				this.#tool({ id: call.idBase, timestamp: call.timestamp }, call, {
 					ok: false,
-					text: "",
+					content: [],
 					images: [],
 					timestamp: call.timestamp,
 				});

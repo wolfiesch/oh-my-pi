@@ -34,6 +34,7 @@ import type {
 	RpcSubagentProgressFrame,
 	RpcSubagentSnapshot,
 	RpcSubagentSubscriptionLevel,
+	RpcSubagentTranscriptSelector,
 } from "./rpc-types";
 
 /** Distributive Omit that works with union types */
@@ -523,16 +524,14 @@ export class RpcClient {
 	/**
 	 * Read persisted transcript entries for a tracked subagent session.
 	 */
-	async getSubagentMessages(selector: {
-		subagentId?: string;
-		sessionFile?: string;
-		fromByte?: number;
-	}): Promise<RpcSubagentMessagesResult> {
+	async getSubagentMessages(selector: RpcSubagentTranscriptSelector): Promise<RpcSubagentMessagesResult> {
 		const response = await this.#send({
 			type: "get_subagent_messages",
 			subagentId: selector.subagentId,
 			sessionFile: selector.sessionFile,
 			fromByte: selector.fromByte,
+			maxBytes: selector.maxBytes,
+			includeMessages: selector.includeMessages,
 		});
 		return this.#getData<RpcSubagentMessagesResult>(response);
 	}

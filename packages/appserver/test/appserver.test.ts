@@ -175,6 +175,9 @@ describe("idempotency", () => {
 	});
 });
 describe("appserver lifecycle", () => {
+	test("advertises the exact default implemented feature set", () => {
+		expect(appserverSupportedFeatures({})).toEqual(["resume", "prompt.images", "agent.transcript"]);
+	});
 	test("advertises transcript image reads only with an explicit blob root", () => {
 		expect(appserverSupportedFeatures({})).not.toContain("transcript.images");
 		expect(appserverSupportedFeatures({ transcriptImageRoot: "/tmp/omp-blobs" })).toContain("transcript.images");
