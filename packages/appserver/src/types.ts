@@ -175,6 +175,28 @@ export interface AppserverOptions {
 	remoteListener?: BunRemoteListener;
 	admin?: AppserverAdminCallbacks;
 }
+export interface AppserverDrainBusy {
+	readonly connections: number;
+	readonly inflightMessages: number;
+	readonly startingSupervisors: number;
+	readonly lifecycleMutations: number;
+	readonly sessionOperations: number;
+	readonly activePrompts: number;
+	readonly rpcSupervisorsWithPendingCalls: number;
+	readonly busySessions: number;
+	readonly openTerminalSessions: number;
+	readonly pendingConfirmations: number;
+	readonly outboundSends: number;
+}
+export interface AppserverDrainHealth {
+	readonly ok: true;
+	readonly hostId: HostId;
+	readonly epoch: string;
+}
+export type AppserverDrainResult =
+	| { readonly state: "draining"; readonly health: AppserverDrainHealth; readonly busy: AppserverDrainBusy }
+	| { readonly state: "busy"; readonly health: AppserverDrainHealth; readonly busy: AppserverDrainBusy }
+	| { readonly state: "identity_mismatch"; readonly health: AppserverDrainHealth; readonly busy: AppserverDrainBusy };
 export interface Projection {
 	hostId: HostId;
 	sessionId: SessionId;

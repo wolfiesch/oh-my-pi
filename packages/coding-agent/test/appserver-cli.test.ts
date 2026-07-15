@@ -1,8 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { join } from "node:path";
+import { hostId } from "@oh-my-pi/app-wire";
 import { type AppserverHandle, BunRpcChildFactory, resolveRpcChildInvocation } from "@oh-my-pi/appserver";
 import {
 	type AppserverHealth,
 	type AppserverServeConfig,
+	runAppserverDrainIfIdle,
 	runAppserverServe,
 	runAppserverStatus,
 } from "@oh-my-pi/pi-coding-agent/cli/appserver-cli";
@@ -11,6 +14,20 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SETTINGS_SCHEMA } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
 
 const health: AppserverHealth = { ok: true, hostId: "host-test", epoch: "epoch-test" };
+const drainHealth = { ok: true as const, hostId: hostId("host-test"), epoch: "epoch-test" };
+const drainBusy = {
+	connections: 0,
+	inflightMessages: 0,
+	startingSupervisors: 0,
+	lifecycleMutations: 0,
+	sessionOperations: 0,
+	activePrompts: 0,
+	rpcSupervisorsWithPendingCalls: 0,
+	busySessions: 0,
+	openTerminalSessions: 0,
+	pendingConfirmations: 0,
+	outboundSends: 0,
+};
 function immediateHandle(onStart: () => void): AppserverHandle {
 	return {
 		hostId: "host-test" as never,
@@ -121,6 +138,187 @@ describe("appserver CLI routing", () => {
 		expect(starts).toBe(1);
 		expect(stops).toBe(1);
 		expect(removed.sort()).toEqual(["SIGINT", "SIGTERM"]);
+	});
+});
+
+describe("appserver drain CLI", () => {
+	test("runtime help proves the drain capability and the action enforces its identity fence", async () => {
+		const cli = join(import.meta.dir, "../src/cli.ts");
+		const help = Bun.spawn([process.execPath, cli, "appserver", "drain-if-idle", "--help"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [helpStatus, helpStdout, helpStderr] = await Promise.all([
+			help.exited,
+			new Response(help.stdout).text(),
+			new Response(help.stderr).text(),
+		]);
+		expect(helpStatus).toBe(0);
+		expect(helpStderr).toBe("");
+		expect(helpStdout).toContain("ACTION   Appserver action (serve|status|drain-if-idle|pair|devices|revoke)");
+		expect(helpStdout).toContain("omp appserver drain-if-idle --expected-host-id HOST --expected-epoch EPOCH --json");
+
+		const probe = Bun.spawn([process.execPath, cli, "appserver", "drain-if-idle"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [probeStatus, probeStdout, probeStderr] = await Promise.all([
+			probe.exited,
+			new Response(probe.stdout).text(),
+			new Response(probe.stderr).text(),
+		]);
+		expect(probeStatus).toBe(1);
+		expect(probeStdout).toBe("");
+		expect(probeStderr).toBe("appserver usage/error: --expected-host-id is required\n");
+	});
+
+	test("posts the exact expected identity and emits the validated draining result", async () => {
+		let request:
+			| {
+					socketPath: string;
+					path: string;
+					method: "GET" | "POST";
+					body?: Record<string, unknown>;
+			  }
+			| undefined;
+		let output = "";
+		const write = spyOn(process.stdout, "write").mockImplementation(chunk => {
+			output += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
+			return true;
+		});
+		const previousExitCode = process.exitCode;
+		process.exitCode = 0;
+		try {
+			const expected = { state: "draining" as const, health: drainHealth, busy: drainBusy };
+			const result = await runAppserverDrainIfIdle(
+				{
+					socketPath: () => "/tmp/test-appserver.sock",
+					adminRequest: async (socketPath, path, method, body) => {
+						request = { socketPath, path, method, body };
+						return expected;
+					},
+				},
+				{ json: true, expectedHostId: "host-test", expectedEpoch: "epoch-test" },
+			);
+
+			expect(request).toEqual({
+				socketPath: "/tmp/test-appserver.sock",
+				path: "/admin/drain-if-idle",
+				method: "POST",
+				body: { expectedHostId: "host-test", expectedEpoch: "epoch-test" },
+			});
+			expect(result).toEqual(expected);
+			expect(output).toBe(`${JSON.stringify(expected)}\n`);
+			expect(process.exitCode).toBe(0);
+		} finally {
+			write.mockRestore();
+			process.exitCode = previousExitCode ?? 0;
+		}
+	});
+
+	test("maps busy and identity mismatch results to the temporary-failure exit code", async () => {
+		const write = spyOn(process.stdout, "write").mockImplementation(() => true);
+		const previousExitCode = process.exitCode;
+		try {
+			for (const state of ["busy", "identity_mismatch"] as const) {
+				process.exitCode = 0;
+				const expected =
+					state === "busy"
+						? { state, health: drainHealth, busy: { ...drainBusy, connections: 1 } }
+						: {
+								state,
+								health: { ...drainHealth, hostId: hostId("another-host") },
+								busy: drainBusy,
+							};
+				expect(
+					await runAppserverDrainIfIdle(
+						{ adminRequest: async () => expected },
+						{ json: true, expectedHostId: "host-test", expectedEpoch: "epoch-test" },
+					),
+				).toEqual(expected);
+				expect(process.exitCode).toBe(75);
+			}
+		} finally {
+			write.mockRestore();
+			process.exitCode = previousExitCode ?? 0;
+		}
+	});
+
+	test("rejects responses that violate the required drain safety schema", async () => {
+		const malformed: unknown[] = [
+			{ state: "running", health: drainHealth, busy: drainBusy },
+			{ state: "draining", health: { ...drainHealth, ok: false }, busy: drainBusy },
+			{ state: "draining", health: { ...drainHealth, epoch: "another-epoch" }, busy: drainBusy },
+			{
+				state: "busy",
+				health: { ...drainHealth, hostId: hostId("another-host") },
+				busy: { ...drainBusy, connections: 1 },
+			},
+			{ state: "identity_mismatch", health: drainHealth, busy: drainBusy },
+			{ state: "draining", health: drainHealth, busy: { ...drainBusy, connections: 1 } },
+			{ state: "busy", health: drainHealth, busy: drainBusy },
+			{ state: "draining", health: drainHealth, busy: { ...drainBusy, outboundSends: -1 } },
+			{ state: "draining", health: drainHealth, busy: { ...drainBusy, outboundSends: 0.5 } },
+			{
+				state: "draining",
+				health: drainHealth,
+				busy: {
+					connections: 0,
+					inflightMessages: 0,
+					startingSupervisors: 0,
+					lifecycleMutations: 0,
+					sessionOperations: 0,
+					activePrompts: 0,
+					rpcSupervisorsWithPendingCalls: 0,
+					busySessions: 0,
+					openTerminalSessions: 0,
+					pendingConfirmations: 0,
+				},
+			},
+		];
+		const write = spyOn(process.stdout, "write").mockImplementation(() => true);
+		const previousExitCode = process.exitCode;
+		process.exitCode = 0;
+		try {
+			for (const response of malformed) {
+				await expect(
+					runAppserverDrainIfIdle(
+						{ adminRequest: async () => response },
+						{ json: true, expectedHostId: "host-test", expectedEpoch: "epoch-test" },
+					),
+				).rejects.toThrow("malformed appserver drain response");
+			}
+			expect(write).not.toHaveBeenCalled();
+			expect(process.exitCode).toBe(0);
+		} finally {
+			write.mockRestore();
+			process.exitCode = previousExitCode ?? 0;
+		}
+	});
+
+	test("accepts additive diagnostics while returning only the known safety contract", async () => {
+		const write = spyOn(process.stdout, "write").mockImplementation(() => true);
+		const previousExitCode = process.exitCode;
+		process.exitCode = 0;
+		try {
+			const result = await runAppserverDrainIfIdle(
+				{
+					adminRequest: async () => ({
+						state: "draining",
+						health: { ...drainHealth, draining: true },
+						busy: { ...drainBusy, futureWork: 0 },
+						diagnostics: { generation: 2 },
+					}),
+				},
+				{ json: true, expectedHostId: "host-test", expectedEpoch: "epoch-test" },
+			);
+
+			expect(result).toEqual({ state: "draining", health: drainHealth, busy: drainBusy });
+			expect(process.exitCode).toBe(0);
+		} finally {
+			write.mockRestore();
+			process.exitCode = previousExitCode ?? 0;
+		}
 	});
 });
 

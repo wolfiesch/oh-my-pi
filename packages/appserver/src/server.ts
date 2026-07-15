@@ -67,6 +67,8 @@ import { SubagentProjection } from "./subagent-projection.ts";
 import { asAppWireEvent, TranscriptEventTranslator } from "./transcript-events.ts";
 import { TranscriptImageError, TranscriptImageReader } from "./transcript-image-reader.ts";
 import type {
+	AppserverDrainBusy,
+	AppserverDrainResult,
 	AppserverHandle,
 	AppserverOptions,
 	ChildHandle,
@@ -400,6 +402,9 @@ export class LocalAppserver implements AppserverHandle {
 	#connectionIdempotency = new Map<AppWs, IdempotencyStore>();
 	#server?: Bun.Server<ServerWebSocketData>;
 	#clients = new Set<AppWs>();
+	#draining = false;
+	#inflightMessages = 0;
+	#inflightLifecycleMutations = 0;
 	#hello = new Set<AppWs>();
 	#clientCapabilities = new Map<AppWs, Set<string>>();
 	#clientFeatures = new Map<AppWs, Set<string>>();
@@ -500,6 +505,7 @@ export class LocalAppserver implements AppserverHandle {
 	async start(): Promise<void> {
 		if (this.#started) return;
 		this.#stopping = false;
+		this.#draining = false;
 		this.#closedSessions.clear();
 		if (!this.#hostProvided) this.hostId = await loadPersistentHostId();
 		this.#records.clear();
@@ -546,6 +552,10 @@ export class LocalAppserver implements AppserverHandle {
 					backpressureLimit: 1024 * 1024,
 					closeOnBackpressureLimit: true,
 					open: ws => {
+						if (this.#draining || this.#stopping) {
+							ws.close(1012, "appserver maintenance");
+							return;
+						}
 						const transport = this.#createLocalTransport(ws);
 						this.#localTransports.set(ws, transport);
 						this.#clients.add(transport);
@@ -1462,7 +1472,7 @@ export class LocalAppserver implements AppserverHandle {
 		);
 	}
 	private beginSessionOperation(sessionId: SessionId): boolean {
-		if (this.#lifecycleMutations.has(sessionId)) return false;
+		if (this.#draining || this.#stopping || this.#lifecycleMutations.has(sessionId)) return false;
 		this.#inflightSessionOperations.set(sessionId, (this.#inflightSessionOperations.get(sessionId) ?? 0) + 1);
 		return true;
 	}
@@ -1775,6 +1785,7 @@ export class LocalAppserver implements AppserverHandle {
 		void this.refreshState(sessionId, supervisor, requestId, preserveProjectedStatus).catch(() => undefined);
 	}
 	private async ensureSupervisor(sessionId: SessionId): Promise<RpcChildSupervisor> {
+		if (this.#draining) throw new Error("appserver is draining");
 		if (this.#stopping) throw new Error("appserver is stopping");
 		if (this.#closedSessions.has(sessionId)) throw new Error("session is closed");
 		if (this.#lifecycleMutations.has(sessionId)) throw new Error("session lifecycle mutation is in progress");
@@ -1882,7 +1893,12 @@ export class LocalAppserver implements AppserverHandle {
 		}
 	}
 	private async message(ws: AppWs, raw: string | Uint8Array): Promise<void> {
+		this.#inflightMessages += 1;
 		try {
+			if (this.#draining || this.#stopping) {
+				ws.close(1012, "appserver maintenance");
+				return;
+			}
 			if (typeof raw !== "string") throw new Error("binary websocket frames are not supported");
 			const frame = decodeClientFrame(parseBounded(raw));
 			if (frame.type === "hello") {
@@ -2099,6 +2115,8 @@ export class LocalAppserver implements AppserverHandle {
 			}
 			await this.#sendFrame(ws, { v: "omp-app/1", type: "error", code: "invalid_frame", message: "invalid frame" });
 			ws.close(1008, "invalid frame");
+		} finally {
+			this.#inflightMessages -= 1;
 		}
 	}
 	private challenge(ws: AppWs, command: CommandFrame): ConfirmationChallenge {
@@ -2186,6 +2204,8 @@ export class LocalAppserver implements AppserverHandle {
 		this.#remoteConnections.delete(ws);
 		this.#remoteTransports.delete(ws.connectionId);
 		this.#connectionIdempotency.delete(ws);
+		for (const [confirmationId, pending] of this.#challenges)
+			if (pending.ws === ws) this.#challenges.delete(confirmationId);
 		for (const [socket, transport] of this.#localTransports)
 			if (transport === ws) this.#localTransports.delete(socket);
 	}
@@ -2254,6 +2274,10 @@ export class LocalAppserver implements AppserverHandle {
 		return transport;
 	}
 	#remoteConnected(connection: RemoteConnection): void {
+		if (this.#draining || this.#stopping) {
+			connection.socket.close(1012, "appserver maintenance");
+			return;
+		}
 		let closed = false;
 		const transport: AppWs = {
 			connectionId: connection.connectionId,
@@ -2281,9 +2305,14 @@ export class LocalAppserver implements AppserverHandle {
 		if (transport) await this.message(transport, typeof message === "string" ? message : new Uint8Array(message));
 	}
 	async #remoteDisconnected(connection: RemoteConnection): Promise<void> {
-		const transport = this.#remoteTransports.get(connection.connectionId);
-		if (transport) await this.disconnectClient(transport);
-		if (this.#remotePolicy?.disconnected) await this.#remotePolicy.disconnected(connection);
+		this.#inflightLifecycleMutations += 1;
+		try {
+			const transport = this.#remoteTransports.get(connection.connectionId);
+			if (transport) await this.disconnectClient(transport);
+			if (this.#remotePolicy?.disconnected) await this.#remotePolicy.disconnected(connection);
+		} finally {
+			this.#inflightLifecycleMutations -= 1;
+		}
 	}
 	async #sendFrame(transport: AppWs, frame: ServerFrame): Promise<boolean> {
 		const previous = this.#outboundTails.get(transport) ?? Promise.resolve();
@@ -2421,10 +2450,68 @@ export class LocalAppserver implements AppserverHandle {
 			await this.#sendFrame(client, frame);
 		}
 	}
+	#emptyDrainBusy(): AppserverDrainBusy {
+		return {
+			connections: 0,
+			inflightMessages: 0,
+			startingSupervisors: 0,
+			lifecycleMutations: 0,
+			sessionOperations: 0,
+			activePrompts: 0,
+			rpcSupervisorsWithPendingCalls: 0,
+			busySessions: 0,
+			openTerminalSessions: 0,
+			pendingConfirmations: 0,
+			outboundSends: 0,
+		};
+	}
+	#drainBusy(): AppserverDrainBusy {
+		const now = Date.now();
+		for (const [confirmationId, pending] of this.#challenges)
+			if (pending.expiresAt < now || !this.#clients.has(pending.ws)) this.#challenges.delete(confirmationId);
+		let sessionOperations = 0;
+		for (const count of this.#inflightSessionOperations.values()) sessionOperations += count;
+		let rpcSupervisorsWithPendingCalls = 0;
+		for (const supervisor of this.#supervisors.values())
+			if (supervisor.hasPendingCalls()) rpcSupervisorsWithPendingCalls += 1;
+		let busySessions = 0;
+		let openTerminalSessions = 0;
+		for (const sessionId of this.#records.keys()) {
+			if (this.sessionLifecycleBusy(sessionId)) busySessions += 1;
+			if (this.#operations?.hasOpenTerminals(sessionId)) openTerminalSessions += 1;
+		}
+		return {
+			connections: this.#clients.size,
+			inflightMessages: this.#inflightMessages,
+			startingSupervisors: this.#startPromises.size,
+			lifecycleMutations: this.#lifecycleMutations.size + this.#inflightLifecycleMutations,
+			sessionOperations,
+			activePrompts: this.#promptLifecycles.size,
+			rpcSupervisorsWithPendingCalls,
+			busySessions,
+			openTerminalSessions,
+			pendingConfirmations: this.#challenges.size,
+			outboundSends: this.#outboundTails.size,
+		};
+	}
+	#tryDrainIfIdle(expectedHostId: string, expectedEpoch: string): AppserverDrainResult {
+		const health = { ok: true as const, hostId: this.hostId, epoch: this.epoch };
+		if (expectedHostId !== this.hostId || expectedEpoch !== this.epoch)
+			return { state: "identity_mismatch", health, busy: this.#drainBusy() };
+		if (this.#draining) return { state: "draining", health, busy: this.#emptyDrainBusy() };
+		this.#draining = true;
+		const busy = this.#drainBusy();
+		if (Object.values(busy).some(count => count > 0)) {
+			this.#draining = false;
+			return { state: "busy", health, busy };
+		}
+		return { state: "draining", health, busy };
+	}
 	private async fetch(request: Request, server: Bun.Server<ServerWebSocketData>): Promise<Response | undefined> {
 		const url = new URL(request.url);
 		if (url.pathname === "/health" && request.method === "GET")
-			return Response.json({ ok: true, hostId: this.hostId, epoch: this.epoch });
+			return Response.json({ ok: true, hostId: this.hostId, epoch: this.epoch, draining: this.#draining });
+		if (url.pathname === "/admin/drain-if-idle") return this.#adminDrainIfIdle(request);
 		if (url.pathname === "/admin/pair-ticket") return this.adminPairTicket(request);
 		if (url.pathname === "/admin/devices") return this.adminDevices(request);
 		if (url.pathname === "/admin/revoke") return this.adminRevoke(request);
@@ -2434,6 +2521,7 @@ export class LocalAppserver implements AppserverHandle {
 			request.headers.get("upgrade")?.toLowerCase() !== "websocket"
 		)
 			return new Response("Not Found", { status: 404 });
+		if (this.#draining || this.#stopping) return new Response("Service Unavailable", { status: 503 });
 		if (server.upgrade(request, { data: { socket: {} } })) return undefined;
 		return new Response("Upgrade Required", { status: 426 });
 	}
@@ -2463,28 +2551,51 @@ export class LocalAppserver implements AppserverHandle {
 		if (Object.keys(body).some(key => !keys.includes(key))) return this.adminError();
 		return body;
 	}
-	private async adminPairTicket(request: Request): Promise<Response> {
-		if (!this.#admin || request.method !== "POST") return this.adminError(404);
-		const body = await this.adminJson(request, ["capabilities", "ttlMs", "expectedNodeId"]);
+	async #adminDrainIfIdle(request: Request): Promise<Response> {
+		if (this.#stopping) return this.adminError(503);
+		const body = await this.adminJson(request, ["expectedHostId", "expectedEpoch"]);
 		if (body instanceof Response) return body;
-		const capabilities = body.capabilities;
+		if (this.#stopping) return this.adminError(503);
 		if (
-			!Array.isArray(capabilities) ||
-			capabilities.length === 0 ||
-			capabilities.length > 32 ||
-			capabilities.some(value => typeof value !== "string" || value.length === 0 || value.length > 128)
+			typeof body.expectedHostId !== "string" ||
+			body.expectedHostId.length === 0 ||
+			body.expectedHostId.length > 1024 ||
+			typeof body.expectedEpoch !== "string" ||
+			body.expectedEpoch.length === 0 ||
+			body.expectedEpoch.length > 1024
 		)
 			return this.adminError();
-		const ttl = body.ttlMs;
-		if (ttl !== undefined && (typeof ttl !== "number" || !Number.isSafeInteger(ttl) || ttl <= 0 || ttl > 600_000))
-			return this.adminError();
-		const nodeId = body.expectedNodeId;
-		if (nodeId !== undefined && (typeof nodeId !== "string" || nodeId.length === 0 || nodeId.length > 512))
-			return this.adminError();
+		return Response.json(this.#tryDrainIfIdle(body.expectedHostId, body.expectedEpoch));
+	}
+	private async adminPairTicket(request: Request): Promise<Response> {
+		if (!this.#admin || request.method !== "POST") return this.adminError(404);
+		if (this.#draining || this.#stopping) return this.adminError(503);
+		this.#inflightLifecycleMutations += 1;
 		try {
-			return Response.json(this.#admin.issuePairingTicket(capabilities, ttl, nodeId));
-		} catch {
-			return this.adminError();
+			const body = await this.adminJson(request, ["capabilities", "ttlMs", "expectedNodeId"]);
+			if (body instanceof Response) return body;
+			if (this.#draining || this.#stopping) return this.adminError(503);
+			const capabilities = body.capabilities;
+			if (
+				!Array.isArray(capabilities) ||
+				capabilities.length === 0 ||
+				capabilities.length > 32 ||
+				capabilities.some(value => typeof value !== "string" || value.length === 0 || value.length > 128)
+			)
+				return this.adminError();
+			const ttl = body.ttlMs;
+			if (ttl !== undefined && (typeof ttl !== "number" || !Number.isSafeInteger(ttl) || ttl <= 0 || ttl > 600_000))
+				return this.adminError();
+			const nodeId = body.expectedNodeId;
+			if (nodeId !== undefined && (typeof nodeId !== "string" || nodeId.length === 0 || nodeId.length > 512))
+				return this.adminError();
+			try {
+				return Response.json(this.#admin.issuePairingTicket(capabilities, ttl, nodeId));
+			} catch {
+				return this.adminError();
+			}
+		} finally {
+			this.#inflightLifecycleMutations -= 1;
 		}
 	}
 	private adminDevices(request: Request): Response {
@@ -2497,14 +2608,21 @@ export class LocalAppserver implements AppserverHandle {
 	}
 	private async adminRevoke(request: Request): Promise<Response> {
 		if (!this.#admin || request.method !== "POST") return this.adminError(404);
-		const body = await this.adminJson(request, ["deviceId"]);
-		if (body instanceof Response) return body;
-		if (typeof body.deviceId !== "string" || body.deviceId.length === 0 || body.deviceId.length > 512)
-			return this.adminError();
+		if (this.#draining || this.#stopping) return this.adminError(503);
+		this.#inflightLifecycleMutations += 1;
 		try {
-			return Response.json(this.#admin.revokeDevice(body.deviceId));
-		} catch {
-			return this.adminError();
+			const body = await this.adminJson(request, ["deviceId"]);
+			if (body instanceof Response) return body;
+			if (this.#draining || this.#stopping) return this.adminError(503);
+			if (typeof body.deviceId !== "string" || body.deviceId.length === 0 || body.deviceId.length > 512)
+				return this.adminError();
+			try {
+				return Response.json(this.#admin.revokeDevice(body.deviceId));
+			} catch {
+				return this.adminError();
+			}
+		} finally {
+			this.#inflightLifecycleMutations -= 1;
 		}
 	}
 }

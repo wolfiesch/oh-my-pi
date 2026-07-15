@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added an owner-socket `appserver drain-if-idle` maintenance fence that atomically refuses new client work only after the exact appserver identity is confirmed idle.
 - Added desktop appserver controls for session model, thinking level, and fast mode, with live settings, model-role, and task-agent catalog metadata.
 - Added desktop session archive, restore, and delete backed by private profile metadata and crash-recoverable same-filesystem tombstones.
 

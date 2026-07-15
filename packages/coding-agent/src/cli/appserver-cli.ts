@@ -1,13 +1,13 @@
 import * as http from "node:http";
 import { isIP } from "node:net";
 import { isAbsolute, join } from "node:path";
-import type { AppserverHandle } from "@oh-my-pi/appserver";
+import type { AppserverDrainBusy, AppserverDrainResult, AppserverHandle } from "@oh-my-pi/appserver";
 import { createRemoteAppserver, defaultSocketPath } from "@oh-my-pi/appserver";
 import { getBlobsDir, getProfileRootDir, postmortem } from "@oh-my-pi/pi-utils";
 import type { Settings as SettingsType } from "../config/settings";
 import { getCodingAgentAppserverIdentity } from "./appserver-identity";
 
-export type AppserverAction = "serve" | "status" | "pair" | "devices" | "revoke";
+export type AppserverAction = "serve" | "status" | "drain-if-idle" | "pair" | "devices" | "revoke";
 export type RemoteMode = "direct" | "serve";
 
 export interface AppserverServeConfig {
@@ -27,6 +27,8 @@ export interface AppserverCommandArgs {
 		capabilities?: readonly string[];
 		ttlSeconds?: number;
 		expectedNodeId?: string;
+		expectedHostId?: string;
+		expectedEpoch?: string;
 		deviceId?: string;
 	};
 }
@@ -456,6 +458,66 @@ function writeStatus(status: AppserverStatus, json: boolean): void {
 function writeJson(value: unknown): void {
 	process.stdout.write(`${JSON.stringify(value)}\n`);
 }
+const DRAIN_BUSY_KEYS = [
+	"connections",
+	"inflightMessages",
+	"startingSupervisors",
+	"lifecycleMutations",
+	"sessionOperations",
+	"activePrompts",
+	"rpcSupervisorsWithPendingCalls",
+	"busySessions",
+	"openTerminalSessions",
+	"pendingConfirmations",
+	"outboundSends",
+] as const satisfies readonly (keyof AppserverDrainBusy)[];
+function parseDrainResult(value: unknown): AppserverDrainResult {
+	if (!isRecord(value) || !["draining", "busy", "identity_mismatch"].includes(String(value.state)))
+		throw new Error("malformed appserver drain response");
+	let health: AppserverHealth;
+	try {
+		health = parseHealth(value.health);
+	} catch {
+		throw new Error("malformed appserver drain response");
+	}
+	if (!isRecord(value.busy)) throw new Error("malformed appserver drain response");
+	const busy = {} as Record<(typeof DRAIN_BUSY_KEYS)[number], number>;
+	for (const key of DRAIN_BUSY_KEYS) {
+		const count = value.busy[key];
+		if (!Number.isSafeInteger(count) || (count as number) < 0) throw new Error("malformed appserver drain response");
+		busy[key] = count as number;
+	}
+	const counts = Object.values(busy);
+	if (value.state === "draining" && counts.some(count => count !== 0))
+		throw new Error("malformed appserver drain response");
+	if (value.state === "busy" && counts.every(count => count === 0))
+		throw new Error("malformed appserver drain response");
+	return { state: value.state, health, busy } as AppserverDrainResult;
+}
+export async function runAppserverDrainIfIdle(
+	deps: AppserverRunnerDeps = {},
+	flags: AppserverCommandArgs["flags"] = {},
+): Promise<AppserverDrainResult> {
+	if (!validIdentifier(flags.expectedHostId)) throw new Error("--expected-host-id is required");
+	if (!validIdentifier(flags.expectedEpoch)) throw new Error("--expected-epoch is required");
+	const socketPath = (deps.socketPath ?? defaultSocketPath)();
+	const request = deps.adminRequest ?? readUnixAdmin;
+	const result = parseDrainResult(
+		await request(socketPath, "/admin/drain-if-idle", "POST", {
+			expectedHostId: flags.expectedHostId,
+			expectedEpoch: flags.expectedEpoch,
+		}),
+	);
+	const identityMatches = result.health.hostId === flags.expectedHostId && result.health.epoch === flags.expectedEpoch;
+	if ((result.state === "identity_mismatch") === identityMatches)
+		throw new Error("malformed appserver drain response");
+	if (flags.json) writeJson(result);
+	else if (result.state === "draining")
+		process.stdout.write(`appserver draining (host ${result.health.hostId}, epoch ${result.health.epoch})\n`);
+	else process.stderr.write(`appserver drain deferred (${result.state})\n`);
+	if (result.state !== "draining") process.exitCode = 75;
+	return result;
+}
 function parseTicket(value: unknown): { code: string; expiresAt: number } {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("malformed pair ticket response");
 	const body = value as Record<string, unknown>;
@@ -535,6 +597,10 @@ export async function runAppserverCommand(cmd: AppserverCommandArgs, deps: Appse
 	}
 	if (cmd.action === "revoke") {
 		await runAppserverRevoke(deps, cmd.flags.deviceId, cmd.flags.json === true);
+		return;
+	}
+	if (cmd.action === "drain-if-idle") {
+		await runAppserverDrainIfIdle(deps, cmd.flags);
 		return;
 	}
 	const status = await runAppserverStatus(deps);
