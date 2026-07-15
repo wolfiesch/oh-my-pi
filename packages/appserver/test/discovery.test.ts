@@ -49,6 +49,116 @@ function sessionTranscript(id: string, cwd: string, title: string): string {
 }
 
 describe("current OMP JSONL projection", () => {
+	test("preserves bounded IRC metadata for exact collaboration rendering", () => {
+		const projector = new SessionEntryProjector(host, sessionId("session-irc"), "batch");
+		const [entry] = projector.project({
+			type: "custom_message",
+			id: "irc-message",
+			parentId: null,
+			timestamp: stamp,
+			customType: "irc:incoming",
+			content: "Incoming message from ReviewAgent",
+			display: true,
+			attribution: "agent",
+			details: {
+				id: "message-1",
+				from: "ReviewAgent",
+				message: "Found one issue.",
+				replyTo: "message-0",
+			},
+		});
+
+		expect(entry?.data).toEqual({
+			role: "assistant",
+			text: "Incoming message from ReviewAgent",
+			customType: "irc:incoming",
+			customDetails: {
+				id: "message-1",
+				from: "ReviewAgent",
+				message: "Found one issue.",
+				replyTo: "message-0",
+			},
+		});
+	});
+
+	test("preserves async-result job metadata without flattening it into prose", () => {
+		const projector = new SessionEntryProjector(host, sessionId("session-async-result"), "batch");
+		const [entry] = projector.project({
+			type: "custom_message",
+			id: "async-result",
+			parentId: null,
+			timestamp: stamp,
+			customType: "async-result",
+			content: '<task-result agent="ReleaseReview" status="completed"><output>Ready.</output></task-result>',
+			display: true,
+			attribution: "agent",
+			details: {
+				jobs: [{ jobId: "ReleaseReview", type: "task", label: "Release review", durationMs: 91_000 }],
+			},
+		});
+
+		expect(entry?.data.customType).toBe("async-result");
+		expect(entry?.data.customDetails).toEqual({
+			jobs: [{ jobId: "ReleaseReview", type: "task", label: "Release review", durationMs: 91_000 }],
+		});
+	});
+
+	test("does not attach custom metadata to ordinary assistant messages", () => {
+		const projector = new SessionEntryProjector(host, sessionId("session-ordinary"), "batch");
+		const [entry] = projector.project({
+			type: "message",
+			id: "ordinary-message",
+			parentId: null,
+			timestamp: stamp,
+			customType: "irc:incoming",
+			details: { from: "SpoofedAgent" },
+			message: { role: "assistant", content: "Ordinary assistant prose" },
+		});
+
+		expect(entry?.data).toEqual({ role: "assistant", text: "Ordinary assistant prose" });
+	});
+
+	test("redacts sensitive custom details and omits oversized metadata", () => {
+		const projector = new SessionEntryProjector(host, sessionId("session-custom-details"), "batch");
+		const [safeEntry] = projector.project({
+			type: "custom_message",
+			id: "sensitive-details",
+			parentId: null,
+			timestamp: stamp,
+			customType: `  notice\u0000${"x".repeat(256)}  `,
+			content: "Sanitized metadata",
+			display: true,
+			details: {
+				from: "Worker",
+				token: "top-secret-token",
+				nested: { password: "top-secret-password", log: "opened /home/tester/private/report.txt" },
+			},
+		});
+		const [oversizedEntry] = projector.project({
+			type: "custom_message",
+			id: "oversized-details",
+			parentId: "sensitive-details",
+			timestamp: stamp,
+			customType: "async-result",
+			content: "Oversized metadata",
+			display: true,
+			details: { jobs: ["a".repeat(64 * 1024), "b".repeat(64 * 1024), "c".repeat(64 * 1024)] },
+		});
+
+		const customType = safeEntry?.data.customType;
+		expect(typeof customType).toBe("string");
+		expect(new TextEncoder().encode(String(customType)).byteLength).toBeLessThanOrEqual(128);
+		expect(String(customType)).not.toContain("\u0000");
+		expect(safeEntry?.data.customDetails).toEqual({
+			from: "Worker",
+			nested: { log: "opened [path]" },
+		});
+		expect(JSON.stringify(safeEntry?.data)).not.toContain("top-secret");
+		expect(oversizedEntry?.data.customDetails).toEqual({
+			omitted: "Tool result details exceeded the app-wire display budget.",
+		});
+	});
+
 	test("projects ordered transcript image metadata without image bytes or paths", () => {
 		const first = "a".repeat(64);
 		const second = "b".repeat(64);

@@ -22,6 +22,7 @@ const MAX_TEXT_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 64 * 1024;
 const MAX_RESULT_DETAILS_BYTES = 128 * 1024;
 const MAX_ARGUMENT_BYTES = 128 * 1024;
+const MAX_CUSTOM_TYPE_BYTES = 128;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 type DiscoveryFileSystem = FileSystem & {
@@ -460,10 +461,19 @@ export class SessionEntryProjector {
 			const text = contentText(content);
 			const images = contentImages(content, this.mode === "live");
 			const customRole = raw.attribution === "agent" ? "assistant" : "user";
+			const customType =
+				typeof raw.customType === "string" ? cleanText(raw.customType, MAX_CUSTOM_TYPE_BYTES, true) : "";
+			const customDetails = customType ? toolResultDetails(raw.details) : undefined;
 			const entry = this.#add(
 				raw,
 				"message",
-				{ role: customRole, text, ...(images.length > 0 ? { images } : {}) },
+				{
+					role: customRole,
+					text,
+					...(customType ? { customType } : {}),
+					...(customDetails === undefined ? {} : { customDetails }),
+					...(images.length > 0 ? { images } : {}),
+				},
 				parentId,
 			);
 			this.#aliases.set(String(raw.id), entry.id);
