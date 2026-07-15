@@ -100,6 +100,7 @@ const fastWorkspacePackages = [
 // or coding-agent-adjacent benchmark paths. Keep them low-concurrency and in jobs
 // that have downloaded the Linux x64 native addon artifacts.
 const nativeAndIntegrationPackages = [
+	"packages/appserver",
 	"packages/natives",
 	"packages/tui",
 	"packages/collab-web",

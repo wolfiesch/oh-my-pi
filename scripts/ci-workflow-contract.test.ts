@@ -3,7 +3,10 @@ import * as path from "node:path";
 
 type Config = Record<string, unknown>;
 
-const workflowPath = path.resolve(import.meta.dir, "..", ".github", "workflows", "ci.yml");
+const repoRoot = path.resolve(import.meta.dir, "..");
+const workflowPath = path.join(repoRoot, ".github", "workflows", "ci.yml");
+const ciTestPlanPath = path.join(repoRoot, "scripts", "ci-test-ts.ts");
+const appserverManifestPath = path.join(repoRoot, "packages", "appserver", "package.json");
 const workflow = Bun.YAML.parse(await Bun.file(workflowPath).text()) as Config;
 
 function config(value: unknown, label: string): Config {
@@ -116,5 +119,19 @@ describe("CI workflow product release contract", () => {
 		expect(crossRunner).toContain("github.repository != 'can1357/oh-my-pi'");
 		expect(crossRunner).toContain("ubuntu-22.04");
 		expect(crossRunner).toContain("matrix.os");
+	});
+
+	it("gates appserver types and runtime tests before publishing product binaries", async () => {
+		const manifest = config(await Bun.file(appserverManifestPath).json(), "appserver manifest");
+		expect(config(manifest.scripts, "appserver scripts").check).toBe("bun run build");
+
+		const dryRun = Bun.spawnSync(["bun", ciTestPlanPath, "native", "--dry-run"], {
+			cwd: repoRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(dryRun.exitCode).toBe(0);
+		expect(dryRun.stdout.toString()).toContain("==> packages/appserver");
+		expect(job("release_binary").if).toContain("needs.test_ts_native.result == 'success'");
 	});
 });
