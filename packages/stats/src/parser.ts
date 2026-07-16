@@ -471,7 +471,7 @@ export async function listAllSessionFiles(): Promise<string[]> {
 		allFiles.push(...files);
 	}
 
-	return allFiles;
+	return allFiles.sort((a, b) => a.localeCompare(b));
 }
 
 /**

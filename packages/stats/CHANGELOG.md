@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed session sync visiting session files in filesystem-dependent order. Files now sync in deterministic name order, so a forked session's copied entries always land after the filename-timestamped original and stay attributed to the parent session instead of whichever file happened to sync first.
+
 ## [16.4.7] - 2026-07-12
 
 ### Fixed
