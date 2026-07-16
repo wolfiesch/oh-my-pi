@@ -38,6 +38,10 @@ inputs:
       description: Run clippy/rustfmt checks (only one matrix entry should set this)
       required: false
       default: "false"
+   rust_tests:
+      description: Run the Rust workspace tests for native, non-darwin builds
+      required: false
+      default: "true"
    save_cache:
       description: Whether Swatinem/rust-cache should write a cache entry (GitHub-hosted only)
       required: false
@@ -212,14 +216,14 @@ runs:
 
       # --- cargo-nextest (native test runner; non-cross builds only) ----------
       - name: Ensure baked cargo-nextest (omp-kata)
-        if: steps.detect.outputs.on_infra == 'true' && inputs.target == ''
+        if: steps.detect.outputs.on_infra == 'true' && inputs.rust_tests == 'true' && inputs.target == ''
         uses: ./.github/actions/ensure-cargo-tool
         with:
            binary: cargo-nextest
            crate: cargo-nextest
       - name: Install cargo-nextest (GitHub-hosted)
-        if: steps.detect.outputs.on_infra == 'false' && inputs.target == ''
-        uses: taiki-e/install-action@v2
+        if: steps.detect.outputs.on_infra == 'false' && inputs.rust_tests == 'true' && inputs.target == ''
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         with:
            tool: nextest
 
@@ -248,11 +252,12 @@ runs:
         with:
            binary: cargo-zigbuild
            crate: cargo-zigbuild
+           version: "0.23.0"
       - name: Install cargo-zigbuild (GitHub-hosted, non-MSVC cross)
         if: steps.detect.outputs.on_infra == 'false' && steps.resolve.outputs.cross_target != '' && !endsWith(steps.resolve.outputs.cross_target, '-msvc')
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         with:
-           tool: cargo-zigbuild
+           tool: cargo-zigbuild@0.23.0
       - name: Install LLVM tooling (GitHub-hosted, MSVC cross)
         if: steps.detect.outputs.on_infra == 'false' && endsWith(steps.resolve.outputs.cross_target, '-msvc')
         shell: bash
@@ -265,17 +270,18 @@ runs:
         with:
            binary: cargo-xwin
            crate: cargo-xwin
+           version: "0.23.0"
       - name: Install cargo-xwin (GitHub-hosted, MSVC cross)
         if: steps.detect.outputs.on_infra == 'false' && endsWith(steps.resolve.outputs.cross_target, '-msvc')
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         with:
-           tool: cargo-xwin
+           tool: cargo-xwin@0.23.0
       - name: Cache cargo-xwin Windows SDK
         if: endsWith(steps.resolve.outputs.cross_target, '-msvc')
         uses: actions/cache@v4
         with:
            path: ~/.cache/cargo-xwin
-           key: cargo-xwin-${{ runner.os }}-v1
+           key: cargo-xwin-${{ runner.os }}-0.23.0
       - name: Accept xwin license
         if: endsWith(steps.resolve.outputs.cross_target, '-msvc')
         shell: bash
@@ -291,7 +297,7 @@ runs:
         # Windows-only tests are no longer exercised in CI (win32-x64 cross-builds
         # on Linux). Skipping the duplicate Linux runs on macOS saves ~10 min of
         # parallel runner time.
-        if: inputs.target == '' && inputs.platform != 'darwin'
+        if: inputs.rust_tests == 'true' && inputs.target == '' && inputs.platform != 'darwin'
         shell: bash
         run: bun run test:rs
       - name: Build native addon(s)

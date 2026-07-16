@@ -24,9 +24,23 @@ runs:
            VERSION: ${{ inputs.version }}
         run: |
            set -euo pipefail
+           tool_version() {
+             "$BINARY" --version 2>/dev/null || "$BINARY" "${BINARY#cargo-}" --version
+           }
+           force_install=false
            if command -v "$BINARY" >/dev/null 2>&1; then
-             echo "Using baked cargo tool: $BINARY"
-             exit 0
+             if [ -z "$VERSION" ]; then
+               echo "Using baked cargo tool: $BINARY"
+               exit 0
+             fi
+             escaped_version=${VERSION//./\\.}
+             actual_version=$(tool_version 2>/dev/null || true)
+             if echo "$actual_version" | grep -Eq "(^|[[:space:]])v?${escaped_version}([[:space:]]|$)"; then
+               echo "Using baked cargo tool: $BINARY $VERSION"
+               exit 0
+             fi
+             echo "Baked $BINARY does not match required version $VERSION; reinstalling"
+             force_install=true
            fi
 
            crate="${CRATE:-$BINARY}"
@@ -34,5 +48,11 @@ runs:
            if [ -n "$VERSION" ]; then
              install_args+=(--version "$VERSION")
            fi
+           if $force_install; then
+             install_args+=(--force)
+           fi
            cargo "${install_args[@]}"
-           echo "Installed cargo tool: $BINARY"
+           cargo_bin_dir="${CARGO_HOME:-$HOME/.cargo}/bin"
+           export PATH="$cargo_bin_dir:$PATH"
+           echo "$cargo_bin_dir" >> "$GITHUB_PATH"
+           tool_version

@@ -75,8 +75,10 @@ jobs:
            run: bun scripts/ci-release-metadata.ts
 
    # Compute a stable hash of every input that affects the native cdylib output,
-   # then look for any prior successful main run that already uploaded the
-   # native artifacts for this hash. Two independent outputs:
+   # then look for a prior successful run on the branch that owns this workflow
+   # invocation (`main` or `t4code/main`) that already uploaded the native
+   # artifacts for this hash. Pull requests use their base branch. Two
+   # independent outputs:
    #   * `linux-x64-run-id` — set when the linux x64 canary
    #     (`pi-natives-linux-x64-modern-h<hash>`) is present on a prior main run,
    #     so native-dependent TS test jobs and `native_linux_x64` can reuse it.
@@ -84,8 +86,11 @@ jobs:
    #     also have non-expired artifacts on that same prior run, so
    #     `native_cross_platform` can skip the cold rebuild on main pushes after
    #     dep changes have already warmed sccache there.
-   # Non-release native jobs are skipped when their canary hits; the canary
-   # retention window (see build-native action) is the effective TTL.
+   # Native jobs, including releases, are skipped when their canary hits. The
+   # source hash makes reuse content-addressed rather than version- or
+   # branch-addressed; the owning branch only limits provenance to trusted,
+   # successful push runs. The canary retention window (see build-native action)
+   # is the effective TTL.
    native_artifact_lookup:
       name: Look up cached native artifacts
       runs-on: ${{ (github.event_name == 'pull_request' || github.repository != 'can1357/oh-my-pi') && 'ubuntu-22.04' || 'omp-kata' }}
@@ -95,33 +100,44 @@ jobs:
          cross-platform-run-id: ${{ steps.find.outputs.cross-platform-run-id }}
       steps:
          - uses: actions/checkout@v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+           with:
+              bun-version: "1.3"
          - name: Compute native source hash
            id: compute
            shell: bash
            run: |
-              source_hash=$(find crates Cargo.toml Cargo.lock rust-toolchain.toml \
-                      packages/natives/scripts packages/natives/package.json \
-                      scripts/ci-build-native.ts scripts/host-detect.ts \
-                      -type f -print0 \
-                    | sort -z \
-                    | xargs -0 sha256sum \
-                    | sha256sum \
-                    | cut -c1-16)
+              source_hash=$(bun scripts/ci-native-source-hash.ts)
               echo "source-hash=$source_hash" >> "$GITHUB_OUTPUT"
               echo "Native source hash: $source_hash"
-         - name: Find prior main build with matching native artifacts
+         - name: Find trusted build with matching native artifacts
            id: find
            env:
               GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              PR_BASE_REF: ${{ github.base_ref }}
+              REPOSITORY: ${{ github.repository }}
            shell: bash
            run: |
               hash="${{ steps.compute.outputs.source-hash }}"
-              # Canary for native_linux_x64: presence of the modern artifact
-              # implies the baseline sibling is also there (they upload from the
-              # same job).
+              cache_branch="main"
+              case "$GITHUB_REF" in
+                refs/heads/t4code/main|refs/tags/t4code-*)
+                  cache_branch="t4code/main"
+                  ;;
+                refs/pull/*)
+                  cache_branch="$PR_BASE_REF"
+                  ;;
+              esac
+              if [ -z "$cache_branch" ]; then
+                echo "Unable to resolve a trusted native artifact branch for $GITHUB_REF" >&2
+                exit 1
+              fi
+              echo "Searching successful $cache_branch push runs for native source hash $hash"
               linux_canary="pi-natives-linux-x64-modern-h${hash}"
-              # Required set for cross-platform reuse — names must match the
-              # `actions/upload-artifact` `name:` template in build-native action.
+              linux_required=(
+                "pi-natives-linux-x64-baseline-h${hash}"
+                "$linux_canary"
+              )
               cross_platform_required=(
                 "pi-natives-linux-arm64-h${hash}"
                 "pi-natives-darwin-x64-baseline-h${hash}"
@@ -130,29 +146,43 @@ jobs:
               )
               linux_x64_run_id=""
               cross_platform_run_id=""
-              for candidate in $(gh run list \
-                  --workflow=ci.yml --branch=main --status=success --event=push \
-                  --limit=20 --json databaseId --jq='.[].databaseId'); do
-                names=$(gh api "/repos/${{ github.repository }}/actions/runs/$candidate/artifacts?per_page=100" \
+              # Query by the exact content-addressed canary instead of searching
+              # only the latest N runs. This honors the full artifact retention
+              # window without making one API request for every intervening push.
+              candidates=$(gh api --paginate \
+                "/repos/$REPOSITORY/actions/artifacts?name=$linux_canary&per_page=100" \
+                --jq '.artifacts[] | select(.expired == false) | .workflow_run.id' \
+                | awk '!seen[$0]++')
+              for candidate in $candidates; do
+                metadata=$(gh api "/repos/$REPOSITORY/actions/runs/$candidate" \
+                  --jq '[.conclusion, .event, .head_branch, .path] | @tsv')
+                IFS=$'\t' read -r conclusion event head_branch workflow_path <<< "$metadata"
+                if [ "$conclusion" != "success" ] || [ "$event" != "push" ] || \
+                   [ "$head_branch" != "$cache_branch" ] || [ "$workflow_path" != ".github/workflows/ci.yml" ]; then
+                  continue
+                fi
+                names=$(gh api "/repos/$REPOSITORY/actions/runs/$candidate/artifacts?per_page=100" \
                     --jq '.artifacts[] | select(.expired == false) | .name')
-                if [ -z "$linux_x64_run_id" ] && echo "$names" | grep -qFx "$linux_canary"; then
-                  linux_x64_run_id="$candidate"
+                if [ -z "$linux_x64_run_id" ]; then
+                  all_linux_found=true
+                  for req in "${linux_required[@]}"; do
+                    if ! echo "$names" | grep -qFx "$req"; then
+                      all_linux_found=false
+                      break
+                    fi
+                  done
+                  if $all_linux_found; then
+                    linux_x64_run_id="$candidate"
+                  fi
                 fi
                 if [ -z "$cross_platform_run_id" ]; then
                   all_found=true
-                  # Cross-platform reuse requires the linux canary AND every
-                  # cross-platform artifact, since release_binary downloads them
-                  # from the same run.
-                  if ! echo "$names" | grep -qFx "$linux_canary"; then
-                    all_found=false
-                  else
-                    for req in "${cross_platform_required[@]}"; do
-                      if ! echo "$names" | grep -qFx "$req"; then
-                        all_found=false
-                        break
-                      fi
-                    done
-                  fi
+                  for req in "${linux_required[@]}" "${cross_platform_required[@]}"; do
+                    if ! echo "$names" | grep -qFx "$req"; then
+                      all_found=false
+                      break
+                    fi
+                  done
                   if $all_found; then
                     cross_platform_run_id="$candidate"
                   fi
@@ -188,19 +218,91 @@ jobs:
          - name: Build collab web
            run: bun run collab:web:build
 
-   # Linux x64 baseline + modern: required by `test`, so it runs on every PR
-   # unless native_artifact_lookup found a cached run. Release runs always
-   # rebuild for fresh artifacts.
+   # Rust validation used to run inside both Linux native matrix entries, which
+   # serialized check + test + artifact build and made every native-dependent TS
+   # job wait. Keep the Linux validation authority, but run check and test once
+   # each as parallel matrix legs beside artifact production.
+   rust_validation:
+      name: "Validate Rust: ${{ matrix.phase }}"
+      runs-on: ${{ (github.event_name == 'pull_request' || github.repository != 'can1357/oh-my-pi') && 'ubuntu-22.04' || 'omp-kata' }}
+      strategy:
+         fail-fast: false
+         matrix:
+            phase: [check, test]
+      steps:
+         - uses: actions/checkout@v4
+         - uses: ./.github/actions/ensure-rust-toolchain
+           with:
+              toolchain: nightly-2026-04-29
+              components: ${{ matrix.phase == 'check' && 'clippy,rustfmt' || '' }}
+         - name: Detect runner environment
+           id: detect
+           shell: bash
+           run: |
+              if [ -n "${SCCACHE_BUCKET:-}" ]; then
+                echo "on_infra=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "on_infra=false" >> "$GITHUB_OUTPUT"
+              fi
+         - name: Cache Rust target (GitHub-hosted)
+           if: steps.detect.outputs.on_infra == 'false'
+           uses: Swatinem/rust-cache@v2
+           with:
+              shared-key: rust-validation-${{ matrix.phase }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+              cache-on-failure: true
+              save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/t4code/main') }}
+              cache-workspace-crates: true
+         - name: Ensure baked sccache (omp-kata)
+           if: steps.detect.outputs.on_infra == 'true'
+           uses: ./.github/actions/ensure-sccache
+           with:
+              version: "0.15.0"
+         - name: Setup sccache (GitHub-hosted)
+           if: steps.detect.outputs.on_infra == 'false'
+           uses: mozilla-actions/sccache-action@v0.0.10
+         - name: Enable sccache for cargo
+           shell: bash
+           run: |
+              {
+                echo "RUSTC_WRAPPER=sccache"
+                echo "CARGO_INCREMENTAL=0"
+              } >> "$GITHUB_ENV"
+              if [ -n "${SCCACHE_BUCKET:-}" ]; then
+                echo "sccache backend: shared S3 ($SCCACHE_BUCKET @ $SCCACHE_ENDPOINT)"
+              else
+                echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+                echo "sccache backend: GitHub Actions cache"
+              fi
+         - name: Ensure baked cargo-nextest (omp-kata)
+           if: steps.detect.outputs.on_infra == 'true' && matrix.phase == 'test'
+           uses: ./.github/actions/ensure-cargo-tool
+           with:
+              binary: cargo-nextest
+              crate: cargo-nextest
+         - name: Install cargo-nextest (GitHub-hosted)
+           if: steps.detect.outputs.on_infra == 'false' && matrix.phase == 'test'
+           uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+           with:
+              tool: nextest
+         - uses: ./.github/actions/setup-system-deps
+         - uses: ./.github/actions/bun-install
+         - name: Validate Rust workspace
+           run: bun run ${{ matrix.phase == 'check' && 'check:rs' || 'test:rs' }}
+
+   # Linux x64 baseline + modern: required by `test`, so it runs only when the
+   # content-addressed lookup did not find a complete trusted artifact pair.
+   # Releases reuse the same immutable bits when their native source hash is
+   # unchanged; a native-affecting change necessarily produces a new hash.
    native_linux_x64:
       name: "Native: Linux x64 (${{ matrix.variant }})"
       needs: [release_metadata, native_artifact_lookup]
-      if: ${{ needs.release_metadata.outputs.is-release == 'true' || needs.native_artifact_lookup.outputs.linux-x64-run-id == '' }}
+      if: ${{ needs.native_artifact_lookup.outputs.linux-x64-run-id == '' }}
       runs-on: ${{ (github.event_name == 'pull_request' || github.repository != 'can1357/oh-my-pi') && 'ubuntu-22.04' || 'omp-kata' }}
       strategy:
          fail-fast: false
          matrix:
             include:
-               - { variant: baseline, rust_checks: true }
+               - { variant: baseline }
                - { variant: modern }
       steps:
          - uses: actions/checkout@v4
@@ -211,16 +313,19 @@ jobs:
               arch: x64
               variant: ${{ matrix.variant }}
               glibc: ${{ env.GLIBC_FLOOR }}
-              rust_checks: ${{ matrix.rust_checks && 'true' || 'false' }}
-              save_cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+              rust_checks: "false"
+              rust_tests: "false"
+              save_cache: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/t4code/main') }}
 
-   # Pre-warm the cross-platform native build cache on `main`, in addition to
-   # building the artifacts that ship in releases. Skipped on main when
-   # native_artifact_lookup already found a recent run with all artifacts intact.
+   # Pre-warm the cross-platform native build cache on each owning branch, in
+   # addition to building the artifacts that ship in releases. This lets a
+   # reviewed t4code/main merge establish the trusted push artifacts before its
+   # tag-ref publication retry. Skipped when native_artifact_lookup already
+   # found a recent run with all artifacts intact.
    native_cross_platform_kata:
       name: "Native: ${{ matrix.platform }} ${{ matrix.arch }}"
       needs: [release_metadata, native_artifact_lookup]
-      if: ${{ needs.release_metadata.outputs.is-release == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.native_artifact_lookup.outputs.cross-platform-run-id == '') }}
+      if: ${{ (needs.release_metadata.outputs.is-release == 'true' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/t4code/main'))) && needs.native_artifact_lookup.outputs.cross-platform-run-id == '' }}
       strategy:
          fail-fast: false
          matrix:
@@ -238,12 +343,13 @@ jobs:
               variant: ${{ matrix.variant }}
               target: ${{ matrix.target }}
               glibc: ${{ matrix.platform == 'linux' && env.GLIBC_FLOOR || '' }}
-              save_cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+              rust_tests: "false"
+              save_cache: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/t4code/main') }}
 
    native_cross_platform_macos:
       name: "Native: ${{ matrix.platform }} ${{ matrix.arch }}"
       needs: [release_metadata, native_artifact_lookup]
-      if: ${{ needs.release_metadata.outputs.is-release == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.native_artifact_lookup.outputs.cross-platform-run-id == '') }}
+      if: ${{ (needs.release_metadata.outputs.is-release == 'true' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/t4code/main'))) && needs.native_artifact_lookup.outputs.cross-platform-run-id == '' }}
       strategy:
          fail-fast: false
          matrix:
@@ -260,7 +366,8 @@ jobs:
               arch: ${{ matrix.arch }}
               variant: ${{ matrix.variant }}
               target: ${{ matrix.target }}
-              save_cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+              rust_tests: "false"
+              save_cache: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/t4code/main') }}
    test_workspace:
       name: Test TS workspace fast
       runs-on: ${{ (github.event_name == 'pull_request' || github.repository != 'can1357/oh-my-pi') && 'ubuntu-22.04' || 'omp-kata' }}
@@ -534,8 +641,9 @@ jobs:
    release_binary:
       name: "Release binary: ${{ matrix.target_id }}"
       if: ${{ needs.release_metadata.outputs.is-release == 'true' && !cancelled() &&
-         needs.native_linux_x64.result == 'success' && needs.native_cross_platform_kata.result ==
-         'success' && needs.native_cross_platform_macos.result == 'success' &&
+         (needs.native_linux_x64.result == 'success' || (needs.native_linux_x64.result == 'skipped' && needs.native_artifact_lookup.outputs.linux-x64-run-id != '')) &&
+         (needs.native_cross_platform_kata.result == 'success' || (needs.native_cross_platform_kata.result == 'skipped' && needs.native_artifact_lookup.outputs.cross-platform-run-id != '')) &&
+         (needs.native_cross_platform_macos.result == 'success' || (needs.native_cross_platform_macos.result == 'skipped' && needs.native_artifact_lookup.outputs.cross-platform-run-id != '')) &&
          needs.test_workspace.result == 'success' &&
          needs.test_coding_agent_singleton.result == 'success' &&
          needs.test_ts_native.result == 'success' &&
@@ -543,8 +651,8 @@ jobs:
          needs.test_coding_agent_runtime.result == 'success' &&
          needs.test_coding_agent_native.result == 'success' &&
          needs.test_smoke.result == 'success' && needs.check.result == 'success' &&
-         needs.install_methods.result == 'success' }}
-      needs: [release_metadata, check, native_linux_x64, native_cross_platform_kata, native_cross_platform_macos, test_workspace, test_coding_agent_singleton, test_ts_native, test_coding_agent_ui, test_coding_agent_runtime, test_coding_agent_native, test_smoke, install_methods, native_artifact_lookup]
+         needs.rust_validation.result == 'success' && needs.install_methods.result == 'success' }}
+      needs: [release_metadata, check, rust_validation, native_linux_x64, native_cross_platform_kata, native_cross_platform_macos, test_workspace, test_coding_agent_singleton, test_ts_native, test_coding_agent_ui, test_coding_agent_runtime, test_coding_agent_native, test_smoke, install_methods, native_artifact_lookup]
       strategy:
          fail-fast: false
          matrix:
@@ -587,6 +695,7 @@ jobs:
       runs-on: ${{ matrix.os }}
       permissions:
          contents: read
+         actions: read
          id-token: write
       env:
          MACOS_SIGNING: ${{ secrets.APPLE_CERTIFICATE_P12 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER_ID != '' && secrets.APPLE_API_KEY != '' }}
@@ -614,12 +723,48 @@ jobs:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - run: bun install --frozen-lockfile
+         - name: Resolve native artifact run
+           id: native-source
+           shell: bash
+           env:
+              PLATFORM: ${{ matrix.platform }}
+              ARCH: ${{ matrix.arch }}
+              LINUX_JOB_RESULT: ${{ needs.native_linux_x64.result }}
+              KATA_JOB_RESULT: ${{ needs.native_cross_platform_kata.result }}
+              MACOS_JOB_RESULT: ${{ needs.native_cross_platform_macos.result }}
+              CACHED_LINUX_RUN_ID: ${{ needs.native_artifact_lookup.outputs.linux-x64-run-id }}
+              CACHED_CROSS_RUN_ID: ${{ needs.native_artifact_lookup.outputs.cross-platform-run-id }}
+           run: |
+              if [ "$PLATFORM:$ARCH" = "linux:x64" ]; then
+                job_result="$LINUX_JOB_RESULT"
+                cached_run_id="$CACHED_LINUX_RUN_ID"
+              elif [ "$PLATFORM" = "darwin" ]; then
+                job_result="$MACOS_JOB_RESULT"
+                cached_run_id="$CACHED_CROSS_RUN_ID"
+              else
+                job_result="$KATA_JOB_RESULT"
+                cached_run_id="$CACHED_CROSS_RUN_ID"
+              fi
+
+              if [ "$job_result" = "success" ]; then
+                artifact_run_id="$GITHUB_RUN_ID"
+              else
+                artifact_run_id="$cached_run_id"
+              fi
+              if [ -z "$artifact_run_id" ]; then
+                echo "No native artifact run is available for $PLATFORM:$ARCH (job result: $job_result)" >&2
+                exit 1
+              fi
+              echo "Using native artifacts from run $artifact_run_id for $PLATFORM:$ARCH"
+              echo "artifact-run-id=$artifact_run_id" >> "$GITHUB_OUTPUT"
          - name: Download native addon(s)
            uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
            with:
               pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*-h${{ needs.native_artifact_lookup.outputs.source-hash }}
               path: packages/natives/native
               merge-multiple: true
+              run-id: ${{ steps.native-source.outputs.artifact-run-id }}
+              github-token: ${{ secrets.GITHUB_TOKEN }}
          - name: Build release binary
            env:
               RELEASE_TARGETS: ${{ matrix.target_id }}
@@ -746,7 +891,7 @@ jobs:
          needs.release_binary.result == 'success' &&
          needs.release_github_verify.result == 'success' &&
          !inputs.skip_npm }}
-      needs: [release_metadata, release_binary, release_github_verify, native_artifact_lookup]
+      needs: [release_metadata, release_binary, release_github_verify, native_linux_x64, native_artifact_lookup]
       runs-on: ubuntu-22.04
       # `id-token: write` lets npm mint the GitHub OIDC token it exchanges for a
       # short-lived publish token (trusted publishing + provenance). When a
@@ -755,6 +900,7 @@ jobs:
       permissions:
          id-token: write
          contents: read
+         actions: read
       steps:
          - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -777,14 +923,31 @@ jobs:
          # The pi-coding-agent prepack executes workspace code (bundle-dist
          # imports the pi-utils barrel, which loads the pi-natives addon), so
          # this job needs the linux x64 native addons just like `test` does.
-         # Release runs always rebuild natives in this same run, so the
-         # default run-id resolves the artifacts.
+         # Native artifacts may come from this run or from a hash-identical,
+         # successful push on the trusted owning branch. Resolve that source
+         # explicitly so cached-native releases preserve the npm prepack path.
+         - name: Resolve Linux x64 native artifact run
+           id: native-source
+           shell: bash
+           run: |
+              if [ "${{ needs.native_linux_x64.result }}" = "success" ]; then
+                artifact_run_id="$GITHUB_RUN_ID"
+              else
+                artifact_run_id="${{ needs.native_artifact_lookup.outputs.linux-x64-run-id }}"
+              fi
+              if [ -z "$artifact_run_id" ]; then
+                echo "No Linux x64 native artifact run is available for npm publishing" >&2
+                exit 1
+              fi
+              echo "artifact-run-id=$artifact_run_id" >> "$GITHUB_OUTPUT"
          - name: Download native addons
            uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
            with:
               pattern: pi-natives-linux-x64-*-h${{ needs.native_artifact_lookup.outputs.source-hash }}
               path: packages/natives/native
               merge-multiple: true
+              run-id: ${{ steps.native-source.outputs.artifact-run-id }}
+              github-token: ${{ secrets.GITHUB_TOKEN }}
          - name: Publish to npm
            env:
               # Fallback auth: setup-node wrote an .npmrc referencing
