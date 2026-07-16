@@ -484,8 +484,8 @@ describe("remote appserver policy transport", () => {
 			releaseActive.resolve();
 			await promptDispatch;
 			await flush();
-			expect(transformOrder).toEqual(["active:start", "active:end", "response"]);
-			expect(sentFrames(socket).map(frame => frame.type)).toEqual(["session.delta", "response"]);
+			expect(transformOrder).toEqual(["active:start", "active:end", "active:start", "active:end", "response"]);
+			expect(sentFrames(socket).map(frame => frame.type)).toEqual(["session.delta", "session.delta", "response"]);
 			await appserver.stop();
 		} finally {
 			harness.restore();

@@ -4,7 +4,7 @@
  * so they re-enter context when the user resumes. Internal (non-user) aborts keep
  * the prior behavior — advisor advice stays in the auto-continue path.
  *
- * Five seams:
+ * Six seams:
  *  1. A concern already steered into the agent queue when the user hits Esc is
  *     pulled out of the post-abort auto-continue path and re-recorded as advice.
  *  2. A concern parked hidden (#pendingNextTurnMessages) by the suppressed
@@ -16,11 +16,13 @@
  *  5. The same queued as a follow-up: continuing from the preserved advisor card
  *     (which converts to `developer`) would send an invalid provider tail, so the
  *     follow-up stays queued for the next explicit resume rather than auto-running.
+ *  6. App-server cancellation explicitly resumes an already-accepted follow-up,
+ *     including when the preserved advisor card would otherwise block continuation.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ToolCall } from "@oh-my-pi/pi-ai";
-import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, type MockHandler, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -87,7 +89,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 	 * `streamStarted` promise resolves from the mock handler, before the delay, so
 	 * tests await the real stream-begin signal rather than a timer.
 	 */
-	async function createParkedSession(tailResponses: MockResponse[] = []): Promise<ParkedHarness> {
+	async function createParkedSession(tailResponses: MockHandler[] = []): Promise<ParkedHarness> {
 		const started = Promise.withResolvers<void>();
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
@@ -483,6 +485,55 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		expect(userMessageText([...session.agent.peekFollowUpQueue()])).toContain("then add the test");
 		expect(userMessageText(session.agent.state.messages)).not.toContain("then add the test");
 		expect(mock.calls.length).toBe(1);
+	});
+
+	it("resumes an accepted app follow-up after cancelling the running root", async () => {
+		const resumed = Promise.withResolvers<void>();
+		const { session, mock, streamStarted } = await createParkedSession([
+			() => {
+				resumed.resolve();
+				return { content: ["completed queued app follow-up"], stopReason: "stop" };
+			},
+		]);
+		const running = session.prompt("root A");
+		await streamStarted;
+
+		await session.followUp("queued B", undefined, { clientCorrelationId: "queued-b" });
+		await session.abort({ reason: USER_INTERRUPT_LABEL, resumeQueuedMessages: true });
+		await running.catch(() => {});
+		await resumed.promise;
+		await session.waitForIdle();
+
+		expect(session.agent.peekFollowUpQueue()).toEqual([]);
+		expect(userMessageText(session.agent.state.messages)).toContain("queued B");
+		expect(mock.calls.length).toBe(2);
+	});
+
+	it("resumes an accepted app follow-up behind a preserved advisor card", async () => {
+		const resumed = Promise.withResolvers<void>();
+		const { session, sessionManager, mock, streamStarted } = await createParkedSession([
+			() => {
+				resumed.resolve();
+				return { content: ["completed queued app follow-up"], stopReason: "stop" };
+			},
+		]);
+		const persisted = capturePersistedAdvice(sessionManager);
+		const running = session.prompt("root A");
+		await streamStarted;
+
+		await session.sendCustomMessage(advisorCard("keep this concern"), { deliverAs: "steer", triggerTurn: true });
+		await session.followUp("queued B", undefined, { clientCorrelationId: "queued-b" });
+		await session.abort({ reason: USER_INTERRUPT_LABEL, resumeQueuedMessages: true });
+		await running.catch(() => {});
+		await resumed.promise;
+		await session.waitForIdle();
+
+		expect(session.agent.state.messages.filter(isAdvisorCard)).toHaveLength(1);
+		expect(persisted).toEqual(["keep this concern"]);
+		expect(session.agent.peekSteeringQueue()).toEqual([]);
+		expect(session.agent.peekFollowUpQueue()).toEqual([]);
+		expect(userMessageText(session.agent.state.messages)).toContain("queued B");
+		expect(mock.calls.length).toBe(2);
 	});
 
 	it("wakes a turn for an IRC aside stranded across a user interrupt", async () => {

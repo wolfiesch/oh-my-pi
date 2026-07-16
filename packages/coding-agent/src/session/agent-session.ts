@@ -1007,6 +1007,8 @@ export interface AgentSessionConfig {
 export interface PromptOptions {
 	/** Whether to expand file-based prompt templates (default: true) */
 	expandPromptTemplates?: boolean;
+	/** App/RPC command correlation persisted only on the authored user message. */
+	clientCorrelationId?: string;
 	/** Image attachments */
 	images?: ImageContent[];
 	/** When streaming, how to queue the message: "steer" (interrupt) or "followUp" (wait). */
@@ -1031,6 +1033,8 @@ export interface PromptOptions {
 export interface FollowUpOptions {
 	/** Enqueue as a hidden developer message (agent-attributed by default) instead of a user follow-up. */
 	synthetic?: boolean;
+	/** App/RPC command correlation persisted only on the authored user message. */
+	clientCorrelationId?: string;
 	/** Whether to expand file-based prompt templates (default: true). */
 	expandPromptTemplates?: boolean;
 	/** Explicit billing/initiator attribution. Defaults to `agent` for synthetic follow-ups. */
@@ -4311,6 +4315,7 @@ export class AgentSession {
 						event.message.display,
 						event.message.details,
 						event.message.attribution ?? "agent",
+						event.message.role === "custom" ? event.message.clientCorrelationId : undefined,
 					);
 					if (event.message.role === "custom" && event.message.customType === "ttsr-injection") {
 						this.#markTtsrInjected(this.#extractTtsrRuleNames(event.message.details));
@@ -8072,9 +8077,9 @@ export class AgentSession {
 				await this.sendCustomMessage(notice, { deliverAs: options.streamingBehavior });
 			}
 			if (options.streamingBehavior === "followUp") {
-				await this.#queueUserMessage(expandedText, options?.images, "followUp");
+				await this.#queueUserMessage(expandedText, options?.images, "followUp", options.clientCorrelationId);
 			} else {
-				await this.#queueUserMessage(expandedText, options?.images, "steer");
+				await this.#queueUserMessage(expandedText, options?.images, "steer", options.clientCorrelationId);
 			}
 			return true;
 		}
@@ -8100,7 +8105,13 @@ export class AgentSession {
 		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
 		const message = options?.synthetic
 			? { role: "developer" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() }
-			: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
+			: {
+					role: "user" as const,
+					content: userContent,
+					attribution: promptAttribution,
+					timestamp: Date.now(),
+					...(options?.clientCorrelationId ? { clientCorrelationId: options.clientCorrelationId } : {}),
+				};
 
 		const preludeMessages: AgentMessage[] = [];
 		if (eagerTodoPrelude) {
@@ -8133,7 +8144,10 @@ export class AgentSession {
 	}
 
 	async promptCustomMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
+		message: Pick<
+			CustomMessage<T>,
+			"customType" | "content" | "display" | "details" | "attribution" | "clientCorrelationId"
+		>,
 		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice"> & {
 			queueChipText?: string;
 			queueOnly?: boolean;
@@ -8177,6 +8191,7 @@ export class AgentSession {
 			await this.sendCustomMessage(message, {
 				deliverAs: options.streamingBehavior,
 				queueChipText: options.queueChipText,
+				clientCorrelationId: message.clientCorrelationId,
 			});
 			return;
 		}
@@ -8188,6 +8203,7 @@ export class AgentSession {
 			display: message.display,
 			details: message.details,
 			attribution: message.attribution ?? "agent",
+			...(message.clientCorrelationId ? { clientCorrelationId: message.clientCorrelationId } : {}),
 			timestamp: Date.now(),
 		};
 
@@ -8534,13 +8550,13 @@ export class AgentSession {
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
-	async steer(text: string, images?: ImageContent[]): Promise<void> {
+	async steer(text: string, images?: ImageContent[], options?: { clientCorrelationId?: string }): Promise<void> {
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
 
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
-		await this.#queueUserMessage(expandedText, images, "steer");
+		await this.#queueUserMessage(expandedText, images, "steer", options?.clientCorrelationId);
 	}
 
 	/**
@@ -8558,7 +8574,7 @@ export class AgentSession {
 		const expandedText =
 			options?.expandPromptTemplates === false ? text : expandPromptTemplate(text, [...this.#promptTemplates]);
 		if (!options?.synthetic) {
-			await this.#queueUserMessage(expandedText, images, "followUp");
+			await this.#queueUserMessage(expandedText, images, "followUp", options?.clientCorrelationId);
 			return;
 		}
 		// Synthetic branch: agent-initiated hidden developer message. Bypass
@@ -8587,6 +8603,7 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		mode: "steer" | "followUp",
+		clientCorrelationId?: string,
 	): Promise<void> {
 		// A queued user message (RPC/SDK/collab steer or follow-up, or a typed message
 		// while streaming) is a deliberate resume; re-enable advisor auto-resume that
@@ -8609,6 +8626,7 @@ export class AgentSession {
 				content,
 				attribution: "user",
 				timestamp: Date.now(),
+				...(clientCorrelationId ? { clientCorrelationId } : {}),
 			});
 		} else {
 			if (imageDescriptionNotice) this.agent.steer(imageDescriptionNotice);
@@ -8618,6 +8636,7 @@ export class AgentSession {
 				steering: true,
 				attribution: "user",
 				timestamp: Date.now(),
+				...(clientCorrelationId ? { clientCorrelationId } : {}),
 			});
 		}
 		this.#scheduleIdleQueueDrain();
@@ -8625,6 +8644,20 @@ export class AgentSession {
 
 	#scheduleIdleQueueDrain(): void {
 		this.#scheduleQueuedMessageDrain();
+	}
+
+	/**
+	 * App-server cancellation has already acknowledged these follow-ups to a
+	 * remote client, so they must not remain stranded behind a transcript tail
+	 * that cannot be continued directly (for example, a preserved advisor card).
+	 * Moving them to the steering queue changes only how the next idle loop is
+	 * entered: order, message contents, and client correlation stay intact.
+	 */
+	#promoteBlockedFollowUpsForAppResume(): void {
+		if (this.agent.peekSteeringQueue().length > 0) return;
+		const followUps = this.agent.peekFollowUpQueue();
+		if (followUps.length === 0 || this.#canAutoContinueForFollowUp()) return;
+		this.agent.replaceQueues([...followUps], []);
 	}
 
 	#scheduleQueuedMessageDrain(): void {
@@ -8783,7 +8816,10 @@ export class AgentSession {
 
 	/** Queue a custom message without starting a turn, matching steer/follow-up delivery. */
 	async #queueCustomMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
+		message: Pick<
+			CustomMessage<T>,
+			"customType" | "content" | "display" | "details" | "attribution" | "clientCorrelationId"
+		>,
 		deliverAs: "steer" | "followUp",
 		queueChipText?: string,
 	): Promise<void> {
@@ -8804,6 +8840,7 @@ export class AgentSession {
 			display: message.display,
 			details,
 			attribution: message.attribution ?? "agent",
+			...(message.clientCorrelationId ? { clientCorrelationId: message.clientCorrelationId } : {}),
 			timestamp: Date.now(),
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
@@ -8836,6 +8873,8 @@ export class AgentSession {
 			deliverAs?: "steer" | "followUp" | "nextTurn";
 			queueChipText?: string;
 			acceptTerminalEmptyStop?: boolean;
+			/** Internal app/RPC correlation for user-authored custom prompts. */
+			clientCorrelationId?: string;
 		},
 	): Promise<boolean> {
 		const normalizedPayload = normalizeCustomMessagePayload<T>(message);
@@ -8855,6 +8894,7 @@ export class AgentSession {
 			display: normalizedPayload.display,
 			details,
 			attribution: normalizedPayload.attribution,
+			...(options?.clientCorrelationId ? { clientCorrelationId: options.clientCorrelationId } : {}),
 			timestamp: Date.now(),
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
@@ -8891,6 +8931,7 @@ export class AgentSession {
 				normalizedAppMessage.display,
 				normalizedAppMessage.details,
 				normalizedAppMessage.attribution,
+				normalizedAppMessage.clientCorrelationId,
 			);
 			return false;
 		}
@@ -8911,6 +8952,7 @@ export class AgentSession {
 			normalizedAppMessage.display,
 			normalizedAppMessage.details,
 			normalizedAppMessage.attribution,
+			normalizedAppMessage.clientCorrelationId,
 		);
 		return false;
 	}
@@ -9179,6 +9221,8 @@ export class AgentSession {
 	async abort(options?: {
 		goalReason?: "interrupted" | "internal";
 		reason?: string;
+		/** Resume accepted queued messages after aborting the current turn. */
+		resumeQueuedMessages?: boolean;
 		/** Internal `/compact` startup keeps the manual-compaction marker alive while aborting the active turn. */
 		preserveCompaction?: boolean;
 	}): Promise<void> {
@@ -9244,6 +9288,10 @@ export class AgentSession {
 			}
 		} finally {
 			this.#abortInProgress = false;
+			if (options?.resumeQueuedMessages) {
+				this.#advisorAutoResumeSuppressed = false;
+				this.#promoteBlockedFollowUpsForAppResume();
+			}
 			this.#drainStrandedQueuedMessages();
 		}
 	}

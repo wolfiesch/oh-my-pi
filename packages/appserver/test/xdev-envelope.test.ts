@@ -41,7 +41,7 @@ describe("xdev execution envelopes", () => {
 		expect(xdevWriteCall("write", { path: "xd://resolve/extra", content: "Apply" })).toBeUndefined();
 	});
 
-	test("requires exact derived arguments only for deterministic plain-text devices", () => {
+	test("requires supplied arguments to match while permitting JSON schema defaults", () => {
 		const call = xdevWriteCall("write", { path: "xd://resolve", content: "Apply A" });
 		expect(
 			xdevExecutionMatches(call, {
@@ -68,12 +68,54 @@ describe("xdev execution envelopes", () => {
 			}),
 		).toBe(false);
 		expect(
-			xdevExecutionMatches(xdevWriteCall("write", { path: "xd://hub", content: '{"op":"list"}' }), {
+			xdevExecutionMatches(
+				xdevWriteCall("write", {
+					path: "xd://hub",
+					content: '{"op":"send","to":"reviewer","options":{"priority":"high"},"tags":["one"]}',
+				}),
+				{
+					tool: "hub",
+					mode: "execute",
+					args: {
+						op: "send",
+						to: "reviewer",
+						options: { priority: "high", retries: 1 },
+						tags: ["one"],
+						defaulted: true,
+					},
+					inner: {},
+				},
+			),
+		).toBe(true);
+		expect(
+			xdevExecutionMatches(
+				xdevWriteCall("write", {
+					path: "xd://hub",
+					content: '{"op":"send","options":{"priority":"high"}}',
+				}),
+				{
+					tool: "hub",
+					mode: "execute",
+					args: { op: "send", options: { priority: "low", retries: 1 } },
+					inner: {},
+				},
+			),
+		).toBe(false);
+		expect(
+			xdevExecutionMatches(xdevWriteCall("write", { path: "xd://hub", content: '{"op":"send","to":"reviewer"}' }), {
 				tool: "hub",
 				mode: "execute",
-				args: { op: "list", defaulted: true },
+				args: { op: "delete", to: "victim" },
 				inner: {},
 			}),
-		).toBe(true);
+		).toBe(false);
+		expect(
+			xdevExecutionMatches(xdevWriteCall("write", { path: "xd://hub", content: '{"op":"send","to":"reviewer"}' }), {
+				tool: "hub",
+				mode: "execute",
+				args: { op: "send" },
+				inner: {},
+			}),
+		).toBe(false);
 	});
 });

@@ -3,7 +3,7 @@ import { mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decodeServerFrame, entryId, hostId, parseBounded, projectId, sessionId } from "@oh-my-pi/app-wire";
-import { FileSessionDiscovery, SessionEntryProjector } from "../src/discovery.ts";
+import { FileSessionDiscovery, projectMessageText, SessionEntryProjector } from "../src/discovery.ts";
 import { SessionProjection } from "../src/projection.ts";
 import type { FileSystem } from "../src/types.ts";
 
@@ -49,6 +49,13 @@ function sessionTranscript(id: string, cwd: string, title: string): string {
 }
 
 describe("current OMP JSONL projection", () => {
+	test("bounds multibyte plain-string prompt projections without splitting UTF-8", () => {
+		const projected = projectMessageText("🙂".repeat(4_000), 8 * 1024);
+		expect(new TextEncoder().encode(projected).byteLength).toBeLessThanOrEqual(8 * 1024);
+		expect(projected).not.toContain("�");
+		expect(projected.length).toBeLessThan("🙂".repeat(4_000).length);
+	});
+
 	test("preserves bounded IRC metadata for exact collaboration rendering", () => {
 		const projector = new SessionEntryProjector(host, sessionId("session-irc"), "batch");
 		const [entry] = projector.project({
@@ -534,6 +541,15 @@ describe("current OMP JSONL projection", () => {
 						name: "write",
 						arguments: { path: "xd://resolve", content: "Apply A" },
 					},
+					{
+						type: "toolCall",
+						id: "xdev-json-argument-mismatch",
+						name: "write",
+						arguments: {
+							path: "xd://hub",
+							content: JSON.stringify({ op: "send", to: "reviewer" }),
+						},
+					},
 				],
 			},
 		});
@@ -587,6 +603,25 @@ describe("current OMP JSONL projection", () => {
 				},
 			},
 		});
+		const [jsonArgumentMismatch] = projector.project({
+			type: "message",
+			id: "xdev-json-argument-mismatch-result",
+			parentId: "xdev-same-tool-mismatch-result",
+			timestamp: stamp,
+			message: {
+				role: "toolResult",
+				toolCallId: "xdev-json-argument-mismatch",
+				content: [{ type: "text", text: "unexpected" }],
+				details: {
+					xdev: {
+						tool: "hub",
+						mode: "execute",
+						args: { op: "delete", to: "victim" },
+						inner: { action: "delete" },
+					},
+				},
+			},
+		});
 
 		expect(mismatch?.data).toMatchObject({
 			tool: "write",
@@ -602,6 +637,11 @@ describe("current OMP JSONL projection", () => {
 			tool: "write",
 			args: { path: "xd://resolve", content: "Apply A" },
 			result: { details: { xdev: { tool: "resolve", args: { reason: "Apply B" } } } },
+		});
+		expect(jsonArgumentMismatch?.data).toMatchObject({
+			tool: "write",
+			args: { path: "xd://hub", content: '{"op":"send","to":"reviewer"}' },
+			result: { details: { xdev: { tool: "hub", args: { op: "delete", to: "victim" } } } },
 		});
 	});
 

@@ -27,6 +27,7 @@ for await (const value of readJsonl(Bun.stdin.stream())) {
 		output({ type: "agent_start" });
 		output({ type: "turn_end" });
 		output({ type: "agent_end", messages: [] });
+		output({ type: "prompt_result", id, agentInvoked: true });
 		output({ id, type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
 		continue;
 	}

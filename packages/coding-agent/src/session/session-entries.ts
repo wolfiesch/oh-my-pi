@@ -199,6 +199,8 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	content: string | (TextContent | ImageContent)[];
 	details?: T;
 	display: boolean;
+	/** App/RPC command correlation for the durable user-authored custom prompt. */
+	clientCorrelationId?: string;
 	/** Who initiated this message for billing/attribution semantics. */
 	attribution?: MessageAttribution;
 }

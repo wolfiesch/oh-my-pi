@@ -325,6 +325,7 @@ export function buildSessionContext(
 					normalized.details,
 					entry.timestamp,
 					attribution,
+					entry.clientCorrelationId,
 				),
 			);
 		} else if (entry.type === "branch_summary" && entry.summary) {

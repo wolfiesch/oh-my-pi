@@ -20,6 +20,8 @@ export interface CustomMessage<T = unknown> {
 	content: string | (TextContent | ImageContent)[];
 	display: boolean;
 	details?: T;
+	/** App/RPC command correlation persisted locally and omitted from provider conversion. */
+	clientCorrelationId?: string;
 	/** Who initiated this message for billing/attribution semantics. */
 	attribution?: MessageAttribution;
 	timestamp: number;
@@ -132,6 +134,7 @@ export function createCustomMessage(
 	details: unknown | undefined,
 	timestamp: string,
 	attribution?: MessageAttribution,
+	clientCorrelationId?: string,
 ): CustomMessage {
 	return {
 		role: "custom",
@@ -140,6 +143,7 @@ export function createCustomMessage(
 		display,
 		details,
 		attribution,
+		...(clientCorrelationId ? { clientCorrelationId } : {}),
 		timestamp: new Date(timestamp).getTime(),
 	};
 }
@@ -213,7 +217,15 @@ export function convertMessageToLlm(message: AgentMessage): Message | undefined 
 
 	switch (message.role) {
 		case "user":
-			return { ...message, attribution: message.attribution ?? "user" };
+			return {
+				role: "user",
+				content: message.content,
+				...(message.synthetic === undefined ? {} : { synthetic: message.synthetic }),
+				...(message.steering === undefined ? {} : { steering: message.steering }),
+				attribution: message.attribution ?? "user",
+				...(message.providerPayload === undefined ? {} : { providerPayload: message.providerPayload }),
+				timestamp: message.timestamp,
+			};
 		case "developer":
 			return { ...message, attribution: message.attribution ?? "agent" };
 		case "assistant":

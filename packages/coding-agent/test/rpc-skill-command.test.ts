@@ -15,7 +15,9 @@ describe("tryRunRpcSkillCommand", () => {
 			"---\nname: reviewer\ndescription: Review code\n---\n\nReview the supplied code carefully.\n",
 		);
 
-		let message: Pick<CustomMessage, "attribution" | "content" | "customType" | "details" | "display"> | undefined;
+		let message:
+			| Pick<CustomMessage, "attribution" | "clientCorrelationId" | "content" | "customType" | "details" | "display">
+			| undefined;
 		let options: { streamingBehavior?: "steer" | "followUp" } | undefined;
 
 		const handled = await tryRunRpcSkillCommand(
@@ -30,6 +32,8 @@ describe("tryRunRpcSkillCommand", () => {
 				},
 			},
 			"/skill:reviewer focus on risks",
+			"steer",
+			"rpc-skill-1",
 		);
 
 		expect(handled).toEqual({ agentInvoked: true });
@@ -41,6 +45,7 @@ describe("tryRunRpcSkillCommand", () => {
 		expect(message?.content).toContain("User: focus on risks");
 		expect(message?.display).toBe(true);
 		expect(message?.attribution).toBe("user");
+		expect(message?.clientCorrelationId).toBe("rpc-skill-1");
 		expect(options).toEqual({ streamingBehavior: "steer" });
 
 		await removeWithRetries(dir);

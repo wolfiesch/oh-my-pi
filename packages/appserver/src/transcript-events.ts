@@ -7,15 +7,23 @@ import { type XdevWriteCall, xdevExecutionMatches, xdevResultEnvelope, xdevWrite
 export type TranscriptMessageEvent = {
 	type: "message.update";
 	entryId: string;
-	role: "assistant";
+	role: "assistant" | "user";
 	text: string;
 	reasoning: string;
+	/** Safe prompt attachment cardinality; image bytes and transport refs stay out of transcript events. */
+	attachmentCount?: number;
 	at: string;
 };
 export type TranscriptMessageSettledEvent = {
 	type: "message.settled";
 	transientEntryId: string;
 	entryId: string;
+	at: string;
+};
+export type TranscriptMessageDiscardedEvent = {
+	type: "message.discarded";
+	transientEntryId: string;
+	reason: "rejected" | "local-only" | "failed" | "cancelled" | "completed-without-entry";
 	at: string;
 };
 export type TranscriptToolStartEvent = {
@@ -53,6 +61,7 @@ export type TranscriptEvent =
 	  }
 	| TranscriptMessageEvent
 	| TranscriptMessageSettledEvent
+	| TranscriptMessageDiscardedEvent
 	| TranscriptToolStartEvent
 	| TranscriptToolProgressEvent
 	| TranscriptToolResultEvent;
@@ -662,14 +671,14 @@ export class TranscriptEventTranslator {
 		return [];
 	}
 	#translatePromptResult(frame: Record<string, unknown>, current: boolean): AppserverEvent[] {
-		if (typeof frame.error !== "string") return [];
+		if (typeof frame.error !== "string" || !current) return [];
 		const at = this.#nowIso();
 		const error: Extract<TranscriptEvent, { type: "turn.error" }> = {
 			type: "turn.error",
 			message: safeOptionalDisplay(frame.error, 1_024) ?? "The prompt stopped with an error.",
 			at,
 		};
-		if (!current || this.#turnAt === undefined) return [error];
+		if (this.#turnAt === undefined) return [error];
 		this.#turnAt = undefined;
 		this.#activeAssistant = this.#activeAssistant?.ended ? undefined : this.#activeAssistant;
 		return [error, { type: "turn.end", at }];

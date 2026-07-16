@@ -1687,6 +1687,7 @@ export class SessionManager {
 		display: boolean | undefined,
 		details?: T,
 		attribution: MessageAttribution | undefined = "agent",
+		clientCorrelationId?: string,
 	): string {
 		const normalized = normalizeCustomMessagePayload<T>({ customType, content, display, details, attribution });
 		const entry: CustomMessageEntry<T> = {
@@ -1697,6 +1698,7 @@ export class SessionManager {
 			// Drop AgentSession-internal transient fields before disk persistence.
 			details: stripInternalDetailsFields(normalized.details),
 			attribution: normalized.attribution,
+			...(clientCorrelationId ? { clientCorrelationId } : {}),
 			...this.#freshEntryFields(),
 		};
 		this.#recordEntry(entry);

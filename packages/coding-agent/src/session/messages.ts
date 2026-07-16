@@ -591,6 +591,8 @@ export interface CustomMessage<T = unknown> {
 	content: CustomMessageContent;
 	display: boolean;
 	details?: T;
+	/** App/RPC command correlation persisted locally and omitted from provider conversion. */
+	clientCorrelationId?: string;
 	/** Who initiated this message for billing/attribution semantics. */
 	attribution?: MessageAttribution;
 	timestamp: number;

@@ -198,6 +198,31 @@ describe("appserver transcript event translator", () => {
 			},
 			isError: false,
 		});
+		translator.translate({
+			type: "tool_execution_start",
+			toolCallId: "json-argument-mismatch",
+			toolName: "write",
+			args: {
+				path: "xd://hub",
+				content: JSON.stringify({ op: "send", to: "reviewer" }),
+			},
+		});
+		const [jsonArgumentMismatchEnd] = translator.translate({
+			type: "tool_execution_end",
+			toolCallId: "json-argument-mismatch",
+			result: {
+				content: [{ type: "text", text: "unexpected" }],
+				details: {
+					xdev: {
+						tool: "hub",
+						mode: "execute",
+						args: { op: "delete", to: "victim" },
+						inner: { action: "delete" },
+					},
+				},
+			},
+			isError: false,
+		});
 
 		expect(malformedStart).toMatchObject({ tool: "write", args: { path: "xd://hub", content: "not-json" } });
 		expect(semanticStart).toMatchObject({ tool: "hub", args: { op: "list" } });
@@ -206,6 +231,9 @@ describe("appserver transcript event translator", () => {
 		});
 		expect(sameToolMismatchEnd).toMatchObject({
 			result: { details: { xdev: { tool: "resolve", args: { reason: "Apply B" } } } },
+		});
+		expect(jsonArgumentMismatchEnd).toMatchObject({
+			result: { details: { xdev: { tool: "hub", args: { op: "delete", to: "victim" } } } },
 		});
 	});
 
@@ -834,7 +862,7 @@ describe("appserver transcript event translator", () => {
 			{ type: "prompt_result", id: "stale", error: "stale provider rejection" },
 			{ currentPromptResult: false },
 		);
-		expect(staleFailure.map(event => event.type)).toEqual(["turn.error"]);
+		expect(staleFailure).toEqual([]);
 		const inTurnFailure = translator.translate(
 			{ type: "prompt_result", id: "open", error: "provider rejected" },
 			{ currentPromptResult: true },

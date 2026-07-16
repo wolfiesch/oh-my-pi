@@ -132,15 +132,20 @@ function asObject(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 }
 
-function contentText(content: unknown): string {
-	if (typeof content === "string") return cleanText(content, MAX_TEXT_BYTES);
+function contentText(content: unknown, maxBytes = MAX_TEXT_BYTES): string {
+	if (typeof content === "string") return cleanText(content, maxBytes);
 	if (!Array.isArray(content)) return "";
 	const parts: string[] = [];
 	for (const item of content) {
 		const block = asObject(item);
 		if (block?.type === "text" && typeof block.text === "string") parts.push(block.text);
 	}
-	return cleanText(parts.join(""), MAX_TEXT_BYTES);
+	return cleanText(parts.join(""), maxBytes);
+}
+
+/** Project prompt text through the exact sanitizer and byte budget used by durable messages. */
+export function projectMessageText(content: unknown, maxBytes = MAX_TEXT_BYTES): string {
+	return contentText(content, maxBytes);
 }
 
 interface ProjectedToolResultText {

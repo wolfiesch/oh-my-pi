@@ -658,6 +658,8 @@ export async function tryRunRpcSkillCommand(
 	session: RpcSkillCommandSession,
 	text: string,
 	streamingBehavior: "steer" | "followUp" = "steer",
+	clientCorrelationId?: string,
+	onPrompt?: (prompt: Promise<void>) => void,
 ): Promise<RpcSkillCommandResult | false> {
 	if (!session.skillsSettings?.enableSkillCommands) return false;
 	const parsed = parseSkillInvocation(text);
@@ -665,16 +667,19 @@ export async function tryRunRpcSkillCommand(
 	const skill = session.skills.find(candidate => candidate.name === parsed.name);
 	if (!skill) return false;
 	const built = await buildSkillPromptMessage(skill, parsed.args, "user");
-	await session.promptCustomMessage(
+	const prompt = session.promptCustomMessage(
 		{
 			customType: SKILL_PROMPT_MESSAGE_TYPE,
 			content: built.message,
 			display: true,
 			details: built.details,
 			attribution: "user",
+			...(clientCorrelationId ? { clientCorrelationId } : {}),
 		},
 		{ streamingBehavior },
 	);
+	if (onPrompt) onPrompt(prompt);
+	else await prompt;
 	return { agentInvoked: true };
 }
 
@@ -687,11 +692,16 @@ export function reportLocalOnlyPromptResult(input: {
 }): void {
 	void input.prompt
 		.then(async agentInvoked => {
-			if (agentInvoked) return;
-			await input.waitForExtensionAgentMessageTasks?.();
-			if (!input.hasExtensionAgentMessageTask?.()) {
-				input.output({ type: "prompt_result", id: input.id, agentInvoked: false });
+			if (agentInvoked) {
+				input.output({ type: "prompt_result", id: input.id, agentInvoked: true });
+				return;
 			}
+			await input.waitForExtensionAgentMessageTasks?.();
+			input.output({
+				type: "prompt_result",
+				id: input.id,
+				agentInvoked: input.hasExtensionAgentMessageTask?.() === true,
+			});
 		})
 		.catch(error => {
 			input.output({
@@ -1481,6 +1491,10 @@ export async function runRpcMode(
 
 	// Output all agent events as JSON
 	session.subscribe(event => {
+		// Async session-event hooks can let an old terminal frame arrive after a
+		// resumed/new turn is already streaming. It is superseded, not the live
+		// run's terminal boundary (same guard as the interactive EventController).
+		if (event.type === "agent_end" && session.isStreaming) return;
 		output(boundedRpcSessionEvent(event));
 	});
 
@@ -1514,7 +1528,18 @@ export async function runRpcMode(
 				// The appserver receives this response only after managed image bytes
 				// have been opened, validated, and converted to native ImageContent.
 				const promptImages = await resolveRpcPromptImages(command.images, command.appImageRefs);
-				const skillResult = await tryRunRpcSkillCommand(session, command.message, command.streamingBehavior);
+				const skillResult = await tryRunRpcSkillCommand(
+					session,
+					command.message,
+					command.streamingBehavior,
+					id,
+					prompt =>
+						reportLocalOnlyPromptResult({
+							id,
+							prompt: prompt.then(() => true),
+							output,
+						}),
+				);
 				if (skillResult) {
 					return success(id, "prompt", skillResult);
 				}
@@ -1537,7 +1562,8 @@ export async function runRpcMode(
 					if ("prompt" in builtinResult) {
 						watchAndReportLocalOnlyPromptResult({
 							id,
-							startPrompt: () => session.prompt(builtinResult.prompt, { images: promptImages }),
+							startPrompt: () =>
+								session.prompt(builtinResult.prompt, { images: promptImages, clientCorrelationId: id }),
 							output,
 							extensionUserMessageTracker,
 						});
@@ -1555,6 +1581,7 @@ export async function runRpcMode(
 						session.prompt(command.message, {
 							images: promptImages,
 							streamingBehavior: command.streamingBehavior,
+							clientCorrelationId: id,
 						}),
 					output,
 					extensionUserMessageTracker,
@@ -1563,17 +1590,20 @@ export async function runRpcMode(
 			}
 
 			case "steer": {
-				await session.steer(command.message, command.images);
+				await session.steer(command.message, command.images, { clientCorrelationId: id });
 				return success(id, "steer");
 			}
 
 			case "follow_up": {
-				await session.followUp(command.message, command.images);
+				await session.followUp(command.message, command.images, { clientCorrelationId: id });
 				return success(id, "follow_up");
 			}
 
 			case "abort": {
-				await session.abort({ reason: USER_INTERRUPT_LABEL });
+				await session.abort({
+					reason: USER_INTERRUPT_LABEL,
+					resumeQueuedMessages: command.resumeQueuedMessages === true,
+				});
 				return success(id, "abort");
 			}
 			case "retry": {

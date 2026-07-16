@@ -52,6 +52,18 @@ function toolResult(overrides: Partial<Extract<AgentMessage, { role: "toolResult
 }
 
 describe("sessionMessagePersistenceKey", () => {
+	test("distinguishes app-correlated user messages without changing ordinary user identity", () => {
+		const base = {
+			role: "user" as const,
+			content: "same content",
+			timestamp: 100,
+			attribution: "user" as const,
+		};
+		expect(sessionMessagePersistenceKey(base)).toBe(sessionMessagePersistenceKey({ ...base }));
+		expect(sessionMessagePersistenceKey({ ...base, clientCorrelationId: "prompt:1" })).not.toBe(
+			sessionMessagePersistenceKey({ ...base, clientCorrelationId: "prompt:2" }),
+		);
+	});
 	test("assistant identity covers timestamp/provider/model/responseId/stopReason — different content keeps the same key", () => {
 		// Two assistant variants emitted for the same logical turn (one streamed,
 		// one finalized; or one obfuscated, one deobfuscated for display) must

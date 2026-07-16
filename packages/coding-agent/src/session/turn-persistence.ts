@@ -53,6 +53,7 @@ export function sessionMessagePersistenceKey(message: AgentMessage): string | un
 		case "toolResult":
 			return `toolResult:${message.timestamp}:${message.toolCallId}:${message.toolName}`;
 		case "user":
+			return `${message.role}:${message.timestamp}:${message.attribution ?? ""}:${message.clientCorrelationId ?? ""}`;
 		case "developer":
 			return `${message.role}:${message.timestamp}:${message.attribution ?? ""}`;
 		case "fileMention":

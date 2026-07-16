@@ -234,7 +234,10 @@ export class RpcChildSupervisor {
 		);
 	}
 	async cancel(id: string): Promise<RpcResponse> {
-		return this.call({ type: "abort" }, id);
+		// Appserver owns accepted queued messages separately from the running root.
+		// Resume those messages after aborting the root instead of applying the
+		// interactive UI's "stop until the next explicit prompt" latch.
+		return this.call({ type: "abort", resumeQueuedMessages: true }, id);
 	}
 	async respondUi(
 		requestId: string,

@@ -59,6 +59,41 @@ describe("convertToLlm compaction summary", () => {
 	});
 });
 
+describe("convertToLlm app correlation", () => {
+	it("keeps ordinary user correlation out of provider-bound messages", () => {
+		const converted = convertToLlm([
+			{
+				role: "user",
+				content: [{ type: "text", text: "hello" }],
+				clientCorrelationId: "rpc:ordinary",
+				timestamp: 1,
+			},
+		]);
+
+		expect(converted).toHaveLength(1);
+		expect("clientCorrelationId" in converted[0]!).toBe(false);
+		expect(JSON.stringify(converted)).not.toContain("rpc:ordinary");
+	});
+
+	it("keeps skill custom-message correlation out of provider-bound messages", () => {
+		const converted = convertToLlm([
+			{
+				role: "custom",
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
+				content: "run the skill",
+				display: true,
+				attribution: "user",
+				clientCorrelationId: "rpc:skill",
+				timestamp: 1,
+			},
+		]);
+
+		expect(converted).toHaveLength(1);
+		expect("clientCorrelationId" in converted[0]!).toBe(false);
+		expect(JSON.stringify(converted)).not.toContain("rpc:skill");
+	});
+});
+
 describe("assistant refusal replay policy", () => {
 	it("preserves API-level Anthropic refusals for summaries but drops them from provider replay", () => {
 		const messages: AgentMessage[] = [

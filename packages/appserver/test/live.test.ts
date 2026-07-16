@@ -7,9 +7,17 @@ import { decodeServerFrame, entryId, hostId, projectId, type ServerFrame, sessio
 import { appserverLockCheck } from "../../coding-agent/src/session/appserver-authority";
 import { inspectSessionLock } from "../../coding-agent/src/session/session-lock";
 import type { DesktopOperationsAuthority } from "../src/operations/dispatcher.ts";
+import type { PendingPromptProjection } from "../src/projection.ts";
 import { BunRpcChildFactory } from "../src/rpc-child.ts";
 import { createAppserver, type LocalAppserver } from "../src/server.ts";
-import type { ChildHandle, RpcChildFactory, SessionAuthority, SessionDiscovery, SessionRecord } from "../src/types.ts";
+import type {
+	ChildHandle,
+	Clock,
+	RpcChildFactory,
+	SessionAuthority,
+	SessionDiscovery,
+	SessionRecord,
+} from "../src/types.ts";
 import { frameBytes, RawUdsWebSocket } from "./raw-uds-client.ts";
 
 const host = hostId("live-test-host");
@@ -18,6 +26,32 @@ const stamp = "2026-01-01T00:00:00.000Z";
 const RPC_LOCK_CHILD = join(import.meta.dir, "fixtures", "rpc-lock-child.ts");
 const sid = (value: string) => sessionId(value);
 const rid = (value: string) => value as never;
+const promptTransientId = (commandId: string) =>
+	`user:${createHash("sha256").update(commandId).digest("hex").slice(0, 32)}`;
+function decodePendingPrompts(value: unknown): PendingPromptProjection[] {
+	if (!Array.isArray(value)) throw new Error("pending prompt projection is not an array");
+	return value.map((item, index) => {
+		if (!item || typeof item !== "object" || Array.isArray(item))
+			throw new Error(`pending prompt projection ${index} is not an object`);
+		const candidate = item as Record<string, unknown>;
+		if (
+			typeof candidate.entryId !== "string" ||
+			typeof candidate.text !== "string" ||
+			typeof candidate.attachmentCount !== "number" ||
+			typeof candidate.at !== "string"
+		)
+			throw new Error(`pending prompt projection ${index} is malformed`);
+		return {
+			entryId: candidate.entryId,
+			text: candidate.text,
+			attachmentCount: candidate.attachmentCount,
+			at: candidate.at,
+		};
+	});
+}
+function pendingPromptTexts(value: unknown): string[] {
+	return decodePendingPrompts(value).map(item => item.text);
+}
 function record(id: string): SessionRecord {
 	return {
 		sessionId: sid(id),
@@ -165,8 +199,12 @@ class LiveChild implements ChildHandle {
 	};
 	readonly stdout: AsyncIterable<string> = this.stream();
 	readonly stderr: AsyncIterable<string> = (async function* () {})();
-	constructor(readonly exitMode: LiveChildExitMode = "graceful") {}
+	constructor(
+		readonly exitMode: LiveChildExitMode = "graceful",
+		readonly readyGate?: Gate,
+	) {}
 	async *stream(): AsyncGenerator<string> {
+		await this.readyGate?.lock();
 		yield `${JSON.stringify({ type: "ready" })}\n`;
 		while (true) {
 			const line = this.#lines.shift() ?? (await this.nextLine());
@@ -206,9 +244,12 @@ class LiveChild implements ChildHandle {
 }
 class LiveFactory implements RpcChildFactory {
 	readonly children: LiveChild[] = [];
-	constructor(readonly exitMode: LiveChildExitMode = "graceful") {}
+	constructor(
+		readonly exitMode: LiveChildExitMode = "graceful",
+		readonly readyGate?: Gate,
+	) {}
 	spawn(): ChildHandle {
-		const child = new LiveChild(this.exitMode);
+		const child = new LiveChild(this.exitMode, this.readyGate);
 		this.children.push(child);
 		this.#spawned.resolve(child);
 		return child;
@@ -233,6 +274,63 @@ function responseFor(child: LiveChild, command: string, success = true): void {
 		command,
 		success,
 		...(success ? { data: { agentInvoked: true } } : { error: "fake failure" }),
+	});
+}
+async function waitForRpcWrite(
+	child: LiveChild,
+	type: string,
+	startIndex = 0,
+): Promise<{ frame: Record<string, unknown>; index: number }> {
+	for (;;) {
+		for (let index = startIndex; index < child.writes.length; index++) {
+			const frame = JSON.parse(child.writes[index] ?? "{}") as Record<string, unknown>;
+			if (frame.type === type) return { frame, index };
+		}
+		await child.waitForWrites(child.writes.length + 1);
+	}
+}
+async function waitForRpcWriteId(
+	child: LiveChild,
+	type: string,
+	idPrefix: string,
+	startIndex = 0,
+): Promise<{ frame: Record<string, unknown>; index: number }> {
+	for (;;) {
+		for (let index = startIndex; index < child.writes.length; index++) {
+			const frame = JSON.parse(child.writes[index] ?? "{}") as Record<string, unknown>;
+			if (frame.type === type && typeof frame.id === "string" && frame.id.startsWith(idPrefix))
+				return { frame, index };
+		}
+		await child.waitForWrites(child.writes.length + 1);
+	}
+}
+function respondState(
+	child: LiveChild,
+	call: Record<string, unknown>,
+	overrides: Partial<{
+		isStreaming: boolean;
+		isCompacting: boolean;
+		isPaused: boolean;
+		messageCount: number;
+		queuedMessageCount: number;
+	}> = {},
+): void {
+	child.push({
+		type: "response",
+		id: call.id,
+		command: "get_state",
+		success: true,
+		data: {
+			isStreaming: false,
+			isCompacting: false,
+			isPaused: false,
+			messageCount: 0,
+			queuedMessageCount: 0,
+			steeringMode: "one-at-a-time",
+			followUpMode: "all",
+			interruptMode: "wait",
+			...overrides,
+		},
 	});
 }
 async function readyClient(
@@ -278,6 +376,53 @@ async function untilResponse(
 		if (frame.type === "response" && frame.requestId === rid(requestId)) return { response: frame, frames };
 	}
 }
+async function untilPong(client: RawUdsWebSocket, nonce: string): Promise<ServerFrame[]> {
+	const frames: ServerFrame[] = [];
+	for (;;) {
+		const frame = await client.nextServer();
+		frames.push(frame);
+		if (frame.type === "pong" && frame.nonce === nonce) return frames;
+	}
+}
+async function acceptedPromptPublication(
+	client: RawUdsWebSocket,
+	commandId: string,
+	expectedText?: string,
+	attachmentCount = 0,
+): Promise<{ active: ServerFrame; pending: ServerFrame; transient: ServerFrame }> {
+	const active = await client.nextServer();
+	const pending = await client.nextServer();
+	const transient = await client.nextServer();
+	expect(active.type).toBe("session.delta");
+	if (active.type !== "session.delta" || !active.upsert) throw new Error("missing active prompt projection");
+	expect(active.upsert.status).toBe("active");
+	expect(pending.type).toBe("session.delta");
+	if (pending.type !== "session.delta" || !pending.upsert) throw new Error("missing pending prompt projection");
+	const projected = decodePendingPrompts(pending.upsert.liveState?.pendingPrompts);
+	expect(projected).toHaveLength(1);
+	expect(projected[0]?.entryId).toBe(promptTransientId(commandId));
+	expect(projected[0]?.attachmentCount).toBe(attachmentCount);
+	if (expectedText !== undefined) expect(projected[0]?.text).toBe(expectedText);
+	expect(transient.type).toBe("event");
+	if (transient.type !== "event") throw new Error("missing transient prompt event");
+	expect(transient.event.type).toBe("message.update");
+	if (transient.event.type !== "message.update") throw new Error("missing transient prompt update");
+	expect(transient.event.entryId).toBe(promptTransientId(commandId));
+	expect(transient.event.attachmentCount).toBe(attachmentCount);
+	if (expectedText !== undefined) expect(transient.event.text).toBe(expectedText);
+	return { active, pending, transient };
+}
+async function untilSessionStatus(
+	client: RawUdsWebSocket,
+	status: "idle" | "active" | "closed",
+): Promise<{ frame: Extract<ServerFrame, { type: "session.delta" }>; frames: ServerFrame[] }> {
+	const frames: ServerFrame[] = [];
+	for (;;) {
+		const frame = await client.nextServer();
+		frames.push(frame);
+		if (frame.type === "session.delta" && frame.upsert?.status === status) return { frame, frames };
+	}
+}
 async function startIdleSessionRuntime(
 	client: RawUdsWebSocket,
 	factory: LiveFactory,
@@ -319,6 +464,7 @@ async function liveServer(
 	records = [record("s1"), record("s2")],
 	ringSize = 256,
 	transcriptImageRoot?: string,
+	clock?: Clock,
 ): Promise<{ appserver: LocalAppserver; root: string; path: string }> {
 	const root = await mkdtemp(join(tmpdir(), "omp-appserver-live-"));
 	const path = join(root, "run", "app.sock");
@@ -330,6 +476,7 @@ async function liveServer(
 		childFactory: factory,
 		ringSize,
 		transcriptImageRoot,
+		clock,
 	});
 	await appserver.start();
 	return { appserver, root, path };
@@ -462,6 +609,8 @@ describe("live Unix websocket protocol", () => {
 
 		const connected = await readyClient(path, ["sessions.read", "sessions.prompt"], ["resume", "prompt.images"]);
 		expect(connected.welcome.grantedFeatures).toContain("prompt.images");
+		connected.client.sendJson(command("attach-image-prompt", "attach-image-prompt", "session.attach", "s1", {}));
+		await responseAndSnapshot(connected.client, "attach-image-prompt");
 		connected.client.sendJson(
 			command("image-begin", "image-begin", "session.image.begin", "s1", {
 				mimeType: "image/png",
@@ -522,6 +671,10 @@ describe("live Unix websocket protocol", () => {
 		);
 		const child = await factory.child();
 		await child.waitForWrites(1);
+		const publication = await acceptedPromptPublication(connected.client, "image-prompt", "", 1);
+		expect(JSON.stringify(publication)).not.toContain(imageId);
+		expect(JSON.stringify(publication)).not.toContain(sha256);
+		expect(JSON.stringify(publication)).not.toContain(png.toString("base64"));
 		const childPrompt = JSON.parse(child.writes[0] ?? "{}") as Record<string, unknown>;
 		expect(childPrompt).toMatchObject({
 			type: "prompt",
@@ -645,15 +798,15 @@ describe("live Unix websocket protocol", () => {
 		await closeClients([readOnly.client]);
 		await appserver.stop();
 	});
-	test("a model change reaches a second client before its command response when the first client is delayed", async () => {
+	test("a slow first client cannot delay ordered index or prompt publication to a fast second client", async () => {
 		const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("reserved") });
 		const port = reserved.port;
 		reserved.stop(true);
 		if (!port) throw new Error("failed to reserve a remote listener port");
 
 		const factory = new LiveFactory();
-		const releaseDelta = Promise.withResolvers<void>();
-		const delayedDelta = Promise.withResolvers<void>();
+		let releaseDelta = Promise.withResolvers<void>();
+		let delayedDelta = Promise.withResolvers<void>();
 		let holdDelta = false;
 		const root = await mkdtemp(join(tmpdir(), "omp-index-order-live-"));
 		const appserver = createAppserver({
@@ -703,7 +856,11 @@ describe("live Unix websocket protocol", () => {
 			});
 			await observerReady.promise;
 
-			const readyOwner = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage"]);
+			const readyOwner = await readyClient(appserver.socketPath, [
+				"sessions.read",
+				"sessions.manage",
+				"sessions.prompt",
+			]);
 			owner = readyOwner.client;
 			owner.sendJson(command("attach-model-owner", "attach-model-owner", "session.attach", "s1", {}));
 			const [, snapshot] = await responseAndSnapshot(owner, "attach-model-owner");
@@ -758,6 +915,39 @@ describe("live Unix websocket protocol", () => {
 				upsert: { model: "xai-oauth/grok-4.5" },
 			});
 			expect(changed.response).toMatchObject({ ok: true, result: { accepted: true } });
+
+			releaseDelta = Promise.withResolvers<void>();
+			delayedDelta = Promise.withResolvers<void>();
+			holdDelta = true;
+			owner.sendJson(command("ordered-prompt", "ordered-prompt", "session.prompt", "s1", { message: "ordered" }));
+			const promptWrite = await waitForRpcWrite(child, "prompt", 2);
+			await delayedDelta.promise;
+			const active = await owner.nextServer();
+			const pending = await owner.nextServer();
+			const transient = await owner.nextServer();
+			expect(active.type).toBe("session.delta");
+			if (active.type !== "session.delta" || !active.upsert) throw new Error("ordered prompt active delta missing");
+			expect(active.upsert.status).toBe("active");
+			expect(pending.type).toBe("session.delta");
+			if (pending.type !== "session.delta" || !pending.upsert)
+				throw new Error("ordered prompt pending delta missing");
+			expect(decodePendingPrompts(pending.upsert.liveState?.pendingPrompts)[0]?.text).toBe("ordered");
+			expect(transient.type).toBe("event");
+			if (transient.type !== "event") throw new Error("ordered prompt transient missing");
+			expect(transient.event.type).toBe("message.update");
+			releaseDelta.resolve();
+			holdDelta = false;
+			child.push({
+				type: "response",
+				id: promptWrite.frame.id,
+				command: "prompt",
+				success: true,
+				data: { agentInvoked: false },
+			});
+			expect((await untilResponse(owner, "ordered-prompt")).response.ok).toBe(true);
+			const terminalState = await waitForRpcWriteId(child, "get_state", "ordered-prompt:terminal:state");
+			respondState(child, terminalState.frame);
+			await untilSessionStatus(owner, "idle");
 		} finally {
 			releaseDelta.resolve();
 			owner?.destroy();
@@ -856,29 +1046,40 @@ describe("live Unix websocket protocol", () => {
 
 	test("cursor attach replays contiguous frames, while an evicted cursor gets gap and snapshot", async () => {
 		const factory = new LiveFactory();
-		const { appserver, path } = await liveServer(factory, [record("s1")], 5);
+		const { appserver, path } = await liveServer(factory, [record("s1")], 6);
 		const first = await readyClient(path, ["sessions.read", "sessions.prompt"]);
 		first.client.sendJson(command("attach-1", "attach-1", "session.attach", "s1", {}));
 		await responseAndSnapshot(first.client, "attach-1");
 		first.client.sendJson(command("prompt-1", "prompt-1", "session.prompt", "s1", { message: "hello" }));
 		const child = await factory.child();
 		await child.waitForWrites(1);
+		const prompt = JSON.parse(child.writes[0] ?? "{}") as { id?: string };
 		child.push({
 			type: "session_entry",
-			entry: { id: "entry-1", parentId: null, type: "message", timestamp: stamp, text: "hello" },
+			entry: {
+				id: "entry-1",
+				parentId: null,
+				type: "message",
+				timestamp: stamp,
+				message: { role: "user", content: "hello", clientCorrelationId: prompt.id },
+			},
 		});
 		child.push({ type: "turn_start" });
 		child.push({ type: "turn_end" });
 		child.push({ type: "agent_end", messages: [] });
+		child.push({ type: "prompt_result", id: prompt.id, agentInvoked: true });
 		responseFor(child, "prompt");
 		const firstOutput = await untilResponse(first.client, "prompt-1");
 		expect(firstOutput.frames.map(frame => frame.type)).toEqual([
 			"session.delta",
+			"session.delta",
+			"event",
 			"entry",
 			"event",
-			"event",
-			"event",
 			"session.delta",
+			"event",
+			"event",
+			"event",
 			"response",
 		]);
 		const replayClient = await readyClient(path, ["sessions.read"]);
@@ -886,17 +1087,12 @@ describe("live Unix websocket protocol", () => {
 			command("attach-replay", "attach-replay", "session.attach", "s1", { cursor: { epoch, seq: 0 } }),
 		);
 		const replayResponse = await replayClient.client.nextServer();
-		const replayFrames = [
-			await replayClient.client.nextServer(),
-			await replayClient.client.nextServer(),
-			await replayClient.client.nextServer(),
-			await replayClient.client.nextServer(),
-		];
+		const replayFrames = await Promise.all(Array.from({ length: 6 }, () => replayClient.client.nextServer()));
 		expect(replayResponse.type).toBe("response");
-		expect(replayFrames.map(frame => frame.type)).toEqual(["entry", "event", "event", "event"]);
+		expect(replayFrames.map(frame => frame.type)).toEqual(["event", "entry", "event", "event", "event", "event"]);
 		expect(
 			replayFrames.map(frame => (frame.type === "entry" || frame.type === "event" ? frame.cursor.seq : -1)),
-		).toEqual([1, 2, 3, 4]);
+		).toEqual([1, 2, 3, 4, 5, 6]);
 		await closeClients([first.client, replayClient.client]);
 		await appserver.stop();
 
@@ -908,9 +1104,11 @@ describe("live Unix websocket protocol", () => {
 		source.client.sendJson(command("prompt-e", "prompt-e", "session.prompt", "s1", { message: "hello" }));
 		const evictChild = await evictFactory.child();
 		await evictChild.waitForWrites(1);
+		const evictPrompt = JSON.parse(evictChild.writes[0] ?? "{}") as { id?: string };
 		evictChild.push({ type: "turn_start" });
 		evictChild.push({ type: "turn_end" });
 		evictChild.push({ type: "agent_end", messages: [] });
+		evictChild.push({ type: "prompt_result", id: evictPrompt.id, agentInvoked: true });
 		responseFor(evictChild, "prompt");
 		await untilResponse(source.client, "prompt-e");
 		const gapClient = await readyClient(evicted.path, ["sessions.read"]);
@@ -943,14 +1141,13 @@ describe("live Unix websocket protocol", () => {
 		}
 		expect(factory.children).toHaveLength(0);
 		const allowed = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+		allowed.client.sendJson(command("attach-allowed", "attach-allowed", "session.attach", "s1", {}));
+		await responseAndSnapshot(allowed.client, "attach-allowed");
 		allowed.client.sendJson(command("prompt-a", "prompt-a", "session.prompt", "s1", { message: "a" }));
 		const child = await factory.child();
 		await child.waitForWrites(1);
 		expect(factory.children).toHaveLength(1);
-		expect(await allowed.client.nextServer()).toMatchObject({
-			type: "session.delta",
-			upsert: expect.objectContaining({ status: "active" }),
-		});
+		await acceptedPromptPublication(allowed.client, "prompt-a", "a");
 
 		const promptB = command("prompt-b", "prompt-b", "session.prompt", "s1", { message: "b" });
 		allowed.client.sendJson(promptB);
@@ -973,6 +1170,15 @@ describe("live Unix websocket protocol", () => {
 		expect((await untilResponse(allowed.client, "prompt-a")).response.ok).toBe(true);
 		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("active");
 		child.push({ type: "agent_end", messages: [] });
+		child.push({ type: "prompt_result", id: promptA.id, agentInvoked: true });
+		expect(await allowed.client.nextServer()).toMatchObject({ type: "event", event: { type: "agent.end" } });
+		expect(await allowed.client.nextServer()).toMatchObject({
+			type: "event",
+			event: { type: "message.discarded", reason: "completed-without-entry" },
+		});
+		expect((await allowed.client.nextServer()).type).toBe("session.delta");
+		const terminalState = await waitForRpcWrite(child, "get_state", 3);
+		respondState(child, terminalState.frame);
 		expect(await allowed.client.nextServer()).toMatchObject({
 			type: "session.delta",
 			upsert: expect.objectContaining({ status: "idle" }),
@@ -984,6 +1190,18 @@ describe("live Unix websocket protocol", () => {
 		const prompts = child.writes.map(value => JSON.parse(value)).filter(frame => frame.type === "prompt");
 		expect(prompts).toHaveLength(2);
 		expect(prompts[1]?.message).toBe("c");
+		await acceptedPromptPublication(allowed.client, "prompt-c", "c");
+		child.push({
+			type: "response",
+			id: prompts[1]?.id,
+			command: "prompt",
+			success: true,
+			data: { agentInvoked: false },
+		});
+		expect((await untilResponse(allowed.client, "prompt-c")).response.ok).toBe(true);
+		const promptCState = await waitForRpcWriteId(child, "get_state", "prompt-c:terminal:state");
+		respondState(child, promptCState.frame);
+		await untilSessionStatus(allowed.client, "idle");
 		await closeClients([denied.client, allowed.client]);
 		await appserver.stop();
 	});
@@ -1001,24 +1219,55 @@ describe("live Unix websocket protocol", () => {
 		s1.client.sendJson(command("prompt-s1", "prompt-s1", "session.prompt", "s1", { message: "event" }));
 		const child = await factory.child();
 		await child.waitForWrites(1);
+		await acceptedPromptPublication(s1.client, "prompt-s1", "event");
 		child.push({
 			type: "session_entry",
-			entry: { id: "broadcast-entry", parentId: null, type: "message", timestamp: stamp, text: "entry" },
+			entry: {
+				id: "broadcast-entry",
+				parentId: null,
+				type: "message",
+				timestamp: stamp,
+				message: { role: "user", content: "entry" },
+			},
 		});
-		child.push({ type: "subagent_progress", payload: { message: "progress" } });
+		child.push({
+			type: "subagent_lifecycle",
+			payload: {
+				id: "BroadcastWorker",
+				index: 0,
+				agent: "task",
+				agentSource: "bundled",
+				description: "Broadcast worker",
+				status: "started",
+				lastUpdate: 100,
+			},
+		});
 		responseFor(child, "prompt");
 		const received = await untilResponse(s1.client, "prompt-s1");
-		expect(received.frames.map(frame => frame.type)).toEqual(["session.delta", "entry", "response"]);
+		expect(
+			received.frames.some(frame => frame.type === "entry" && frame.entry.id === entryId("broadcast-entry")),
+		).toBe(true);
+		expect(received.frames).toContainEqual(
+			expect.objectContaining({ type: "agent", agentId: "BroadcastWorker", state: "started" }),
+		);
 		s2.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "s2", timestamp: stamp });
 		unattached.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "none", timestamp: stamp });
-		const s2Delta = await s2.client.nextServer();
-		const unattachedDelta = await unattached.client.nextServer();
-		expect(s2Delta).toMatchObject({ type: "session.delta", sessionId: "s1", upsert: { status: "active" } });
-		expect(unattachedDelta).toMatchObject({ type: "session.delta", sessionId: "s1", upsert: { status: "active" } });
-		const s2Pong = await s2.client.nextServer();
-		const unattachedPong = await unattached.client.nextServer();
-		expect(s2Pong.type).toBe("pong");
-		expect(unattachedPong.type).toBe("pong");
+		const s2Frames = await untilPong(s2.client, "s2");
+		const unattachedFrames = await untilPong(unattached.client, "none");
+		expect(s2Frames).toContainEqual(
+			expect.objectContaining({
+				type: "session.delta",
+				sessionId: "s1",
+				upsert: expect.objectContaining({ status: "active" }),
+			}),
+		);
+		expect(unattachedFrames).toContainEqual(
+			expect.objectContaining({
+				type: "session.delta",
+				sessionId: "s1",
+				upsert: expect.objectContaining({ status: "active" }),
+			}),
+		);
 		await s1.client.close();
 		await s1.client.closed();
 		child.push({ type: "subagent_progress", payload: { message: "after-disconnect" } });
@@ -1037,8 +1286,7 @@ describe("live Unix websocket protocol", () => {
 		client.client.sendJson(command("prompt-project", "prompt-project", "session.prompt", "s1", { message: "go" }));
 		const child = await factory.child();
 		await child.waitForWrites(1);
-		const active = await client.client.nextServer();
-		expect(active.type).toBe("session.delta");
+		await acceptedPromptPublication(client.client, "prompt-project", "go");
 		child.push({
 			type: "session_entry",
 			entry: {
@@ -1151,6 +1399,324 @@ describe("live Unix websocket protocol", () => {
 		await closeClients([client.client]);
 		await appserver.stop();
 	});
+	test("keeps an accepted prompt authoritative across attach and settles only its exactly correlated user entry", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory, [record("s1")]);
+		const owner = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+		owner.client.sendJson(command("attach-authority", "attach-authority", "session.attach", "s1", {}));
+		await responseAndSnapshot(owner.client, "attach-authority");
+
+		const message = `Inspect /home/tester/project token=plaintext ${"🙂".repeat(4_000)}`;
+		owner.client.sendJson(
+			command("prompt-authority", "prompt-authority-command", "session.prompt", "s1", { message }),
+		);
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		const active = await owner.client.nextServer();
+		const pendingDelta = await owner.client.nextServer();
+		const transient = await owner.client.nextServer();
+		const transientEntryId = promptTransientId("prompt-authority-command");
+		expect(active).toMatchObject({
+			type: "session.delta",
+			upsert: expect.objectContaining({ status: "active" }),
+		});
+		if (pendingDelta.type !== "session.delta" || !pendingDelta.upsert)
+			throw new Error("missing authoritative pending prompt");
+		const pendingPrompts = pendingDelta.upsert.liveState?.pendingPrompts;
+		if (!Array.isArray(pendingPrompts) || pendingPrompts.length !== 1)
+			throw new Error(`pending prompt list is malformed: ${JSON.stringify(pendingDelta)}`);
+		const pendingPrompt = pendingPrompts[0];
+		if (!pendingPrompt || typeof pendingPrompt !== "object" || Array.isArray(pendingPrompt))
+			throw new Error(`pending prompt metadata is malformed: ${JSON.stringify(pendingDelta)}`);
+		expect("entryId" in pendingPrompt ? pendingPrompt.entryId : undefined).toBe(transientEntryId);
+		expect("attachmentCount" in pendingPrompt ? pendingPrompt.attachmentCount : undefined).toBe(0);
+		const pendingText = "text" in pendingPrompt ? pendingPrompt.text : undefined;
+		const pendingAt = "at" in pendingPrompt ? pendingPrompt.at : undefined;
+		expect(typeof pendingText).toBe("string");
+		expect(new TextEncoder().encode(String(pendingText)).byteLength).toBeLessThanOrEqual(8 * 1024);
+		expect(String(pendingText)).not.toContain("/home/tester");
+		expect(String(pendingText)).not.toContain("plaintext");
+		expect(typeof pendingAt).toBe("string");
+		expect(new Date(String(pendingAt)).toISOString()).toBe(pendingAt);
+		expect(transient).toMatchObject({
+			type: "event",
+			event: {
+				type: "message.update",
+				entryId: transientEntryId,
+				role: "user",
+				at: pendingAt,
+			},
+		});
+		if (transient.type !== "event") throw new Error("missing transient prompt event");
+		expect(new TextEncoder().encode(String(transient.event.text)).byteLength).toBeGreaterThan(8 * 1024);
+		expect(String(transient.event.text)).not.toContain("/home/tester");
+		expect(String(transient.event.text)).not.toContain("plaintext");
+
+		const reconnected = await readyClient(path, ["sessions.read"]);
+		const reconnectRef = reconnected.sessions.sessions.find(session => session.sessionId === sid("s1"));
+		expect(reconnectRef?.liveState?.pendingPrompts).toEqual([pendingPrompt]);
+		reconnected.client.sendJson(command("attach-reconnected", "attach-reconnected", "session.attach", "s1", {}));
+		const [, reconnectSnapshot] = await responseAndSnapshot(reconnected.client, "attach-reconnected");
+		expect(reconnectSnapshot.cursor).toEqual({ epoch, seq: 1 });
+		expect(appserver.snapshot(sid("s1"))?.ref.liveState?.pendingPrompts).toEqual([pendingPrompt]);
+
+		const prompt = JSON.parse(child.writes[0]!) as { id: string; message: string; type: string };
+		expect(prompt).toMatchObject({ type: "prompt", message });
+		child.push({ type: "response", id: prompt.id, command: "prompt", success: true, data: { agentInvoked: true } });
+		expect((await untilResponse(owner.client, "prompt-authority")).response.ok).toBe(true);
+
+		child.push({
+			type: "session_entry",
+			entry: {
+				id: "unrelated-user",
+				parentId: null,
+				type: "message",
+				timestamp: stamp,
+				message: {
+					role: "user",
+					content: message,
+					timestamp: 1,
+					clientCorrelationId: "another-rpc-command",
+				},
+			},
+		});
+		expect(await owner.client.nextServer()).toMatchObject({ type: "entry", entry: { id: "unrelated-user" } });
+		expect(appserver.snapshot(sid("s1"))?.ref.liveState?.pendingPrompts).toEqual([pendingPrompt]);
+
+		child.push({
+			type: "session_entry",
+			entry: {
+				id: "correlated-user",
+				parentId: "unrelated-user",
+				type: "message",
+				timestamp: stamp,
+				message: {
+					role: "user",
+					content: message,
+					timestamp: 2,
+					clientCorrelationId: prompt.id,
+				},
+			},
+		});
+		const durable = await owner.client.nextServer();
+		const settled = await owner.client.nextServer();
+		const cleared = await owner.client.nextServer();
+		expect(durable).toMatchObject({ type: "entry", entry: { id: "correlated-user" } });
+		expect(settled).toMatchObject({
+			type: "event",
+			event: { type: "message.settled", transientEntryId, entryId: "correlated-user" },
+		});
+		expect(cleared.type).toBe("session.delta");
+		if (cleared.type !== "session.delta" || !cleared.upsert) throw new Error("missing pending prompt clear");
+		expect(cleared.upsert.liveState?.pendingPrompts).toBeUndefined();
+		expect(appserver.snapshot(sid("s1"))?.ref.liveState?.pendingPrompts).toBeUndefined();
+
+		const replay = await readyClient(path, ["sessions.read"]);
+		expect(
+			replay.sessions.sessions.find(session => session.sessionId === sid("s1"))?.liveState?.pendingPrompts,
+		).toBeUndefined();
+		replay.client.sendJson(
+			command("attach-authority-replay", "attach-authority-replay", "session.attach", "s1", {
+				cursor: { epoch, seq: 0 },
+			}),
+		);
+		const replayResponse = await replay.client.nextServer();
+		const replayFrames = [
+			await replay.client.nextServer(),
+			await replay.client.nextServer(),
+			await replay.client.nextServer(),
+			await replay.client.nextServer(),
+		];
+		expect(replayResponse.type).toBe("response");
+		expect(replayFrames.map(frame => frame.type)).toEqual(["event", "entry", "entry", "event"]);
+		expect(replayFrames[0]).toMatchObject({ event: { type: "message.update", entryId: transientEntryId } });
+		expect(replayFrames[3]).toMatchObject({
+			event: { type: "message.settled", transientEntryId, entryId: "correlated-user" },
+		});
+
+		child.push({ type: "prompt_result", id: prompt.id, agentInvoked: true });
+		await child.waitForWrites(3);
+		const terminalState = JSON.parse(child.writes[2] ?? "{}") as { id?: string; type?: string };
+		expect(terminalState.type).toBe("get_state");
+		child.push({
+			type: "response",
+			id: terminalState.id,
+			command: "get_state",
+			success: true,
+			data: {
+				isStreaming: false,
+				isCompacting: false,
+				isPaused: false,
+				messageCount: 1,
+				queuedMessageCount: 0,
+				steeringMode: "one-at-a-time",
+				followUpMode: "all",
+				interruptMode: "wait",
+			},
+		});
+		expect(await owner.client.nextServer()).toMatchObject({
+			type: "session.delta",
+			upsert: expect.objectContaining({ status: "idle" }),
+		});
+		await closeClients([owner.client, reconnected.client, replay.client]);
+		await appserver.stop();
+	});
+
+	test("keeps an accepted prompt alive across sender disconnect and settles it for a reconnecting client", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory, [record("s1")]);
+		const sender = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+		sender.client.sendJson(command("attach-disconnect", "attach-disconnect", "session.attach", "s1", {}));
+		await responseAndSnapshot(sender.client, "attach-disconnect");
+		sender.client.sendJson(
+			command("prompt-disconnect", "prompt-disconnect", "session.prompt", "s1", { message: "survive" }),
+		);
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		await acceptedPromptPublication(sender.client, "prompt-disconnect", "survive");
+		const prompt = JSON.parse(child.writes[0] ?? "{}") as { id?: string; type?: string };
+		expect(prompt.type).toBe("prompt");
+		if (!prompt.id) throw new Error("disconnect prompt RPC id missing");
+		sender.client.destroy();
+		await sender.client.closed();
+
+		const reconnected = await readyClient(path, ["sessions.read"]);
+		const pending = reconnected.sessions.sessions.find(session => session.sessionId === sid("s1"));
+		expect(decodePendingPrompts(pending?.liveState?.pendingPrompts)[0]?.text).toBe("survive");
+		expect(child.writes.map(value => JSON.parse(value).type)).toEqual(["prompt"]);
+		reconnected.client.sendJson(
+			command("attach-reconnected", "attach-reconnected", "session.attach", "s1", {
+				cursor: { epoch, seq: 0 },
+			}),
+		);
+		expect((await reconnected.client.nextServer()).type).toBe("response");
+		expect(await reconnected.client.nextServer()).toMatchObject({
+			type: "event",
+			event: { type: "message.update", entryId: promptTransientId("prompt-disconnect") },
+		});
+
+		child.push({
+			type: "session_entry",
+			entry: {
+				id: "disconnect-user",
+				parentId: null,
+				type: "custom_message",
+				timestamp: stamp,
+				customType: "skill-prompt",
+				content: "survive",
+				display: true,
+				attribution: "user",
+				clientCorrelationId: prompt.id,
+			},
+		});
+		const durable = await reconnected.client.nextServer();
+		const settled = await reconnected.client.nextServer();
+		const cleared = await reconnected.client.nextServer();
+		expect(durable).toMatchObject({ type: "entry", entry: { id: "disconnect-user" } });
+		expect(settled).toMatchObject({
+			type: "event",
+			event: {
+				type: "message.settled",
+				transientEntryId: promptTransientId("prompt-disconnect"),
+				entryId: "disconnect-user",
+			},
+		});
+		expect(cleared.type).toBe("session.delta");
+		if (cleared.type !== "session.delta" || !cleared.upsert) throw new Error("disconnect pending clear missing");
+		expect(cleared.upsert.liveState?.pendingPrompts).toBeUndefined();
+		child.push({
+			type: "response",
+			id: prompt.id,
+			command: "prompt",
+			success: true,
+			data: { agentInvoked: true },
+		});
+		child.push({ type: "prompt_result", id: prompt.id, agentInvoked: true });
+		const terminalState = await waitForRpcWriteId(child, "get_state", `${prompt.id}:terminal:state`);
+		respondState(child, terminalState.frame);
+		await untilSessionStatus(reconnected.client, "idle");
+		expect(child.writes.some(value => JSON.parse(value).type === "abort")).toBe(false);
+		await closeClients([reconnected.client]);
+		await appserver.stop();
+	});
+
+	test("discards rejected and local-only prompt transients with replay-safe terminal events", async () => {
+		for (const scenario of [
+			{ name: "rejected", success: false, reason: "rejected", ok: false },
+			{ name: "local", success: true, reason: "local-only", ok: true },
+		] as const) {
+			const factory = new LiveFactory();
+			const { appserver, path } = await liveServer(factory, [record("s1")]);
+			const client = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+			client.client.sendJson(
+				command(`attach-${scenario.name}`, `attach-${scenario.name}`, "session.attach", "s1", {}),
+			);
+			await responseAndSnapshot(client.client, `attach-${scenario.name}`);
+			const commandId = `prompt-${scenario.name}-command`;
+			client.client.sendJson(
+				command(`prompt-${scenario.name}`, commandId, "session.prompt", "s1", { message: scenario.name }),
+			);
+			const child = await factory.child();
+			await child.waitForWrites(1);
+			expect((await client.client.nextServer()).type).toBe("session.delta");
+			expect((await client.client.nextServer()).type).toBe("session.delta");
+			expect(await client.client.nextServer()).toMatchObject({
+				type: "event",
+				event: { type: "message.update", entryId: promptTransientId(commandId) },
+			});
+			const prompt = JSON.parse(child.writes[0]!) as { id: string };
+			child.push({
+				type: "response",
+				id: prompt.id,
+				command: "prompt",
+				success: scenario.success,
+				...(scenario.success ? { data: { agentInvoked: false } } : { error: "busy" }),
+			});
+			const terminal = await untilResponse(client.client, `prompt-${scenario.name}`);
+			expect(terminal.response.ok).toBe(scenario.ok);
+			expect(terminal.frames).toContainEqual(
+				expect.objectContaining({
+					type: "event",
+					event: expect.objectContaining({
+						type: "message.discarded",
+						transientEntryId: promptTransientId(commandId),
+						reason: scenario.reason,
+					}),
+				}),
+			);
+			const stateCall = await waitForRpcWrite(child, "get_state", 1);
+			respondState(child, stateCall.frame);
+			expect(await client.client.nextServer()).toMatchObject({
+				type: "session.delta",
+				upsert: expect.objectContaining({ status: "idle" }),
+			});
+			expect(appserver.snapshot(sid("s1"))?.ref).toMatchObject({ status: "idle" });
+			expect(appserver.snapshot(sid("s1"))?.ref.liveState?.pendingPrompts).toBeUndefined();
+
+			const replay = await readyClient(path, ["sessions.read"]);
+			replay.client.sendJson(
+				command(`replay-${scenario.name}`, `replay-${scenario.name}`, "session.attach", "s1", {
+					cursor: { epoch, seq: 0 },
+				}),
+			);
+			expect((await replay.client.nextServer()).type).toBe("response");
+			expect(await replay.client.nextServer()).toMatchObject({
+				type: "event",
+				event: { type: "message.update", entryId: promptTransientId(commandId) },
+			});
+			expect(await replay.client.nextServer()).toMatchObject({
+				type: "event",
+				event: {
+					type: "message.discarded",
+					transientEntryId: promptTransientId(commandId),
+					reason: scenario.reason,
+				},
+			});
+			await closeClients([client.client, replay.client]);
+			await appserver.stop();
+		}
+	});
+
 	test("translates a live RPC turn once and survives meta/future frames", async () => {
 		const factory = new LiveFactory();
 		const { appserver, path } = await liveServer(factory, [record("s1")]);
@@ -1160,6 +1726,9 @@ describe("live Unix websocket protocol", () => {
 		client.client.sendJson(command("prompt-pipeline", "prompt-pipeline", "session.prompt", "s1", { message: "go" }));
 		const child = await factory.child();
 		await child.waitForWrites(1);
+		await acceptedPromptPublication(client.client, "prompt-pipeline", "go");
+		const prompt = JSON.parse(child.writes[0] ?? "{}") as { id?: string };
+		if (!prompt.id) throw new Error("pipeline prompt RPC id missing");
 		child.push({ type: "turn_start" });
 		child.push({
 			type: "message_start",
@@ -1216,11 +1785,11 @@ describe("live Unix websocket protocol", () => {
 			},
 		});
 		child.push({ type: "message_persisted", streamId: "assistant-stream-1", entryId: "assistant-1" });
-		child.push({ type: "prompt_result", agentInvoked: true });
 		child.push({ type: "future_frame", payload: "ignored" });
 		child.push({ type: "turn_end" });
 		child.push({ type: "agent_end", messages: [] });
-		responseFor(child, "prompt");
+		child.push({ type: "prompt_result", id: prompt.id, agentInvoked: true });
+		child.push({ type: "response", id: prompt.id, command: "prompt", success: true, data: { agentInvoked: true } });
 		const output = await untilResponse(client.client, "prompt-pipeline");
 		const eventFrames = output.frames.filter(frame => frame.type === "event");
 		expect(eventFrames.map(frame => (frame.type === "event" ? frame.event.type : ""))).toEqual([
@@ -1232,6 +1801,7 @@ describe("live Unix websocket protocol", () => {
 			"message.settled",
 			"turn.end",
 			"agent.end",
+			"message.discarded",
 		]);
 		const messageUpdateIndex = output.frames.findIndex(
 			frame => frame.type === "event" && frame.event.type === "message.update",
@@ -1254,12 +1824,9 @@ describe("live Unix websocket protocol", () => {
 			transientEntryId: messageUpdate.event.entryId,
 			entryId: durable.entry.id,
 		});
-		expect(output.frames).toContainEqual(
-			expect.objectContaining({
-				type: "session.delta",
-				upsert: expect.objectContaining({ status: "idle" }),
-			}),
-		);
+		const terminalState = await waitForRpcWriteId(child, "get_state", `${prompt.id}:terminal:state`);
+		respondState(child, terminalState.frame);
+		await untilSessionStatus(client.client, "idle");
 		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
 		expect(eventFrames.filter(frame => frame.type === "event" && frame.event.type === "message.update")).toHaveLength(
 			1,
@@ -1281,20 +1848,18 @@ describe("live Unix websocket protocol", () => {
 		client.client.sendJson(command("prompt-local", "prompt-local", "session.prompt", "s1", { message: "/local" }));
 		const child = await factory.child();
 		await child.waitForWrites(1);
-		expect(await client.client.nextServer()).toMatchObject({
-			type: "session.delta",
-			upsert: expect.objectContaining({ status: "active" }),
-		});
+		await acceptedPromptPublication(client.client, "prompt-local", "/local");
 		const prompt = JSON.parse(child.writes[0]!) as { id: string };
-		child.push({ type: "prompt_result", id: prompt.id, agentInvoked: false });
-		const idle = await client.client.nextServer();
-		expect(idle).toMatchObject({
-			type: "session.delta",
-			upsert: expect.objectContaining({ status: "idle" }),
-		});
-		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
-		responseFor(child, "prompt");
+		child.push({ type: "response", id: prompt.id, command: "prompt", success: true, data: { agentInvoked: true } });
 		expect((await untilResponse(client.client, "prompt-local")).response.ok).toBe(true);
+		child.push({ type: "prompt_result", id: prompt.id, agentInvoked: false });
+		const terminalState = await waitForRpcWriteId(child, "get_state", `${prompt.id}:terminal:state`);
+		respondState(child, terminalState.frame);
+		const idle = await untilSessionStatus(client.client, "idle");
+		expect(idle.frames).toContainEqual(
+			expect.objectContaining({ type: "event", event: expect.objectContaining({ type: "message.discarded" }) }),
+		);
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
 
 		await closeClients([client.client]);
 		await appserver.stop();
@@ -1309,10 +1874,7 @@ describe("live Unix websocket protocol", () => {
 		client.client.sendJson(command("prompt-rejected", "prompt-rejected", "session.prompt", "s1", { message: "A" }));
 		const child = await factory.child();
 		await child.waitForWrites(1);
-		expect(await client.client.nextServer()).toMatchObject({
-			type: "session.delta",
-			upsert: expect.objectContaining({ status: "active" }),
-		});
+		await acceptedPromptPublication(client.client, "prompt-rejected", "A");
 		const rejectedPrompt = JSON.parse(child.writes[0]!) as { id: string };
 		child.push({
 			type: "response",
@@ -1324,8 +1886,11 @@ describe("live Unix websocket protocol", () => {
 		const rejected = await untilResponse(client.client, "prompt-rejected");
 		expect(rejected.response).toMatchObject({ ok: false, error: { code: "child_error" } });
 		expect(rejected.frames).toContainEqual(
-			expect.objectContaining({ type: "session.delta", upsert: expect.objectContaining({ status: "idle" }) }),
+			expect.objectContaining({ type: "event", event: expect.objectContaining({ type: "message.discarded" }) }),
 		);
+		const rejectedState = await waitForRpcWriteId(child, "get_state", "prompt-rejected:terminal:state");
+		respondState(child, rejectedState.frame);
+		await untilSessionStatus(client.client, "idle");
 		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
 
 		client.client.sendJson(
@@ -1335,10 +1900,7 @@ describe("live Unix websocket protocol", () => {
 		);
 		while (child.writes.map(value => JSON.parse(value)).filter(frame => frame.type === "prompt").length < 2)
 			await child.waitForWrites(child.writes.length + 1);
-		expect(await client.client.nextServer()).toMatchObject({
-			type: "session.delta",
-			upsert: expect.objectContaining({ status: "active" }),
-		});
+		await acceptedPromptPublication(client.client, "prompt-local-response", "B");
 		const secondPrompt = child.writes.map(value => JSON.parse(value)).filter(frame => frame.type === "prompt")[1];
 		child.push({
 			type: "response",
@@ -1350,8 +1912,11 @@ describe("live Unix websocket protocol", () => {
 		const local = await untilResponse(client.client, "prompt-local-response");
 		expect(local.response).toMatchObject({ ok: true, result: { accepted: true } });
 		expect(local.frames).toContainEqual(
-			expect.objectContaining({ type: "session.delta", upsert: expect.objectContaining({ status: "idle" }) }),
+			expect.objectContaining({ type: "event", event: expect.objectContaining({ type: "message.discarded" }) }),
 		);
+		const localState = await waitForRpcWriteId(child, "get_state", "prompt-local-response:terminal:state");
+		respondState(child, localState.frame);
+		await untilSessionStatus(client.client, "idle");
 		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
 
 		client.client.sendJson(
@@ -1379,6 +1944,7 @@ describe("live Unix websocket protocol", () => {
 			client.client.sendJson(command("prompt-a", "prompt-a-correlated", "session.prompt", "s1", { message: "A" }));
 			const child = await factory.child();
 			await child.waitForWrites(1);
+			await acceptedPromptPublication(client.client, "prompt-a-correlated", "A");
 			const promptA = child.writes
 				.map(value => JSON.parse(value) as Record<string, unknown>)
 				.find(frame => frame.type === "prompt");
@@ -1386,12 +1952,10 @@ describe("live Unix websocket protocol", () => {
 			child.push({ type: "response", id: promptA.id, command: "prompt", success: true });
 			expect((await untilResponse(client.client, "prompt-a")).response.ok).toBe(true);
 			expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("active");
-			child.push({ type: "agent_end", messages: [] });
-			expect(await client.client.nextServer()).toMatchObject({ type: "event", event: { type: "agent.end" } });
-			expect(await client.client.nextServer()).toMatchObject({
-				type: "session.delta",
-				upsert: expect.objectContaining({ status: "idle" }),
-			});
+			child.push({ type: "prompt_result", id: promptA.id, agentInvoked: true });
+			const terminalAState = await waitForRpcWriteId(child, "get_state", `${promptA.id}:terminal:state`);
+			respondState(child, terminalAState.frame);
+			await untilSessionStatus(client.client, "idle");
 
 			client.client.sendJson(command("prompt-b", "prompt-b-correlated", "session.prompt", "s1", { message: "B" }));
 			let promptB: Record<string, unknown> | undefined;
@@ -1402,10 +1966,7 @@ describe("live Unix websocket protocol", () => {
 				if (!promptB) await child.waitForWrites(child.writes.length + 1);
 			}
 			if (typeof promptB.id !== "string") throw new Error("prompt B RPC id missing");
-			expect(await client.client.nextServer()).toMatchObject({
-				type: "session.delta",
-				upsert: expect.objectContaining({ status: "active" }),
-			});
+			await acceptedPromptPublication(client.client, "prompt-b-correlated", "B");
 			child.push({ type: "response", id: promptB.id, command: "prompt", success: true });
 			expect((await untilResponse(client.client, "prompt-b")).response.ok).toBe(true);
 			child.push({ type: "turn_start" });
@@ -1413,33 +1974,28 @@ describe("live Unix websocket protocol", () => {
 
 			child.push({ type: "prompt_result", id: promptA.id, ...staleResult.frame });
 			child.push({ type: "notice", level: "info", message: "stale-result-barrier" });
-			if ("error" in staleResult.frame) {
-				const staleError = await client.client.nextServer();
-				expect(staleError).toMatchObject({
-					type: "event",
-					event: { type: "turn.error", message: "Bearer [redacted] failed at [path]" },
-				});
+			const staleFrames: ServerFrame[] = [];
+			for (;;) {
+				const frame = await client.client.nextServer();
+				staleFrames.push(frame);
+				if (frame.type === "event" && frame.event.type === "notice") break;
 			}
-			const barrier = await client.client.nextServer();
-			expect(barrier).toMatchObject({
-				type: "event",
-				event: { type: "notice", message: "stale-result-barrier" },
-			});
+			expect(staleFrames.some(frame => frame.type === "event" && frame.event.type === "turn.error")).toBe(false);
+			expect(staleFrames.some(frame => frame.type === "event" && frame.event.type === "message.discarded")).toBe(
+				false,
+			);
 			expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("active");
+			expect(decodePendingPrompts(appserver.snapshot(sid("s1"))?.ref.liveState?.pendingPrompts)[0]?.text).toBe("B");
 
 			child.push({ type: "prompt_result", id: promptB.id, error: "current B failed" });
-			const currentError = await client.client.nextServer();
-			const currentEnd = await client.client.nextServer();
-			const currentIdle = await client.client.nextServer();
-			expect(currentError).toMatchObject({
-				type: "event",
-				event: { type: "turn.error", message: "current B failed" },
-			});
-			expect(currentEnd).toMatchObject({ type: "event", event: { type: "turn.end" } });
-			expect(currentIdle).toMatchObject({
-				type: "session.delta",
-				upsert: expect.objectContaining({ status: "idle" }),
-			});
+			const terminalBState = await waitForRpcWriteId(child, "get_state", `${promptB.id}:terminal:state`);
+			respondState(child, terminalBState.frame);
+			const current = await untilSessionStatus(client.client, "idle");
+			expect(current.frames.some(frame => frame.type === "event" && frame.event.type === "turn.error")).toBe(true);
+			expect(current.frames.some(frame => frame.type === "event" && frame.event.type === "turn.end")).toBe(true);
+			expect(current.frames.some(frame => frame.type === "event" && frame.event.type === "message.discarded")).toBe(
+				true,
+			);
 
 			client.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "after-correlated-error", timestamp: stamp });
 			expect(await client.client.nextServer()).toMatchObject({ type: "pong", nonce: "after-correlated-error" });
@@ -1448,6 +2004,395 @@ describe("live Unix websocket protocol", () => {
 			await appserver.stop();
 		});
 	}
+	test("reconnects plural steer and follow-up transients and settles them out of order by exact correlation", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory, [record("s1")]);
+		const owner = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+		owner.client.sendJson(command("attach-queued-pair", "attach-queued-pair", "session.attach", "s1", {}));
+		await responseAndSnapshot(owner.client, "attach-queued-pair");
+
+		owner.client.sendJson(command("steer-a", "steer-a", "session.steer", "s1", { message: "steer A" }));
+		const child = await factory.child();
+		const steer = await waitForRpcWrite(child, "steer");
+		await acceptedPromptPublication(owner.client, "steer-a", "steer A");
+		child.push({ type: "response", id: steer.frame.id, command: "steer", success: true, data: {} });
+		expect((await untilResponse(owner.client, "steer-a")).response.ok).toBe(true);
+
+		owner.client.sendJson(command("follow-b", "follow-b", "session.followUp", "s1", { message: "follow B" }));
+		const follow = await waitForRpcWrite(child, "follow_up", steer.index + 1);
+		child.push({ type: "response", id: follow.frame.id, command: "follow_up", success: true, data: {} });
+		expect((await untilResponse(owner.client, "follow-b")).response.ok).toBe(true);
+		expect(pendingPromptTexts(appserver.snapshot(sid("s1"))?.ref.liveState?.pendingPrompts)).toEqual([
+			"steer A",
+			"follow B",
+		]);
+		const reconnected = await readyClient(path, ["sessions.read"]);
+		expect(
+			pendingPromptTexts(
+				reconnected.sessions.sessions.find(session => session.sessionId === sid("s1"))?.liveState?.pendingPrompts,
+			),
+		).toEqual(["steer A", "follow B"]);
+
+		if (typeof follow.frame.id !== "string" || typeof steer.frame.id !== "string")
+			throw new Error("queued pair RPC ids missing");
+		child.push({
+			type: "session_entry",
+			entry: {
+				id: "follow-b-user",
+				parentId: null,
+				type: "message",
+				timestamp: stamp,
+				message: { role: "user", content: "follow B", clientCorrelationId: follow.frame.id },
+			},
+		});
+		const followFrames = [
+			await owner.client.nextServer(),
+			await owner.client.nextServer(),
+			await owner.client.nextServer(),
+		];
+		expect(followFrames.map(frame => frame.type)).toEqual(["entry", "event", "session.delta"]);
+		expect(pendingPromptTexts(appserver.snapshot(sid("s1"))?.ref.liveState?.pendingPrompts)).toEqual(["steer A"]);
+		child.push({
+			type: "session_entry",
+			entry: {
+				id: "steer-a-user",
+				parentId: "follow-b-user",
+				type: "message",
+				timestamp: stamp,
+				message: { role: "user", content: "steer A", clientCorrelationId: steer.frame.id },
+			},
+		});
+		const steerFrames = [
+			await owner.client.nextServer(),
+			await owner.client.nextServer(),
+			await owner.client.nextServer(),
+		];
+		expect(steerFrames.map(frame => frame.type)).toEqual(["entry", "event", "session.delta"]);
+		expect(appserver.snapshot(sid("s1"))?.ref.liveState?.pendingPrompts).toBeUndefined();
+		child.push({ type: "agent_end", messages: [] });
+		expect(await owner.client.nextServer()).toMatchObject({ type: "event", event: { type: "agent.end" } });
+		const terminalState = await waitForRpcWriteId(child, "get_state", "agent-end:state");
+		respondState(child, terminalState.frame);
+		await untilSessionStatus(owner.client, "idle");
+		await closeClients([owner.client, reconnected.client]);
+		await appserver.stop();
+	});
+	test("a cancel awaiting supervisor startup never aborts a newer root", async () => {
+		const readyGate = new Gate();
+		const factory = new LiveFactory("graceful", readyGate);
+		const { appserver, path } = await liveServer(factory, [record("s1")]);
+		const client = await readyClient(path, ["sessions.read", "sessions.prompt", "sessions.control"]);
+
+		// The prompt starts the supervisor first but cannot register its lifecycle
+		// until the child becomes ready.
+		client.client.sendJson(command("new-root", "new-root", "session.prompt", "s1", { message: "B" }));
+		const child = await factory.child();
+		await readyGate.started.promise;
+
+		client.client.sendJson(command("cancel-before-ready", "cancel-before-ready", "session.cancel", "s1", {}));
+		const challenge = await client.client.nextServer();
+		expect(challenge.type).toBe("confirmation");
+		if (challenge.type !== "confirmation") throw new Error("cancel confirmation missing");
+		client.client.sendJson(
+			confirmFrame(
+				"cancel-before-ready-confirm",
+				String(challenge.confirmationId),
+				"cancel-before-ready",
+				"approve",
+				"s1",
+			),
+		);
+		// A subsequent ping is handled only after the confirm callback has entered
+		// its first await, proving cancel captured the pre-prompt (undefined) root
+		// and joined the delayed supervisor start before readiness is released.
+		client.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "cancel-awaiting-ready", timestamp: stamp });
+		await untilPong(client.client, "cancel-awaiting-ready");
+		readyGate.opened.resolve();
+
+		const prompt = await waitForRpcWrite(child, "prompt");
+		const cancelled = await untilResponse(client.client, "cancel-before-ready");
+		expect(cancelled.response).toMatchObject({ ok: true, result: { cancelled: false } });
+		expect(child.writes.map(value => JSON.parse(value)).some(frame => frame.type === "abort")).toBe(false);
+
+		child.push({
+			type: "response",
+			id: prompt.frame.id,
+			command: "prompt",
+			success: true,
+			data: { agentInvoked: true },
+		});
+		expect((await untilResponse(client.client, "new-root")).response.ok).toBe(true);
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+	test("cancelling root A preserves a queued cross-client follow-up B until its exact durable entry", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory, [record("s1")]);
+		const owner = await readyClient(path, ["sessions.read", "sessions.prompt", "sessions.control"]);
+		const queueClient = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+		owner.client.sendJson(command("attach-cancel-owner", "attach-cancel-owner", "session.attach", "s1", {}));
+		await responseAndSnapshot(owner.client, "attach-cancel-owner");
+		queueClient.client.sendJson(command("attach-cancel-queue", "attach-cancel-queue", "session.attach", "s1", {}));
+		await responseAndSnapshot(queueClient.client, "attach-cancel-queue");
+
+		owner.client.sendJson(command("prompt-cancel-a", "prompt-cancel-a", "session.prompt", "s1", { message: "A" }));
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		await acceptedPromptPublication(owner.client, "prompt-cancel-a", "A");
+		await acceptedPromptPublication(queueClient.client, "prompt-cancel-a", "A");
+		const promptA = JSON.parse(child.writes[0] ?? "{}") as { id?: string; type?: string };
+		expect(promptA.type).toBe("prompt");
+		if (!promptA.id) throw new Error("cancel A prompt RPC id missing");
+
+		queueClient.client.sendJson(command("queue-b", "queue-b", "session.followUp", "s1", { message: "B" }));
+		const followUp = await waitForRpcWrite(child, "follow_up", 1);
+		if (typeof followUp.frame.id !== "string") throw new Error("queued B follow-up RPC id missing");
+		child.push({
+			type: "response",
+			id: followUp.frame.id,
+			command: "follow_up",
+			success: true,
+			data: {},
+		});
+		const queued = await untilResponse(queueClient.client, "queue-b");
+		expect(queued.response).toMatchObject({ ok: true, result: { accepted: true } });
+		const ownerPending = await owner.client.nextServer();
+		const ownerTransient = await owner.client.nextServer();
+		expect(ownerPending.type).toBe("session.delta");
+		if (ownerPending.type !== "session.delta" || !ownerPending.upsert)
+			throw new Error("queued B pending projection missing");
+		expect(pendingPromptTexts(ownerPending.upsert.liveState?.pendingPrompts)).toEqual(["A", "B"]);
+		expect(ownerTransient).toMatchObject({
+			type: "event",
+			event: { type: "message.update", entryId: promptTransientId("queue-b"), text: "B" },
+		});
+
+		owner.client.sendJson(command("cancel-a", "cancel-a", "session.cancel", "s1", {}));
+		const challenge = await owner.client.nextServer();
+		expect(challenge.type).toBe("confirmation");
+		if (challenge.type !== "confirmation") throw new Error("cancel A confirmation missing");
+		owner.client.sendJson(
+			confirmFrame("cancel-a-confirm", String(challenge.confirmationId), "cancel-a", "approve", "s1"),
+		);
+		const abort = await waitForRpcWrite(child, "abort", followUp.index + 1);
+		expect(abort.frame.resumeQueuedMessages).toBe(true);
+		child.push({ type: "response", id: abort.frame.id, command: "abort", success: true, data: {} });
+		const cancelled = await untilResponse(owner.client, "cancel-a");
+		expect(cancelled.response).toMatchObject({ ok: true, result: { cancelled: true } });
+		expect(cancelled.frames.some(frame => frame.type === "event" && frame.event.type === "message.discarded")).toBe(
+			true,
+		);
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("active");
+		expect(pendingPromptTexts(appserver.snapshot(sid("s1"))?.ref.liveState?.pendingPrompts)).toEqual(["B"]);
+
+		child.push({
+			type: "response",
+			id: promptA.id,
+			command: "prompt",
+			success: true,
+			data: { agentInvoked: true },
+		});
+		expect((await untilResponse(owner.client, "prompt-cancel-a")).response.ok).toBe(true);
+		child.push({ type: "prompt_result", id: promptA.id, agentInvoked: true });
+		child.push({ type: "notice", level: "info", message: "cancelled-a-stale-terminal" });
+		const stale = await owner.client.nextServer();
+		expect(stale).toMatchObject({ type: "event", event: { type: "notice", message: "cancelled-a-stale-terminal" } });
+		expect(pendingPromptTexts(appserver.snapshot(sid("s1"))?.ref.liveState?.pendingPrompts)).toEqual(["B"]);
+
+		child.push({
+			type: "session_entry",
+			entry: {
+				id: "queued-b-user",
+				parentId: null,
+				type: "message",
+				timestamp: stamp,
+				message: { role: "user", content: "B", clientCorrelationId: followUp.frame.id },
+			},
+		});
+		const durable = await owner.client.nextServer();
+		const settled = await owner.client.nextServer();
+		const cleared = await owner.client.nextServer();
+		expect(durable).toMatchObject({ type: "entry", entry: { id: "queued-b-user" } });
+		expect(settled).toMatchObject({
+			type: "event",
+			event: { type: "message.settled", transientEntryId: promptTransientId("queue-b"), entryId: "queued-b-user" },
+		});
+		expect(cleared.type).toBe("session.delta");
+		if (cleared.type !== "session.delta" || !cleared.upsert) throw new Error("queued B clear missing");
+		expect(cleared.upsert.liveState?.pendingPrompts).toBeUndefined();
+		child.push({ type: "agent_end", messages: [] });
+		expect(await owner.client.nextServer()).toMatchObject({ type: "event", event: { type: "agent.end" } });
+		const terminalState = await waitForRpcWriteId(child, "get_state", "agent-end:state");
+		respondState(child, terminalState.frame);
+		await untilSessionStatus(owner.client, "idle");
+		await closeClients([owner.client, queueClient.client]);
+		await appserver.stop();
+	});
+	test("a successful root A terminal cannot idle or clear follow-up B that already started", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory, [record("s1")]);
+		const client = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+		client.client.sendJson(command("attach-a-success", "attach-a-success", "session.attach", "s1", {}));
+		await responseAndSnapshot(client.client, "attach-a-success");
+		client.client.sendJson(command("success-a", "success-a", "session.prompt", "s1", { message: "A" }));
+		const child = await factory.child();
+		const promptA = await waitForRpcWrite(child, "prompt");
+		await acceptedPromptPublication(client.client, "success-a", "A");
+		if (typeof promptA.frame.id !== "string") throw new Error("success A prompt RPC id missing");
+		child.push({
+			type: "response",
+			id: promptA.frame.id,
+			command: "prompt",
+			success: true,
+			data: { agentInvoked: true },
+		});
+		expect((await untilResponse(client.client, "success-a")).response.ok).toBe(true);
+
+		client.client.sendJson(command("success-b", "success-b", "session.followUp", "s1", { message: "B" }));
+		const followB = await waitForRpcWrite(child, "follow_up", promptA.index + 1);
+		if (typeof followB.frame.id !== "string") throw new Error("success B follow-up RPC id missing");
+		child.push({ type: "response", id: followB.frame.id, command: "follow_up", success: true, data: {} });
+		expect((await untilResponse(client.client, "success-b")).response.ok).toBe(true);
+		expect(pendingPromptTexts(appserver.snapshot(sid("s1"))?.ref.liveState?.pendingPrompts)).toEqual(["A", "B"]);
+
+		child.push({ type: "prompt_result", id: promptA.frame.id, agentInvoked: true });
+		const terminalAState = await waitForRpcWriteId(child, "get_state", `${promptA.frame.id}:terminal:state`);
+		respondState(child, terminalAState.frame);
+		child.push({ type: "notice", level: "info", message: "success-a-terminal-applied" });
+		for (;;) {
+			const frame = await client.client.nextServer();
+			if (frame.type === "event" && frame.event.type === "notice") break;
+		}
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("active");
+		expect(pendingPromptTexts(appserver.snapshot(sid("s1"))?.ref.liveState?.pendingPrompts)).toEqual(["B"]);
+
+		child.push({
+			type: "session_entry",
+			entry: {
+				id: "success-b-user",
+				parentId: null,
+				type: "message",
+				timestamp: stamp,
+				message: { role: "user", content: "B", clientCorrelationId: followB.frame.id },
+			},
+		});
+		expect((await client.client.nextServer()).type).toBe("entry");
+		expect((await client.client.nextServer()).type).toBe("event");
+		expect((await client.client.nextServer()).type).toBe("session.delta");
+		child.push({ type: "agent_end", messages: [] });
+		expect(await client.client.nextServer()).toMatchObject({ type: "event", event: { type: "agent.end" } });
+		const terminalBState = await waitForRpcWriteId(child, "get_state", "agent-end:state");
+		respondState(child, terminalBState.frame);
+		await untilSessionStatus(client.client, "idle");
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+	test("caps plural pending prompt state at sixteen and bounds reconnect text", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory, [record("s1")]);
+		const client = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+		client.client.sendJson(command("cap-attach", "cap-attach", "session.attach", "s1", {}));
+		await responseAndSnapshot(client.client, "cap-attach");
+		client.client.sendJson(command("cap-root", "cap-root", "session.prompt", "s1", { message: "root" }));
+		const child = await factory.child();
+		const rootPrompt = await waitForRpcWrite(child, "prompt");
+		child.push({
+			type: "response",
+			id: rootPrompt.frame.id,
+			command: "prompt",
+			success: true,
+			data: { agentInvoked: true },
+		});
+		expect((await untilResponse(client.client, "cap-root")).response.ok).toBe(true);
+
+		let writeIndex = rootPrompt.index + 1;
+		for (let index = 1; index < 16; index++) {
+			const message = index === 15 ? "\n".repeat(63 * 1024) : `queued-${index}`;
+			client.client.sendJson(command(`cap-${index}`, `cap-${index}`, "session.followUp", "s1", { message }));
+			const queued = await waitForRpcWrite(child, "follow_up", writeIndex);
+			writeIndex = queued.index + 1;
+			child.push({
+				type: "response",
+				id: queued.frame.id,
+				command: "follow_up",
+				success: true,
+				data: {},
+			});
+			const accepted = await untilResponse(client.client, `cap-${index}`);
+			expect(accepted.response.ok).toBe(true);
+			if (index === 15) {
+				const transient = accepted.frames.find(
+					frame => frame.type === "event" && frame.event.type === "message.update",
+				);
+				if (!transient) throw new Error("large prompt transient event missing");
+				expect(new TextEncoder().encode(JSON.stringify(transient)).byteLength).toBeLessThanOrEqual(64 * 1024);
+			}
+		}
+		expect(appserver.snapshot(sid("s1"))?.ref.liveState?.pendingPrompts).toHaveLength(16);
+		const bounded =
+			decodePendingPrompts(appserver.snapshot(sid("s1"))?.ref.liveState?.pendingPrompts)[15]?.text ?? "";
+		expect(new TextEncoder().encode(bounded).byteLength).toBeLessThanOrEqual(8 * 1024);
+
+		client.client.sendJson(
+			command("cap-overflow", "cap-overflow", "session.followUp", "s1", { message: "overflow" }),
+		);
+		expect((await untilResponse(client.client, "cap-overflow")).response).toMatchObject({
+			ok: false,
+			error: { code: "message_queue_full" },
+		});
+		expect(child.writes.map(value => JSON.parse(value)).filter(frame => frame.type === "follow_up")).toHaveLength(15);
+		const reconnected = await readyClient(path, ["sessions.read"]);
+		const pending = reconnected.sessions.sessions.find(session => session.sessionId === sid("s1"));
+		expect(pending?.liveState?.pendingPrompts).toHaveLength(16);
+		expect(
+			new TextEncoder().encode(decodePendingPrompts(pending?.liveState?.pendingPrompts)[15]?.text ?? "").byteLength,
+		).toBeLessThanOrEqual(8 * 1024);
+		await closeClients([client.client, reconnected.client]);
+		await appserver.stop();
+	});
+	test("retains accepted prompt command ownership beyond idempotency expiry", async () => {
+		let now = Date.parse(stamp);
+		const clock: Clock = { now: () => new Date(now) };
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory, [record("s1")], 256, undefined, clock);
+		const client = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+		client.client.sendJson(command("owned-first", "owned-command", "session.prompt", "s1", { message: "once" }));
+		const child = await factory.child();
+		const prompt = await waitForRpcWrite(child, "prompt");
+		child.push({
+			type: "response",
+			id: prompt.frame.id,
+			command: "prompt",
+			success: true,
+			data: { agentInvoked: true },
+		});
+		expect((await untilResponse(client.client, "owned-first")).response.ok).toBe(true);
+
+		now += 5 * 60_000 + 1;
+		client.client.sendJson(
+			command("owned-conflict", "owned-command", "session.prompt", "s1", { message: "different" }),
+		);
+		expect((await untilResponse(client.client, "owned-conflict")).response).toMatchObject({
+			ok: false,
+			error: { code: "idempotency_conflict" },
+		});
+		client.client.sendJson(command("owned-replay", "owned-command", "session.prompt", "s1", { message: "once" }));
+		expect((await untilResponse(client.client, "owned-replay")).response).toMatchObject({
+			ok: true,
+			result: { accepted: true },
+		});
+		client.client.sendJson(
+			command("owned-conflict-again", "owned-command", "session.prompt", "s1", { message: "different" }),
+		);
+		expect((await untilResponse(client.client, "owned-conflict-again")).response).toMatchObject({
+			ok: false,
+			error: { code: "idempotency_conflict" },
+		});
+		expect(child.writes.map(value => JSON.parse(value)).filter(frame => frame.type === "prompt")).toHaveLength(1);
+
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
 	test("late prompt failures surface a sanitized error and return the session to idle", async () => {
 		const factory = new LiveFactory();
 		const { appserver, path } = await liveServer(factory, [record("s1")]);
@@ -1458,12 +2403,9 @@ describe("live Unix websocket protocol", () => {
 		client.client.sendJson(command("prompt-error", "prompt-error", "session.prompt", "s1", { message: "go" }));
 		const child = await factory.child();
 		await child.waitForWrites(1);
-		expect(await client.client.nextServer()).toMatchObject({
-			type: "session.delta",
-			upsert: expect.objectContaining({ status: "active" }),
-		});
+		await acceptedPromptPublication(client.client, "prompt-error", "go");
 		const prompt = JSON.parse(child.writes[0]!) as { id: string };
-		responseFor(child, "prompt");
+		child.push({ type: "response", id: prompt.id, command: "prompt", success: true, data: { agentInvoked: true } });
 		expect((await untilResponse(client.client, "prompt-error")).response.ok).toBe(true);
 
 		child.push({
@@ -1471,22 +2413,17 @@ describe("live Unix websocket protocol", () => {
 			id: prompt.id,
 			error: "Bearer abcdefghijklmnop failed at /home/tester/private token=plaintext",
 		});
-		const failure = await client.client.nextServer();
-		const idle = await client.client.nextServer();
+		const terminalState = await waitForRpcWriteId(child, "get_state", `${prompt.id}:terminal:state`);
+		respondState(child, terminalState.frame);
+		const terminal = await untilSessionStatus(client.client, "idle");
+		const failure = terminal.frames.find(frame => frame.type === "event" && frame.event.type === "turn.error");
 		expect(failure).toMatchObject({
 			type: "event",
-			event: {
-				type: "turn.error",
-				message: "Bearer [redacted] failed at [path] token=[redacted]",
-			},
+			event: { type: "turn.error", message: "Bearer [redacted] failed at [path] token=[redacted]" },
 		});
-		expect(idle).toMatchObject({
-			type: "session.delta",
-			upsert: expect.objectContaining({ status: "idle" }),
-		});
-		expect(JSON.stringify([failure, idle])).not.toContain("abcdefghijklmnop");
-		expect(JSON.stringify([failure, idle])).not.toContain("/home/tester");
-		expect(JSON.stringify([failure, idle])).not.toContain("plaintext");
+		expect(JSON.stringify(terminal.frames)).not.toContain("abcdefghijklmnop");
+		expect(JSON.stringify(terminal.frames)).not.toContain("/home/tester");
+		expect(JSON.stringify(terminal.frames)).not.toContain("plaintext");
 		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
 
 		client.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "after-prompt-error", timestamp: stamp });
@@ -1503,14 +2440,14 @@ describe("live Unix websocket protocol", () => {
 		client.client.sendJson(command("prompt-status", "prompt-status", "session.prompt", "s1", { message: "go" }));
 		const child = await factory.child();
 		await child.waitForWrites(1);
-		const active = await client.client.nextServer();
-		expect(active.type).toBe("session.delta");
-		if (active.type === "session.delta") {
-			expect(active.upsert?.status).toBe("active");
-			expect(active.revision).not.toBe(initial.revision);
-			expect(active.upsert?.revision).toBe(active.revision);
+		const publication = await acceptedPromptPublication(client.client, "prompt-status", "go");
+		if (publication.active.type === "session.delta") {
+			expect(publication.active.revision).not.toBe(initial.revision);
+			expect(publication.active.upsert?.revision).toBe(publication.active.revision);
 		}
-		responseFor(child, "prompt");
+		const prompt = JSON.parse(child.writes[0] ?? "{}") as { id?: string };
+		if (!prompt.id) throw new Error("status prompt RPC id missing");
+		child.push({ type: "response", id: prompt.id, command: "prompt", success: true, data: { agentInvoked: true } });
 		const acknowledged = await untilResponse(client.client, "prompt-status");
 		expect(acknowledged.response.ok).toBe(true);
 		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("active");
@@ -1527,10 +2464,12 @@ describe("live Unix websocket protocol", () => {
 		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("active");
 		child.push({ type: "agent_end", messages: [] });
 		const agentEnd = await client.client.nextServer();
-		const agentIdle = await client.client.nextServer();
 		expect(agentEnd.type === "event" ? agentEnd.event.type : agentEnd.type).toBe("agent.end");
-		expect(agentIdle.type).toBe("session.delta");
-		if (agentIdle.type === "session.delta") expect(agentIdle.upsert?.status).toBe("idle");
+		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("active");
+		child.push({ type: "prompt_result", id: prompt.id, agentInvoked: true });
+		const terminalState = await waitForRpcWriteId(child, "get_state", `${prompt.id}:terminal:state`);
+		respondState(child, terminalState.frame);
+		await untilSessionStatus(client.client, "idle");
 		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
 		await closeClients([client.client]);
 		await appserver.stop();
@@ -2327,6 +3266,60 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		await appserver.stop();
 	});
 
+	test("bounds aggregate pending prompt detail in session inventory frames", async () => {
+		const records = Array.from({ length: 96 }, (_, index) => record(`pending-session-${index}`));
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory, records);
+		const escapedText = '\n"\\'.repeat(2_048);
+		const promptsPerSession = 16;
+		for (const session of records) {
+			const projection = appserver.snapshot(session.sessionId);
+			if (!projection) throw new Error(`missing projection for ${session.sessionId}`);
+			projection.ref.liveState = {
+				isStreaming: true,
+				pendingPrompts: Array.from({ length: promptsPerSession }, (_, index) => ({
+					entryId: `${session.sessionId}:pending:${index}`,
+					text: escapedText,
+					attachmentCount: 0,
+					at: stamp,
+				})),
+			};
+		}
+
+		const client = await readyClient(path, ["sessions.read"]);
+		const initialBytes = new TextEncoder().encode(JSON.stringify(client.sessions)).byteLength;
+		expect(initialBytes).toBeLessThanOrEqual(1_048_576);
+		expect(() => decodeServerFrame(JSON.stringify(client.sessions))).not.toThrow();
+		expect(client.sessions.sessions).toHaveLength(records.length);
+		expect(client.sessions.totalCount).toBe(records.length);
+		expect(client.sessions.truncated).toBe(false);
+
+		const listedPrompts = client.sessions.sessions.flatMap(session => {
+			const pending = session.liveState?.pendingPrompts;
+			return Array.isArray(pending) ? pending : [];
+		});
+		expect(listedPrompts.length).toBeGreaterThan(0);
+		expect(listedPrompts.length).toBeLessThan(records.length * promptsPerSession);
+		expect(
+			client.sessions.sessions.some(
+				session =>
+					session.liveState?.pendingPromptsTruncated === true &&
+					session.liveState?.pendingPromptCount === promptsPerSession,
+			),
+		).toBe(true);
+		expect(appserver.snapshot(sid("pending-session-0"))?.ref.liveState?.pendingPrompts).toHaveLength(
+			promptsPerSession,
+		);
+
+		client.client.sendJson(hostCommand("pending-list", "pending-list", "session.list", {}));
+		const response = await client.client.nextServer();
+		expect(response.type).toBe("response");
+		expect(new TextEncoder().encode(JSON.stringify(response)).byteLength).toBeLessThanOrEqual(1_048_576);
+		expect(() => decodeServerFrame(JSON.stringify(response))).not.toThrow();
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+
 	test("confirmation challenge is one-shot, connection-bound, expiry-aware, and gated by revision", async () => {
 		const factory = new LiveFactory();
 		const { appserver, path } = await liveServer(factory, [record("s1")]);
@@ -2455,7 +3448,13 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		if (staleChallenge.type !== "confirmation") throw new Error("missing revisioned cancel challenge");
 		child.push({
 			type: "session_entry",
-			entry: { id: "entry-before-stale-approval", parentId: null, type: "message", timestamp: stamp, text: "first" },
+			entry: {
+				id: "entry-before-stale-approval",
+				parentId: null,
+				type: "message",
+				timestamp: stamp,
+				message: { role: "user", content: "first" },
+			},
 		});
 		expect((await client.client.nextServer()).type).toBe("entry");
 		client.client.sendJson(
@@ -2476,7 +3475,13 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 
 		child.push({
 			type: "session_entry",
-			entry: { id: "entry-during-cancel", parentId: null, type: "message", timestamp: stamp, text: "second" },
+			entry: {
+				id: "entry-during-cancel",
+				parentId: null,
+				type: "message",
+				timestamp: stamp,
+				message: { role: "user", content: "second" },
+			},
 		});
 		const streamedEntry = await client.client.nextServer();
 		expect(streamedEntry.type).toBe("entry");
@@ -2500,9 +3505,9 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 			"turn.end",
 			"agent.end",
 		]);
-		expect(cancelled.frames).toContainEqual(
-			expect.objectContaining({ type: "session.delta", upsert: expect.objectContaining({ status: "idle" }) }),
-		);
+		const terminalState = await waitForRpcWriteId(child, "get_state", "cancel:terminal:state");
+		respondState(child, terminalState.frame);
+		await untilSessionStatus(client.client, "idle");
 		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
 
 		await closeClients([client.client]);
@@ -2658,8 +3663,7 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		client.client.sendJson(command("prompt-guard", "prompt-guard", "session.prompt", "s1", { message: "work" }));
 		const child = await factory.child();
 		await child.waitForWrites(1);
-		const active = await client.client.nextServer();
-		expect(active).toMatchObject({ type: "session.delta", upsert: { status: "active" } });
+		await acceptedPromptPublication(client.client, "prompt-guard", "work");
 		client.client.sendJson({
 			...command("delete-active", "delete-active", "session.delete", "s1", {}),
 			expectedRevision: appserver.snapshot(sid("s1"))!.revision,
@@ -2668,7 +3672,9 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		expect(refused).toMatchObject({ type: "response", ok: false, error: { code: "session_busy" } });
 		expect(authority.lifecycle).toEqual([]);
 
-		responseFor(child, "prompt");
+		const prompt = JSON.parse(child.writes[0] ?? "{}") as { id?: string };
+		if (!prompt.id) throw new Error("guard prompt RPC id missing");
+		child.push({ type: "response", id: prompt.id, command: "prompt", success: true, data: { agentInvoked: true } });
 		await untilResponse(client.client, "prompt-guard");
 		await child.waitForWrites(2);
 		const refreshCall = JSON.parse(child.writes[1] ?? "{}") as { id?: string };
@@ -2689,15 +3695,15 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 				interruptMode: "wait",
 			},
 		});
-		child.push({ type: "turn_end" });
-		await client.client.nextServer();
-		await client.client.nextServer();
+		expect((await client.client.nextServer()).type).toBe("session.delta");
 		child.push({ type: "agent_end", messages: [] });
 		expect(await client.client.nextServer()).toMatchObject({ type: "event", event: { type: "agent.end" } });
-		expect(await client.client.nextServer()).toMatchObject({
-			type: "session.delta",
-			upsert: expect.objectContaining({ status: "idle" }),
-		});
+		child.push({ type: "prompt_result", id: prompt.id, agentInvoked: true });
+		const terminalState = await waitForRpcWriteId(child, "get_state", `${prompt.id}:terminal:state`);
+		respondState(child, terminalState.frame);
+		await untilSessionStatus(client.client, "idle");
+		const agentEndState = await waitForRpcWriteId(child, "get_state", "agent-end:state");
+		respondState(child, agentEndState.frame);
 		authority.failLifecycle = true;
 		client.client.sendJson({
 			...command("archive-fail", "archive-fail", "session.archive", "s1", {}),
@@ -2733,6 +3739,7 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		);
 		const child = await factory.child();
 		await child.waitForWrites(1);
+		await acceptedPromptPublication(client.client, "prompt-stale-state", "work");
 		const promptCall = JSON.parse(child.writes[0]!) as { id: string; type: string };
 		expect(promptCall.type).toBe("prompt");
 		child.push({
@@ -2751,10 +3758,10 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 
 		child.push({ type: "agent_end", messages: [] });
 		expect(await client.client.nextServer()).toMatchObject({ type: "event", event: { type: "agent.end" } });
-		expect(await client.client.nextServer()).toMatchObject({
-			type: "session.delta",
-			upsert: expect.objectContaining({ status: "idle" }),
-		});
+		child.push({ type: "prompt_result", id: promptCall.id, agentInvoked: true });
+		const terminalState = await waitForRpcWriteId(child, "get_state", `${promptCall.id}:terminal:state`);
+		respondState(child, terminalState.frame);
+		await untilSessionStatus(client.client, "idle");
 		child.push({
 			type: "response",
 			id: refreshCall.id,
@@ -2771,6 +3778,8 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 				interruptMode: "wait",
 			},
 		});
+		const agentEndState = await waitForRpcWriteId(child, "get_state", "agent-end:state");
+		respondState(child, agentEndState.frame);
 		child.push({ type: "notice", level: "info", message: "stale-state-barrier" });
 		const postTerminalFrames: ServerFrame[] = [];
 		while (true) {
@@ -2820,6 +3829,7 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		);
 		const child = await factory.child();
 		await child.waitForWrites(1);
+		await acceptedPromptPublication(client.client, "prompt-terminal-state", "work");
 		const promptCall = JSON.parse(child.writes[0]!) as { id: string; type: string };
 		expect(promptCall.type).toBe("prompt");
 		child.push({
@@ -2862,17 +3872,23 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 
 		child.push({ type: "agent_end", messages: [] });
 		expect(await client.client.nextServer()).toMatchObject({ type: "event", event: { type: "agent.end" } });
+		const agentEndState = await waitForRpcWriteId(child, "get_state", "agent-end:state");
+		respondState(child, agentEndState.frame);
 		expect(await client.client.nextServer()).toMatchObject({
 			type: "session.delta",
 			upsert: expect.objectContaining({
-				status: "idle",
+				status: "active",
 				liveState: expect.objectContaining({ isStreaming: false }),
 			}),
 		});
 		expect(appserver.snapshot(sid("s1"))?.ref).toMatchObject({
-			status: "idle",
-			liveState: { isStreaming: false },
+			status: "active",
+			liveState: expect.objectContaining({ isStreaming: false }),
 		});
+		child.push({ type: "prompt_result", id: promptCall.id, agentInvoked: true });
+		const terminalState = await waitForRpcWriteId(child, "get_state", `${promptCall.id}:terminal:state`);
+		respondState(child, terminalState.frame);
+		await untilSessionStatus(client.client, "idle");
 
 		client.client.sendJson({
 			...command("archive-terminal-state", "archive-terminal-state", "session.archive", "s1", {}),
@@ -3193,6 +4209,9 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 				upsert: expect.objectContaining({ status: "active" }),
 			}),
 		);
+		const terminalState = await waitForRpcWriteId(respawned, "get_state", "prompt-after-crash:terminal:state");
+		respondState(respawned, terminalState.frame);
+		await untilSessionStatus(client.client, "idle");
 		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
 		expect(appserver.snapshot(sid("s1"))?.ref.liveState).not.toHaveProperty("runtimeCrashed");
 
@@ -3458,6 +4477,7 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		);
 		const prompted = await untilResponse(client.client, "real-lock-prompt");
 		expect(prompted.response).toMatchObject({ ok: true, result: { accepted: true } });
+		await untilSessionStatus(client.client, "idle");
 		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
 
 		// Drain the prompt's scheduled state refresh through a correlated state
@@ -3828,11 +4848,11 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		);
 		const child = await factory.child();
 		await child.waitForWrites(1);
-		const active = await client.client.nextServer();
-		expect(active).toMatchObject({
-			type: "session.delta",
-			upsert: { project: { name: "authority" }, title: "Session", status: "active" },
-		});
+		const publication = await acceptedPromptPublication(client.client, "prompt-created", "First live request");
+		if (publication.active.type !== "session.delta" || !publication.active.upsert)
+			throw new Error("created prompt did not become active");
+		expect(publication.active.upsert.project.name).toBe("authority");
+		expect(publication.active.upsert.title).toBe("Session");
 		child.push({
 			type: "session_entry",
 			entry: {
@@ -3865,9 +4885,20 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 			type: "session.delta",
 			upsert: { project: { name: "authority" }, title: "Explicit title" },
 		});
-		responseFor(child, "prompt");
+		const prompt = JSON.parse(child.writes[0] ?? "{}") as { id?: string };
+		if (!prompt.id) throw new Error("created prompt RPC id missing");
+		child.push({
+			type: "response",
+			id: prompt.id,
+			command: "prompt",
+			success: true,
+			data: { agentInvoked: false },
+		});
 		const prompted = await untilResponse(client.client, "prompt-created");
-		expect(prompted.frames.map(frame => frame.type)).toEqual(["response"]);
+		expect(prompted.response.ok).toBe(true);
+		const terminalState = await waitForRpcWriteId(child, "get_state", "prompt-created:terminal:state");
+		respondState(child, terminalState.frame);
+		await untilSessionStatus(client.client, "idle");
 
 		const replayClient = await readyClient(appserver.socketPath, ["sessions.read"]);
 		replayClient.client.sendJson(
@@ -3876,9 +4907,13 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 			}),
 		);
 		const replayResponse = await replayClient.client.nextServer();
-		const replay = [await replayClient.client.nextServer()];
+		const replay = [
+			await replayClient.client.nextServer(),
+			await replayClient.client.nextServer(),
+			await replayClient.client.nextServer(),
+		];
 		expect(replayResponse.type).toBe("response");
-		expect(replay.map(frame => frame.type)).toEqual(["entry"]);
+		expect(replay.map(frame => frame.type)).toEqual(["event", "entry", "event"]);
 		await closeClients([client.client, replayClient.client]);
 		await appserver.stop();
 	});

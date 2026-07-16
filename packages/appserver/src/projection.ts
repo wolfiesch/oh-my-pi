@@ -17,6 +17,13 @@ import type { Projection, SessionRecord } from "./types.ts";
 const MAX_REPLAY_BYTES = 512 * 1024;
 const encoder = new TextEncoder();
 
+export interface PendingPromptProjection {
+	entryId: string;
+	text: string;
+	attachmentCount: number;
+	at: string;
+}
+
 function replayBytes(frames: readonly ServerFrame[]): number {
 	return frames.reduce((bytes, frame) => bytes + encoder.encode(JSON.stringify(frame)).byteLength, 0);
 }
@@ -44,6 +51,8 @@ function settledRuntimeRef(current: SessionRef, status: SessionRef["status"]): S
 			isCompacting: false,
 			queuedMessageCount: 0,
 		};
+		delete liveState.pendingPrompt;
+		delete liveState.pendingPrompts;
 		delete liveState.queuedMessages;
 		delete liveState.pendingApproval;
 		delete liveState.pendingUserInput;
@@ -253,6 +262,43 @@ export class SessionProjection {
 			sessionId: this.value.sessionId,
 			upsert: next,
 		};
+	}
+	updatePendingPrompts(pendingPrompts: readonly PendingPromptProjection[]): ServerFrame | undefined {
+		const current = this.value.ref;
+		const liveState = { ...(current.liveState ?? {}) };
+		delete liveState.pendingPrompt;
+		if (pendingPrompts.length > 0) liveState.pendingPrompts = [...pendingPrompts];
+		else delete liveState.pendingPrompts;
+		const next: SessionRef = { ...current };
+		if (Object.keys(liveState).length > 0) next.liveState = liveState;
+		else delete next.liveState;
+		if (JSON.stringify(next) === JSON.stringify(current)) return undefined;
+		return this.updateRef(next, `pending-prompts:${pendingPrompts.map(pending => pending.entryId).join(",")}`);
+	}
+	addPendingPrompt(pending: PendingPromptProjection): ServerFrame | undefined {
+		const current = this.pendingPrompts();
+		if (current.some(candidate => candidate.entryId === pending.entryId)) return undefined;
+		return this.updatePendingPrompts([...current, pending]);
+	}
+	clearPendingPrompt(entryId: string): ServerFrame | undefined {
+		const current = this.pendingPrompts();
+		const next = current.filter(pending => pending.entryId !== entryId);
+		if (next.length === current.length) return undefined;
+		return this.updatePendingPrompts(next);
+	}
+	private pendingPrompts(): PendingPromptProjection[] {
+		const value = this.value.ref.liveState?.pendingPrompts;
+		if (!Array.isArray(value)) return [];
+		return value.filter((pending): pending is PendingPromptProjection => {
+			if (!pending || typeof pending !== "object" || Array.isArray(pending)) return false;
+			const candidate = pending as Record<string, unknown>;
+			return (
+				typeof candidate.entryId === "string" &&
+				typeof candidate.text === "string" &&
+				typeof candidate.attachmentCount === "number" &&
+				typeof candidate.at === "string"
+			);
+		});
 	}
 	appendEvent(event: SessionEvent): ServerFrame {
 		return this.appendFrame({

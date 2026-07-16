@@ -50,6 +50,31 @@ function plainTextArgKey(tool: string): "reason" | "title" | "report" | undefine
 	}
 }
 
+function jsonSubsetMatches(expected: unknown, actual: unknown): boolean {
+	const pending: Array<{ expected: unknown; actual: unknown }> = [{ expected, actual }];
+	while (pending.length > 0) {
+		const pair = pending.pop();
+		if (!pair) continue;
+		if (Array.isArray(pair.expected)) {
+			if (!Array.isArray(pair.actual) || pair.expected.length !== pair.actual.length) return false;
+			for (let index = 0; index < pair.expected.length; index++) {
+				pending.push({ expected: pair.expected[index], actual: pair.actual[index] });
+			}
+			continue;
+		}
+		if (isRecord(pair.expected)) {
+			if (!isRecord(pair.actual)) return false;
+			for (const [key, value] of Object.entries(pair.expected)) {
+				if (!Object.hasOwn(pair.actual, key)) return false;
+				pending.push({ expected: value, actual: pair.actual[key] });
+			}
+			continue;
+		}
+		if (pair.expected !== pair.actual) return false;
+	}
+	return true;
+}
+
 export interface XdevWriteCall {
 	tool: string;
 	args: Record<string, unknown>;
@@ -83,8 +108,9 @@ export interface XdevResultEnvelope {
 
 /**
  * Correlate an executable result to its original device write. JSON devices
- * may apply schema defaults, but the four plain-text devices are deterministic:
- * their one derived argument must match exactly before semantic promotion.
+ * may add schema-defaulted object keys, but every supplied value must remain
+ * deeply equal. The four plain-text devices are deterministic: their one
+ * derived argument must match exactly before semantic promotion.
  */
 export function xdevExecutionMatches(
 	call: Pick<XdevWriteCall, "tool" | "args"> | undefined,
@@ -92,7 +118,7 @@ export function xdevExecutionMatches(
 ): boolean {
 	if (!call || !result || call.tool !== result.tool) return false;
 	const key = plainTextArgKey(call.tool);
-	if (!key) return true;
+	if (!key) return jsonSubsetMatches(call.args, result.args);
 	const callKeys = Object.keys(call.args);
 	const resultKeys = Object.keys(result.args);
 	return (

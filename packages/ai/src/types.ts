@@ -660,6 +660,12 @@ export type ProviderPayload = OpenAIResponsesHistoryPayload;
 export interface UserMessage {
 	role: "user";
 	content: string | (TextContent | ImageContent)[];
+	/**
+	 * App-host correlation for the command that authored this durable message.
+	 * Persisted with local session history, but provider adapters must not
+	 * serialize it onto model requests.
+	 */
+	clientCorrelationId?: string;
 	/** True if the message was injected by the system (e.g., auto-continue). */
 	synthetic?: boolean;
 	/** True when injected mid-turn as a steer; consumed by the agent's pre-LLM transform to wrap it for emphasis. Never rendered. */
