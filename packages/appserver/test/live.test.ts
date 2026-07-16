@@ -5337,7 +5337,9 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 			});
 			expect(factory.children).toHaveLength(0);
 
-			client.client.sendJson(command("stale-prompt", "stale-prompt", "session.prompt", "s1", { message: "blocked" }));
+			client.client.sendJson(
+				command("stale-prompt", "stale-prompt", "session.prompt", "s1", { message: "blocked" }),
+			);
 			expect((await untilResponse(client.client, "stale-prompt")).response).toMatchObject({
 				ok: false,
 				error: { code: "session_locked" },
