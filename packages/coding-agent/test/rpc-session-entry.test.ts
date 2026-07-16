@@ -19,6 +19,7 @@ type EntryListener = (entry: SessionEntry) => void;
 
 class FakeSessionManager {
 	readonly listeners = new Set<EntryListener>();
+	readonly entries: SessionEntry[] = [];
 	subscribeCalls = 0;
 	unsubscribeCalls = 0;
 
@@ -31,7 +32,12 @@ class FakeSessionManager {
 		};
 	}
 
+	getEntries(): readonly SessionEntry[] {
+		return this.entries;
+	}
+
 	append(entry: SessionEntry): void {
+		this.entries.push(entry);
 		for (const listener of this.listeners) listener(entry);
 	}
 }

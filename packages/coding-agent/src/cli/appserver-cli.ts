@@ -329,6 +329,7 @@ async function defaultCreateAppserver(
 		projectRootForProject: runtime.projectRootForProject,
 		usageAuthority: runtime.usageAuthority,
 		lockCheck: runtime.lockCheck,
+		lockStatus: runtime.lockStatus,
 		transcriptImageRoot: getBlobsDir(),
 	};
 	if (!config?.remoteMode) return createAppserver(base);

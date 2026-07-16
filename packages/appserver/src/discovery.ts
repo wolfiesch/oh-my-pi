@@ -28,7 +28,15 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 type DiscoveryFileSystem = FileSystem & {
 	readFileSlice?: (path: string, maxBytes: number) => Promise<string | Uint8Array>;
+	readFileRange?: (
+		path: string,
+		offset: number,
+		maxBytes: number,
+		expectedIdentity?: string,
+	) => Promise<string | Uint8Array>;
 };
+const OBSERVER_MAX_BUFFER_BYTES = 2 * 1024 * 1024;
+const OBSERVER_TAIL_ANCHOR_BYTES = 4 * 1024;
 const realFs: DiscoveryFileSystem = {
 	mkdir: async (path, options) => {
 		await mkdir(path, options);
@@ -54,8 +62,21 @@ const realFs: DiscoveryFileSystem = {
 			await handle.close();
 		}
 	},
+	readFileRange: async (path, offset, maxBytes, expectedIdentity) => {
+		const handle = await open(path, "r");
+		try {
+			const opened = await handle.stat();
+			const openedIdentity = `${opened.dev ?? ""}:${opened.ino ?? ""}`;
+			if (expectedIdentity !== undefined && openedIdentity !== expectedIdentity)
+				throw new Error("transcript inode changed while opening range");
+			const buffer = Buffer.allocUnsafe(maxBytes);
+			const { bytesRead } = await handle.read(buffer, 0, maxBytes, offset);
+			return buffer.subarray(0, bytesRead);
+		} finally {
+			await handle.close();
+		}
+	},
 };
-
 function boundUtf8(value: string, maxBytes: number): string {
 	const bytes = encoder.encode(value);
 	if (bytes.byteLength <= maxBytes) return value;
@@ -283,15 +304,22 @@ function mergeImages(
 }
 
 function validRawEntry(raw: Record<string, unknown>): boolean {
-	return (
-		typeof raw.id === "string" &&
-		Boolean(raw.id) &&
-		typeof raw.type === "string" &&
-		Boolean(raw.type) &&
-		(raw.parentId === undefined || raw.parentId === null || typeof raw.parentId === "string") &&
-		typeof raw.timestamp === "string" &&
-		Number.isFinite(Date.parse(raw.timestamp))
-	);
+	if (
+		typeof raw.id !== "string" ||
+		!raw.id ||
+		typeof raw.type !== "string" ||
+		!raw.type ||
+		(raw.parentId !== undefined && raw.parentId !== null && typeof raw.parentId !== "string") ||
+		typeof raw.timestamp !== "string" ||
+		!Number.isFinite(Date.parse(raw.timestamp))
+	)
+		return false;
+	try {
+		entryId(raw.id);
+	} catch {
+		return false;
+	}
+	return true;
 }
 
 export class SessionEntryProjector {
@@ -325,6 +353,9 @@ export class SessionEntryProjector {
 	}
 	get model(): string | undefined {
 		return this.#model;
+	}
+	get unresolvedPendingCount(): number {
+		return this.#pendingCalls.size + this.#pendingResults.size;
 	}
 	get thinking(): string | undefined {
 		return this.#thinking;
@@ -789,6 +820,7 @@ export function parseSessionTranscriptMetadata(input: string | Uint8Array, path:
 interface FileIndexEntry {
 	readonly signature: string;
 	readonly record: SessionRecord;
+	readonly misses: number;
 }
 
 export function compareSessionRecords(a: SessionRecord, b: SessionRecord): number {
@@ -799,6 +831,359 @@ export function compareSessionRecords(a: SessionRecord, b: SessionRecord): numbe
 	return 0;
 }
 
+interface DiscoveryStat {
+	size: number;
+	mtimeMs: number;
+	ctimeMs?: number;
+	dev?: number;
+	ino?: number;
+}
+export interface SessionTranscriptWatermark {
+	readonly entryCount: number;
+	readonly lastEntryId: string | null;
+}
+
+export interface SessionTranscriptPoll {
+	readonly record?: SessionRecord;
+	readonly entries: readonly DurableEntry[];
+	readonly reset: boolean;
+	readonly changed: boolean;
+	readonly watermark: SessionTranscriptWatermark;
+	readonly unresolvedPendingCount: number;
+	readonly stable: boolean;
+	readonly transcript: "live" | "snapshot";
+}
+
+/**
+ * Incrementally consumes complete JSONL records. The byte watermark advances
+ * over partial lines, while the partial text stays buffered until a newline
+ * proves the record durable.
+ */
+export class SessionTranscriptObserver {
+	#identity = "";
+	#offset = 0;
+	#pending = "";
+	#decoder = new TextDecoder("utf-8", { fatal: true });
+	#rawCount = 0;
+	#rawLastId: string | null = null;
+	#stableSamples = 0;
+	#stableIdentity = "";
+	#stableSize = -1;
+	#forceReset = false;
+	#observedSize = -1;
+	#observedStamp = "";
+	#tailAnchor = new Uint8Array();
+	#slotTitle?: string;
+	#headerTitle?: string;
+	#projector?: SessionEntryProjector;
+	#record?: SessionRecord;
+	#fs: DiscoveryFileSystem;
+	#path: string;
+	#host: HostId;
+	constructor(path: string, host: HostId, fs: DiscoveryFileSystem = realFs) {
+		this.#path = path;
+		this.#host = host;
+		this.#fs = fs;
+	}
+	#identityOf(info: DiscoveryStat): string {
+		return `${info.dev ?? ""}:${info.ino ?? ""}`;
+	}
+	#stampOf(info: DiscoveryStat): string {
+		return `${info.mtimeMs}:${info.ctimeMs ?? ""}`;
+	}
+	async #tailStillMatches(identity: string): Promise<boolean> {
+		if (this.#tailAnchor.byteLength === 0 || this.#offset < this.#tailAnchor.byteLength) return true;
+		const start = this.#offset - this.#tailAnchor.byteLength;
+		const chunk = this.#fs.readFileRange
+			? await this.#fs.readFileRange(this.#path, start, this.#tailAnchor.byteLength, identity)
+			: await this.#fs.readFile(this.#path);
+		const bytes = typeof chunk === "string" ? encoder.encode(chunk) : chunk;
+		const candidate = this.#fs.readFileRange
+			? bytes.slice(0, this.#tailAnchor.byteLength)
+			: bytes.slice(start, start + this.#tailAnchor.byteLength);
+		if (candidate.byteLength !== this.#tailAnchor.byteLength) return false;
+		for (let index = 0; index < candidate.byteLength; index++)
+			if (candidate[index] !== this.#tailAnchor[index]) return false;
+		return true;
+	}
+	#rememberTail(bytes: Uint8Array): void {
+		const length = Math.min(OBSERVER_TAIL_ANCHOR_BYTES, this.#tailAnchor.byteLength + bytes.byteLength);
+		const next = new Uint8Array(length);
+		const fromPrior = Math.min(this.#tailAnchor.byteLength, Math.max(0, length - bytes.byteLength));
+		if (fromPrior > 0) next.set(this.#tailAnchor.subarray(this.#tailAnchor.byteLength - fromPrior), 0);
+		const fromCurrent = Math.min(bytes.byteLength, length);
+		if (fromCurrent > 0) next.set(bytes.subarray(bytes.byteLength - fromCurrent), length - fromCurrent);
+		this.#tailAnchor = next;
+	}
+	#result(
+		entries: readonly DurableEntry[],
+		reset: boolean,
+		changed: boolean,
+		transcript: "live" | "snapshot" = "live",
+	): SessionTranscriptPoll {
+		const effectiveTranscript = transcript === "live" && this.#record ? "live" : "snapshot";
+		return {
+			record: this.#record,
+			entries,
+			reset,
+			changed,
+			watermark: { entryCount: this.#rawCount, lastEntryId: this.#rawLastId },
+			unresolvedPendingCount: this.#projector?.unresolvedPendingCount ?? 0,
+			stable: effectiveTranscript === "live" && this.#stableSamples >= 2,
+			transcript: effectiveTranscript,
+		};
+	}
+	#invalidate(forceReset = false): void {
+		this.#stableSamples = 0;
+		this.#stableIdentity = "";
+		this.#stableSize = -1;
+		if (forceReset) this.#forceReset = true;
+	}
+	#reset(identity: string): void {
+		this.#identity = identity;
+		this.#offset = 0;
+		this.#pending = "";
+		this.#decoder = new TextDecoder("utf-8", { fatal: true });
+		this.#projector = undefined;
+		this.#record = undefined;
+		this.#rawCount = 0;
+		this.#rawLastId = null;
+		this.#stableSamples = 0;
+		this.#stableIdentity = "";
+		this.#stableSize = -1;
+		this.#forceReset = false;
+		this.#observedSize = -1;
+		this.#observedStamp = "";
+		this.#slotTitle = undefined;
+		this.#headerTitle = undefined;
+		this.#tailAnchor = new Uint8Array();
+	}
+	#observeEof(identity: string, size: number): boolean {
+		try {
+			const flushed = this.#decoder.decode(new Uint8Array(), { stream: false });
+			if (flushed) this.#pending += flushed;
+		} catch {
+			this.#invalidate(true);
+			return false;
+		}
+		this.#decoder = new TextDecoder("utf-8", { fatal: true });
+		if (this.#pending) {
+			this.#invalidate();
+			return true;
+		}
+		if (this.#stableIdentity === identity && this.#stableSize === size)
+			this.#stableSamples = Math.min(2, this.#stableSamples + 1);
+		else {
+			this.#stableIdentity = identity;
+			this.#stableSize = size;
+			this.#stableSamples = 1;
+		}
+		return true;
+	}
+	async poll(): Promise<SessionTranscriptPoll> {
+		let info: DiscoveryStat;
+		try {
+			info = await this.#fs.stat(this.#path);
+		} catch {
+			this.#invalidate();
+			return this.#result([], false, false, "snapshot");
+		}
+		const identity = this.#identityOf(info);
+		const rewrittenInPlace =
+			identity === this.#identity &&
+			this.#observedSize >= 0 &&
+			(info.size < this.#observedSize ||
+				(info.size === this.#observedSize && this.#stampOf(info) !== this.#observedStamp));
+		let rewrittenWhileGrowing = false;
+		if (
+			identity === this.#identity &&
+			this.#observedSize >= 0 &&
+			info.size > this.#observedSize &&
+			this.#stampOf(info) !== this.#observedStamp
+		) {
+			try {
+				rewrittenWhileGrowing = !(await this.#tailStillMatches(identity));
+			} catch {
+				this.#invalidate(true);
+				return this.#result([], false, false, "snapshot");
+			}
+		}
+		const reset =
+			this.#forceReset ||
+			identity !== this.#identity ||
+			info.size < this.#offset ||
+			rewrittenInPlace ||
+			rewrittenWhileGrowing;
+		if (reset) this.#reset(identity);
+		if (!reset && info.size === this.#offset) {
+			if (!this.#observeEof(identity, info.size)) return this.#result([], false, false, "snapshot");
+			this.#observedSize = info.size;
+			this.#observedStamp = this.#stampOf(info);
+			return this.#result([], false, false);
+		}
+		const bytesToRead = Math.min(OBSERVER_MAX_BUFFER_BYTES, Math.max(0, info.size - this.#offset));
+		if (bytesToRead === 0) {
+			if (!this.#observeEof(identity, info.size)) return this.#result([], reset, false, "snapshot");
+			this.#observedSize = info.size;
+			this.#observedStamp = this.#stampOf(info);
+			return this.#result([], reset, reset);
+		}
+		const readOffset = this.#offset;
+		let chunk: string | Uint8Array;
+		let fullFallback = false;
+		try {
+			if (this.#fs.readFileRange)
+				chunk = await this.#fs.readFileRange(this.#path, readOffset, bytesToRead, identity);
+			else {
+				chunk = await this.#fs.readFile(this.#path);
+				fullFallback = true;
+			}
+			const afterRead = await this.#fs.stat(this.#path);
+			if (
+				this.#identityOf(afterRead) !== identity ||
+				afterRead.size !== info.size ||
+				this.#stampOf(afterRead) !== this.#stampOf(info)
+			)
+				throw new Error("transcript changed while reading");
+		} catch {
+			this.#invalidate(true);
+			return this.#result([], reset, false, "snapshot");
+		}
+		this.#observedSize = info.size;
+		this.#observedStamp = this.#stampOf(info);
+		const fullBytes = typeof chunk === "string" ? encoder.encode(chunk) : chunk;
+		if (fullFallback && fullBytes.byteLength < readOffset) {
+			this.#invalidate(true);
+			return this.#result([], reset, false, "snapshot");
+		}
+		const raw = fullFallback
+			? fullBytes.slice(readOffset, readOffset + bytesToRead)
+			: fullBytes.slice(0, bytesToRead);
+		let text: string;
+		try {
+			text = this.#decoder.decode(raw, { stream: true });
+		} catch {
+			this.#invalidate(true);
+			return this.#result([], reset, false, "snapshot");
+		}
+		this.#rememberTail(raw);
+		const pending = this.#pending + text;
+		if (encoder.encode(pending).byteLength > OBSERVER_MAX_BUFFER_BYTES) {
+			this.#invalidate(true);
+			return this.#result([], reset, false, "snapshot");
+		}
+		this.#pending = pending;
+		this.#offset = fullFallback ? readOffset + raw.byteLength : readOffset + raw.byteLength;
+		const complete: string[] = [];
+		let newline = this.#pending.indexOf("\n");
+		while (newline >= 0) {
+			complete.push(this.#pending.slice(0, newline).replace(/\r$/, ""));
+			this.#pending = this.#pending.slice(newline + 1);
+			newline = this.#pending.indexOf("\n");
+		}
+		const entries: DurableEntry[] = [];
+		for (const line of complete) {
+			if (!line || encoder.encode(line).byteLength > MAX_LINE_BYTES) continue;
+			let rawValue: Record<string, unknown>;
+			try {
+				const parsed = JSON.parse(line);
+				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+				rawValue = parsed as Record<string, unknown>;
+			} catch {
+				continue;
+			}
+			if (!this.#record && rawValue.type === "title" && rawValue.v === 1 && typeof rawValue.title === "string") {
+				this.#slotTitle = cleanText(rawValue.title, 512, true);
+				continue;
+			}
+			if (!this.#record) {
+				let value: Record<string, unknown>;
+				try {
+					const parsed = parseBounded(JSON.stringify(rawValue));
+					if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+					value = parsed as Record<string, unknown>;
+				} catch {
+					continue;
+				}
+				if (
+					value.type !== "session" ||
+					typeof value.id !== "string" ||
+					!value.id ||
+					typeof value.cwd !== "string" ||
+					!value.cwd ||
+					typeof value.timestamp !== "string" ||
+					!Number.isFinite(Date.parse(value.timestamp))
+				)
+					continue;
+				let sid: SessionId;
+				try {
+					sid = sessionId(value.id);
+				} catch {
+					continue;
+				}
+				const cwd = resolve(value.cwd);
+				this.#headerTitle =
+					typeof value.title === "string" ? cleanText(value.title, 512, true) || undefined : undefined;
+				this.#projector = new SessionEntryProjector(this.#host, sid, "live");
+				this.#record = {
+					sessionId: sid,
+					path: this.#path,
+					cwd,
+					projectId: stableProjectId(cwd),
+					projectName: projectNameFromCwd(cwd),
+					title: this.#slotTitle || this.#headerTitle || "Untitled",
+					updatedAt: new Date(info.mtimeMs).toISOString(),
+					status: "idle",
+					entries: this.#projector.entries,
+				};
+				continue;
+			}
+			if (!validRawEntry(rawValue)) continue;
+			this.#rawCount += 1;
+			this.#rawLastId = String(rawValue.id);
+			let value: Record<string, unknown>;
+			try {
+				// The coding-agent loader accepts JSON duplicate keys with the
+				// platform parser's last-key-wins semantics. Validate and project
+				// that same parsed value so the promotion watermark cannot agree
+				// while the observer silently drops the record.
+				const parsed = parseBounded(JSON.stringify(rawValue));
+				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+				value = parsed as Record<string, unknown>;
+			} catch {
+				continue;
+			}
+			if (!validRawEntry(value)) continue;
+			let projected: DurableEntry[];
+			try {
+				projected = this.#projector!.project(value);
+			} catch {
+				this.#invalidate(true);
+				return this.#result([], reset, false, "snapshot");
+			}
+			entries.push(...projected);
+			if (this.#slotTitle) this.#record.title = this.#slotTitle;
+			else if (this.#projector!.titleChange) this.#record.title = this.#projector!.titleChange;
+			else if (!this.#headerTitle) {
+				const fallback = fallbackSessionTitle(this.#projector!.firstUserText);
+				if (fallback) this.#record.title = fallback;
+			}
+			if (this.#projector!.model) this.#record.model = this.#projector!.model;
+			if (this.#projector!.thinking) this.#record.thinking = this.#projector!.thinking;
+		}
+		if (this.#record) {
+			this.#record.updatedAt = new Date(info.mtimeMs).toISOString();
+			this.#record.entries = this.#projector?.entries ?? [];
+		}
+		if (this.#offset === info.size && !this.#observeEof(identity, info.size))
+			return this.#result([], reset, false, "snapshot");
+		if (this.#offset !== info.size) this.#invalidate();
+		this.#observedSize = info.size;
+		this.#observedStamp = this.#stampOf(info);
+		return this.#result(entries, reset, true);
+	}
+}
+
 function isEncodedProjectDirectory(path: string): boolean {
 	const name = path.slice(path.lastIndexOf("/") + 1);
 	return name === "-" || name.startsWith("-");
@@ -806,6 +1191,7 @@ function isEncodedProjectDirectory(path: string): boolean {
 
 export class FileSessionDiscovery implements SessionDiscovery {
 	private readonly index = new Map<string, FileIndexEntry>();
+	private rootMisses = 0;
 
 	constructor(
 		private readonly root: string,
@@ -839,12 +1225,32 @@ export class FileSessionDiscovery implements SessionDiscovery {
 		}
 		return output;
 	}
+	private retainMiss(identity: string): SessionRecord | undefined {
+		const cached = this.index.get(identity);
+		if (!cached) return undefined;
+		if (cached.misses >= 1) {
+			this.index.delete(identity);
+			return undefined;
+		}
+		this.index.set(identity, { ...cached, misses: 1 });
+		return cached.record;
+	}
+	forget(path: string): void {
+		const target = resolve(path);
+		for (const [identity, cached] of this.index)
+			if (resolve(cached.record.path) === target) this.index.delete(identity);
+	}
 	async list(): Promise<SessionRecord[]> {
 		let files: string[];
 		try {
 			files = await this.files(this.root);
+			this.rootMisses = 0;
 		} catch {
-			return [];
+			this.rootMisses += 1;
+			if (this.rootMisses >= 2) this.index.clear();
+			const retained = this.rootMisses === 1 ? [...this.index.values()].map(value => value.record) : [];
+			retained.sort(compareSessionRecords);
+			return retained;
 		}
 		const found: SessionRecord[] = [];
 		const seen = new Set<string>();
@@ -871,17 +1277,21 @@ export class FileSessionDiscovery implements SessionDiscovery {
 						record = parseTranscript(await this.fs.readFile(path), path, this.host);
 					}
 					record.updatedAt = new Date(fileStat.mtimeMs).toISOString();
-					this.index.set(identity, { signature, record });
 				} else if (record.path !== path) {
 					record = { ...record, path };
-					this.index.set(identity, { signature, record });
 				}
+				this.index.set(identity, { signature, record, misses: 0 });
 				found.push(record);
 			} catch {
-				this.index.delete(identity);
+				const retained = this.retainMiss(identity);
+				if (retained) found.push(retained);
 			}
 		}
-		for (const identity of this.index.keys()) if (!seen.has(identity)) this.index.delete(identity);
+		for (const [identity] of this.index) {
+			if (seen.has(identity)) continue;
+			const retained = this.retainMiss(identity);
+			if (retained) found.push(retained);
+		}
 		found.sort(compareSessionRecords);
 		return found;
 	}

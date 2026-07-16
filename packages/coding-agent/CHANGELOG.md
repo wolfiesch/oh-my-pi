@@ -7,6 +7,8 @@
 - Added an owner-socket `appserver drain-if-idle` maintenance fence that atomically refuses new client work only after the exact appserver identity is confirmed idle.
 - Added desktop appserver controls for session model, thinking level, and fast mode, with live settings, model-role, and task-agent catalog metadata.
 - Added desktop session archive, restore, and delete backed by private profile metadata and crash-recoverable same-filesystem tombstones.
+- Added the `/continue-in-t4` slash command, which persists the current TUI session and exits through the normal clean teardown so the session can be continued in T4; nothing is taken over while the TUI is still running.
+- Added lock-aware appserver observation of sessions owned by another OMP process, such as an external TUI. The session is followed read-only from complete transcript records on disk; the appserver takes writable control only when the owner's lock is freshly missing — live, suspect, stale, or malformed locks are never seized — and the session stays read-only in a reconciling state until the promoted child reports it loaded the exact transcript the observer last saw.
 
 ### Changed
 

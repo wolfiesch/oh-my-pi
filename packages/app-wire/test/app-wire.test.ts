@@ -458,6 +458,37 @@ describe("app-wire authority", () => {
 			decodeServerFrame({ ...frame, sessions: [{ ...session, liveState: { nested: { "session.key": "x" } } }] }),
 		).toThrow(AppWireError);
 	});
+	test("session observer control is additive, categorical, and exact", () => {
+		expect(ADDITIVE_FEATURES).toContain("session.observer");
+		expect(PROTOCOL_FEATURES).toContain("session.observer");
+		const session = {
+			hostId: "h",
+			sessionId: "s",
+			project: { projectId: "p" },
+			revision: "r",
+			title: "Observed",
+			status: "idle",
+			updatedAt: "now",
+		};
+		const frame = (sessionControl: unknown) => ({
+			v: "omp-app/1",
+			type: "sessions",
+			cursor: { epoch: "e", seq: 1 },
+			sessions: [{ ...session, liveState: { sessionControl } }],
+		});
+		for (const lockStatus of ["live", "suspect", "malformed"])
+			expect(() => decodeServerFrame(frame({ mode: "observer", lockStatus, transcript: "live" }))).not.toThrow();
+		expect(() => decodeServerFrame(frame({ mode: "reconciling", transcript: "snapshot" }))).not.toThrow();
+		for (const invalid of [
+			null,
+			{ mode: "observer", transcript: "live" },
+			{ mode: "observer", lockStatus: "future", transcript: "live" },
+			{ mode: "future", transcript: "live" },
+			{ mode: "reconciling", transcript: "future" },
+			{ mode: "reconciling", transcript: "live", path: "/secret" },
+		])
+			expect(() => decodeServerFrame(frame(invalid))).toThrow(AppWireError);
+	});
 	test("secret-like metadata keys cannot hide behind separators", () => {
 		for (const key of [
 			"api.key",

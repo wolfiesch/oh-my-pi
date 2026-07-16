@@ -29,6 +29,22 @@ export interface ContextUsage {
 	used: number;
 	limit: number;
 }
+export type SessionObserverLockStatus = "live" | "suspect" | "malformed";
+export type SessionObserverTranscript = "live" | "snapshot";
+export type SessionControlState =
+	| {
+			mode: "observer";
+			lockStatus: SessionObserverLockStatus;
+			transcript: SessionObserverTranscript;
+	  }
+	| {
+			mode: "reconciling";
+			transcript: SessionObserverTranscript;
+	  };
+export interface SessionLiveState {
+	sessionControl?: SessionControlState;
+	[key: string]: unknown;
+}
 export interface SessionRef {
 	hostId: HostId;
 	sessionId: SessionId;
@@ -38,7 +54,7 @@ export interface SessionRef {
 	status: "active" | "idle" | "closed" | (string & {});
 	updatedAt: string;
 	archivedAt?: string;
-	liveState?: Record<string, unknown>;
+	liveState?: SessionLiveState;
 	model?: string;
 	thinking?: string;
 	pendingApproval?: boolean;
@@ -60,6 +76,26 @@ export interface SessionsFrame {
 	sessions: SessionRef[];
 	totalCount?: number;
 	truncated?: boolean;
+}
+function decodeSessionControl(value: unknown, path: string): SessionControlState {
+	const control = boundedMap(value, path);
+	if (control.mode === "observer") {
+		if (control.lockStatus !== "live" && control.lockStatus !== "suspect" && control.lockStatus !== "malformed")
+			fail("INVALID_FRAME", "invalid observer lock status", `${path}.lockStatus`);
+		if (control.transcript !== "live" && control.transcript !== "snapshot")
+			fail("INVALID_FRAME", "invalid observer transcript state", `${path}.transcript`);
+		if (Object.keys(control).some(key => !["mode", "lockStatus", "transcript"].includes(key)))
+			fail("INVALID_FRAME", "unknown observer session control field", path);
+		return control as unknown as SessionControlState;
+	}
+	if (control.mode === "reconciling") {
+		if (control.transcript !== "live" && control.transcript !== "snapshot")
+			fail("INVALID_FRAME", "invalid reconciling transcript state", `${path}.transcript`);
+		if (Object.keys(control).some(key => !["mode", "transcript"].includes(key)))
+			fail("INVALID_FRAME", "unknown reconciling session control field", path);
+		return control as unknown as SessionControlState;
+	}
+	fail("INVALID_FRAME", "invalid session control mode", `${path}.mode`);
 }
 function decodeListMetadata(
 	value: Record<string, unknown>,
@@ -91,7 +127,12 @@ export function decodeSessionRef(value: unknown, path: string): SessionRef {
 		if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== archivedAt)
 			fail("INVALID_FRAME", "archivedAt must be a canonical ISO timestamp", `${path}.archivedAt`);
 	}
-	if (session.liveState !== undefined) boundedMetadata(session.liveState, `${path}.liveState`, isSecretLikeKey);
+	if (session.liveState !== undefined) {
+		boundedMetadata(session.liveState, `${path}.liveState`, isSecretLikeKey);
+		const liveState = session.liveState as Record<string, unknown>;
+		if (liveState.sessionControl !== undefined)
+			decodeSessionControl(liveState.sessionControl, `${path}.liveState.sessionControl`);
+	}
 	if (session.model !== undefined) controlFree(session.model, `${path}.model`, 256);
 	if (session.thinking !== undefined) controlFree(session.thinking, `${path}.thinking`, 256);
 	if (session.pendingApproval !== undefined && typeof session.pendingApproval !== "boolean")

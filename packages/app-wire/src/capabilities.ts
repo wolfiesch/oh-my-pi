@@ -30,6 +30,7 @@ export const PROTOCOL_FEATURES = [
 	"session.watch",
 	"session.state",
 	"session.delta",
+	"session.observer",
 	"controller.lease",
 	"prompt.lease",
 	"prompt.images",

@@ -6,6 +6,7 @@ import {
 	type HostId,
 	revision,
 	type ServerFrame,
+	type SessionControlState,
 	type SessionEvent,
 	type SessionRef,
 	type SessionStateResult,
@@ -29,6 +30,7 @@ function replayBytes(frames: readonly ServerFrame[]): number {
 }
 
 function frameCursor(frame: ServerFrame): { epoch: string; seq: number } | undefined {
+	if (frame.type === "gap") return { epoch: frame.to.epoch, seq: frame.to.seq };
 	if (!("cursor" in frame) || !frame.cursor || typeof frame.cursor !== "object") return undefined;
 	const cursor = frame.cursor;
 	if (!("epoch" in cursor) || typeof cursor.epoch !== "string" || !("seq" in cursor) || typeof cursor.seq !== "number")
@@ -157,6 +159,27 @@ export class SessionProjection {
 		else delete next.archivedAt;
 		return this.updateRef(next, `record:${record.updatedAt}:${archivedAt ?? "restored"}`);
 	}
+	reconcileObserverRecord(record: SessionRecord): ServerFrame | undefined {
+		const current = this.value.ref;
+		const project =
+			current.project.projectId === record.projectId && record.projectName !== current.project.name
+				? { projectId: current.project.projectId, ...(record.projectName ? { name: record.projectName } : {}) }
+				: current.project;
+		const title =
+			placeholderTitle(record.title) && !placeholderTitle(current.title)
+				? current.title
+				: record.title || current.title;
+		const next: SessionRef = {
+			...current,
+			project,
+			title,
+			updatedAt: record.updatedAt > current.updatedAt ? record.updatedAt : current.updatedAt,
+		};
+		if (record.model !== undefined) next.model = record.model;
+		if (record.thinking !== undefined) next.thinking = record.thinking;
+		if (JSON.stringify(next) === JSON.stringify(current)) return undefined;
+		return this.updateRef(next, `observer-record:${record.updatedAt}`);
+	}
 	updateArchivedAt(archivedAt?: string): ServerFrame | undefined {
 		if (this.value.ref.archivedAt === archivedAt) return undefined;
 		const next = { ...this.value.ref };
@@ -189,6 +212,63 @@ export class SessionProjection {
 			remove: this.value.sessionId,
 		};
 	}
+	setSessionControl(control?: SessionControlState): ServerFrame | undefined {
+		const current = this.value.ref;
+		const liveState = { ...(current.liveState ?? {}) };
+		if (control) liveState.sessionControl = control;
+		else delete liveState.sessionControl;
+		const next: SessionRef = { ...current };
+		if (Object.keys(liveState).length > 0) next.liveState = liveState;
+		else delete next.liveState;
+		if (JSON.stringify(next) === JSON.stringify(current)) return undefined;
+		return this.updateRef(next, `session-control:${control?.mode ?? "clear"}`);
+	}
+	rebaseEntries(entries: readonly DurableEntry[]): ServerFrame[] {
+		const current = this.value.entries;
+		const prefix =
+			entries.length >= current.length &&
+			current.every((entry, index) => JSON.stringify(entry) === JSON.stringify(entries[index]));
+		if (prefix) {
+			const frames: ServerFrame[] = [];
+			for (const entry of entries.slice(current.length)) {
+				const frame = this.appendEntry(entry);
+				if (frame) frames.push(frame);
+			}
+			return frames;
+		}
+		const previous = this.value.cursor;
+		this.#byId.clear();
+		this.#revisionHash = createHash("sha256");
+		this.value.entries = [];
+		for (const entry of entries) {
+			this.#byId.set(entry.id, entry);
+			this.value.entries.push(entry);
+			this.#revisionHash.update(`${JSON.stringify(entry)}\n`);
+		}
+		this.value.revision = revision(`r-${this.#revisionHash.copy().digest("hex").slice(0, 24)}`);
+		const last = entries.at(-1);
+		this.value.ref = {
+			...this.value.ref,
+			revision: this.value.revision,
+			...(last ? { updatedAt: last.timestamp } : {}),
+		};
+		const cursor = this.nextCursor();
+		const gap: ServerFrame = {
+			v: "omp-app/1",
+			type: "gap",
+			hostId: this.value.hostId,
+			sessionId: this.value.sessionId,
+			from: { epoch: previous.epoch, seq: previous.seq + 1 },
+			to: cursor,
+			reason: "projection_rebase",
+		};
+		const snapshot = this.snapshot();
+		this.value.ring.length = 0;
+		this.appendFrame(gap);
+		this.appendFrame(snapshot);
+		return [gap, snapshot];
+	}
+
 	appendEntry(entry: DurableEntry): ServerFrame | undefined {
 		const previous = this.#byId.get(entry.id);
 		if (previous)

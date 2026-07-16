@@ -93,7 +93,12 @@ describe("AgentSession plan-mode convergence", () => {
 
 	async function createPlanSession(
 		responses: MockResponse[],
-		options?: { advisorResponses?: MockResponse[]; sideResponses?: MockResponse[] },
+		options?: {
+			advisorResponses?: MockResponse[];
+			sideResponses?: MockResponse[];
+			ircBus?: IrcBus;
+			agentRegistry?: AgentRegistry;
+		},
 	): Promise<PlanHarness> {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled anthropic model to exist");
@@ -147,6 +152,8 @@ describe("AgentSession plan-mode convergence", () => {
 			advisorTools: [],
 			advisorStreamFn,
 			sideStreamFn,
+			ircBus: options?.ircBus,
+			agentRegistry: options?.agentRegistry,
 		});
 		created.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" });
 		session = created;
@@ -194,15 +201,29 @@ describe("AgentSession plan-mode convergence", () => {
 	});
 
 	it("T2b: an awaited idle IRC message gets a side-channel auto-reply without waking a turn", async () => {
+		const peerId = `peer-${Snowflake.next()}`;
+		const recipientId = `me-${Snowflake.next()}`;
+		const registry = new AgentRegistry();
+		const bus = new IrcBus(registry);
 		const harness = await createPlanSession([], {
 			sideResponses: [{ content: ["still planning — full reply once the plan settles"] }],
+			ircBus: bus,
+			agentRegistry: registry,
 		});
-		const registry = AgentRegistry.global();
-		registry.register({ id: "peer", displayName: "peer", kind: "sub", session: null, status: "running" });
+		registry.register({ id: peerId, displayName: peerId, kind: "sub", session: null, status: "running" });
+		const waitAbort = new AbortController();
 		try {
-			const bus = IrcBus.global();
-			const replyPromise = bus.wait("peer", { from: "me" }, 0);
-			const msg: IrcMessage = { id: "m2", from: "peer", to: "me", body: "blocked on you — status?", ts: Date.now() };
+			const replyPromise = bus.wait(peerId, { from: recipientId }, 2_000, waitAbort.signal);
+			// Failure cleanup aborts the wait; keep that rejection observed if an
+			// assertion fails before the reply is awaited.
+			void replyPromise.catch(() => {});
+			const msg: IrcMessage = {
+				id: "m2",
+				from: peerId,
+				to: recipientId,
+				body: "blocked on you — status?",
+				ts: Date.now(),
+			};
 
 			const outcome = await harness.session.deliverIrcMessage(msg, { expectsReply: true });
 			expect(outcome).toBe("injected");
@@ -214,7 +235,8 @@ describe("AgentSession plan-mode convergence", () => {
 			expect(harness.mock.calls.length).toBe(0);
 			expect(harness.session.agent.state.messages.some(m => m.role === "assistant")).toBe(false);
 		} finally {
-			registry.unregister("peer");
+			waitAbort.abort();
+			registry.unregister(peerId);
 		}
 	});
 

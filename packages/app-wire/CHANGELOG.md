@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-07-16
+
+### Added
+
+- Advertise the additive `session.observer` feature so capability-aware clients can discover observer support.
+- Add categorical `SessionRef.liveState.sessionControl` state: `observer` mode carries `lockStatus`
+  (`live` | `suspect` | `malformed`) and `transcript` (`live` | `snapshot`); `reconciling` mode carries
+  `transcript` (`live` | `snapshot`). Decoding is fail-closed: unknown modes, invalid values, and
+  unexpected fields are rejected at the wire boundary.
+
 ## [0.5.7] - 2026-07-16
 
 ### Fixed

@@ -1221,7 +1221,14 @@ export async function runRpcMode(
 	});
 	// Readiness guarantees the parent can safely terminate this child: the
 	// postmortem callback that releases the session lock is already armed.
-	output({ type: "ready" });
+	const loadedEntries = session.sessionManager.getEntries();
+	output({
+		type: "ready",
+		transcriptWatermark: {
+			lastEntryId: loadedEntries.at(-1)?.id ?? null,
+			entryCount: loadedEntries.length,
+		},
+	});
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };

@@ -45,6 +45,8 @@ import {
 	projectMessageText,
 	projectNameFromCwd,
 	SessionEntryProjector,
+	SessionTranscriptObserver,
+	type SessionTranscriptPoll,
 	stableProjectId,
 } from "./discovery.ts";
 import { IdempotencyStore, payloadHash } from "./idempotency.ts";
@@ -90,6 +92,7 @@ import type {
 	RpcChildFactory,
 	SessionAuthority,
 	SessionDiscovery,
+	SessionLockStatus,
 	SessionRecord,
 } from "./types.ts";
 
@@ -118,6 +121,16 @@ const DIRECT_SESSION_RPC_COMMANDS: ReadonlySet<string> = new Set([
 	"session.fast.set",
 ]);
 const SESSION_CANCEL_COMMAND = "session.cancel";
+const OBSERVER_READ_COMMANDS = new Set([
+	"session.attach",
+	"session.image.read",
+	"files.read",
+	"files.list",
+	"files.diff",
+	"review.read",
+	"preview.state",
+	"preview.capture",
+]);
 const SUBAGENT_TRANSCRIPT_RPC_BYTES = 384 * 1024;
 const REMOTE_OUTBOUND_TRANSFORM_TIMEOUT_MS = 10_000;
 const DEFAULT_USAGE_READ_TIMEOUT_MS = 15_000;
@@ -457,7 +470,7 @@ export function appserverSupportedFeatures(
 	includeRemotePolicy = false,
 ): string[] {
 	const unsupportedAdditiveFeatures = new Set(["host.watch", "session.watch"]);
-	const implementedFeatures = new Set<string>(["resume", "prompt.images", "agent.transcript"]);
+	const implementedFeatures = new Set<string>(["resume", "prompt.images", "agent.transcript", "session.observer"]);
 	if (includeRemotePolicy) {
 		implementedFeatures.add("controller.lease");
 		implementedFeatures.add("prompt.lease");
@@ -517,6 +530,13 @@ export class LocalAppserver implements AppserverHandle {
 	#stateRefreshGenerations = new Map<SessionId, number>();
 	#transcripts = new Map<SessionId, TranscriptEventTranslator>();
 	#subagents = new Map<SessionId, SubagentProjection>();
+	#lockStatus: (session: SessionRecord) => SessionLockStatus;
+	#observers = new Map<SessionId, SessionTranscriptObserver>();
+	#observerTimers = new Map<SessionId, ReturnType<typeof setInterval>>();
+	#observerRefreshes = new Map<SessionId, { promise: Promise<void>; rerun: boolean }>();
+	#promotionFailures = new Map<SessionId, string>();
+	#sessionRefresh?: Promise<void>;
+	#discoveryMisses = new Map<SessionId, number>();
 	#agentTranscripts = new Map<SessionId, AgentTranscriptProjection>();
 	#startPromises = new Map<SessionId, Promise<RpcChildSupervisor>>();
 	#lifecycleMutations = new Set<SessionId>();
@@ -592,9 +612,14 @@ export class LocalAppserver implements AppserverHandle {
 		this.#transcriptImages = options.transcriptImageRoot
 			? new TranscriptImageReader({ root: options.transcriptImageRoot })
 			: undefined;
+		this.#lockStatus = options.lockStatus ?? (() => "missing");
 		this.#factory = options.childFactory ?? new BunRpcChildFactory(undefined, this.#imageUploads.root);
-		this.#lockCheck = options.lockCheck ?? (() => undefined);
 		this.#ringSize = options.ringSize ?? 256;
+		if (options.lockStatus && !options.lockCheck)
+			this.#lockCheck = () => {
+				throw new Error("session is locked by another process");
+			};
+		else this.#lockCheck = options.lockCheck ?? (() => undefined);
 		this.#lifecycleQuiesceTimeoutMs = options.lifecycleQuiesceTimeoutMs ?? 2_000;
 		this.#usageReadTimeoutMs = options.usageReadTimeoutMs ?? DEFAULT_USAGE_READ_TIMEOUT_MS;
 		if (
@@ -636,7 +661,9 @@ export class LocalAppserver implements AppserverHandle {
 	hasDesktopCatalogCommandHandler(command: string): boolean {
 		if (command === "usage.read") return this.#usageAuthority !== undefined;
 		if (this.#operations?.hasCommand(command)) return true;
-		return this.#handlers.has(command) || DIRECT_SESSION_RPC_COMMANDS.has(command) || command === SESSION_CANCEL_COMMAND;
+		return (
+			this.#handlers.has(command) || DIRECT_SESSION_RPC_COMMANDS.has(command) || command === SESSION_CANCEL_COMMAND
+		);
 	}
 	async start(): Promise<void> {
 		if (this.#started) return;
@@ -803,6 +830,10 @@ export class LocalAppserver implements AppserverHandle {
 					process.emitWarning(error instanceof Error ? error.message : String(error));
 				}
 			}
+			for (const timer of this.#observerTimers.values()) clearInterval(timer);
+			this.#observerTimers.clear();
+			this.#observers.clear();
+			this.#observerRefreshes.clear();
 			for (const supervisor of this.#supervisors.values()) supervisor.stop();
 			this.#supervisors.clear();
 			this.#promptLifecycles.clear();
@@ -1038,6 +1069,7 @@ export class LocalAppserver implements AppserverHandle {
 		if (command.command === "host.list" || command.command === "session.list") await this.refreshSessions();
 		const projection = command.sessionId ? this.#projections.get(command.sessionId) : undefined;
 		// Attach output is connection-scoped and rebuilt on every delivery. A
+		if (this.observerBarrierBlocks(command)) return this.observerBarrierOutcome(command);
 		// cached success cannot attach a session that has since been deleted.
 		if (command.command === "session.attach" && !projection)
 			return {
@@ -1229,6 +1261,7 @@ export class LocalAppserver implements AppserverHandle {
 					}
 				}
 			} else if (command.command === "session.attach") {
+				await this.enqueueExternalRefresh(command.sessionId!);
 				const cursor = command.args.cursor;
 				const attachOutput = prepareAttachOutput(
 					projection!,
@@ -1672,6 +1705,7 @@ export class LocalAppserver implements AppserverHandle {
 				}
 				return this.lifecycleBusyOutcome(command, "session runtime did not stop cleanly");
 			}
+			this.cleanupObserverState(sessionId);
 			this.#releaseAllMessageLifecycles(sessionId, "cancelled");
 			this.#stateRefreshGenerations.delete(sessionId);
 			this.#transcripts.delete(sessionId);
@@ -1717,6 +1751,20 @@ export class LocalAppserver implements AppserverHandle {
 		return Boolean(
 			this.#records.get(sessionId)?.archivedAt || this.#projections.get(sessionId)?.value.ref.archivedAt,
 		);
+	}
+	private observerBarrierBlocks(command: CommandFrame): boolean {
+		if (!command.sessionId || OBSERVER_READ_COMMANDS.has(command.command)) return false;
+		const control = this.#projections.get(command.sessionId)?.value.ref.liveState?.sessionControl;
+		if (!control) return false;
+		return command.command === "session.state.get" || !OBSERVER_READ_COMMANDS.has(command.command);
+	}
+	private observerBarrierOutcome(command: CommandFrame): CommandOutcome {
+		return {
+			frame: response(this.hostId, command, false, undefined, {
+				code: "session_locked",
+				message: "session is locked by another process",
+			}),
+		};
 	}
 	private beginSessionOperation(sessionId: SessionId): boolean {
 		if (this.#draining || this.#stopping || this.#lifecycleMutations.has(sessionId)) return false;
@@ -1957,6 +2005,7 @@ export class LocalAppserver implements AppserverHandle {
 			if (finalGuard) return this.lifecycleFailureOutcome(command, finalGuard);
 			await this.#imageUploads.cleanupSession(sessionId);
 			await this.#authority!.delete(record);
+			this.cleanupObserverState(sessionId);
 			await this.broadcastAttachedOrdered(sessionId, projection.appendEvent({ type: "session_deleted" }));
 			await this.broadcastIndex(projection.remove());
 			this.#records.delete(sessionId);
@@ -2310,9 +2359,11 @@ export class LocalAppserver implements AppserverHandle {
 		this.#supervisors.set(sessionId, supervisor);
 		try {
 			await supervisor.start();
+			if (this.#supervisors.get(sessionId) !== supervisor) throw new Error("rpc child exited during startup");
+			this.releaseSupervisorAfterExit(sessionId, supervisor);
 			return supervisor;
 		} catch (error) {
-			this.#supervisors.delete(sessionId);
+			if (this.#supervisors.get(sessionId) === supervisor) this.#supervisors.delete(sessionId);
 			this.#releaseAllMessageLifecycles(sessionId, "failed");
 			this.#transcripts.delete(sessionId);
 			this.disposeSubagentState(sessionId);
@@ -2322,6 +2373,7 @@ export class LocalAppserver implements AppserverHandle {
 	}
 	private async message(ws: AppWs, raw: string | Uint8Array): Promise<void> {
 		this.#inflightMessages += 1;
+		let attachingSessionId: SessionId | undefined;
 		try {
 			if (this.#draining || this.#stopping) {
 				ws.close(1012, "appserver maintenance");
@@ -2329,6 +2381,7 @@ export class LocalAppserver implements AppserverHandle {
 			}
 			if (typeof raw !== "string") throw new Error("binary websocket frames are not supported");
 			const frame = decodeClientFrame(parseBounded(raw));
+			if (frame.type === "command" && frame.command === "session.attach") attachingSessionId = frame.sessionId;
 			if (frame.type === "hello") {
 				if (this.#hello.has(ws)) throw new Error("hello already received");
 				let decision: RemoteHelloDecision | undefined;
@@ -2410,6 +2463,15 @@ export class LocalAppserver implements AppserverHandle {
 				return;
 			}
 			if (frame.type === "terminal.input" || frame.type === "terminal.resize" || frame.type === "terminal.close") {
+				if (this.#projections.get(frame.sessionId)?.value.ref.liveState?.sessionControl) {
+					await this.#sendFrame(ws, {
+						v: "omp-app/1",
+						type: "error",
+						code: "SESSION_LOCKED",
+						message: "session is locked by another process",
+					});
+					return;
+				}
 				if (!this.#operations) {
 					await this.#sendFrame(ws, {
 						v: "omp-app/1",
@@ -2483,6 +2545,10 @@ export class LocalAppserver implements AppserverHandle {
 				return;
 			}
 			const descriptor = COMMAND_DESCRIPTORS[frame.command];
+			if (this.observerBarrierBlocks(frame)) {
+				await this.#sendFrame(ws, this.observerBarrierOutcome(frame).frame);
+				return;
+			}
 			if (descriptor?.confirmation === "challenge") {
 				if (frame.confirmationId !== undefined) {
 					await this.#sendFrame(
@@ -2515,10 +2581,12 @@ export class LocalAppserver implements AppserverHandle {
 				const attached = this.#attached.get(ws);
 				const projection = this.#projections.get(frame.sessionId);
 				if (!attached || !projection) throw new Error("attach output is incomplete");
+				// Re-check ownership for every delivery, including a cached
+				// idempotent attach replay. The snapshot sent below must already
+				// carry observer/reconciling control; a later timer is too late.
+				await this.enqueueExternalRefresh(frame.sessionId);
 				const cursor = frame.args.cursor;
-				const prepared =
-					outcome.attachOutput ??
-					prepareAttachOutput(projection, cursor === undefined ? undefined : decodeCursor(cursor));
+				const prepared = prepareAttachOutput(projection, cursor === undefined ? undefined : decodeCursor(cursor));
 				// A replayed command outcome carries the baseline from its first
 				// delivery, while its bulk attach output is deliberately rebuilt.
 				// Keep the acknowledgement cursor aligned with the freshly prepared
@@ -2528,6 +2596,7 @@ export class LocalAppserver implements AppserverHandle {
 					cursor: prepared.baseline,
 				});
 				attached.add(frame.sessionId);
+				this.startExternalObserver(frame.sessionId);
 				try {
 					outputFrames.push(...completeAttachOutput(prepared, projection, this.#subagents.get(frame.sessionId)));
 					if (this.#clientFeatures.get(ws)?.has("agent.transcript"))
@@ -2539,6 +2608,10 @@ export class LocalAppserver implements AppserverHandle {
 			}
 			await Promise.all(outputFrames.map(output => this.#sendFrame(ws, output)));
 		} catch {
+			if (attachingSessionId) {
+				this.#attached.get(ws)?.delete(attachingSessionId);
+				if (!this.hasAttachedClient(attachingSessionId)) this.cleanupObserverState(attachingSessionId);
+			}
 			if (ws.remote) {
 				ws.close(1008, "invalid frame");
 				return;
@@ -2607,6 +2680,7 @@ export class LocalAppserver implements AppserverHandle {
 	}
 	private async disconnectClient(ws: AppWs): Promise<void> {
 		if (!this.#clients.has(ws)) return;
+		const detachedSessions = [...(this.#attached.get(ws) ?? [])];
 		const controllers = this.#abortControllers.get(ws);
 		for (const controller of controllers ?? []) controller.abort();
 		if (this.#operations) {
@@ -2628,6 +2702,8 @@ export class LocalAppserver implements AppserverHandle {
 		this.#clientCapabilities.delete(ws);
 		this.#clientFeatures.delete(ws);
 		this.#attached.delete(ws);
+		for (const sessionId of detachedSessions)
+			if (!this.hasAttachedClient(sessionId)) this.cleanupObserverState(sessionId);
 		this.#deviceIds.delete(ws);
 		this.#abortControllers.delete(ws);
 		this.#remoteDecisions.delete(ws);
@@ -2788,11 +2864,27 @@ export class LocalAppserver implements AppserverHandle {
 			);
 		}
 	}
-	private async refreshSessions(): Promise<void> {
+	private refreshSessions(): Promise<void> {
+		if (this.#sessionRefresh) return this.#sessionRefresh;
+		const refresh = this.refreshSessionsOnce();
+		this.#sessionRefresh = refresh;
+		const clear = () => {
+			if (this.#sessionRefresh === refresh) this.#sessionRefresh = undefined;
+		};
+		void refresh.then(clear, clear);
+		return refresh;
+	}
+	private async refreshSessionsOnce(): Promise<void> {
 		const discovered = await this.#discovery.list();
 		const discoveredIds = new Set(discovered.map(record => record.sessionId));
-		for (const record of discovered) {
+		for (const discoveredRecord of discovered) {
+			const previous = this.#records.get(discoveredRecord.sessionId);
+			const record: SessionRecord =
+				previous?.archivedAt && !discoveredRecord.archivedAt
+					? { ...discoveredRecord, archivedAt: previous.archivedAt }
+					: discoveredRecord;
 			this.#records.set(record.sessionId, record);
+			this.#discoveryMisses.delete(record.sessionId);
 			this.#createdPending.delete(record.sessionId);
 			const projection = this.#projections.get(record.sessionId);
 			if (!projection) {
@@ -2800,7 +2892,9 @@ export class LocalAppserver implements AppserverHandle {
 				this.#projections.set(record.sessionId, inserted);
 				await this.broadcastIndex(inserted.indexUpsert());
 			} else {
-				const output = projection.reconcileRecord(record);
+				const output = projection.value.ref.liveState?.sessionControl
+					? projection.reconcileObserverRecord(record)
+					: projection.reconcileRecord(record);
 				if (output) await this.broadcastIndex(output);
 			}
 		}
@@ -2812,8 +2906,10 @@ export class LocalAppserver implements AppserverHandle {
 			if (pending.refreshesRemaining > 0) pending.refreshesRemaining -= 1;
 			else {
 				this.#createdPending.delete(sessionId);
+				this.#discoveryMisses.delete(sessionId);
 				const projection = this.#projections.get(sessionId);
 				if (projection) await this.broadcastIndex(projection.remove());
+				this.cleanupObserverState(sessionId);
 				await this.#imageUploads.cleanupSession(sessionId);
 				this.#records.delete(sessionId);
 				this.#projections.delete(sessionId);
@@ -2823,11 +2919,21 @@ export class LocalAppserver implements AppserverHandle {
 		for (const sessionId of [...this.#records.keys()]) {
 			if (discoveredIds.has(sessionId) || this.#createdPending.has(sessionId)) continue;
 			if (this.#lifecycleMutations.has(sessionId)) continue;
+			const misses = (this.#discoveryMisses.get(sessionId) ?? 0) + 1;
+			if (misses < 2) {
+				this.#discoveryMisses.set(sessionId, misses);
+				continue;
+			}
+			this.#discoveryMisses.delete(sessionId);
 			this.#lifecycleMutations.add(sessionId);
 			try {
-				if (!(await this.quiesceSessionRuntime(sessionId))) continue;
+				if (!(await this.quiesceSessionRuntime(sessionId))) {
+					this.#discoveryMisses.set(sessionId, 1);
+					continue;
+				}
 				const projection = this.#projections.get(sessionId);
 				if (projection) await this.broadcastIndex(projection.remove());
+				this.cleanupObserverState(sessionId);
 				await this.#imageUploads.cleanupSession(sessionId);
 				this.#records.delete(sessionId);
 				this.#projections.delete(sessionId);
@@ -2842,6 +2948,210 @@ export class LocalAppserver implements AppserverHandle {
 			}
 		}
 	}
+	private cleanupObserverState(sessionId: SessionId): void {
+		const timer = this.#observerTimers.get(sessionId);
+		if (timer) clearInterval(timer);
+		this.#observerTimers.delete(sessionId);
+		this.#observers.delete(sessionId);
+		this.#promotionFailures.delete(sessionId);
+	}
+	private hasAttachedClient(sessionId: SessionId): boolean {
+		for (const sessions of this.#attached.values()) if (sessions.has(sessionId)) return true;
+		return false;
+	}
+	private observerIsCurrent(
+		sessionId: SessionId,
+		observer: SessionTranscriptObserver,
+		record: SessionRecord,
+		projection: SessionProjection,
+	): boolean {
+		return (
+			this.#observers.get(sessionId) === observer &&
+			this.#records.get(sessionId)?.path === record.path &&
+			this.#projections.get(sessionId) === projection
+		);
+	}
+	private async applyObserverPoll(
+		sessionId: SessionId,
+		projection: SessionProjection,
+		poll: SessionTranscriptPoll,
+	): Promise<void> {
+		if (!poll.record) return;
+		const current = this.#records.get(sessionId);
+		const record: SessionRecord = {
+			...(current ?? poll.record),
+			...poll.record,
+			...(current?.archivedAt && !poll.record.archivedAt ? { archivedAt: current.archivedAt } : {}),
+		};
+		this.#records.set(sessionId, record);
+		const transcriptFrames = projection.rebaseEntries(record.entries);
+		for (const frame of transcriptFrames) this.broadcast(sessionId, frame);
+		const metadata = projection.reconcileObserverRecord(record);
+		if (metadata) await this.broadcastIndex(metadata);
+		else if (transcriptFrames.length > 0) await this.broadcastIndex(projection.indexUpsert());
+	}
+	private async discardPromotionSupervisor(sessionId: SessionId, supervisor: RpcChildSupervisor): Promise<void> {
+		const child = supervisor.child();
+		supervisor.stop("SIGTERM");
+		if (child && !(await this.childExitedWithinLifecycleTimeout(child))) {
+			supervisor.stop("SIGKILL");
+			await child.exited.catch(() => undefined);
+		}
+		if (this.#supervisors.get(sessionId) === supervisor) this.#supervisors.delete(sessionId);
+		this.#releaseAllMessageLifecycles(sessionId, "failed");
+		this.#stateRefreshGenerations.delete(sessionId);
+		this.#transcripts.delete(sessionId);
+		this.disposeSubagentState(sessionId);
+	}
+	private enqueueExternalRefresh(sessionId: SessionId): Promise<void> {
+		const existing = this.#observerRefreshes.get(sessionId);
+		if (existing) {
+			existing.rerun = true;
+			return existing.promise;
+		}
+		const state = { promise: Promise.resolve(), rerun: false };
+		const run = async (): Promise<void> => {
+			do {
+				state.rerun = false;
+				await this.refreshExternalSession(sessionId);
+			} while (state.rerun);
+		};
+		state.promise = run().finally(() => {
+			if (this.#observerRefreshes.get(sessionId) === state) this.#observerRefreshes.delete(sessionId);
+		});
+		this.#observerRefreshes.set(sessionId, state);
+		return state.promise;
+	}
+	private promotionFingerprint(
+		record: SessionRecord,
+		projection: SessionProjection,
+		poll: SessionTranscriptPoll,
+	): string {
+		return JSON.stringify([
+			record.path,
+			poll.watermark.entryCount,
+			poll.watermark.lastEntryId,
+			projection.value.revision,
+		]);
+	}
+	private async refreshExternalSession(sessionId: SessionId): Promise<void> {
+		const record = this.#records.get(sessionId);
+		const projection = this.#projections.get(sessionId);
+		if (!record || !projection) return;
+		// A local child owns the session. Never let external bytes rebase it.
+		if (this.#supervisors.has(sessionId)) return;
+		let status: SessionLockStatus;
+		try {
+			status = this.#lockStatus(record);
+		} catch {
+			status = "malformed";
+		}
+		if (status === "live" || status === "suspect" || status === "malformed") {
+			this.#promotionFailures.delete(sessionId);
+			let observer = this.#observers.get(sessionId);
+			if (!observer) {
+				observer = new SessionTranscriptObserver(record.path, this.hostId);
+				this.#observers.set(sessionId, observer);
+			}
+			const poll = await observer.poll();
+			const transcript = poll.record && poll.record.sessionId !== sessionId ? "snapshot" : poll.transcript;
+			if (this.#supervisors.has(sessionId) || this.#startPromises.has(sessionId)) return;
+			if (!this.observerIsCurrent(sessionId, observer, record, projection)) return;
+			if (poll.record?.sessionId === sessionId) await this.applyObserverPoll(sessionId, projection, poll);
+			if (!this.observerIsCurrent(sessionId, observer, record, projection)) return;
+			const control = projection.setSessionControl({
+				mode: "observer",
+				lockStatus: status,
+				transcript,
+			});
+			if (control) await this.broadcastIndex(control);
+			return;
+		}
+		let observer = this.#observers.get(sessionId);
+		if (!observer) {
+			if (status === "missing" && !projection.value.ref.liveState?.sessionControl) return;
+			observer = new SessionTranscriptObserver(record.path, this.hostId);
+			this.#observers.set(sessionId, observer);
+		}
+		const poll = await observer.poll();
+		if (this.#supervisors.has(sessionId) || this.#startPromises.has(sessionId)) return;
+		if (!this.observerIsCurrent(sessionId, observer, record, projection)) return;
+		const pollRecordMatches = poll.record?.sessionId === sessionId;
+		if (pollRecordMatches) await this.applyObserverPoll(sessionId, projection, poll);
+		if (!this.observerIsCurrent(sessionId, observer, record, projection)) return;
+		const reconciling = projection.setSessionControl({
+			mode: "reconciling",
+			transcript: pollRecordMatches ? poll.transcript : "snapshot",
+		});
+		if (reconciling) await this.broadcastIndex(reconciling);
+		if (!this.observerIsCurrent(sessionId, observer, record, projection)) return;
+		if (!this.hasAttachedClient(sessionId)) return;
+		if (!pollRecordMatches || !poll.stable || poll.transcript !== "live") return;
+		if (poll.unresolvedPendingCount !== 0) return;
+		let promotionLockStatus: SessionLockStatus;
+		try {
+			promotionLockStatus = this.#lockStatus(record);
+		} catch {
+			promotionLockStatus = "malformed";
+		}
+		if (promotionLockStatus !== "missing") return;
+		const attemptFingerprint = this.promotionFingerprint(record, projection, poll);
+		if (this.#promotionFailures.get(sessionId) === attemptFingerprint) return;
+		let supervisor: RpcChildSupervisor;
+		if (this.#supervisors.has(sessionId) || this.#startPromises.has(sessionId)) return;
+		try {
+			// startSupervisor performs the final write-lock gate immediately before spawn.
+			supervisor = await this.ensureSupervisor(sessionId);
+		} catch {
+			this.#promotionFailures.set(sessionId, this.promotionFingerprint(record, projection, poll));
+			return;
+		}
+		if (this.#supervisors.get(sessionId) !== supervisor) {
+			this.#promotionFailures.set(sessionId, this.promotionFingerprint(record, projection, poll));
+			return;
+		}
+		const final = await observer.poll();
+		if (!this.observerIsCurrent(sessionId, observer, record, projection)) {
+			await this.discardPromotionSupervisor(sessionId, supervisor);
+			return;
+		}
+		if (final.record?.sessionId !== sessionId) {
+			await this.discardPromotionSupervisor(sessionId, supervisor);
+			this.#promotionFailures.set(sessionId, this.promotionFingerprint(record, projection, final));
+			return;
+		}
+		await this.applyObserverPoll(sessionId, projection, final);
+		const loaded = supervisor.loadedWatermark();
+		if (!this.observerIsCurrent(sessionId, observer, record, projection)) {
+			await this.discardPromotionSupervisor(sessionId, supervisor);
+			return;
+		}
+		const matches =
+			final.record?.sessionId === sessionId &&
+			final.stable &&
+			final.transcript === "live" &&
+			final.unresolvedPendingCount === 0 &&
+			loaded !== undefined &&
+			loaded.entryCount === final.watermark.entryCount &&
+			loaded.lastEntryId === final.watermark.lastEntryId;
+		if (!matches) {
+			await this.discardPromotionSupervisor(sessionId, supervisor);
+			this.#promotionFailures.set(sessionId, this.promotionFingerprint(record, projection, final));
+			return;
+		}
+		if (this.#supervisors.get(sessionId) !== supervisor) return;
+		const control = projection.setSessionControl();
+		if (control) await this.broadcastIndex(control);
+		this.cleanupObserverState(sessionId);
+	}
+	private startExternalObserver(sessionId: SessionId): void {
+		if (this.#observerTimers.has(sessionId)) return;
+		const timer = setInterval(() => {
+			void this.enqueueExternalRefresh(sessionId).catch(() => undefined);
+		}, 250);
+		this.#observerTimers.set(sessionId, timer);
+	}
+
 	private sessionListResult(): { sessions: SessionRef[]; totalCount: number; truncated: boolean } {
 		const allSessions = [...this.#projections.values()].map(value => value.value.ref);
 		allSessions.sort((a, b) => {

@@ -880,6 +880,10 @@ export interface AgentSessionConfig {
 	 * to plain `streamSimple` when omitted.
 	 */
 	sideStreamFn?: StreamFn;
+	/** IRC bus used by side-channel auto-replies. Defaults to the process-global bus. */
+	ircBus?: IrcBus;
+	/** Agent registry paired with `ircBus`. Defaults to the process-global registry. */
+	agentRegistry?: AgentRegistry;
 	/**
 	 * Stream wrapper passed to the advisor agent so its requests apply the
 	 * session's `providers.openrouterVariant`, `providers.antigravityEndpoint`,
@@ -1947,6 +1951,8 @@ export class AgentSession {
 	#installedVibeToolNames = new Set<string>();
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
+	#ircBus: IrcBus;
+	#agentRegistry: AgentRegistry;
 	#onResponse: SimpleStreamOptions["onResponse"] | undefined;
 	#onSseEvent: SimpleStreamOptions["onSseEvent"] | undefined;
 	#transformProviderContext: ((context: Context, model: Model) => Context | Promise<Context>) | undefined;
@@ -2566,6 +2572,8 @@ export class AgentSession {
 		this.#pruneToolDescriptions = config.pruneToolDescriptions === true;
 		this.#validateRetryFallbackChains();
 		this.#toolRegistry = config.toolRegistry ?? new Map();
+		this.#ircBus = config.ircBus ?? IrcBus.global();
+		this.#agentRegistry = config.agentRegistry ?? AgentRegistry.global();
 		this.#createVibeTools = config.createVibeTools;
 		this.#builtInToolNames = new Set(config.builtInToolNames ?? []);
 		this.#requestedToolNames = config.requestedToolNames;
@@ -15412,7 +15420,7 @@ export class AgentSession {
 		};
 		void this.#emitSessionEvent({ type: "irc_message", message: record });
 		if (this.isStreaming) {
-			const recipientParentId = AgentRegistry.global().get(msg.to)?.parentId;
+			const recipientParentId = this.#agentRegistry.get(msg.to)?.parentId;
 			if (recipientParentId === msg.from) {
 				this.agent.steer({
 					role: "user",
@@ -15480,7 +15488,7 @@ export class AgentSession {
 			this.#pendingIrcAsides.push(record);
 			// `from` must be the id the sender addressed (msg.to) so their
 			// from-filtered waiter matches.
-			const receipt = await IrcBus.global().send({ from: msg.to, to: msg.from, body, replyTo: msg.id });
+			const receipt = await this.#ircBus.send({ from: msg.to, to: msg.from, body, replyTo: msg.id });
 			if (receipt.outcome === "failed") {
 				logger.warn("IRC auto-reply delivery failed", { to: msg.from, error: receipt.error });
 			}

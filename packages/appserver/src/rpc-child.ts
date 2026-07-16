@@ -14,6 +14,11 @@ export interface ChildCallbacks {
 	crashed(error: Error): void;
 }
 
+export interface RpcLoadedTranscriptWatermark {
+	readonly lastEntryId: string | null;
+	readonly entryCount: number;
+}
+
 export interface RpcChildInvocation {
 	executable: string;
 	prefixArgv: readonly string[];
@@ -139,6 +144,7 @@ export class RpcChildSupervisor {
 	#ignoredResponses = new Set<string>();
 	#closed = false;
 	#readyReject?: (error: Error) => void;
+	#loadedWatermark?: RpcLoadedTranscriptWatermark;
 	#counter = 0;
 	#stderr = "";
 	#ready = false;
@@ -258,6 +264,9 @@ export class RpcChildSupervisor {
 		// The owner must retain this handle until `exited` settles. Clearing it
 		// here would let lifecycle retries lose track of a signal-resistant child.
 	}
+	loadedWatermark(): RpcLoadedTranscriptWatermark | undefined {
+		return this.#loadedWatermark;
+	}
 	child(): ChildHandle | undefined {
 		return this.#child;
 	}
@@ -275,6 +284,19 @@ export class RpcChildSupervisor {
 					throw new Error("rpc frame must be an object");
 				const frame = value as Record<string, unknown>;
 				if (frame.type === "ready") {
+					const watermark = frame.transcriptWatermark;
+					if (watermark && typeof watermark === "object" && !Array.isArray(watermark)) {
+						const candidate = watermark as Record<string, unknown>;
+						const lastEntryId = candidate.lastEntryId;
+						const entryCount = candidate.entryCount;
+						if (
+							((typeof lastEntryId === "string" && lastEntryId.length <= 256) || lastEntryId === null) &&
+							typeof entryCount === "number" &&
+							Number.isSafeInteger(entryCount) &&
+							entryCount >= 0
+						)
+							this.#loadedWatermark = { lastEntryId, entryCount };
+					}
 					if (this.#ready) throw new Error("duplicate rpc ready");
 					this.#ready = true;
 					ready.resolve();

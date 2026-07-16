@@ -2,13 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-	DESKTOP_CATALOG_COMMANDS,
-	type DurableEntry,
-	hostId,
-	projectId,
-	sessionId,
-} from "@oh-my-pi/app-wire";
+import { DESKTOP_CATALOG_COMMANDS, type DurableEntry, hostId, projectId, sessionId } from "@oh-my-pi/app-wire";
 import { completeAttachOutput, prepareAttachOutput } from "../src/attach-output.ts";
 import { IdempotencyStore } from "../src/idempotency.ts";
 import { SessionProjection } from "../src/projection.ts";
@@ -182,7 +176,12 @@ describe("idempotency", () => {
 });
 describe("appserver lifecycle", () => {
 	test("advertises the exact default implemented feature set", () => {
-		expect(appserverSupportedFeatures({})).toEqual(["resume", "prompt.images", "agent.transcript"]);
+		expect(appserverSupportedFeatures({})).toEqual([
+			"resume",
+			"prompt.images",
+			"agent.transcript",
+			"session.observer",
+		]);
 	});
 	test("advertises transcript image reads only with an explicit blob root", () => {
 		expect(appserverSupportedFeatures({})).not.toContain("transcript.images");
@@ -213,9 +212,7 @@ describe("appserver lifecycle", () => {
 				read: async () => ({ generatedAt: 0, reports: [], accountsWithoutUsage: [], capacity: {} }),
 			},
 		});
-		const unhandled = DESKTOP_CATALOG_COMMANDS.filter(
-			command => !appserver.hasDesktopCatalogCommandHandler(command),
-		);
+		const unhandled = DESKTOP_CATALOG_COMMANDS.filter(command => !appserver.hasDesktopCatalogCommandHandler(command));
 		expect(unhandled).toEqual([]);
 	});
 	test("indexes three sessions, starts one child each, and removes socket", async () => {

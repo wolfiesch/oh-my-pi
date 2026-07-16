@@ -55,7 +55,7 @@
     },
     "packages/app-wire": {
       "name": "@oh-my-pi/app-wire",
-      "version": "0.5.7",
+      "version": "0.5.8",
     },
     "packages/appserver": {
       "name": "@oh-my-pi/appserver",

@@ -46,6 +46,7 @@ export interface AppserverRuntimeAuthorities {
 	projectRootForProject(project: ProjectId): Promise<string>;
 	projectRootForSession(session: SessionId): Promise<string>;
 	lockCheck: LockCheckHook;
+	lockStatus: (session: SessionRecord) => "missing" | "live" | "suspect" | "stale" | "malformed";
 }
 
 export interface AppserverAuthorityOptions {
@@ -176,6 +177,7 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 			if (!current || path.resolve(current.path) !== path.resolve(session.path))
 				throw new Error("session deletion target changed during authorization");
 			await lifecycle.deleteSession(session.sessionId, current.path);
+			baseDiscovery.forget(current.path);
 			records.delete(session.sessionId);
 		},
 	};
@@ -345,6 +347,7 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 		projectRootForProject,
 		projectRootForSession,
 		lockCheck: appserverLockCheck,
+		lockStatus: session => inspectSessionLock(session.path).status,
 	};
 }
 
@@ -354,9 +357,13 @@ export function createAppserverAuthority(): SessionAuthority {
 
 export const appserverLockCheck: LockCheckHook = session => {
 	const inspection = inspectSessionLock(session.path);
-	if (inspection.status === "live" || inspection.status === "suspect" || inspection.status === "malformed")
-		throw new Error(`session lock is ${inspection.status}`);
+	if (inspection.status !== "missing") throw new Error(`session lock is ${inspection.status}`);
 };
+
+export type AppserverSessionLockStatus = "missing" | "live" | "suspect" | "stale" | "malformed";
+export function inspectAppserverSessionLock(session: Pick<SessionRecord, "path">): AppserverSessionLockStatus {
+	return inspectSessionLock(session.path).status;
+}
 
 export function sessionFileExists(path: string): boolean {
 	try {

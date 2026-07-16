@@ -74,6 +74,15 @@ function record(id: string): SessionRecord {
 		entries: [],
 	};
 }
+function transcript(id: string, title = "Session"): string {
+	return `${JSON.stringify({ type: "session", id, cwd: "/tmp", timestamp: stamp, title })}\n`;
+}
+async function replaceTranscript(path: string, value: string): Promise<void> {
+	await writeFile(path, value, "utf8");
+}
+function transcriptWithEntry(id: string, title = "Session"): string {
+	return `${transcript(id, title)}{"type":"message","id":"first","id":"last","parentId":null,"timestamp":"${stamp}","message":{"role":"user","content":"safe"}}\n`;
+}
 function hello(
 	capabilities?: string[],
 	authentication = false,
@@ -191,7 +200,7 @@ class Gate {
 		await this.opened.promise;
 	}
 }
-type LiveChildExitMode = "graceful" | "forced" | "manual" | "throwing";
+type LiveChildExitMode = "graceful" | "forced" | "manual" | "throwing" | "ready-exits";
 class LiveChild implements ChildHandle {
 	readonly writes: string[] = [];
 	readonly killed = Promise.withResolvers<void>();
@@ -214,10 +223,15 @@ class LiveChild implements ChildHandle {
 	constructor(
 		readonly exitMode: LiveChildExitMode = "graceful",
 		readonly readyGate?: Gate,
+		readonly readyWatermark?: { entryCount: number; lastEntryId: string | null },
 	) {}
 	async *stream(): AsyncGenerator<string> {
 		await this.readyGate?.lock();
-		yield `${JSON.stringify({ type: "ready" })}\n`;
+		yield `${JSON.stringify({ type: "ready", ...(this.readyWatermark ? { transcriptWatermark: this.readyWatermark } : {}) })}\n`;
+		if (this.exitMode === "ready-exits") {
+			this.release();
+			return;
+		}
 		while (true) {
 			const line = this.#lines.shift() ?? (await this.nextLine());
 			if (line === undefined) return;
@@ -259,9 +273,10 @@ class LiveFactory implements RpcChildFactory {
 	constructor(
 		readonly exitMode: LiveChildExitMode = "graceful",
 		readonly readyGate?: Gate,
+		readonly readyWatermark?: { entryCount: number; lastEntryId: string | null },
 	) {}
 	spawn(): ChildHandle {
-		const child = new LiveChild(this.exitMode, this.readyGate);
+		const child = new LiveChild(this.exitMode, this.readyGate, this.readyWatermark);
 		this.children.push(child);
 		this.#spawned.resolve(child);
 		return child;
@@ -4756,7 +4771,7 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		});
 		const archived = await untilResponse(client.client, "archive-after-exit");
 		expect(archived.response).toMatchObject({ ok: true, result: { archived: true } });
-		expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL", "SIGTERM"]);
+		expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL"]);
 		expect(appserver.childFor(sid("s1"))).toBeUndefined();
 		expect(authority.lifecycle).toEqual(["archive:s1"]);
 
@@ -4883,6 +4898,480 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		await appserver.stop();
 	});
 
+	test("coalesces prompt and external promotion into one child", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-promotion-coalesce-"));
+		const transcriptPath = join(root, "s1.jsonl");
+		await replaceTranscript(transcriptPath, transcript("s1"));
+		const gate = new Gate();
+		const factory = new LiveFactory("graceful", undefined, { entryCount: 0, lastEntryId: null });
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			discovery: new StaticDiscovery([{ ...record("s1"), path: transcriptPath }]),
+			childFactory: factory,
+			lockCheck: () => gate.lock(),
+			lockStatus: () => "missing",
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.prompt"]);
+		try {
+			client.client.sendJson(
+				command("promotion-prompt", "promotion-prompt", "session.prompt", "s1", { message: "prompt" }),
+			);
+			await gate.started.promise;
+			client.client.sendJson(command("promotion-attach", "promotion-attach", "session.attach", "s1", {}));
+			gate.opened.resolve();
+			const child = await factory.child();
+			const prompt = await waitForRpcWrite(child, "prompt");
+			child.push({ type: "response", id: prompt.frame.id, command: "prompt", success: true, data: {} });
+			const first = await untilResponse(client.client, "promotion-prompt");
+			expect(first.response.ok).toBe(true);
+			const second = await untilResponse(client.client, "promotion-attach");
+			expect(second.response.ok).toBe(true);
+			expect(factory.children).toHaveLength(1);
+		} finally {
+			await closeClients([client.client]);
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("ready then immediate child exit never publishes writable state", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-promotion-exit-"));
+		const factory = new LiveFactory("ready-exits", undefined, { entryCount: 0, lastEntryId: null });
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			discovery: new StaticDiscovery([record("s1")]),
+			childFactory: factory,
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.prompt"]);
+		try {
+			client.client.sendJson(command("exit-prompt", "exit-prompt", "session.prompt", "s1", { message: "prompt" }));
+			const child = await factory.child();
+			await child.exited;
+			expect((await untilResponse(client.client, "exit-prompt")).response.ok).toBe(false);
+			expect(appserver.childFor(sid("s1"))).toBeUndefined();
+			expect(appserver.snapshot(sid("s1"))?.ref.liveState?.sessionControl).toBeUndefined();
+		} finally {
+			await closeClients([client.client]);
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("promotion final poll requires matching child watermark and live child", async () => {
+		const cases = [
+			["matching", "graceful", { entryCount: 1, lastEntryId: "last" }, true],
+			["mismatched", "graceful", { entryCount: 0, lastEntryId: null }, false],
+			["ready-exits", "ready-exits", { entryCount: 1, lastEntryId: "last" }, false],
+		] as const;
+		for (const [label, exitMode, readyWatermark, writable] of cases) {
+			const root = await mkdtemp(join(tmpdir(), `omp-promotion-final-${label}-`));
+			const transcriptPath = join(root, "s1.jsonl");
+			await replaceTranscript(transcriptPath, transcript("s1"));
+			let lockStatus: "live" | "missing" = "live";
+			const factory = new LiveFactory(exitMode, undefined, readyWatermark);
+			const appserver = createAppserver({
+				hostId: host,
+				epoch,
+				socketPath: join(root, "app.sock"),
+				discovery: new StaticDiscovery([{ ...record("s1"), path: transcriptPath }]),
+				childFactory: factory,
+				lockStatus: () => lockStatus,
+				lockCheck: () => {},
+			});
+			await appserver.start();
+			const client = await readyClient(appserver.socketPath, ["sessions.read"]);
+			const attach = async (name: string) => {
+				client.client.sendJson(command(name, name, "session.attach", "s1", {}));
+				expect((await untilResponse(client.client, name)).response.ok).toBe(true);
+				await client.client.nextServer();
+			};
+			try {
+				await attach(`${label}-a`);
+				await replaceTranscript(transcriptPath, transcriptWithEntry("s1"));
+				lockStatus = "missing";
+				await attach(`${label}-b`);
+				await attach(`${label}-c`);
+				if (exitMode === "ready-exits") await (await factory.child()).exited;
+				const control = appserver.snapshot(sid("s1"))?.ref.liveState?.sessionControl;
+				if (writable) expect(control).toBeUndefined();
+				else expect(control).toMatchObject({ mode: "reconciling" });
+				if (factory.children.length !== 1)
+					throw new Error(`${label}: expected one promoted child, got ${factory.children.length}`);
+				if (writable) expect(appserver.snapshot(sid("s1"))?.entries).toHaveLength(1);
+			} finally {
+				await closeClients([client.client]);
+				await appserver.stop();
+				await rm(root, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test("promotion stays reconciling for an unresolved tool call, then promotes after its result", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-promotion-pending-tool-"));
+		const transcriptPath = join(root, "s1.jsonl");
+		const toolCall = JSON.stringify({
+			type: "message",
+			id: "assistant-call",
+			parentId: null,
+			timestamp: stamp,
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "pending-call", name: "read", arguments: { path: "file" } }],
+			},
+		});
+		const toolResult = JSON.stringify({
+			type: "message",
+			id: "tool-result",
+			parentId: null,
+			timestamp: stamp,
+			message: {
+				role: "toolResult",
+				toolCallId: "pending-call",
+				content: [{ type: "text", text: "done" }],
+			},
+		});
+		await replaceTranscript(transcriptPath, `${transcript("s1")}${toolCall}\n`);
+		let lockStatus: "live" | "missing" = "live";
+		const factory = new LiveFactory("graceful", undefined, { entryCount: 2, lastEntryId: "tool-result" });
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			discovery: new StaticDiscovery([{ ...record("s1"), path: transcriptPath }]),
+			childFactory: factory,
+			lockStatus: () => lockStatus,
+			lockCheck: () => {},
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read"]);
+		const attach = async (name: string) => {
+			client.client.sendJson(command(name, name, "session.attach", "s1", {}));
+			expect((await untilResponse(client.client, name)).response.ok).toBe(true);
+			await client.client.nextServer();
+		};
+		try {
+			await attach("pending-a");
+			lockStatus = "missing";
+			await attach("pending-b");
+			await attach("pending-c");
+			expect(factory.children).toHaveLength(0);
+			expect(appserver.snapshot(sid("s1"))?.ref.liveState?.sessionControl).toMatchObject({ mode: "reconciling" });
+
+			await replaceTranscript(transcriptPath, `${transcript("s1")}${toolCall}\n${toolResult}\n`);
+			await attach("settled-a");
+			await attach("settled-b");
+			expect(factory.children).toHaveLength(1);
+			expect(appserver.snapshot(sid("s1"))?.ref.liveState?.sessionControl).toBeUndefined();
+			expect(appserver.snapshot(sid("s1"))?.entries.filter(entry => entry.kind === "tool-use")).toHaveLength(1);
+		} finally {
+			await closeClients([client.client]);
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("replacement with empty, title-only, or wrong-session content never promotes", async () => {
+		const replacements = [
+			["empty", ""],
+			["title-only", `${JSON.stringify({ type: "title", v: 1, title: "Only title" })}\n`],
+			["wrong-session", transcript("other")],
+		] as const;
+		for (const [label, replacement] of replacements) {
+			const root = await mkdtemp(join(tmpdir(), `omp-promotion-${label}-`));
+			const transcriptPath = join(root, "s1.jsonl");
+			await replaceTranscript(transcriptPath, transcript("s1"));
+			let lockStatus: "live" | "missing" = "live";
+			const factory = new LiveFactory("graceful", undefined, { entryCount: 0, lastEntryId: null });
+			const appserver = createAppserver({
+				hostId: host,
+				epoch,
+				socketPath: join(root, "app.sock"),
+				discovery: new StaticDiscovery([{ ...record("s1"), path: transcriptPath }]),
+				childFactory: factory,
+				lockStatus: () => lockStatus,
+				lockCheck: () => {},
+			});
+			await appserver.start();
+			const client = await readyClient(appserver.socketPath, ["sessions.read"]);
+			try {
+				client.client.sendJson(command(`${label}-attach-a`, `${label}-attach-a`, "session.attach", "s1", {}));
+				expect((await untilResponse(client.client, `${label}-attach-a`)).response.ok).toBe(true);
+				await client.client.nextServer();
+				if (factory.children.length !== 0) throw new Error(`${label}: child appeared during live observer attach`);
+				expect(appserver.snapshot(sid("s1"))?.ref.liveState?.sessionControl?.mode).toBe("observer");
+				await replaceTranscript(transcriptPath, replacement);
+				lockStatus = "missing";
+				client.client.sendJson(command(`${label}-attach-b`, `${label}-attach-b`, "session.attach", "s1", {}));
+				expect((await untilResponse(client.client, `${label}-attach-b`)).response.ok).toBe(true);
+				await client.client.nextServer();
+				if (factory.children.length !== 0)
+					throw new Error(`${label}: invalid replacement promoted ${factory.children.length} child`);
+			} finally {
+				await closeClients([client.client]);
+				await appserver.stop();
+				await rm(root, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test("disconnect during attach leaves no child or observer runtime", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-observer-disconnect-"));
+		const transcriptPath = join(root, "s1.jsonl");
+		await replaceTranscript(transcriptPath, transcript("s1"));
+		const inspected = Promise.withResolvers<void>();
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			discovery: new StaticDiscovery([{ ...record("s1"), path: transcriptPath }]),
+			lockStatus: () => {
+				inspected.resolve();
+				return "live";
+			},
+			childFactory: new LiveFactory(),
+		});
+		await appserver.start();
+		const disconnected = await readyClient(appserver.socketPath, ["sessions.read"]);
+		try {
+			disconnected.client.sendJson(command("disconnect-attach", "disconnect-attach", "session.attach", "s1", {}));
+			await inspected.promise;
+			disconnected.client.destroy();
+			await disconnected.client.closed();
+			expect(appserver.childFor(sid("s1"))).toBeUndefined();
+			const reconnected = await readyClient(appserver.socketPath, ["sessions.read"]);
+			try {
+				reconnected.client.sendJson(
+					command("disconnect-attach-retry", "disconnect-attach-retry", "session.attach", "s1", {}),
+				);
+				expect((await untilResponse(reconnected.client, "disconnect-attach-retry")).response.ok).toBe(true);
+				await reconnected.client.nextServer();
+				expect(appserver.snapshot(sid("s1"))?.ref.liveState?.sessionControl?.mode).toBe("observer");
+			} finally {
+				await closeClients([reconnected.client]);
+			}
+		} finally {
+			await closeClients([disconnected.client]);
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("disconnect cleanup restarts cached attach observation", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-observer-reconnect-"));
+		const transcriptPath = join(root, "s1.jsonl");
+		await replaceTranscript(transcriptPath, transcript("s1"));
+		let lockStatus: "live" | "missing" = "live";
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			discovery: new StaticDiscovery([{ ...record("s1"), path: transcriptPath }]),
+			lockStatus: () => lockStatus,
+			childFactory: new LiveFactory(),
+		});
+		await appserver.start();
+		const first = await readyClient(appserver.socketPath, ["sessions.read"]);
+		try {
+			first.client.sendJson(command("cached-attach", "cached-attach", "session.attach", "s1", {}));
+			expect((await untilResponse(first.client, "cached-attach")).response.ok).toBe(true);
+			await first.client.nextServer();
+			expect(appserver.snapshot(sid("s1"))?.ref.liveState?.sessionControl?.mode).toBe("observer");
+			first.client.destroy();
+			await first.client.closed();
+
+			lockStatus = "missing";
+			await replaceTranscript(transcriptPath, transcript("s1", "Replaced"));
+			const second = await readyClient(appserver.socketPath, ["sessions.read"]);
+			try {
+				second.client.sendJson(command("cached-attach-replay", "cached-attach", "session.attach", "s1", {}));
+				expect((await untilResponse(second.client, "cached-attach-replay")).response.ok).toBe(true);
+				await second.client.nextServer();
+				// The observer interval is the production reconnect trigger; wait for that real event, not a guessed state.
+				await Bun.sleep(300);
+				expect(appserver.snapshot(sid("s1"))?.ref.liveState?.sessionControl?.mode).toBe("reconciling");
+			} finally {
+				await closeClients([second.client]);
+			}
+		} finally {
+			await closeClients([first.client]);
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("failed attach output leaves no observer", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-observer-attach-failure-"));
+		const transcriptPath = join(root, "s1.jsonl");
+		await replaceTranscript(transcriptPath, transcript("s1"));
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			discovery: new StaticDiscovery([{ ...record("s1"), path: transcriptPath }]),
+			lockStatus: () => "live",
+			childFactory: new LiveFactory(),
+		});
+		await appserver.start();
+		const failed = await readyClient(appserver.socketPath, ["sessions.read"]);
+		try {
+			failed.client.sendJson(
+				command("attach-bad-cursor", "attach-bad-cursor", "session.attach", "s1", { cursor: "bad" }),
+			);
+			expect(await failed.client.nextServer()).toMatchObject({ type: "error", code: "invalid_frame" });
+			await failed.client.closed();
+			expect(appserver.snapshot(sid("s1"))?.ref.liveState?.sessionControl).toBeUndefined();
+			const valid = await readyClient(appserver.socketPath, ["sessions.read"]);
+			try {
+				valid.client.sendJson(command("attach-after-failure", "attach-after-failure", "session.attach", "s1", {}));
+				expect((await untilResponse(valid.client, "attach-after-failure")).response.ok).toBe(true);
+				await valid.client.nextServer();
+				expect(appserver.snapshot(sid("s1"))?.ref.liveState?.sessionControl?.mode).toBe("observer");
+			} finally {
+				await closeClients([valid.client]);
+			}
+		} finally {
+			await closeClients([failed.client]);
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("observer and reconciling sessions reject raw terminal mutations and state reads", async () => {
+		for (const target of ["observer", "reconciling"] as const) {
+			const root = await mkdtemp(join(tmpdir(), `omp-observer-barrier-${target}-`));
+			const transcriptPath = join(root, "s1.jsonl");
+			await replaceTranscript(transcriptPath, transcript("s1"));
+			let lockStatus: "live" | "missing" = "live";
+			const appserver = createAppserver({
+				hostId: host,
+				epoch,
+				socketPath: join(root, "app.sock"),
+				discovery: new StaticDiscovery([{ ...record("s1"), path: transcriptPath }]),
+				lockStatus: () => lockStatus,
+				childFactory: new LiveFactory(),
+			});
+			await appserver.start();
+			const client = await readyClient(appserver.socketPath, ["sessions.read"]);
+			try {
+				client.client.sendJson(
+					command(`barrier-attach-${target}`, `barrier-attach-${target}`, "session.attach", "s1", {}),
+				);
+				expect((await untilResponse(client.client, `barrier-attach-${target}`)).response.ok).toBe(true);
+				await client.client.nextServer();
+				if (target === "reconciling") {
+					lockStatus = "missing";
+					client.client.sendJson(command("barrier-reconcile", "barrier-reconcile", "session.attach", "s1", {}));
+					expect((await untilResponse(client.client, "barrier-reconcile")).response.ok).toBe(true);
+					await client.client.nextServer();
+				}
+				expect(appserver.snapshot(sid("s1"))?.ref.liveState?.sessionControl?.mode).toBe(target);
+				client.client.sendJson({
+					v: "omp-app/1",
+					type: "terminal.input",
+					hostId: host,
+					sessionId: sid("s1"),
+					terminalId: "terminal",
+					data: "x",
+				});
+				expect(await client.client.nextServer()).toMatchObject({ type: "error", code: "SESSION_LOCKED" });
+				client.client.sendJson(
+					command(`barrier-state-${target}`, `barrier-state-${target}`, "session.state.get", "s1", {}),
+				);
+				expect((await untilResponse(client.client, `barrier-state-${target}`)).response).toMatchObject({
+					ok: false,
+					error: { code: "session_locked" },
+				});
+				expect(appserver.childFor(sid("s1"))).toBeUndefined();
+			} finally {
+				await closeClients([client.client]);
+				await appserver.stop();
+				await rm(root, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test("stale first attach publishes reconciling, rejects writes, and promotes only after lock removal", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-observer-stale-first-attach-"));
+		const transcriptPath = join(root, "s1.jsonl");
+		await replaceTranscript(transcriptPath, transcriptWithEntry("s1"));
+		let lockStatus: "stale" | "missing" = "stale";
+		const factory = new LiveFactory("graceful", undefined, { entryCount: 1, lastEntryId: "last" });
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			discovery: new StaticDiscovery([{ ...record("s1"), path: transcriptPath }]),
+			childFactory: factory,
+			lockStatus: () => lockStatus,
+			lockCheck: () => {},
+		});
+		await appserver.start();
+		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.prompt"]);
+		try {
+			client.client.sendJson(command("stale-attach", "stale-attach", "session.attach", "s1", {}));
+			const firstAttachFrames: ServerFrame[] = [];
+			for (;;) {
+				const frame = await client.client.nextServer();
+				firstAttachFrames.push(frame);
+				if (frame.type === "snapshot") break;
+			}
+			expect(firstAttachFrames).toContainEqual(expect.objectContaining({ type: "response", ok: true }));
+			expect(firstAttachFrames).toContainEqual(
+				expect.objectContaining({
+					type: "session.delta",
+					upsert: expect.objectContaining({
+						liveState: expect.objectContaining({
+							sessionControl: { mode: "reconciling", transcript: "live" },
+						}),
+					}),
+				}),
+			);
+			expect(appserver.snapshot(sid("s1"))?.ref.liveState?.sessionControl).toMatchObject({
+				mode: "reconciling",
+			});
+			expect(factory.children).toHaveLength(0);
+
+			client.client.sendJson(command("stale-prompt", "stale-prompt", "session.prompt", "s1", { message: "blocked" }));
+			expect((await untilResponse(client.client, "stale-prompt")).response).toMatchObject({
+				ok: false,
+				error: { code: "session_locked" },
+			});
+			expect(factory.children).toHaveLength(0);
+			client.client.sendJson({
+				v: "omp-app/1",
+				type: "terminal.input",
+				hostId: host,
+				sessionId: sid("s1"),
+				terminalId: "stale-terminal",
+				data: "blocked",
+			});
+			expect(await client.client.nextServer()).toMatchObject({ type: "error", code: "SESSION_LOCKED" });
+			expect(factory.children).toHaveLength(0);
+
+			lockStatus = "missing";
+			client.client.sendJson(command("stale-removed", "stale-removed", "session.attach", "s1", {}));
+			const removedAttachFrames: ServerFrame[] = [];
+			for (;;) {
+				const frame = await client.client.nextServer();
+				removedAttachFrames.push(frame);
+				if (frame.type === "snapshot") break;
+			}
+			expect(removedAttachFrames).toContainEqual(expect.objectContaining({ type: "response", ok: true }));
+			expect(factory.children).toHaveLength(1);
+			expect(appserver.snapshot(sid("s1"))?.ref.liveState?.sessionControl).toBeUndefined();
+		} finally {
+			await closeClients([client.client]);
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("session list reconciliation broadcasts newly discovered safe metadata", async () => {
 		const records: SessionRecord[] = [{ ...record("s1"), title: "Session" }];
 		const factory = new LiveFactory();
@@ -4994,8 +5483,11 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 			if (frame.type === "session.delta") expect((await observer.client.nextServer()).type).toBe("session.delta");
 
 		records.pop();
-		client.client.sendJson(hostCommand("list-removed", "list-removed", "session.list", {}));
-		const removed = await untilResponse(client.client, "list-removed");
+		client.client.sendJson(hostCommand("list-removed-first", "list-removed-first", "session.list", {}));
+		const firstMiss = await untilResponse(client.client, "list-removed-first");
+		expect(firstMiss.frames.map(frame => frame.type)).toEqual(["response"]);
+		client.client.sendJson(hostCommand("list-removed-second", "list-removed-second", "session.list", {}));
+		const removed = await untilResponse(client.client, "list-removed-second");
 		expect(removed.frames[0]).toMatchObject({ type: "session.delta", remove: sid("s2") });
 		expect(await observer.client.nextServer()).toMatchObject({ type: "session.delta", remove: sid("s2") });
 		expect(await child.killed.promise).toBeUndefined();

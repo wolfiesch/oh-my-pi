@@ -140,6 +140,32 @@ function formatFreshSessionResult(result: FreshSessionResult): string {
 	const stateLabel = result.closedProviderSessions === 1 ? "provider state" : "provider states";
 	return `Fresh provider session started (${result.closedProviderSessions} ${stateLabel} pruned).`;
 }
+export function getTuiTransferRefusal(ctx: InteractiveModeContext): string | undefined {
+	if (ctx.isShuttingDown) return "Cannot continue in T4 while the session is already shutting down.";
+	if (ctx.session.isStreaming || ctx.streamingComponent) return "Cannot continue in T4 while a response is streaming.";
+	if (ctx.autoCompactionLoader) return "Cannot continue in T4 while compaction is running.";
+	if (ctx.compactionQueuedMessages.length > 0) return "Cannot continue in T4 while compaction has queued work.";
+	if (ctx.session.queuedMessageCount > 0) return "Cannot continue in T4 while queued work is pending.";
+	if (ctx.hookSelector || ctx.hookInput || ctx.hookEditor) {
+		return "Cannot continue in T4 while approval or UI input is pending.";
+	}
+	return undefined;
+}
+
+export const transferToT4Handler = (
+	_command: ParsedSlashCommand,
+	runtime: TuiSlashCommandRuntime,
+): SlashCommandResult => {
+	const refusal = getTuiTransferRefusal(runtime.ctx);
+	if (refusal) {
+		runtime.ctx.showWarning(refusal);
+		return commandConsumed();
+	}
+	runtime.ctx.editor.setText("");
+	runtime.ctx.showStatus("Continuing in T4…");
+	void runtime.ctx.shutdown();
+	return commandConsumed();
+};
 
 const shutdownHandlerTui = (_command: ParsedSlashCommand, runtime: TuiSlashCommandRuntime): SlashCommandResult => {
 	runtime.ctx.editor.setText("");
@@ -1756,6 +1782,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		name: "exit",
 		description: "Exit the application",
 		handleTui: shutdownHandlerTui,
+	},
+	{
+		name: "continue-in-t4",
+		description: "Persist and continue this session in T4",
+		handleTui: transferToT4Handler,
 	},
 	{
 		name: "marketplace",

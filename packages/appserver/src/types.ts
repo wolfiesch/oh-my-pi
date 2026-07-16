@@ -125,6 +125,9 @@ export interface ChildHandle {
 	exited: Promise<number>;
 	kill(signal?: string): void;
 }
+
+export type SessionLockStatus = "missing" | "live" | "suspect" | "stale" | "malformed";
+export type SessionLockInspector = (session: SessionRecord) => SessionLockStatus;
 export type LockCheckHook = (session: SessionRecord) => Promise<void> | void;
 export interface RpcChildFactory {
 	spawn(spec: { session: SessionRecord; argv: string[]; cwd: string }): ChildHandle;
@@ -163,11 +166,14 @@ export interface AppserverOptions {
 	/** Maximum time allowed for one account-usage snapshot read. */
 	usageReadTimeoutMs?: number;
 	projectRootForProject?: (projectId: ProjectId) => Promise<string> | string;
-	childFactory?: RpcChildFactory;
+	/** Categorizes external ownership without weakening the write lock gate. */
+	lockStatus?: SessionLockInspector;
+	/** Final write-lock gate, retained for every child/lifecycle mutation. */
 	lockCheck?: LockCheckHook;
 	socketPath?: string;
 	ompVersion?: string;
 	ompBuild?: string;
+	childFactory?: RpcChildFactory;
 	appserverVersion?: string;
 	appserverBuild?: string;
 	supportedFeatures?: readonly string[];
