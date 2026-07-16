@@ -755,6 +755,7 @@ describe("app-wire authority", () => {
 	});
 	test("desktop catalog commands are an explicit canonical descriptor subset", () => {
 		const expected = [
+			"broker.status",
 			"session.create",
 			"session.rename",
 			"session.archive",
@@ -765,6 +766,7 @@ describe("app-wire authority", () => {
 			"session.thinking.set",
 			"session.fast.set",
 			"session.cancel",
+			"usage.read",
 		];
 		expect([...DESKTOP_CATALOG_COMMANDS].sort()).toEqual(expected.sort());
 		for (const command of DESKTOP_CATALOG_COMMANDS) expect(COMMAND_DESCRIPTORS[command].desktopCatalog).toBe(true);

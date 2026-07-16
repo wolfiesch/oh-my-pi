@@ -16,6 +16,7 @@ describe("broker.status wire contract", () => {
 			revision: "none",
 			revisionOwner: "none",
 			confirmation: "none",
+			desktopCatalog: true,
 		});
 		expect(REMOTE_DEFAULT_CAPABILITIES).not.toContain("broker.read");
 		expect(decodeCommandArguments("broker.status", {})).toEqual({});

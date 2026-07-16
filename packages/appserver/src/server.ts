@@ -633,10 +633,10 @@ export class LocalAppserver implements AppserverHandle {
 		this.#handlers.register("session.restore", command => this.handleRestore(command));
 		this.#handlers.register("session.delete", command => this.handleDelete(command));
 	}
-	hasDesktopSessionCommandHandler(command: string): boolean {
-		return (
-			this.#handlers.has(command) || DIRECT_SESSION_RPC_COMMANDS.has(command) || command === SESSION_CANCEL_COMMAND
-		);
+	hasDesktopCatalogCommandHandler(command: string): boolean {
+		if (command === "usage.read") return this.#usageAuthority !== undefined;
+		if (this.#operations?.hasCommand(command)) return true;
+		return this.#handlers.has(command) || DIRECT_SESSION_RPC_COMMANDS.has(command) || command === SESSION_CANCEL_COMMAND;
 	}
 	async start(): Promise<void> {
 		if (this.#started) return;

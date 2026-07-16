@@ -373,6 +373,7 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		revision: "none",
 		revisionOwner: "none",
 		confirmation: "none",
+		desktopCatalog: true,
 	},
 	"usage.read": {
 		capability: "usage.read",
@@ -380,6 +381,7 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		revision: "none",
 		revisionOwner: "none",
 		confirmation: "none",
+		desktopCatalog: true,
 	},
 	"host.watch": {
 		capability: "sessions.read",

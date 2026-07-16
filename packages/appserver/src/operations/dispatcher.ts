@@ -253,6 +253,9 @@ export class DesktopOperationDispatcher implements OperationCommandHandler {
 		private readonly terminalOwners = new TerminalOwnerRegistry(),
 		private readonly output?: (frame: unknown, owner: TerminalOwner) => void,
 	) {}
+	hasCommand(command: string): boolean {
+		return commandIsRoutable(this.authority, command);
+	}
 
 	async dispatch(command: CommandFrame, context: OperationContext): Promise<CommandResult> {
 		const descriptor = COMMAND_DESCRIPTORS[command.command];

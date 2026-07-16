@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-07-16
+
+### Fixed
+
+- Publish `usage.read` and `broker.status` in the desktop command catalog so capability-aware clients can discover them.
+
 ## [0.5.6] - 2026-07-16
 
 ### Added

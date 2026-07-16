@@ -74,6 +74,7 @@ describe("usage.read wire contract", () => {
 			revision: "none",
 			revisionOwner: "none",
 			confirmation: "none",
+			desktopCatalog: true,
 		});
 		expect(REMOTE_DEFAULT_CAPABILITIES).not.toContain("usage.read");
 		expect(decodeCommandArguments("usage.read", {})).toEqual({});

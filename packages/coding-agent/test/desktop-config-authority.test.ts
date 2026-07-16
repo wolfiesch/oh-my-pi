@@ -122,10 +122,12 @@ describe("DesktopConfigAuthority", () => {
 			["session.model.set", "sessions.manage"],
 			["session.thinking.set", "sessions.manage"],
 			["session.fast.set", "sessions.manage"],
+			["broker.status", "broker.read"],
+			["usage.read", "usage.read"],
 		] as const;
 		expect(
 			frame.items
-				.filter(item => item.kind === "command" && item.name.startsWith("session."))
+				.filter(item => item.kind === "command" && expectedCommands.some(([name]) => name === item.name))
 				.map(item => item.name)
 				.sort(),
 		).toEqual(expectedCommands.map(([name]) => name).sort());
