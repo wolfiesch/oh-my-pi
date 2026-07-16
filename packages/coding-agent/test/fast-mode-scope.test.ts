@@ -59,6 +59,7 @@ describe("/fast targets the current model's service-tier family", () => {
 		session.setFastMode(true);
 		expect(session.serviceTierByFamily).toEqual({ anthropic: "priority" });
 		expect(session.isFastModeEnabled()).toBe(true);
+		expect(session.isFastModeAvailable()).toBe(true);
 	});
 
 	it("enables priority on the OpenAI family for an OpenAI model", async () => {
@@ -66,6 +67,7 @@ describe("/fast targets the current model's service-tier family", () => {
 		session.setFastMode(true);
 		expect(session.serviceTierByFamily).toEqual({ openai: "priority" });
 		expect(session.isFastModeEnabled()).toBe(true);
+		expect(session.isFastModeAvailable()).toBe(true);
 	});
 
 	it("enables priority for a custom OpenAI-compatible relay serving an OpenAI model", async () => {
@@ -87,6 +89,7 @@ describe("/fast targets the current model's service-tier family", () => {
 		expect(session.serviceTierByFamily).toEqual({ openai: "priority" });
 		expect(session.isFastModeEnabled()).toBe(true);
 		expect(session.isFastModeActive()).toBe(true);
+		expect(session.isFastModeAvailable()).toBe(true);
 	});
 
 	it("leaves Fireworks models on the dedicated Fireworks tier control", async () => {
@@ -108,6 +111,7 @@ describe("/fast targets the current model's service-tier family", () => {
 		expect(session.serviceTierByFamily).toEqual({});
 		expect(session.isFastModeEnabled()).toBe(false);
 		expect(session.isFastModeActive()).toBe(false);
+		expect(session.isFastModeAvailable()).toBe(false);
 	});
 
 	it("clears only the current model's family when disabled", async () => {

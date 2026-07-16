@@ -231,7 +231,10 @@ function toolResultImages(content: unknown, details: unknown, allowManagedMarker
 
 export function projectNameFromCwd(cwd: string): string {
 	const pieces = cwd.replace(/[\\/]+$/u, "").split(/[\\/]/u);
-	return cleanText(pieces.at(-1) ?? "", 256, true);
+	const name = cleanText(pieces.at(-1) ?? "", 256, true);
+	if (name) return name;
+	if (/^[\\/]+$/u.test(cwd)) return cwd[0]!;
+	return "Project";
 }
 
 type ProjectionMode = "batch" | "live";
@@ -731,7 +734,7 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
 	};
 }
 /** Build a metadata-only record for oversized transcripts; entries stay empty because SessionRecord has no truncation flag. */
-function parseTranscriptMetadata(input: string | Uint8Array, path: string): SessionRecord {
+export function parseSessionTranscriptMetadata(input: string | Uint8Array, path: string): SessionRecord {
 	const bytes = typeof input === "string" ? encoder.encode(input).byteLength : input.byteLength;
 	if (bytes > MAX_METADATA_BYTES) throw new Error("metadata prefix exceeds limit");
 	const text = typeof input === "string" ? input : new TextDecoder("utf-8", { fatal: true }).decode(input);
@@ -863,7 +866,7 @@ export class FileSessionDiscovery implements SessionDiscovery {
 				if (!record) {
 					if (fileStat.size > MAX_TRANSCRIPT_BYTES) {
 						if (!this.fs.readFileSlice) throw new Error("oversized transcript has no bounded reader");
-						record = parseTranscriptMetadata(await this.fs.readFileSlice(path, MAX_METADATA_BYTES), path);
+						record = parseSessionTranscriptMetadata(await this.fs.readFileSlice(path, MAX_METADATA_BYTES), path);
 					} else {
 						record = parseTranscript(await this.fs.readFile(path), path, this.host);
 					}

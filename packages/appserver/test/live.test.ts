@@ -1,16 +1,26 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { decodeServerFrame, entryId, hostId, projectId, type ServerFrame, sessionId } from "@oh-my-pi/app-wire";
+import {
+	decodeServerFrame,
+	entryId,
+	hostId,
+	projectId,
+	type ServerFrame,
+	sessionId,
+	type UsageReadResult,
+} from "@oh-my-pi/app-wire";
 import { appserverLockCheck } from "../../coding-agent/src/session/appserver-authority";
 import { inspectSessionLock } from "../../coding-agent/src/session/session-lock";
+import { stableProjectId } from "../src/discovery.ts";
 import type { DesktopOperationsAuthority } from "../src/operations/dispatcher.ts";
 import type { PendingPromptProjection } from "../src/projection.ts";
 import { BunRpcChildFactory } from "../src/rpc-child.ts";
 import { createAppserver, type LocalAppserver } from "../src/server.ts";
 import type {
+	AppserverUsageAuthority,
 	ChildHandle,
 	Clock,
 	RpcChildFactory,
@@ -143,12 +153,14 @@ class StaticDiscovery implements SessionDiscovery {
 class FakeAuthority implements SessionAuthority {
 	readonly created = Promise.withResolvers<{ cwd: string; title?: string }>();
 	readonly lifecycle: string[] = [];
+	createCalls = 0;
 	failLifecycle = false;
 	constructor(private readonly values: SessionRecord[] = []) {}
 	async list(): Promise<SessionRecord[]> {
 		return this.values;
 	}
 	async create(cwd: string, title?: string) {
+		this.createCalls += 1;
 		this.created.resolve({ cwd, title });
 		return { sessionId: sid("created"), path: "/tmp/created.jsonl", cwd, title, entries: [] };
 	}
@@ -482,7 +494,156 @@ async function liveServer(
 	return { appserver, root, path };
 }
 
+const usageSnapshot: UsageReadResult = {
+	generatedAt: 1_800_000_000_000,
+	reports: [
+		{
+			provider: "anthropic",
+			fetchedAt: 1_799_999_999_000,
+			limits: [
+				{
+					id: "five-hour",
+					label: "5 Hour",
+					scope: { provider: "anthropic", accountId: "account-1", windowId: "5h", shared: true },
+					window: { id: "5h", label: "5 Hour", durationMs: 18_000_000, resetsAt: 1_800_010_000_000 },
+					amount: { usedFraction: 0.25, remainingFraction: 0.75, unit: "percent" },
+					status: "ok",
+				},
+			],
+			metadata: { email: "user@example.com", planType: "Max" },
+		},
+	],
+	accountsWithoutUsage: [],
+	capacity: {
+		anthropic: [{ window: "5h", durationMs: 18_000_000, accounts: 1, usedAccounts: 0.25, remainingAccounts: 0.75 }],
+	},
+};
+
+async function usageLiveServer(
+	usageAuthority: AppserverUsageAuthority,
+	usageReadTimeoutMs = 1_000,
+): Promise<{ appserver: LocalAppserver; root: string; path: string }> {
+	const root = await mkdtemp(join(tmpdir(), "omp-appserver-usage-live-"));
+	const path = join(root, "run", "app.sock");
+	const appserver = createAppserver({
+		hostId: host,
+		epoch,
+		socketPath: path,
+		discovery: new StaticDiscovery([]),
+		childFactory: new LiveFactory(),
+		usageAuthority,
+		usageReadTimeoutMs,
+	});
+	await appserver.start();
+	return { appserver, root, path };
+}
+
 describe("live Unix websocket protocol", () => {
+	test("serves a typed usage snapshot only to clients granted the dedicated capability", async () => {
+		let reads = 0;
+		const { appserver, path, root } = await usageLiveServer({
+			read: async signal => {
+				expect(signal.aborted).toBe(false);
+				reads += 1;
+				return usageSnapshot;
+			},
+		});
+		try {
+			const denied = await readyClient(path, ["sessions.read"]);
+			denied.client.sendJson(hostCommand("usage-denied", "usage-denied", "usage.read", {}));
+			expect((await untilResponse(denied.client, "usage-denied")).response).toMatchObject({
+				ok: false,
+				error: { code: "capability_denied" },
+			});
+
+			const allowed = await readyClient(path, ["usage.read"]);
+			expect(allowed.welcome.grantedCapabilities).toEqual(["usage.read"]);
+			allowed.client.sendJson(hostCommand("usage-ok", "usage-ok", "usage.read", {}));
+			expect((await untilResponse(allowed.client, "usage-ok")).response).toMatchObject({
+				ok: true,
+				result: usageSnapshot,
+			});
+			expect(reads).toBe(1);
+			await closeClients([denied.client, allowed.client]);
+		} finally {
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("fails closed when a usage authority returns secret or malformed provider data", async () => {
+		const unsafe = {
+			...usageSnapshot,
+			reports: [
+				{
+					...usageSnapshot.reports[0],
+					raw: { accessToken: "must-not-cross-wire" },
+					metadata: { accessToken: "must-not-cross-wire" },
+				},
+			],
+		} as unknown as UsageReadResult;
+		const { appserver, path, root } = await usageLiveServer({ read: async () => unsafe });
+		try {
+			const connected = await readyClient(path, ["usage.read"]);
+			connected.client.sendJson(hostCommand("usage-unsafe", "usage-unsafe", "usage.read", {}));
+			const response = (await untilResponse(connected.client, "usage-unsafe")).response;
+			expect(response).toMatchObject({ ok: false, error: { code: "usage_unavailable" } });
+			expect(JSON.stringify(response)).not.toContain("must-not-cross-wire");
+			await closeClients([connected.client]);
+		} finally {
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("bounds a stuck usage authority by timeout and aborts an in-flight read on disconnect", async () => {
+		const timedOut = Promise.withResolvers<UsageReadResult>();
+		let timeoutSignal: AbortSignal | undefined;
+		const timeoutServer = await usageLiveServer(
+			{
+				read: async signal => {
+					timeoutSignal = signal;
+					return timedOut.promise;
+				},
+			},
+			10,
+		);
+		try {
+			const connected = await readyClient(timeoutServer.path, ["usage.read"]);
+			connected.client.sendJson(hostCommand("usage-timeout", "usage-timeout", "usage.read", {}));
+			expect((await untilResponse(connected.client, "usage-timeout")).response).toMatchObject({
+				ok: false,
+				error: { code: "timeout" },
+			});
+			expect(timeoutSignal?.aborted).toBe(true);
+			await closeClients([connected.client]);
+		} finally {
+			await timeoutServer.appserver.stop();
+			await rm(timeoutServer.root, { recursive: true, force: true });
+		}
+
+		const started = Promise.withResolvers<void>();
+		const aborted = Promise.withResolvers<void>();
+		const disconnected = Promise.withResolvers<UsageReadResult>();
+		const disconnectServer = await usageLiveServer({
+			read: async signal => {
+				signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+				started.resolve();
+				return disconnected.promise;
+			},
+		});
+		try {
+			const connected = await readyClient(disconnectServer.path, ["usage.read"]);
+			connected.client.sendJson(hostCommand("usage-disconnect", "usage-disconnect", "usage.read", {}));
+			await started.promise;
+			connected.client.destroy();
+			await Promise.all([connected.client.closed(), aborted.promise]);
+		} finally {
+			await disconnectServer.appserver.stop();
+			await rm(disconnectServer.root, { recursive: true, force: true });
+		}
+	});
+
 	test("ignores unknown additive client feature requests", async () => {
 		const { appserver, path, root } = await liveServer(new LiveFactory());
 		try {
@@ -2493,6 +2654,14 @@ describe("live Unix websocket protocol", () => {
 			data: {
 				model: { id: "gpt-5.6", provider: "openai", name: "GPT 5.6" },
 				thinkingLevel: "high",
+				thinkingEffective: "medium",
+				thinkingResolved: "high",
+				thinkingLevels: ["minimal", "low", "medium", "high"],
+				thinkingSupported: true,
+				thinkingOffFloored: false,
+				fast: true,
+				fastAvailable: true,
+				fastActive: true,
 				isStreaming: false,
 				isCompacting: false,
 				isPaused: true,
@@ -2513,6 +2682,14 @@ describe("live Unix websocket protocol", () => {
 				isPaused: true,
 				model: { id: "gpt-5.6", provider: "openai", displayName: "GPT 5.6" },
 				thinking: "high",
+				thinkingEffective: "medium",
+				thinkingResolved: "high",
+				thinkingLevels: ["minimal", "low", "medium", "high"],
+				thinkingSupported: true,
+				thinkingOffFloored: false,
+				fast: true,
+				fastAvailable: true,
+				fastActive: true,
 				sessionName: "Renamed",
 				queuedMessages: { steering: ["steer"], followUp: ["follow"] },
 				contextUsage: { used: 123, limit: 1_000 },
@@ -2599,6 +2776,22 @@ describe("live Unix websocket protocol", () => {
 			event: { type: "approval.resolved", approvalId: "approval-1" },
 		});
 		expect(confirmed.response.ok).toBe(true);
+		child.push({
+			type: "thinking_level_changed",
+			thinkingLevel: "medium",
+			configured: "auto",
+			resolved: "medium",
+		});
+		expect(await client.client.nextServer()).toMatchObject({
+			type: "event",
+			event: { type: "thinking.level.changed", configured: "auto", resolved: "medium" },
+		});
+		const eventRefresh = await waitForRpcWriteId(child, "get_state", "thinking-level-changed:state", 3);
+		respondState(child, eventRefresh.frame);
+		expect(await client.client.nextServer()).toMatchObject({
+			type: "session.delta",
+			upsert: { liveState: { isStreaming: false } },
+		});
 		await closeClients([client.client]);
 		await appserver.stop();
 	});
@@ -4811,21 +5004,103 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		await appserver.stop();
 	});
 
-	test("created sessions publish project names and live fallback and explicit titles", async () => {
+	test("revalidates project identity and directory availability immediately before session creation", async () => {
 		const authority = new FakeAuthority();
-		const factory = new LiveFactory();
-		const root = await mkdtemp(join(tmpdir(), "omp-created-title-live-"));
+		const root = await mkdtemp(join(tmpdir(), "omp-create-project-fence-live-"));
+		const projectRoot = join(root, "project");
+		await mkdir(projectRoot);
+		let removeBeforeReturn = false;
 		const appserver = createAppserver({
 			hostId: host,
 			epoch,
 			socketPath: join(root, "app.sock"),
 			sessionAuthority: authority,
-			projectRootForProject: () => "/tmp/authority",
+			projectRootForProject: async () => {
+				if (removeBeforeReturn) await rm(projectRoot, { recursive: true, force: true });
+				return projectRoot;
+			},
+		});
+		try {
+			await appserver.start();
+			const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage"]);
+			client.client.sendJson(
+				hostCommand("create-mismatch", "create-mismatch", "session.create", {
+					projectId: "project-mismatch",
+				}),
+			);
+			const mismatch = await untilResponse(client.client, "create-mismatch");
+			expect(mismatch.frames.map(frame => frame.type)).toEqual(["response"]);
+			expect(mismatch.response.ok).toBe(false);
+			expect(authority.createCalls).toBe(0);
+
+			removeBeforeReturn = true;
+			client.client.sendJson(
+				hostCommand("create-removed", "create-removed", "session.create", {
+					projectId: stableProjectId(projectRoot),
+				}),
+			);
+			const removed = await untilResponse(client.client, "create-removed");
+			expect(removed.frames.map(frame => frame.type)).toEqual(["response"]);
+			expect(removed.response.ok).toBe(false);
+			expect(authority.createCalls).toBe(0);
+			await closeClients([client.client]);
+		} finally {
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("canonicalizes a project resolver alias before session creation", async () => {
+		const authority = new FakeAuthority();
+		const root = await mkdtemp(join(tmpdir(), "omp-create-project-alias-live-"));
+		const projectRoot = join(root, "project");
+		const projectAlias = join(root, "project-alias");
+		await mkdir(projectRoot);
+		await symlink(projectRoot, projectAlias);
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			projectRootForProject: () => projectAlias,
+		});
+		try {
+			await appserver.start();
+			const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage"]);
+			client.client.sendJson(
+				hostCommand("create-alias", "create-alias", "session.create", {
+					projectId: stableProjectId(projectAlias),
+				}),
+			);
+			const outcome = await untilResponse(client.client, "create-alias");
+			expect(outcome.response.ok).toBe(true);
+			await expect(authority.created.promise).resolves.toEqual({ cwd: projectRoot, title: undefined });
+			await closeClients([client.client]);
+		} finally {
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("created sessions publish project names and live fallback and explicit titles", async () => {
+		const authority = new FakeAuthority();
+		const factory = new LiveFactory();
+		const root = await mkdtemp(join(tmpdir(), "omp-created-title-live-"));
+		const authorityRoot = join(root, "authority");
+		await mkdir(authorityRoot);
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			sessionAuthority: authority,
+			projectRootForProject: () => authorityRoot,
 			childFactory: factory,
 		});
 		await appserver.start();
 		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]);
-		client.client.sendJson(hostCommand("create-live", "create-live", "session.create", { projectId: "requested" }));
+		client.client.sendJson(
+			hostCommand("create-live", "create-live", "session.create", { projectId: stableProjectId(authorityRoot) }),
+		);
 		const createdOutcome = await untilResponse(client.client, "create-live");
 		expect(createdOutcome.frames.map(frame => frame.type)).toEqual(["session.delta", "response"]);
 		const created = createdOutcome.response;
@@ -4922,17 +5197,21 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		const authority = new FakeAuthority();
 		const factory = new LiveFactory();
 		const root = await mkdtemp(join(tmpdir(), "omp-authority-live-"));
+		const authorityRoot = join(root, "authority");
+		await mkdir(authorityRoot);
 		const appserver = createAppserver({
 			hostId: host,
 			epoch,
 			socketPath: join(root, "app.sock"),
 			sessionAuthority: authority,
-			projectRootForProject: () => "/tmp/authority",
+			projectRootForProject: () => authorityRoot,
 			childFactory: factory,
 		});
 		await appserver.start();
 		const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage", "sessions.prompt"]);
-		client.client.sendJson(hostCommand("create", "create", "session.create", { projectId: "project-authority" }));
+		client.client.sendJson(
+			hostCommand("create", "create", "session.create", { projectId: stableProjectId(authorityRoot) }),
+		);
 		const createdOutcome = await untilResponse(client.client, "create");
 		expect(createdOutcome.frames.map(frame => frame.type)).toEqual(["session.delta", "response"]);
 		const created = createdOutcome.response;
@@ -4946,7 +5225,7 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 					title: "Session",
 				},
 			});
-			expect(JSON.stringify(created.result)).not.toContain("/tmp/authority");
+			expect(JSON.stringify(created.result)).not.toContain(authorityRoot);
 		}
 		await closeClients([client.client]);
 		await appserver.stop();

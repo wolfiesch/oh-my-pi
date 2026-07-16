@@ -2,8 +2,8 @@ import * as http from "node:http";
 import { isIP } from "node:net";
 import { isAbsolute, join } from "node:path";
 import type { AppserverDrainBusy, AppserverDrainResult, AppserverHandle } from "@oh-my-pi/appserver";
-import { createRemoteAppserver, defaultSocketPath } from "@oh-my-pi/appserver";
-import { getBlobsDir, getProfileRootDir, postmortem } from "@oh-my-pi/pi-utils";
+import { createRemoteAppserver, profileSocketPath } from "@oh-my-pi/appserver";
+import { getActiveProfile, getAgentDir, getBlobsDir, getProfileRootDir, postmortem } from "@oh-my-pi/pi-utils";
 import type { Settings as SettingsType } from "../config/settings";
 import { getCodingAgentAppserverIdentity } from "./appserver-identity";
 
@@ -37,6 +37,11 @@ export interface AppserverHealth {
 	ok: true;
 	hostId: string;
 	epoch: string;
+}
+
+export interface ActiveAppserverLocalIdentity {
+	socketPath: string;
+	hostIdPath?: string;
 }
 
 export interface AppserverDeviceSummary {
@@ -292,6 +297,7 @@ async function defaultCreateAppserver(
 	if (settings) runtimeOptions.settings = settings;
 	try {
 		const authStorage = await sdk.discoverAuthStorage();
+		runtimeOptions.authStorage = authStorage;
 		const modelRegistry = new modelModule.ModelRegistry(authStorage);
 		runtimeOptions.modelRegistry = modelRegistry;
 		if (settings) {
@@ -316,10 +322,12 @@ async function defaultCreateAppserver(
 	const runtime = createAppserverRuntime(runtimeOptions);
 	const base = {
 		...getCodingAgentAppserverIdentity(),
+		...activeAppserverLocalIdentity(),
 		sessionAuthority: runtime.sessionAuthority,
 		discovery: runtime.discovery,
 		operationsAuthority: runtime.operationsAuthority,
 		projectRootForProject: runtime.projectRootForProject,
+		usageAuthority: runtime.usageAuthority,
 		lockCheck: runtime.lockCheck,
 		transcriptImageRoot: getBlobsDir(),
 	};
@@ -335,8 +343,18 @@ async function defaultCreateAppserver(
 	};
 	return createRemoteAppserver({ stateDir: config.remoteStateDir, remoteEndpoint: endpoint, appserver: base });
 }
+export function activeAppserverLocalIdentity(): ActiveAppserverLocalIdentity {
+	const profile = getActiveProfile();
+	return {
+		socketPath: profileSocketPath(profile),
+		...(profile ? { hostIdPath: join(getAgentDir(), "appserver", "host-id") } : {}),
+	};
+}
+export function activeAppserverSocketPath(): string {
+	return activeAppserverLocalIdentity().socketPath;
+}
 function defaultRemoteStateDir(): string {
-	return join(getProfileRootDir(undefined), "appserver");
+	return join(getProfileRootDir(getActiveProfile()), "appserver");
 }
 export function validateAppserverServeConfig(config: AppserverServeConfig = {}): AppserverServeConfig {
 	const remoteFlags = hasRemoteFlags(config);
@@ -439,7 +457,7 @@ export async function runAppserverServe(
 }
 export async function runAppserverStatus(deps: AppserverRunnerDeps = {}): Promise<AppserverStatus> {
 	const readHealth = deps.readHealth ?? readUnixHealth;
-	const socketPath = (deps.socketPath ?? defaultSocketPath)();
+	const socketPath = (deps.socketPath ?? activeAppserverSocketPath)();
 	try {
 		const health = parseHealth(await readHealth(socketPath, deps.timeoutMs ?? STATUS_TIMEOUT_MS));
 		return { state: "running", health };
@@ -500,7 +518,7 @@ export async function runAppserverDrainIfIdle(
 ): Promise<AppserverDrainResult> {
 	if (!validIdentifier(flags.expectedHostId)) throw new Error("--expected-host-id is required");
 	if (!validIdentifier(flags.expectedEpoch)) throw new Error("--expected-epoch is required");
-	const socketPath = (deps.socketPath ?? defaultSocketPath)();
+	const socketPath = (deps.socketPath ?? activeAppserverSocketPath)();
 	const request = deps.adminRequest ?? readUnixAdmin;
 	const result = parseDrainResult(
 		await request(socketPath, "/admin/drain-if-idle", "POST", {
@@ -542,7 +560,7 @@ export async function runAppserverPair(
 		throw new Error("--ttl-seconds must be between 1 and 120");
 	if (flags.expectedNodeId !== undefined && (flags.expectedNodeId.length === 0 || flags.expectedNodeId.length > 512))
 		throw new Error("--expected-node-id is invalid");
-	const socketPath = (deps.socketPath ?? defaultSocketPath)();
+	const socketPath = (deps.socketPath ?? activeAppserverSocketPath)();
 	const request = deps.adminRequest ?? readUnixAdmin;
 	const ticket = parseTicket(
 		await request(socketPath, "/admin/pair-ticket", "POST", {
@@ -555,7 +573,7 @@ export async function runAppserverPair(
 	else process.stdout.write(`pair code ${ticket.code} expires ${new Date(ticket.expiresAt).toISOString()}\n`);
 }
 export async function runAppserverDevices(deps: AppserverRunnerDeps = {}, json = false): Promise<void> {
-	const socketPath = (deps.socketPath ?? defaultSocketPath)();
+	const socketPath = (deps.socketPath ?? activeAppserverSocketPath)();
 	const request = deps.adminRequest ?? readUnixAdmin;
 	const result = await request(socketPath, "/admin/devices", "GET");
 	if (!isRecord(result)) throw new Error("malformed devices response");
@@ -575,7 +593,7 @@ export async function runAppserverRevoke(
 	json = false,
 ): Promise<void> {
 	if (!deviceId || deviceId.length > 512) throw new Error("--device-id is required");
-	const socketPath = (deps.socketPath ?? defaultSocketPath)();
+	const socketPath = (deps.socketPath ?? activeAppserverSocketPath)();
 	const request = deps.adminRequest ?? readUnixAdmin;
 	const result = await request(socketPath, "/admin/revoke", "POST", { deviceId });
 	if (!isRecord(result) || result.revoked !== true) throw new Error("malformed revoke response");

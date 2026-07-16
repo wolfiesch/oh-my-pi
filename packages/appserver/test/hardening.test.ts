@@ -12,9 +12,16 @@ import {
 	projectId,
 	sessionId,
 } from "@oh-my-pi/app-wire";
-import { FileSessionDiscovery, stableProjectId } from "../src/discovery.ts";
+import { FileSessionDiscovery, projectNameFromCwd, stableProjectId } from "../src/discovery.ts";
 import { IdempotencyStore } from "../src/idempotency.ts";
-import { createEpoch, createHostId, loadPersistentHostId, unixSocketActive } from "../src/identity.ts";
+import {
+	createEpoch,
+	createHostId,
+	defaultSocketPath,
+	loadPersistentHostId,
+	profileSocketPath,
+	unixSocketActive,
+} from "../src/identity.ts";
 import { SessionProjection } from "../src/projection.ts";
 import { RpcChildSupervisor, resolveRpcChildInvocation } from "../src/rpc-child.ts";
 import { createAppserver } from "../src/server.ts";
@@ -216,6 +223,19 @@ describe("discovery hardening", () => {
 });
 
 describe("identity and socket ownership", () => {
+	test("default and named profile socket aliases preserve the public path contract", () => {
+		expect(defaultSocketPath("linux", "/home/test", "/run/user/1000")).toBe("/run/user/1000/omp/appserver.sock");
+		expect(profileSocketPath(undefined, "linux", "/home/test", "/run/user/1000")).toBe(
+			"/run/user/1000/omp/appserver.sock",
+		);
+		expect(profileSocketPath("default", "darwin", "/Users/test")).toBe("/Users/test/.omp/run/appserver.sock");
+		expect(profileSocketPath("alpha", "linux", "/home/test", "/run/user/1000")).toBe(
+			"/run/user/1000/omp/appserver-profile-8ed3f6ad685b959ead702251.sock",
+		);
+		expect(profileSocketPath("alpha", "darwin", "/Users/test")).toBe(
+			"/Users/test/.omp/run/appserver-profile-8ed3f6ad685b959ead702251.sock",
+		);
+	});
 	test("host identity persists while epochs are fresh", async () => {
 		const root = await mkdtemp(join(tmpdir(), "omp-id-"));
 		const path = join(root, "host-id");
@@ -226,6 +246,38 @@ describe("identity and socket ownership", () => {
 		expect(createEpoch("explicit-epoch")).toBe("explicit-epoch");
 		expect(createEpoch()).not.toBe(createEpoch());
 		expect((await stat(path)).mode & 0o777).toBe(0o600);
+	});
+	test("two named profiles coexist with isolated persistent host identities", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-profile-appservers-"));
+		const runtime = join(root, "runtime");
+		const home = join(root, "home");
+		const alphaSocket = profileSocketPath("alpha", "linux", home, runtime);
+		const betaSocket = profileSocketPath("beta", "linux", home, runtime);
+		const alphaIdentity = join(root, "profiles", "alpha", "agent", "appserver", "host-id");
+		const betaIdentity = join(root, "profiles", "beta", "agent", "appserver", "host-id");
+		const alpha = createAppserver({
+			socketPath: alphaSocket,
+			hostIdPath: alphaIdentity,
+			discovery: new StaticDiscovery([]),
+		});
+		const beta = createAppserver({
+			socketPath: betaSocket,
+			hostIdPath: betaIdentity,
+			discovery: new StaticDiscovery([]),
+		});
+		try {
+			await Promise.all([alpha.start(), beta.start()]);
+			expect(alpha.socketPath).not.toBe(beta.socketPath);
+			expect(await unixSocketActive(alphaSocket)).toBe(true);
+			expect(await unixSocketActive(betaSocket)).toBe(true);
+			expect(alpha.hostId).not.toBe(beta.hostId);
+			expect(await loadPersistentHostId(alphaIdentity)).toBe(alpha.hostId);
+			expect(await loadPersistentHostId(betaIdentity)).toBe(beta.hostId);
+		} finally {
+			await Promise.allSettled([alpha.stop(), beta.stop()]);
+		}
+		expect(await unixSocketActive(alphaSocket)).toBe(false);
+		expect(await unixSocketActive(betaSocket)).toBe(false);
 	});
 	test("refuses regular path and removes stale socket", async () => {
 		const root = await mkdtemp(join(tmpdir(), "omp-sock-"));
@@ -266,6 +318,51 @@ describe("identity and socket ownership", () => {
 		await expect(second.start()).rejects.toThrow();
 		await first.stop();
 		expect(await unixSocketActive(path)).toBe(false);
+	});
+});
+
+describe("project identity projection", () => {
+	test("root cwd is serialized as a non-empty project name and empty optional names are omitted", () => {
+		const rootRecord: SessionRecord = {
+			...record("root-project"),
+			cwd: "/",
+			projectId: stableProjectId("/"),
+			projectName: projectNameFromCwd("/"),
+		};
+		const rootProjection = new SessionProjection(host, rootRecord, "epoch-root").value;
+		const projected = rootProjection.ref;
+		expect(projected.project).toEqual({ projectId: stableProjectId("/"), name: "/" });
+		const decodedRoot = decodeServerFrame(
+			JSON.stringify({
+				v: "omp-app/1",
+				type: "sessions",
+				hostId: host,
+				cursor: rootProjection.cursor,
+				sessions: [projected],
+				totalCount: 1,
+				truncated: false,
+			}),
+		);
+		expect(decodedRoot.type).toBe("sessions");
+		if (decodedRoot.type === "sessions") expect(decodedRoot.sessions[0]?.project.name).toBe("/");
+
+		const unnamedProjection = new SessionProjection(host, { ...rootRecord, projectName: "" }, "epoch-unnamed").value;
+		const unnamed = unnamedProjection.ref;
+		expect(Object.hasOwn(unnamed.project, "name")).toBe(false);
+		const decodedUnnamed = decodeServerFrame(
+			JSON.stringify({
+				v: "omp-app/1",
+				type: "sessions",
+				hostId: host,
+				cursor: unnamedProjection.cursor,
+				sessions: [unnamed],
+				totalCount: 1,
+				truncated: false,
+			}),
+		);
+		expect(decodedUnnamed.type).toBe("sessions");
+		if (decodedUnnamed.type === "sessions")
+			expect(Object.hasOwn(decodedUnnamed.sessions[0]!.project, "name")).toBe(false);
 	});
 });
 
@@ -389,7 +486,15 @@ describe("projection, replay, and idempotency", () => {
 			followUpMode: "all",
 			interruptMode: "wait",
 			model: { id: "gpt-5.6", provider: "openai-codex", displayName: "GPT 5.6" },
-			thinking: "high",
+			thinking: "auto",
+			thinkingEffective: "medium",
+			thinkingResolved: "high",
+			thinkingLevels: ["minimal", "low", "medium", "high"],
+			thinkingSupported: true,
+			thinkingOffFloored: false,
+			fast: true,
+			fastAvailable: true,
+			fastActive: true,
 			contextUsage: { used: 12, limit: 100 },
 		});
 		projection.value.ref = {
@@ -409,7 +514,7 @@ describe("projection, replay, and idempotency", () => {
 			upsert: {
 				status: "closed",
 				model: "openai-codex/gpt-5.6",
-				thinking: "high",
+				thinking: "auto",
 				contextUsage: { used: 12, limit: 100 },
 				liveState: {
 					isStreaming: false,
@@ -417,6 +522,14 @@ describe("projection, replay, and idempotency", () => {
 					isPaused: true,
 					messageCount: 7,
 					queuedMessageCount: 0,
+					thinkingEffective: "medium",
+					thinkingResolved: "high",
+					thinkingLevels: ["minimal", "low", "medium", "high"],
+					thinkingSupported: true,
+					thinkingOffFloored: false,
+					fast: true,
+					fastAvailable: true,
+					fastActive: true,
 				},
 			},
 		});

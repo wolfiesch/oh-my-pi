@@ -14,6 +14,10 @@ export interface QueuedMessages {
 	steering: string[];
 	followUp: string[];
 }
+export const SESSION_THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type SessionThinkingEffort = (typeof SESSION_THINKING_EFFORTS)[number];
+export type SessionConfiguredThinking = "inherit" | "off" | "auto" | SessionThinkingEffort;
+export type SessionEffectiveThinking = "off" | SessionThinkingEffort;
 const MAX_QUEUE_ITEMS = 128;
 const MAX_QUEUE_TEXT = 65_536;
 export interface SessionStateResult {
@@ -27,8 +31,15 @@ export interface SessionStateResult {
 	interruptMode: "immediate" | "wait";
 	queuedMessages?: QueuedMessages;
 	model?: SessionModel;
-	thinking?: string;
+	thinking?: SessionConfiguredThinking;
+	thinkingEffective?: SessionEffectiveThinking;
+	thinkingResolved?: SessionThinkingEffort;
+	thinkingLevels?: SessionThinkingEffort[];
+	thinkingSupported?: boolean;
+	thinkingOffFloored?: boolean;
 	fast?: boolean;
+	fastAvailable?: boolean;
+	fastActive?: boolean;
 	sessionName?: string;
 	contextUsage?: ContextUsage;
 }
@@ -43,7 +54,14 @@ const KEYS = new Set([
 	"interruptMode",
 	"model",
 	"thinking",
+	"thinkingEffective",
+	"thinkingResolved",
+	"thinkingLevels",
+	"thinkingSupported",
+	"thinkingOffFloored",
 	"fast",
+	"fastAvailable",
+	"fastActive",
 	"sessionName",
 	"contextUsage",
 	"queuedMessages",
@@ -72,6 +90,11 @@ function queues(value: unknown, path: string): QueuedMessages {
 	const steering = boundedArray(raw.steering, `${path}.steering`, MAX_QUEUE_ITEMS).map(decode);
 	const followUp = boundedArray(raw.followUp, `${path}.followUp`, MAX_QUEUE_ITEMS).map(decode);
 	return { steering, followUp };
+}
+function thinkingValue<const T extends readonly string[]>(value: unknown, path: string, allowed: T): T[number] {
+	const text = controlFree(value, path, 64);
+	if (!allowed.includes(text)) fail("INVALID_FRAME", "invalid thinking level", path);
+	return text as T[number];
 }
 export function decodeSessionStateResult(value: unknown): SessionStateResult {
 	const out = strict(value, "result");
@@ -105,13 +128,33 @@ export function decodeSessionStateResult(value: unknown): SessionStateResult {
 			...(raw.role === undefined ? {} : { role: controlFree(raw.role, "result.model.role", 256) }),
 		};
 	}
-	const thinking = out.thinking === undefined ? undefined : controlFree(out.thinking, "result.thinking", 64);
-	if (
-		thinking !== undefined &&
-		!["inherit", "off", "auto", "minimal", "low", "medium", "high", "xhigh", "max"].includes(thinking)
-	)
-		fail("INVALID_FRAME", "invalid thinking level", "result.thinking");
+	const configuredLevels = ["inherit", "off", "auto", ...SESSION_THINKING_EFFORTS] as const;
+	const thinking =
+		out.thinking === undefined ? undefined : thinkingValue(out.thinking, "result.thinking", configuredLevels);
+	const effectiveLevels = ["off", ...SESSION_THINKING_EFFORTS] as const;
+	const thinkingEffective =
+		out.thinkingEffective === undefined
+			? undefined
+			: thinkingValue(out.thinkingEffective, "result.thinkingEffective", effectiveLevels);
+	const thinkingResolved =
+		out.thinkingResolved === undefined
+			? undefined
+			: thinkingValue(out.thinkingResolved, "result.thinkingResolved", SESSION_THINKING_EFFORTS);
+	const thinkingLevels =
+		out.thinkingLevels === undefined
+			? undefined
+			: boundedArray(out.thinkingLevels, "result.thinkingLevels", SESSION_THINKING_EFFORTS.length).map(
+					(value, index) => thinkingValue(value, `result.thinkingLevels[${index}]`, SESSION_THINKING_EFFORTS),
+				);
+	if (thinkingLevels && new Set(thinkingLevels).size !== thinkingLevels.length)
+		fail("INVALID_FRAME", "duplicate thinking level", "result.thinkingLevels");
+	const thinkingSupported =
+		out.thinkingSupported === undefined ? undefined : bool(out.thinkingSupported, "result.thinkingSupported");
+	const thinkingOffFloored =
+		out.thinkingOffFloored === undefined ? undefined : bool(out.thinkingOffFloored, "result.thinkingOffFloored");
 	const fast = out.fast === undefined ? undefined : bool(out.fast, "result.fast");
+	const fastAvailable = out.fastAvailable === undefined ? undefined : bool(out.fastAvailable, "result.fastAvailable");
+	const fastActive = out.fastActive === undefined ? undefined : bool(out.fastActive, "result.fastActive");
 	const sessionName =
 		out.sessionName === undefined ? undefined : controlFree(out.sessionName, "result.sessionName", 512);
 	const contextUsage = out.contextUsage === undefined ? undefined : context(out.contextUsage, "result.contextUsage");
@@ -129,6 +172,13 @@ export function decodeSessionStateResult(value: unknown): SessionStateResult {
 		...(model ? { model } : {}),
 		...(thinking === undefined ? {} : { thinking }),
 		...(fast === undefined ? {} : { fast }),
+		...(thinkingEffective === undefined ? {} : { thinkingEffective }),
+		...(thinkingResolved === undefined ? {} : { thinkingResolved }),
+		...(thinkingLevels === undefined ? {} : { thinkingLevels }),
+		...(thinkingSupported === undefined ? {} : { thinkingSupported }),
+		...(thinkingOffFloored === undefined ? {} : { thinkingOffFloored }),
+		...(fastAvailable === undefined ? {} : { fastAvailable }),
+		...(fastActive === undefined ? {} : { fastActive }),
 		...(sessionName === undefined ? {} : { sessionName }),
 		...(contextUsage ? { contextUsage } : {}),
 		...(queuedMessages ? { queuedMessages } : {}),

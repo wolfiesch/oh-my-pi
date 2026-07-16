@@ -102,6 +102,24 @@ describe("computeProviderWindowStats", () => {
 		expect(sevenDay.remainingAccounts).toBeCloseTo(1.4);
 	});
 
+	it("caps overage at one account of aggregate capacity", () => {
+		const reports = [
+			makeReport("anthropic", "account-a@example.test", [
+				makeLimit({ id: "5h", usedFraction: 1.2, durationMs: FIVE_HOURS, windowId: "5h" }),
+			]),
+		];
+
+		expect(computeProviderWindowStats(reports)).toEqual([
+			{
+				window: "5h",
+				durationMs: FIVE_HOURS,
+				accounts: 1,
+				usedAccounts: 1,
+				remainingAccounts: 0,
+			},
+		]);
+	});
+
 	it("ignores limits without a resolvable fraction", () => {
 		const reports = [
 			makeReport("anthropic", "account-a@example.test", [

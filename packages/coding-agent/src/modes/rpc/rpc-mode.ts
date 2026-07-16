@@ -1653,16 +1653,25 @@ export async function runRpcMode(
 
 			case "get_state": {
 				const queued = session.getQueuedMessages();
+				const model = session.model;
+				const thinkingLevels = [...session.getAvailableThinkingLevels()];
 				const state: RpcSessionState = {
-					model: session.model
+					model: model
 						? {
-								...session.model,
+								...model,
 								...(session.configuredModelSelector() ? { selector: session.configuredModelSelector() } : {}),
 								...(session.configuredModelRole() ? { role: session.configuredModelRole() } : {}),
 							}
 						: undefined,
 					thinkingLevel: session.configuredThinkingLevel(),
+					thinkingEffective: session.thinkingLevel,
+					thinkingResolved: session.autoResolvedThinkingLevel(),
+					thinkingLevels,
+					thinkingSupported: thinkingLevels.length > 0,
+					thinkingOffFloored: model?.thinking?.requiresEffort === true && model.thinking.suppressWhenOff !== true,
 					fast: session.isFastModeEnabled(),
+					fastAvailable: session.isFastModeAvailable(),
+					fastActive: session.isFastModeActive(),
 					isStreaming: session.isStreaming,
 					isCompacting: session.isCompacting,
 					isPaused: agentPauseGate.paused,

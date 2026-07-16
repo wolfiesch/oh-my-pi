@@ -1,6 +1,7 @@
 export * from "./additive.js";
 export * from "./agents.js";
 export * from "./audit.js";
+export * from "./broker.js";
 export * from "./capabilities.js";
 export * from "./command.js";
 export * from "./cursor.js";
@@ -21,4 +22,5 @@ export * from "./session-index.js";
 export * from "./session-state.js";
 export * from "./snapshot.js";
 export * from "./terminal.js";
+export * from "./usage.js";
 export * from "./user-terminals.js";

@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
-import { chmod, stat as fsStat, lstat, open, readlink, rename, symlink, unlink } from "node:fs/promises";
+import { chmod, stat as fsStat, lstat, open, readlink, realpath, rename, symlink, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import {
 	COMMAND_DESCRIPTORS,
@@ -13,6 +13,7 @@ import {
 	decodeCursor,
 	decodeSessionPromptArguments,
 	decodeSessionStateResult,
+	decodeUsageReadResult,
 	type HelloFrame,
 	type HostId,
 	IMAGE_UPLOAD_CHUNK_BYTES,
@@ -27,6 +28,7 @@ import {
 	type SessionImageReadArguments,
 	type SessionRef,
 	type SessionStateResult,
+	type UsageReadResult,
 	utf8ByteLength,
 } from "@oh-my-pi/app-wire";
 import type {
@@ -77,6 +79,7 @@ import type {
 	AppserverDrainResult,
 	AppserverHandle,
 	AppserverOptions,
+	AppserverUsageAuthority,
 	ChildHandle,
 	Clock,
 	CommandOutcome,
@@ -117,6 +120,7 @@ const DIRECT_SESSION_RPC_COMMANDS: ReadonlySet<string> = new Set([
 const SESSION_CANCEL_COMMAND = "session.cancel";
 const SUBAGENT_TRANSCRIPT_RPC_BYTES = 384 * 1024;
 const REMOTE_OUTBOUND_TRANSFORM_TIMEOUT_MS = 10_000;
+const DEFAULT_USAGE_READ_TIMEOUT_MS = 15_000;
 const PENDING_PROMPT_TEXT_BYTES = 8 * 1024;
 // cleanText removes most controls, but retained newlines, quotes, and
 // backslashes can double when JSON encoded. Keep enough room for that escaping
@@ -205,6 +209,19 @@ async function boundedRemoteTransform<T>(operation: Promise<T> | T): Promise<T> 
 		return await Promise.race([Promise.resolve(operation), timeout]);
 	} finally {
 		if (timer) clearTimeout(timer);
+	}
+}
+
+async function raceAbortSignal<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+	if (signal.aborted) throw new Error("operation aborted");
+	const gate = Promise.withResolvers<T>();
+	const onAbort = (): void => gate.reject(new Error("operation aborted"));
+	signal.addEventListener("abort", onAbort, { once: true });
+	operation.then(gate.resolve, gate.reject);
+	try {
+		return await gate.promise;
+	} finally {
+		signal.removeEventListener("abort", onAbort);
 	}
 }
 
@@ -321,8 +338,15 @@ function safeSessionState(value: unknown): SessionStateResult {
 				}
 			: {}),
 		...(raw.thinkingLevel === undefined ? {} : { thinking: raw.thinkingLevel }),
+		...(raw.thinkingEffective === undefined ? {} : { thinkingEffective: raw.thinkingEffective }),
+		...(raw.thinkingResolved === undefined ? {} : { thinkingResolved: raw.thinkingResolved }),
+		...(raw.thinkingLevels === undefined ? {} : { thinkingLevels: raw.thinkingLevels }),
+		...(raw.thinkingSupported === undefined ? {} : { thinkingSupported: raw.thinkingSupported }),
+		...(raw.thinkingOffFloored === undefined ? {} : { thinkingOffFloored: raw.thinkingOffFloored }),
 		...(typeof raw.fast === "boolean" ? { fast: raw.fast } : {}),
-		...(raw.sessionName === undefined ? {} : { sessionName: raw.sessionName }),
+		...(raw.fastAvailable === undefined ? {} : { fastAvailable: raw.fastAvailable }),
+		...(raw.fastActive === undefined ? {} : { fastActive: raw.fastActive }),
+		...(typeof raw.sessionName === "string" ? { sessionName: raw.sessionName } : {}),
 		...(context
 			? { contextUsage: { used: context.used ?? context.tokens, limit: context.limit ?? context.contextWindow } }
 			: {}),
@@ -453,7 +477,7 @@ export function appserverSupportedFeatures(
 	);
 }
 export function appserverSupportedCapabilities(
-	options: Pick<AppserverOptions, "operationsAuthority" | "supportedCapabilities">,
+	options: Pick<AppserverOptions, "operationsAuthority" | "supportedCapabilities" | "usageAuthority">,
 ): string[] {
 	const implemented = new Set([
 		"sessions.read",
@@ -462,6 +486,7 @@ export function appserverSupportedCapabilities(
 		"sessions.control",
 		...operationCapabilities(options.operationsAuthority),
 	]);
+	if (options.usageAuthority?.read) implemented.add("usage.read");
 	return [...(options.supportedCapabilities ?? implemented)];
 }
 export class LocalAppserver implements AppserverHandle {
@@ -472,12 +497,14 @@ export class LocalAppserver implements AppserverHandle {
 	#discovery: SessionDiscovery;
 	#authority?: SessionAuthority;
 	#operations?: DesktopOperationDispatcher;
+	#usageAuthority?: AppserverUsageAuthority;
 	#factory: RpcChildFactory;
 	#imageUploads: ImageUploadStore;
 	#transcriptImages?: TranscriptImageReader;
 	#lockCheck: LockCheckHook;
 	#ringSize: number;
 	#lifecycleQuiesceTimeoutMs: number;
+	#usageReadTimeoutMs: number;
 	#handlers = new AppserverCommandHandlers();
 	#challenges = new Map<string, { command: CommandFrame; ws: AppWs; expiresAt: number; hash: string }>();
 	#records = new Map<SessionId, SessionRecord>();
@@ -521,6 +548,7 @@ export class LocalAppserver implements AppserverHandle {
 	#started = false;
 	#stopping = false;
 	#hostProvided: boolean;
+	#hostIdPath?: string;
 	#ownerLock = false;
 	#ownerId?: string;
 	#ownerPaths?: OwnerPaths;
@@ -539,6 +567,7 @@ export class LocalAppserver implements AppserverHandle {
 	constructor(options: AppserverOptions = {}) {
 		this.#hostProvided = Boolean(options.hostId);
 		this.hostId = options.hostId ?? createHostId();
+		this.#hostIdPath = options.hostIdPath;
 		this.epoch = createEpoch(options.epoch);
 		this.socketPath = options.socketPath ?? defaultSocketPath();
 		this.#remotePolicy = options.remotePolicy;
@@ -556,6 +585,7 @@ export class LocalAppserver implements AppserverHandle {
 							void this.#sendFrame(ws, frame as ServerFrame);
 				})
 			: undefined;
+		this.#usageAuthority = options.usageAuthority;
 		this.#projectRootForProject = options.projectRootForProject;
 		this.#discovery = options.discovery ?? options.sessionAuthority ?? { list: async () => [] };
 		this.#imageUploads = new ImageUploadStore({ root: `${this.socketPath}.images` });
@@ -566,12 +596,19 @@ export class LocalAppserver implements AppserverHandle {
 		this.#lockCheck = options.lockCheck ?? (() => undefined);
 		this.#ringSize = options.ringSize ?? 256;
 		this.#lifecycleQuiesceTimeoutMs = options.lifecycleQuiesceTimeoutMs ?? 2_000;
+		this.#usageReadTimeoutMs = options.usageReadTimeoutMs ?? DEFAULT_USAGE_READ_TIMEOUT_MS;
 		if (
 			!Number.isSafeInteger(this.#lifecycleQuiesceTimeoutMs) ||
 			this.#lifecycleQuiesceTimeoutMs <= 0 ||
 			this.#lifecycleQuiesceTimeoutMs > 60_000
 		)
 			throw new Error("lifecycleQuiesceTimeoutMs must be between 1 and 60000");
+		if (
+			!Number.isSafeInteger(this.#usageReadTimeoutMs) ||
+			this.#usageReadTimeoutMs <= 0 ||
+			this.#usageReadTimeoutMs > 60_000
+		)
+			throw new Error("usageReadTimeoutMs must be between 1 and 60000");
 		this.#ompVersion = options.ompVersion ?? "local";
 		this.#ompBuild = options.ompBuild ?? "local";
 		this.#appserverVersion = options.appserverVersion ?? "0.1.0";
@@ -586,6 +623,7 @@ export class LocalAppserver implements AppserverHandle {
 			"sessions.control",
 			...operationCapabilities(options.operationsAuthority),
 		]);
+		if (options.usageAuthority?.read) implemented.add("usage.read");
 		if (requested.some(capability => !implemented.has(capability)))
 			throw new Error("unsupported capability has no handler");
 		this.#supportedCapabilities = new Set(requested);
@@ -605,7 +643,7 @@ export class LocalAppserver implements AppserverHandle {
 		this.#stopping = false;
 		this.#draining = false;
 		this.#closedSessions.clear();
-		if (!this.#hostProvided) this.hostId = await loadPersistentHostId();
+		if (!this.#hostProvided) this.hostId = await loadPersistentHostId(this.#hostIdPath);
 		this.#records.clear();
 		this.#projections.clear();
 		await this.loadSessions();
@@ -1160,7 +1198,37 @@ export class LocalAppserver implements AppserverHandle {
 						...this.sessionListResult(),
 					}),
 				};
-			else if (command.command === "session.attach") {
+			else if (command.command === "usage.read") {
+				if (!this.#usageAuthority) {
+					outcome = {
+						frame: response(this.hostId, command, false, undefined, {
+							code: "unsupported",
+							message: "usage reading is unavailable",
+						}),
+					};
+				} else {
+					const timeoutSignal = AbortSignal.timeout(this.#usageReadTimeoutMs);
+					const usageSignal = AbortSignal.any([controller.signal, timeoutSignal]);
+					try {
+						const result: UsageReadResult = decodeUsageReadResult(
+							await raceAbortSignal(this.#usageAuthority.read(usageSignal), usageSignal),
+						);
+						outcome = { frame: response(this.hostId, command, true, result) };
+					} catch {
+						const code = controller.signal.aborted
+							? "aborted"
+							: timeoutSignal.aborted
+								? "timeout"
+								: "usage_unavailable";
+						outcome = {
+							frame: response(this.hostId, command, false, undefined, {
+								code,
+								message: code === "timeout" ? "usage read timed out" : "usage read failed",
+							}),
+						};
+					}
+				}
+			} else if (command.command === "session.attach") {
 				const cursor = command.args.cursor;
 				const attachOutput = prepareAttachOutput(
 					projection!,
@@ -1540,11 +1608,21 @@ export class LocalAppserver implements AppserverHandle {
 		if (!this.#projectRootForProject) throw new Error("session project resolver is unavailable");
 		const requestedProjectId = args.projectId;
 		if (typeof requestedProjectId !== "string") throw new Error("session projectId is invalid");
-		const requestedCwd = await this.#projectRootForProject(projectId(requestedProjectId));
+		const requestedProject = projectId(requestedProjectId);
+		const requestedCwd = await this.#projectRootForProject(requestedProject);
 		if (typeof requestedCwd !== "string" || !requestedCwd.startsWith("/"))
 			throw new Error("project resolver returned an invalid local root");
+		let canonical: string;
+		try {
+			canonical = await realpath(requestedCwd);
+			if (!(await fsStat(canonical)).isDirectory()) throw new Error("not a directory");
+		} catch {
+			throw new Error("project resolver returned an unavailable local root");
+		}
+		if (stableProjectId(canonical) !== requestedProject)
+			throw new Error("project resolver returned a mismatched local root");
 		const title = typeof args.title === "string" ? args.title : undefined;
-		const created = await this.#authority.create(requestedCwd, title);
+		const created = await this.#authority.create(canonical, title);
 		const timestamp = this.#clock.now().toISOString();
 		const record: SessionRecord = {
 			sessionId: created.sessionId,
@@ -2220,6 +2298,8 @@ export class LocalAppserver implements AppserverHandle {
 							this.#projectTerminalStatus(sessionId, supervisor, `${frame.id}:terminal`);
 					}
 					if (frame.type === "agent_end") this.scheduleStateRefresh(sessionId, supervisor, "agent-end");
+					if (frame.type === "thinking_level_changed")
+						this.scheduleStateRefresh(sessionId, supervisor, "thinking-level-changed");
 				},
 				crashed: () => {
 					this.markSupervisorCrashed(sessionId, supervisor);

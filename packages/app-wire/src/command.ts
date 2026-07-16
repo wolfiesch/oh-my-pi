@@ -1,4 +1,5 @@
 import { decodeAuditEvent, decodeCatalogItem, decodeFileListEntry } from "./additive.js";
+import { decodeBrokerStatusResult } from "./broker.js";
 import type { DeviceCapability } from "./capabilities.js";
 import { decodeCursor } from "./cursor.js";
 import { fail } from "./errors.js";
@@ -51,6 +52,7 @@ import {
 } from "./limits.js";
 import { decodeSessionListResult, decodeSessionRef, type SessionListResult } from "./session-index.js";
 import { decodeSessionStateResult } from "./session-state.js";
+import { decodeUsageReadResult } from "./usage.js";
 export type RevisionOwner = "none" | "session" | "authority";
 export interface CommandDescriptor {
 	capability: DeviceCapability;
@@ -360,6 +362,20 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 	},
 	"catalog.get": {
 		capability: "catalog.read",
+		scope: "host",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "none",
+	},
+	"broker.status": {
+		capability: "broker.read",
+		scope: "host",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "none",
+	},
+	"usage.read": {
+		capability: "usage.read",
 		scope: "host",
 		revision: "none",
 		revisionOwner: "none",
@@ -959,6 +975,8 @@ export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown)
 	"settings.read": args,
 	"settings.write": value => metadata(value, "args"),
 	"catalog.get": args,
+	"broker.status": noArgs,
+	"usage.read": noArgs,
 	"host.watch": value => {
 		const x = args(value);
 		decodeCursor(x.cursor, "args.cursor");
@@ -1090,6 +1108,8 @@ export const COMMAND_RESULT_DECODERS: Readonly<Record<string, (value: unknown) =
 	"settings.read": decodeSettingsResult,
 	"settings.write": value => metadata(value, "result"),
 	"catalog.get": decodeCatalogResult,
+	"broker.status": value => decodeBrokerStatusResult(value) as unknown as CommandResult,
+	"usage.read": value => decodeUsageReadResult(value) as unknown as CommandResult,
 	"host.watch": decodeWatchResult,
 	"session.watch": decodeWatchResult,
 	"controller.lease.acquire": decodeLeaseResult,

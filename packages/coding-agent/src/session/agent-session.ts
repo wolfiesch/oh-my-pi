@@ -10009,6 +10009,11 @@ export class AgentSession {
 		return family ? this.#serviceTierByFamily[family] === "priority" : false;
 	}
 
+	/** Whether the selected model exposes a service-tier family that `/fast` can control. */
+	isFastModeAvailable(): boolean {
+		return this.model ? serviceTierFamily(this.model) !== undefined : false;
+	}
+
 	/**
 	 * True when `priority` is actually realized on the wire for the currently
 	 * selected model (OpenAI/Google `service_tier`, direct Anthropic fast mode,

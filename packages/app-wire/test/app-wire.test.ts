@@ -741,7 +741,9 @@ describe("app-wire authority", () => {
 			"audit.read": "none",
 			"audit.tail": "none",
 			"settings.read": "none",
+			"broker.status": "none",
 			"catalog.get": "none",
+			"usage.read": "none",
 			"host.watch": "none",
 			"session.watch": "none",
 		};
@@ -873,6 +875,27 @@ describe("app-wire authority", () => {
 		for (const level of ["invalid", "ultra", "extreme"]) {
 			expect(() => decodeCommandResult("session.state.get", { ...state, thinking: level })).toThrow(AppWireError);
 		}
+		const semanticState = {
+			...state,
+			thinking: "auto",
+			thinkingEffective: "medium",
+			thinkingResolved: "high",
+			thinkingLevels: ["minimal", "low", "medium", "high"],
+			thinkingSupported: true,
+			thinkingOffFloored: false,
+			fast: true,
+			fastAvailable: true,
+			fastActive: true,
+		};
+		expect(decodeCommandResult("session.state.get", semanticState)).toEqual(semanticState);
+		for (const malformed of [
+			{ ...semanticState, thinkingEffective: "auto" },
+			{ ...semanticState, thinkingResolved: "off" },
+			{ ...semanticState, thinkingLevels: ["low", "low"] },
+			{ ...semanticState, thinkingLevels: ["inherit"] },
+			{ ...semanticState, fastAvailable: "yes" },
+		])
+			expect(() => decodeCommandResult("session.state.get", malformed)).toThrow(AppWireError);
 		expect(() =>
 			decodeClientFrame({
 				v: "omp-app/1",

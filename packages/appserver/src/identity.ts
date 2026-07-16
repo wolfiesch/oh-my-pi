@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
@@ -20,6 +20,26 @@ export function defaultSocketPath(
 	return platform === "darwin"
 		? join(home, ".omp", "run", "appserver.sock")
 		: join(runtime || join(home, ".omp", "run"), "omp", "appserver.sock");
+}
+
+/**
+ * Resolve the public Unix-socket alias for an OMP profile.
+ *
+ * The implicit/default profile deliberately delegates to {@link defaultSocketPath}
+ * so its path remains byte-for-byte compatible. Named profiles share the same
+ * secured runtime directory while receiving a deterministic, fixed-width alias.
+ * Hashing keeps the pathname bounded even for the longest valid OMP profile name
+ * and prevents profile text from becoming a path segment.
+ */
+export function profileSocketPath(
+	profile: string | undefined,
+	platform = process.platform,
+	home = homedir(),
+	runtime = process.env.XDG_RUNTIME_DIR,
+): string {
+	if (!profile || profile === "default") return defaultSocketPath(platform, home, runtime);
+	const digest = createHash("sha256").update(profile).digest("hex").slice(0, 24);
+	return join(dirname(defaultSocketPath(platform, home, runtime)), `appserver-profile-${digest}.sock`);
 }
 export async function loadPersistentHostId(
 	path = join(process.env.HOME || homedir(), ".omp", "agent", "appserver", "host-id"),

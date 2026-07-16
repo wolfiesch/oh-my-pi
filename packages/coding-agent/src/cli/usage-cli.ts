@@ -460,9 +460,10 @@ export interface ProviderWindowStat {
  * Aggregate one provider's reports into per-window quota capacity stats.
  *
  * Limits are bucketed by window duration (5h, 7d, ...). Within a bucket each
- * account contributes its single highest used fraction — when an account has
- * several meters on the same window (tiered/metered limits), the most-burned
- * one is what binds.
+ * account contributes its single highest used fraction, capped to one account
+ * of aggregate capacity. The uncapped per-limit value still carries overage.
+ * When an account has several meters on the same window (tiered/metered limits),
+ * the most-burned one is what binds.
  */
 export function computeProviderWindowStats(reports: UsageReport[]): ProviderWindowStat[] {
 	const buckets = new Map<string, { window: string; durationMs?: number; fractions: number[] }>();
@@ -484,7 +485,7 @@ export function computeProviderWindowStats(reports: UsageReport[]): ProviderWind
 				buckets.set(key, { window, durationMs, fractions: [] });
 			}
 		}
-		for (const [key, fraction] of accountMax) buckets.get(key)!.fractions.push(fraction);
+		for (const [key, fraction] of accountMax) buckets.get(key)!.fractions.push(Math.max(0, Math.min(1, fraction)));
 	}
 	return [...buckets.values()]
 		.sort((a, b) => (a.durationMs ?? Number.POSITIVE_INFINITY) - (b.durationMs ?? Number.POSITIVE_INFINITY))
@@ -724,7 +725,7 @@ export function formatUsageHistory(
 	return lines.join("\n");
 }
 
-function collectStoredAccounts(authStorage: AuthStorage): UsageAccountIdentity[] {
+export function collectStoredAccounts(authStorage: AuthStorage): UsageAccountIdentity[] {
 	const accounts: UsageAccountIdentity[] = [];
 	const all = authStorage.getAll();
 	for (const provider in all) {

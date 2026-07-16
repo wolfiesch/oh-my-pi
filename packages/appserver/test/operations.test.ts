@@ -56,6 +56,7 @@ function authority(overrides: Partial<DesktopOperationsAuthority> = {}): Desktop
 		termOpen: async () => ({ terminalId: "term-1" }),
 		catalogGet: async () => ({ items: [] }),
 		settingsRead: async () => ({ revision: "revision-settings", settings: {} }),
+		brokerStatus: async () => ({ state: "local", generation: 1 }),
 		settingsWrite: async () => ({}),
 		configWrite: async () => ({}),
 		previewLaunch: async () => ({}),
@@ -84,6 +85,7 @@ describe("desktop operation dispatcher", () => {
 			"bash.run",
 			"catalog.get",
 			"settings.read",
+			"broker.status",
 			"settings.write",
 			"config.write",
 			"preview.launch",
@@ -106,7 +108,13 @@ describe("desktop operation dispatcher", () => {
 							: name === "bash.run"
 								? { command: "structured" }
 								: {};
-			const hostCommand = ["catalog.get", "settings.read", "settings.write", "config.write"].includes(name);
+			const hostCommand = [
+				"catalog.get",
+				"settings.read",
+				"broker.status",
+				"settings.write",
+				"config.write",
+			].includes(name);
 			await expect(
 				dispatcher.dispatch(command(name, args, !hostCommand), {
 					...context,

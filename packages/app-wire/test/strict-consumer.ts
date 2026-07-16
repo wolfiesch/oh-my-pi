@@ -33,3 +33,4 @@ void decodeServerFrame(result);
 void decoded;
 void APP_WIRE_VERSION;
 void COMMAND_DESCRIPTORS["session.create"];
+void COMMAND_DESCRIPTORS["usage.read"];

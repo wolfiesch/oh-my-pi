@@ -85,7 +85,7 @@ export class SessionProjection {
 			ref: {
 				hostId: host,
 				sessionId: record.sessionId,
-				project: { projectId: record.projectId, name: record.projectName },
+				project: { projectId: record.projectId, ...(record.projectName ? { name: record.projectName } : {}) },
 				revision: currentRevision,
 				title: record.title,
 				status: record.status,
@@ -221,6 +221,14 @@ export class SessionProjection {
 		delete liveState.modelProvider;
 		delete liveState.modelDisplayName;
 		delete liveState.runtimeCrashed;
+		delete liveState.thinkingEffective;
+		delete liveState.thinkingResolved;
+		delete liveState.thinkingLevels;
+		delete liveState.thinkingSupported;
+		delete liveState.thinkingOffFloored;
+		delete liveState.fast;
+		delete liveState.fastAvailable;
+		delete liveState.fastActive;
 		if (state.queuedMessages) liveState.queuedMessages = state.queuedMessages;
 		else delete liveState.queuedMessages;
 		if (state.sessionName !== undefined) next.title = state.sessionName;
@@ -232,6 +240,14 @@ export class SessionProjection {
 		} else delete next.model;
 		if (state.thinking !== undefined) next.thinking = state.thinking;
 		else delete next.thinking;
+		if (state.thinkingEffective !== undefined) liveState.thinkingEffective = state.thinkingEffective;
+		if (state.thinkingResolved !== undefined) liveState.thinkingResolved = state.thinkingResolved;
+		if (state.thinkingLevels !== undefined) liveState.thinkingLevels = state.thinkingLevels;
+		if (state.thinkingSupported !== undefined) liveState.thinkingSupported = state.thinkingSupported;
+		if (state.thinkingOffFloored !== undefined) liveState.thinkingOffFloored = state.thinkingOffFloored;
+		if (state.fast !== undefined) liveState.fast = state.fast;
+		if (state.fastAvailable !== undefined) liveState.fastAvailable = state.fastAvailable;
+		if (state.fastActive !== undefined) liveState.fastActive = state.fastActive;
 		if (state.contextUsage !== undefined) next.contextUsage = state.contextUsage;
 		else delete next.contextUsage;
 		if (next.status !== "closed" || recoverClosedStatus)

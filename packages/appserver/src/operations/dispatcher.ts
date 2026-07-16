@@ -40,6 +40,7 @@ export interface DesktopOperationsAuthority {
 	termOpen?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	catalogGet?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	settingsRead?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	brokerStatus?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	settingsWrite?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	configWrite?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	previewLaunch?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
@@ -84,6 +85,7 @@ const OPERATION_METHOD_BY_COMMAND: Readonly<Record<string, keyof DesktopOperatio
 	"term.open": "termOpen",
 	"catalog.get": "catalogGet",
 	"settings.read": "settingsRead",
+	"broker.status": "brokerStatus",
 	"settings.write": "settingsWrite",
 	"config.write": "configWrite",
 	"preview.launch": "previewLaunch",

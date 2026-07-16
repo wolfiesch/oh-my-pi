@@ -6,7 +6,7 @@ import { DESKTOP_CATALOG_COMMANDS, type DurableEntry, hostId, projectId, session
 import { completeAttachOutput, prepareAttachOutput } from "../src/attach-output.ts";
 import { IdempotencyStore } from "../src/idempotency.ts";
 import { SessionProjection } from "../src/projection.ts";
-import { appserverSupportedFeatures, createAppserver } from "../src/server.ts";
+import { appserverSupportedCapabilities, appserverSupportedFeatures, createAppserver } from "../src/server.ts";
 import { SubagentProjection } from "../src/subagent-projection.ts";
 import type { ChildHandle, RpcChildFactory, SessionDiscovery, SessionRecord } from "../src/types.ts";
 
@@ -184,6 +184,19 @@ describe("appserver lifecycle", () => {
 		expect(
 			appserverSupportedFeatures({ supportedFeatures: ["transcript.images"], transcriptImageRoot: undefined }),
 		).not.toContain("transcript.images");
+	});
+	test("advertises usage reads only when a concrete read authority exists", () => {
+		expect(appserverSupportedCapabilities({})).not.toContain("usage.read");
+		expect(
+			appserverSupportedCapabilities({
+				usageAuthority: {
+					read: async () => ({ generatedAt: 0, reports: [], accountsWithoutUsage: [], capacity: {} }),
+				},
+			}),
+		).toContain("usage.read");
+		expect(() => createAppserver({ supportedCapabilities: ["usage.read"] })).toThrow(
+			"unsupported capability has no handler",
+		);
 	});
 	test("every desktop catalog command has a live appserver handler", () => {
 		const appserver = createAppserver();

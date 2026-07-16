@@ -1,17 +1,29 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { join } from "node:path";
 import { hostId } from "@oh-my-pi/app-wire";
-import { type AppserverHandle, BunRpcChildFactory, resolveRpcChildInvocation } from "@oh-my-pi/appserver";
+import {
+	type AppserverHandle,
+	BunRpcChildFactory,
+	profileSocketPath,
+	resolveRpcChildInvocation,
+} from "@oh-my-pi/appserver";
 import {
 	type AppserverHealth,
 	type AppserverServeConfig,
+	activeAppserverLocalIdentity,
+	activeAppserverSocketPath,
+	runAppserverDevices,
 	runAppserverDrainIfIdle,
+	runAppserverPair,
+	runAppserverRevoke,
 	runAppserverServe,
 	runAppserverStatus,
+	validateAppserverServeConfig,
 } from "@oh-my-pi/pi-coding-agent/cli/appserver-cli";
 import { commands, isSubcommand } from "@oh-my-pi/pi-coding-agent/cli-commands";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SETTINGS_SCHEMA } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
+import { getActiveProfile, getAgentDir, getProfileRootDir, setProfile } from "@oh-my-pi/pi-utils/dirs";
 
 const health: AppserverHealth = { ok: true, hostId: "host-test", epoch: "epoch-test" };
 const drainHealth = { ok: true as const, hostId: hostId("host-test"), epoch: "epoch-test" };
@@ -79,6 +91,68 @@ describe("appserver CLI routing", () => {
 				readHealth: async () => health,
 			}),
 		).toEqual({ state: "running", health });
+	});
+
+	test("serve identity and every control action route to the active named profile", async () => {
+		const originalProfile = getActiveProfile();
+		const previousExitCode = process.exitCode;
+		const write = spyOn(process.stdout, "write").mockImplementation(() => true);
+		const requests: Array<{ socketPath: string; path: string; method: "GET" | "POST" }> = [];
+		try {
+			setProfile(undefined);
+			expect(activeAppserverLocalIdentity()).toEqual({ socketPath: profileSocketPath(undefined) });
+			expect(validateAppserverServeConfig({ remoteMode: "direct", remoteAddress: "127.0.0.1" }).remoteStateDir).toBe(
+				join(getProfileRootDir(undefined), "appserver"),
+			);
+			setProfile("profile-route-test");
+			process.exitCode = 0;
+			const expectedSocket = profileSocketPath("profile-route-test");
+			expect(activeAppserverSocketPath()).toBe(expectedSocket);
+			expect(activeAppserverLocalIdentity()).toEqual({
+				socketPath: expectedSocket,
+				hostIdPath: join(getAgentDir(), "appserver", "host-id"),
+			});
+			expect(validateAppserverServeConfig({ remoteMode: "direct", remoteAddress: "127.0.0.1" }).remoteStateDir).toBe(
+				join(getProfileRootDir("profile-route-test"), "appserver"),
+			);
+
+			const adminRequest = async (socketPath: string, path: string, method: "GET" | "POST"): Promise<unknown> => {
+				requests.push({ socketPath, path, method });
+				if (path === "/admin/drain-if-idle") return { state: "draining", health: drainHealth, busy: drainBusy };
+				if (path === "/admin/pair-ticket") return { code: "123456", expiresAt: Date.now() + 60_000 };
+				if (path === "/admin/devices") return { devices: [] };
+				if (path === "/admin/revoke") return { revoked: true };
+				throw new Error(`unexpected admin path ${path}`);
+			};
+			const deps = { adminRequest };
+			expect(
+				await runAppserverStatus({
+					readHealth: async socketPath => {
+						requests.push({ socketPath, path: "/health", method: "GET" });
+						return health;
+					},
+				}),
+			).toEqual({ state: "running", health });
+			await runAppserverDrainIfIdle(deps, {
+				expectedHostId: "host-test",
+				expectedEpoch: "epoch-test",
+			});
+			await runAppserverPair(deps);
+			await runAppserverDevices(deps);
+			await runAppserverRevoke(deps, "device-test");
+
+			expect(requests).toEqual([
+				{ socketPath: expectedSocket, path: "/health", method: "GET" },
+				{ socketPath: expectedSocket, path: "/admin/drain-if-idle", method: "POST" },
+				{ socketPath: expectedSocket, path: "/admin/pair-ticket", method: "POST" },
+				{ socketPath: expectedSocket, path: "/admin/devices", method: "GET" },
+				{ socketPath: expectedSocket, path: "/admin/revoke", method: "POST" },
+			]);
+		} finally {
+			setProfile(originalProfile);
+			write.mockRestore();
+			process.exitCode = previousExitCode ?? 0;
+		}
 	});
 
 	test("status maps malformed and unavailable health to stopped states", async () => {

@@ -13,6 +13,7 @@ import type {
 	SessionEvent,
 	SessionId,
 	SessionRef,
+	UsageReadResult,
 } from "@oh-my-pi/app-wire";
 import type { DesktopOperationsAuthority } from "./operations/dispatcher.ts";
 import type { BunRemoteListener } from "./remote/listener.ts";
@@ -146,13 +147,21 @@ export interface AppserverAdminCallbacks {
 	}[];
 	revokeDevice(deviceId: string): { readonly revoked: true };
 }
+export interface AppserverUsageAuthority {
+	read(signal: AbortSignal): Promise<UsageReadResult>;
+}
 export interface AppserverOptions {
 	hostId?: HostId;
+	/** Persistent host identity path. Omitted to preserve the default OMP identity location. */
+	hostIdPath?: string;
 	epoch?: string;
 	clock?: Clock;
 	discovery?: SessionDiscovery;
 	sessionAuthority?: SessionAuthority;
 	operationsAuthority?: DesktopOperationsAuthority;
+	usageAuthority?: AppserverUsageAuthority;
+	/** Maximum time allowed for one account-usage snapshot read. */
+	usageReadTimeoutMs?: number;
 	projectRootForProject?: (projectId: ProjectId) => Promise<string> | string;
 	childFactory?: RpcChildFactory;
 	lockCheck?: LockCheckHook;

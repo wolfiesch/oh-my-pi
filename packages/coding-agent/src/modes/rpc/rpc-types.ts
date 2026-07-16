@@ -118,7 +118,14 @@ export interface RpcSessionState {
 	model?: Model;
 	isStreaming: boolean;
 	thinkingLevel: ThinkingLevel | "auto" | undefined;
+	thinkingEffective?: ThinkingLevel;
+	thinkingResolved?: Effort;
+	thinkingLevels?: Effort[];
+	thinkingSupported?: boolean;
+	thinkingOffFloored?: boolean;
 	fast: boolean;
+	fastAvailable: boolean;
+	fastActive: boolean;
 	isCompacting: boolean;
 	steeringMode: "all" | "one-at-a-time";
 	isPaused?: boolean;

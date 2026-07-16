@@ -16,8 +16,10 @@ export const DEVICE_CAPABILITIES = [
 	"agents.control",
 	"audit.read",
 	"config.read",
-	"config.write",
 	"catalog.read",
+	"config.write",
+	"broker.read",
+	"usage.read",
 	"preview.read",
 	"preview.control",
 ] as const;

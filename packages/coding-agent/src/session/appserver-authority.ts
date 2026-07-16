@@ -1,5 +1,6 @@
 import { statSync } from "node:fs";
 import * as path from "node:path";
+import type { UsageReadResult } from "@oh-my-pi/app-wire";
 import { hostId, type ProjectId, type SessionId, sessionId } from "@oh-my-pi/app-wire";
 import type { LockCheckHook, SessionAuthority, SessionAuthoritySession, SessionRecord } from "@oh-my-pi/appserver";
 import {
@@ -14,7 +15,15 @@ import { getAgentDir, getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import type { AgentRegistry } from "../registry/agent-registry";
+import { createAppserverBrokerStatus } from "./appserver-broker";
+import {
+	defaultSameFamilyProjectCatalog,
+	type ProjectRootCatalog,
+	resolveProjectRootFromRecords,
+} from "./appserver-project-catalog";
 import { AppserverSessionLifecycleStore } from "./appserver-session-lifecycle";
+import { createAppserverUsageAuthority } from "./appserver-usage";
+import type { AuthStorage } from "./auth-storage";
 import {
 	createDesktopConfigAuthority,
 	type DesktopConfigAuthority,
@@ -33,6 +42,7 @@ export interface AppserverRuntimeAuthorities {
 	sessionAuthority: SessionAuthority;
 	discovery: { list(): Promise<SessionRecord[]> };
 	operationsAuthority: DesktopOperationsAuthority;
+	usageAuthority?: { read(signal: AbortSignal): Promise<UsageReadResult> };
 	projectRootForProject(project: ProjectId): Promise<string>;
 	projectRootForSession(session: SessionId): Promise<string>;
 	lockCheck: LockCheckHook;
@@ -41,8 +51,10 @@ export interface AppserverRuntimeAuthorities {
 export interface AppserverAuthorityOptions {
 	sessionsDir?: string;
 	lifecycleMetadataPath?: string;
+	/** Override or disable the read-only same-family project catalog. */
+	projectCatalog?: ProjectRootCatalog | false;
 	settings?: Settings;
-	modelRegistry?: Pick<ModelRegistry, "getAll" | "getAvailable">;
+	modelRegistry?: Pick<ModelRegistry, "getAll" | "getAvailable" | "getProviderBaseUrl">;
 	agentRegistry?: Pick<AgentRegistry, "list">;
 	skillsLoader?: () => unknown | Promise<unknown>;
 	pluginManager?: { list(): unknown[] | Promise<unknown[]> };
@@ -52,6 +64,8 @@ export interface AppserverAuthorityOptions {
 		apply(request: DesktopReviewApplyRequest, context?: unknown): unknown | Promise<unknown>;
 	};
 	agentAuthority?: { cancel(agentId: string, sessionId: string): Promise<boolean> };
+	authStorage?: AuthStorage;
+	usageAuthority?: { read(signal: AbortSignal): Promise<UsageReadResult> };
 }
 
 function settingsPort(settings: Settings): DesktopSettingsPort {
@@ -82,6 +96,8 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 	};
 	const authorityHost = hostId("appserver-authority");
 	const baseDiscovery = new FileSessionDiscovery(sessionsDir, undefined, authorityHost);
+	const projectCatalog =
+		options.projectCatalog === false ? undefined : (options.projectCatalog ?? defaultSameFamilyProjectCatalog());
 	const refresh = async (): Promise<SessionRecord[]> => {
 		await ensureRecovered();
 		const archived = await lifecycle.archivedSessions();
@@ -174,11 +190,7 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 		return projectRootForSessionSync(session);
 	};
 	const projectRootForProject = async (project: ProjectId): Promise<string> => {
-		const matches = (await discovery.list()).filter(record => record.projectId === project);
-		const roots = [...new Set(matches.map(record => record.cwd))];
-		if (roots.length === 0) throw new Error("unknown project");
-		if (roots.length !== 1) throw new Error("ambiguous project");
-		return roots[0];
+		return resolveProjectRootFromRecords(project, await discovery.list(), projectCatalog);
 	};
 	const firstSession = (): SessionRecord => {
 		const record = [...records.values()][0];
@@ -193,7 +205,18 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 		...(options.agentAuthority ? { agentAuthority: options.agentAuthority } : {}),
 	};
 	const coding = new CodingAgentDesktopAuthority(codingContext);
+	const brokerStatus = createAppserverBrokerStatus({
+		authStorage: options.authStorage,
+		configuredUrl: options.settings?.get("auth.broker.url"),
+	});
+	const usageAuthority =
+		options.usageAuthority ??
+		(options.authStorage && options.modelRegistry
+			? createAppserverUsageAuthority(options.authStorage, options.modelRegistry)
+			: undefined);
 	const operations: DesktopOperationsAuthority = {
+		brokerStatus: async (_args, context) =>
+			(await brokerStatus(context.abortSignal)) as unknown as Record<string, unknown>,
 		filesRead: (args, context) =>
 			coding.filesRead(args as unknown as Parameters<typeof coding.filesRead>[0], context) as unknown as Promise<
 				Record<string, unknown>
@@ -318,6 +341,7 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 		sessionAuthority,
 		discovery,
 		operationsAuthority: operations,
+		...(usageAuthority ? { usageAuthority } : {}),
 		projectRootForProject,
 		projectRootForSession,
 		lockCheck: appserverLockCheck,
