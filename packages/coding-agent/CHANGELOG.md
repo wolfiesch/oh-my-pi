@@ -45,11 +45,13 @@
 ### Removed
 
 - Removed the unreliable Bing and Yahoo HTML-scraping web search providers
+### Added
+
+- Added model- and reasoning-aware advisor auto-activation through `advisor.autoEnableFor`, plus `/advisor auto` to restore configured behavior after a session override ([#5824](https://github.com/can1357/oh-my-pi/pull/5824) by [@wolfiesch](https://github.com/wolfiesch)).
 
 ## [17.0.2] - 2026-07-17
 
 ### Added
-
 - Added native Warp CLI-agent events for rich session status, tool approvals, and completion notifications.
 - Added support for ChatGPT/Codex subscriptions in the `generate_image` tool, allowing image generation without a metered `OPENAI_API_KEY` even when using other active models.
 - Added an optional `provider` parameter to `generate_image` to override the global `providers.image` setting for a single request.

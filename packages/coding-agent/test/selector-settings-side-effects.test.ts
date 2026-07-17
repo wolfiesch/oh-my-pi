@@ -52,6 +52,23 @@ describe("selector setting side effects", () => {
 		expect(requestRender).toHaveBeenCalledTimes(1);
 	});
 
+	it("refreshes advisor settings without clearing the session override", () => {
+		const refreshAdvisorActivation = vi.fn();
+		const resetAdvisorEnabledOverride = vi.fn();
+		const invalidate = vi.fn();
+		const controller = new SelectorController({
+			session: { refreshAdvisorActivation, resetAdvisorEnabledOverride },
+			statusLine: { invalidate },
+		} as unknown as InteractiveModeContext);
+
+		controller.handleSettingChange("advisor.autoEnableFor", "pi/smol:low");
+		controller.handleSettingChange("advisor.enabled", false);
+
+		expect(refreshAdvisorActivation).toHaveBeenCalledTimes(2);
+		expect(resetAdvisorEnabledOverride).not.toHaveBeenCalled();
+		expect(invalidate).toHaveBeenCalledTimes(2);
+	});
+
 	it("invalidates the UI and requests a repaint when tui.tight changes", () => {
 		const invalidate = vi.fn();
 		const requestRender = vi.fn();

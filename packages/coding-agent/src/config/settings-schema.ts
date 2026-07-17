@@ -419,9 +419,20 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "model",
 			group: "Advisor",
-			label: "Enable Advisor",
+			label: "Always Enable Advisor",
 			description:
-				"Pair a second model (assigned to the 'advisor' role) that passively reviews each turn and injects notes.",
+				"Pair a second model (assigned to the 'advisor' role) that passively reviews every turn. Overrides automatic model rules.",
+		},
+	},
+	"advisor.autoEnableFor": {
+		type: "string",
+		default: "",
+		ui: {
+			tab: "model",
+			group: "Advisor",
+			label: "Auto-Enable For",
+			description:
+				"Comma-separated model or role selectors. Add a thinking suffix such as :low to match that configured level only.",
 		},
 	},
 	"prewalk.enabled": {

@@ -1139,13 +1139,20 @@ export interface ResolvedModelRoleValue {
 	model: Model<Api> | undefined;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	explicitThinkingLevel: boolean;
+	/** Unclamped explicit thinking selector from the matched pattern. */
+	explicitThinkingSelector?: ConfiguredThinkingLevel;
 	warning: string | undefined;
 }
 
 export function resolveModelRoleValue(
 	roleValue: string | undefined,
 	availableModels: Model<Api>[],
-	options?: { settings?: Settings; roleLookup?: ModelRoleLookup; matchPreferences?: ModelMatchPreferences },
+	options?: {
+		settings?: Settings;
+		roleLookup?: ModelRoleLookup;
+		matchPreferences?: ModelMatchPreferences;
+		allowInvalidThinkingSelectorFallback?: boolean;
+	},
 ): ResolvedModelRoleValue {
 	if (!roleValue) {
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
@@ -1168,7 +1175,9 @@ export function resolveModelRoleValue(
 	// rebuilding it per pattern inside parseModelPattern.
 	const preferenceContext = buildPreferenceContext(availableModels, matchPreferences);
 	for (const effectivePattern of effectivePatterns) {
-		const resolved = matchPatternWithContext(effectivePattern, availableModels, preferenceContext);
+		const resolved = matchPatternWithContext(effectivePattern, availableModels, preferenceContext, {
+			allowInvalidThinkingSelectorFallback: options?.allowInvalidThinkingSelectorFallback,
+		});
 		if (resolved.model) {
 			return {
 				model: resolved.model,
@@ -1178,6 +1187,7 @@ export function resolveModelRoleValue(
 						: (resolveThinkingLevelForModel(resolved.model, resolved.thinkingLevel) ?? resolved.thinkingLevel)
 					: resolved.thinkingLevel,
 				explicitThinkingLevel: resolved.explicitThinkingLevel,
+				explicitThinkingSelector: resolved.explicitThinkingLevel ? resolved.thinkingLevel : undefined,
 				warning: resolved.warning,
 			};
 		}

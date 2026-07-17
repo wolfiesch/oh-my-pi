@@ -431,6 +431,11 @@ export class SelectorController {
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
 				break;
+			case "advisor.enabled":
+			case "advisor.autoEnableFor":
+				this.ctx.session.refreshAdvisorActivation();
+				this.ctx.statusLine.invalidate();
+				break;
 			case "personality":
 				void this.ctx.session.refreshBaseSystemPrompt().catch(err => {
 					this.ctx.showError(`Failed to apply personality: ${err}`);
