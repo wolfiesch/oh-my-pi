@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ## [17.0.3] - 2026-07-17
+### Breaking Changes
+
+- Reworked the task tool wire schema: the top-level `agent` field moved into each task item as `agent` (so one call can mix agent types), `assignment` was renamed `task`, `id` was renamed `name`, and the `role` and `description` fields were removed. The one-line UI label previously supplied via `description` is now generated automatically from the `task` text by the tiny/title model.
+
+### Added
+
+- Added `auto` as a valid `thinking-level` in agent frontmatter; the bundled `task` subagent now defaults to it. An explicit `:level` suffix on a resolved model pattern takes precedence over an agent-definition default.
+- Added optional session-wide spawn, request, and counted-token budgets for task trees, with atomic batch rejection, graceful descendant aborts, and budget usage telemetry.
 
 ### Changed
 
@@ -467,6 +475,7 @@
 - Fixed agents getting stuck waiting for messages from peers that have already stopped running.
 - Fixed compiled Linux binary extension loading when bundled web-search header generation cannot read `header-generator` data files from the build-time path. ([#5178](https://github.com/can1357/oh-my-pi/issues/5178))
 - Fixed plugin custom tool loading to skip and report invalid feature entries instead of crashing startup when a plugin dependency tree leaves one feature unresolved. ([#5189](https://github.com/can1357/oh-my-pi/issues/5189))
+- Fixed task-tree budgets to honor runtime limit changes and abort keep-alive follow-up turns after aggregate exhaustion.
 
 ## [16.4.4] - 2026-07-11
 

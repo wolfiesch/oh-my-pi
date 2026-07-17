@@ -8,7 +8,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { runSubprocess, TaskTreeBudget } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -31,6 +31,7 @@ interface MockSessionHandle {
 	prompts: Array<{ text: string; options?: PromptOptions }>;
 	abortCalls: () => number;
 	disposeCalls: () => number;
+	emit: (event: AgentSessionEvent) => void;
 }
 
 function assistantText(text: string, stopReason: "stop" | "aborted" = "stop") {
@@ -45,6 +46,7 @@ function createMockSession(
 	}) => void,
 ): MockSessionHandle {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
+	const disposeListeners = new Set<() => void>();
 	const messages: unknown[] = [];
 	const prompts: Array<{ text: string; options?: PromptOptions }> = [];
 	let abortCount = 0;
@@ -84,8 +86,14 @@ function createMockSession(
 		abort: async () => {
 			abortCount += 1;
 		},
+		onDispose: listener => {
+			disposeListeners.add(listener);
+			return () => disposeListeners.delete(listener);
+		},
 		dispose: async () => {
 			disposeCount += 1;
+			for (const listener of disposeListeners) listener();
+			disposeListeners.clear();
 		},
 	};
 
@@ -94,6 +102,7 @@ function createMockSession(
 		prompts,
 		abortCalls: () => abortCount,
 		disposeCalls: () => disposeCount,
+		emit,
 	};
 }
 
@@ -233,7 +242,8 @@ describe("runSubprocess soft request budget", () => {
 		mockCreateAgentSession(handle.session);
 		registerRunning(id, handle.session);
 
-		const result = await runSubprocess(baseOptions(id));
+		const treeBudget = new TaskTreeBudget({ maxRequests: 20 });
+		const result = await runSubprocess({ ...baseOptions(id), taskTreeBudget: treeBudget });
 
 		expect(result.aborted).toBe(true);
 		expect(result.abortReason).toMatch(/Soft request budget exceeded/);
@@ -241,6 +251,12 @@ describe("runSubprocess soft request budget", () => {
 		expect(AgentRegistry.global().get(id)?.status).toBe("idle");
 		expect(AgentLifecycleManager.global().has(id)).toBe(true);
 		expect(handle.disposeCalls()).toBe(0);
+		const requestsAfterInitialRun = treeBudget.snapshot().requests;
+		handle.emit({
+			type: "message_end",
+			message: assistantText("resumed"),
+		} as unknown as AgentSessionEvent);
+		expect(treeBudget.snapshot().requests).toBe(requestsAfterInitialRun + 1);
 
 		// The whole point: irc can reach the stopped agent to resume it.
 		const receipt = await new IrcBus().send({ from: "Main", to: id, body: "resume your inventory" });

@@ -304,6 +304,7 @@ import {
 	type SecretObfuscator,
 } from "../secrets/obfuscator";
 import { usesCodexTaskPrompt } from "../task/prompt-policy";
+import type { TaskTreeBudget } from "../task/tree-budget";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -873,6 +874,8 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
+	/** Shared aggregate budget for this session task tree. */
+	taskTreeBudget?: TaskTreeBudget;
 	/** Whether the caller explicitly requested yolo/auto-approve behavior for this session. */
 	autoApprove?: boolean;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
@@ -1844,6 +1847,7 @@ export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settings: Settings;
+	readonly taskTreeBudget: TaskTreeBudget | undefined;
 	/** Entries of tools mounted under `xd://`; empty when virtual devices are unmounted. */
 	getXdevToolEntries: () => Array<{ name: string; summary: string }>;
 	readonly yieldQueue: YieldQueue;
@@ -2023,6 +2027,7 @@ export class AgentSession {
 	#autolearnCaptureAbortController: AbortController | undefined;
 	#autolearnCaptureTask: Promise<void> | undefined;
 	#isDisposed = false;
+	readonly #disposeListeners = new Set<() => void>();
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	/**
@@ -2651,6 +2656,7 @@ export class AgentSession {
 			destination: { kind: "current", manager: this.sessionManager },
 		};
 		this.settings = config.settings;
+		this.taskTreeBudget = config.taskTreeBudget;
 		this.#autoApprove = config.autoApprove === true;
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
@@ -6677,6 +6683,16 @@ export class AgentSession {
 		this.#movedFromEmptySessionFile = path.resolve(sessionFile);
 	}
 
+	/** Register cleanup that runs synchronously when disposal begins. */
+	onDispose(listener: () => void): () => void {
+		if (this.#isDisposed) {
+			listener();
+			return () => {};
+		}
+		this.#disposeListeners.add(listener);
+		return () => this.#disposeListeners.delete(listener);
+	}
+
 	/**
 	 * Synchronously mark the session as disposing so new work is rejected
 	 * immediately: eval starts throw, queued asides are dropped, and the
@@ -6687,7 +6703,18 @@ export class AgentSession {
 	 * gap slips past the disposal guards.
 	 */
 	beginDispose(): void {
+		const firstDispose = !this.#isDisposed;
 		this.#isDisposed = true;
+		if (firstDispose) {
+			for (const listener of this.#disposeListeners) {
+				try {
+					listener();
+				} catch (error) {
+					logger.warn("AgentSession dispose listener failed", { error: String(error) });
+				}
+			}
+			this.#disposeListeners.clear();
+		}
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
 		this.#flushPendingIrcAsides();

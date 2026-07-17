@@ -4269,6 +4269,60 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.treeMaxSpawns": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Task Tree Spawn Budget",
+			description:
+				"Maximum task descendants created during one session, shared across sibling and nested task calls. A batch that would cross the limit is rejected atomically. 0 disables the guard.",
+			options: [
+				{ value: "0", label: "Disabled", description: "Default" },
+				{ value: "8", label: "8 spawns" },
+				{ value: "16", label: "16 spawns" },
+				{ value: "32", label: "32 spawns" },
+			],
+		},
+	},
+
+	"task.treeMaxRequests": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Task Tree Request Budget",
+			description:
+				"Maximum completed assistant requests across all task descendants in one session. Crossing the limit aborts every active descendant gracefully. 0 disables the guard.",
+			options: [
+				{ value: "0", label: "Disabled", description: "Default" },
+				{ value: "100", label: "100 requests" },
+				{ value: "250", label: "250 requests" },
+				{ value: "500", label: "500 requests" },
+			],
+		},
+	},
+
+	"task.treeMaxTokens": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Task Tree Token Budget",
+			description:
+				"Maximum counted tokens across all task descendants in one session, using the same input + output + cache-write metric as task progress when provider buckets are available and the provider total otherwise. Crossing the limit aborts every active descendant gracefully. 0 disables the guard.",
+			options: [
+				{ value: "0", label: "Disabled", description: "Default" },
+				{ value: "1000000", label: "1M tokens" },
+				{ value: "5000000", label: "5M tokens" },
+				{ value: "10000000", label: "10M tokens" },
+			],
+		},
+	},
+
 	"task.disabledAgents": {
 		type: "array",
 		default: [] as string[],

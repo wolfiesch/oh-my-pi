@@ -442,6 +442,38 @@ describe("task progress rendering", () => {
 		expect(collapsed).toContain("5 succeeded");
 		expect(collapsed).toContain("1 failed");
 	});
+	it("renders configured task-tree budget usage", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const details: TaskToolDetails = {
+			projectAgentsDir: null,
+			results: [finishedResult({ requests: 4, tokens: 1200 })],
+			totalDurationMs: 1000,
+			treeBudget: {
+				spawns: 3,
+				requests: 42,
+				tokens: 123_456,
+				maxSpawns: 8,
+				maxRequests: 250,
+				maxTokens: 1_000_000,
+				exhausted: false,
+			},
+		};
+
+		const rendered = Bun.stripANSI(
+			taskToolRenderer
+				.renderResult(
+					{ content: [{ type: "text", text: "" }], details },
+					{ expanded: false, isPartial: false },
+					theme,
+				)
+				.render(120)
+				.join("\n"),
+		);
+
+		expect(rendered).toContain("Tree budget: 3/8 agents");
+		expect(rendered).toContain("42/250 req");
+		expect(rendered).toContain("123K/1M tok");
+	});
 });
 
 describe("task result detail-less state", () => {

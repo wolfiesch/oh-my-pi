@@ -1561,6 +1561,24 @@ export function renderResult(
 		const { expanded, isPartial, spinnerFrame } = options;
 		const frozen = options.renderContext?.frozen === true;
 		const lines: string[] = [];
+		const treeBudget = details.treeBudget;
+		if (
+			treeBudget &&
+			(treeBudget.maxSpawns > 0 || treeBudget.maxRequests > 0 || treeBudget.maxTokens > 0 || treeBudget.exhausted)
+		) {
+			const budgetParts: string[] = [];
+			if (treeBudget.maxSpawns > 0) {
+				budgetParts.push(`${formatNumber(treeBudget.spawns)}/${formatNumber(treeBudget.maxSpawns)} agents`);
+			}
+			if (treeBudget.maxRequests > 0) {
+				budgetParts.push(`${formatNumber(treeBudget.requests)}/${formatNumber(treeBudget.maxRequests)} req`);
+			}
+			if (treeBudget.maxTokens > 0) {
+				budgetParts.push(`${formatNumber(treeBudget.tokens)}/${formatNumber(treeBudget.maxTokens)} tok`);
+			}
+			const budgetText = `Tree budget: ${budgetParts.join(theme.sep.dot)}`;
+			lines.push(theme.fg(treeBudget.exhausted ? "error" : "dim", budgetText));
+		}
 
 		// Result rows win once any exist; progress rows for spawns without a
 		// result (a mixed call's async subset) render as a supplement below.
