@@ -12,6 +12,7 @@ import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/
 import { SessionObserverRegistry } from "@oh-my-pi/pi-coding-agent/modes/session-observer-registry";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import type { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -89,6 +90,95 @@ describe("Agent hub Enter activation", () => {
 		hub.dispose();
 	});
 
+	it("t opens the active transcript without changing focus", () => {
+		const focusedIds: string[] = [];
+		const agents = new AgentRegistry();
+		agents.register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			session: { subscribe: () => () => {} } as unknown as AgentSession,
+			status: "running",
+		});
+		let overlayCalls = 0;
+		const hub = new AgentHubOverlayComponent({
+			observers: new SessionObserverRegistry(),
+			hubKeys: [],
+			onDone: () => {},
+			requestRender: () => {},
+			registry: agents,
+			irc: new IrcBus(agents),
+			focusAgent: async id => {
+				focusedIds.push(id);
+			},
+			ui: {
+				showOverlay: () => {
+					overlayCalls++;
+					return { hide: () => {} };
+				},
+				setFocus: () => {},
+				requestRender: () => {},
+				requestComponentRender: () => {},
+			} as never,
+		});
+
+		hub.handleInput("t");
+		expect(overlayCalls).toBe(1);
+		expect(focusedIds).toEqual([]);
+		hub.dispose();
+	});
+
+	it("archive Enter opens a transcript and r is the only revive action", async () => {
+		const agents = new AgentRegistry();
+		agents.register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			session: null,
+			sessionFile: "/tmp/worker.jsonl",
+			status: "parked",
+		});
+		const focusedIds: string[] = [];
+		const revivedIds: string[] = [];
+		let overlayCalls = 0;
+		const hub = new AgentHubOverlayComponent({
+			observers: new SessionObserverRegistry(),
+			hubKeys: [],
+			onDone: () => {},
+			requestRender: () => {},
+			registry: agents,
+			irc: new IrcBus(agents),
+			focusAgent: async id => {
+				focusedIds.push(id);
+			},
+			lifecycle: {
+				ensureLive: async (id: string) => {
+					revivedIds.push(id);
+					return {} as AgentSession;
+				},
+			} as unknown as AgentLifecycleManager,
+			ui: {
+				showOverlay: () => {
+					overlayCalls++;
+					return { hide: () => {} };
+				},
+				setFocus: () => {},
+				requestRender: () => {},
+				requestComponentRender: () => {},
+			} as never,
+		});
+
+		hub.handleInput("\t");
+		hub.handleInput("\r");
+		expect(overlayCalls).toBe(1);
+		expect(focusedIds).toEqual([]);
+		expect(revivedIds).toEqual([]);
+		hub.handleInput("r");
+		await Promise.resolve();
+		expect(revivedIds).toEqual([AGENT_ID]);
+		hub.dispose();
+	});
+
 	it("lists persisted subagent session files after restart", async () => {
 		using tempDir = TempDir.createSync("@omp-agent-hub-persisted-");
 		const sessionFile = path.join(tempDir.path(), "main.jsonl");
@@ -108,6 +198,7 @@ describe("Agent hub Enter activation", () => {
 		});
 		await hub.persistedSubagentsReady;
 
+		hub.handleInput("\t");
 		const rendered = Bun.stripANSI(hub.render(120).join("\n"));
 		expect(rendered).toContain("Worker");
 		expect(rendered).toContain("parked");

@@ -121,7 +121,7 @@ describe("Agent hub row ordering", () => {
 		}
 	});
 
-	it("truncates lines and sanitizes newlines to prevent terminal wrapping", () => {
+	it("truncates lines and sanitizes controls to prevent terminal corruption", () => {
 		geometry = stubStdoutGeometry(80);
 		const agents = new AgentRegistry();
 		const sessionA = {} as AgentSession;
@@ -139,7 +139,7 @@ describe("Agent hub row ordering", () => {
 				kind: "subagent",
 				label: "Subagent",
 				status: "active",
-				description: "Complete the assignment below, thoroughly:\n- check performance\n- check leaks",
+				description: "Complete the assignment\tbelow, thoroughly:\n- check performance\u0007\n- check leaks",
 				lastUpdate: Date.now(),
 			},
 		]);
@@ -159,6 +159,8 @@ describe("Agent hub row ordering", () => {
 			const cleanLine = Bun.stripANSI(line);
 			expect(cleanLine.includes("\n")).toBe(false);
 			expect(cleanLine.includes("\r")).toBe(false);
+			expect(cleanLine.includes("\t")).toBe(false);
+			expect(cleanLine.includes("\u0007")).toBe(false);
 			const width = visibleWidth(line);
 			expect(width).toBeLessThanOrEqual(78);
 		}

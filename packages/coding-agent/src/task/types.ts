@@ -1,3 +1,4 @@
+import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env } from "@oh-my-pi/pi-utils";
 import { type BaseType, type } from "arktype";
@@ -416,6 +417,12 @@ export interface AgentProgress {
 	modelOverride?: string | string[];
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Undefined when the model could not be resolved. */
 	resolvedModel?: string;
+	/** Current reasoning level, when known from the live session. */
+	thinkingLevel?: ThinkingLevel;
+	/** Whether the session exposes the LSP tool. Undefined for older or cold-restored snapshots. */
+	lspEnabled?: boolean;
+	/** Whether an advisor is active for the session. Undefined for older or cold-restored snapshots. */
+	advisorActive?: boolean;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
 	extractedToolData?: Record<string, unknown[]>;
 	/**
