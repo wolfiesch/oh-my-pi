@@ -78,23 +78,34 @@ export function sameIdentity(
 }
 
 const DARWIN_SYSTEM_ALIASES = [
-	{ alias: "/tmp", target: "private/tmp" },
-	{ alias: "/var", target: "private/var" },
+	{ alias: "/tmp", target: "/private/tmp" },
+	{ alias: "/var", target: "/private/var" },
 ] as const;
+const PROTECTED_SOCKET_DIRECTORIES: Readonly<Record<string, true>> = Object.freeze({
+	"/": true,
+	"/tmp": true,
+	"/var": true,
+	"/private/tmp": true,
+	"/private/var": true,
+});
 
 async function normalizeDarwinSystemAlias(directory: string): Promise<string> {
 	if (process.platform !== "darwin") return directory;
 	for (const { alias, target } of DARWIN_SYSTEM_ALIASES) {
 		if (directory !== alias && !directory.startsWith(`${alias}${sep}`)) continue;
 		const info = await lstat(alias);
-		if (!info.isSymbolicLink() || (await readlink(alias)) !== target) return directory;
-		return join(sep, target, relative(alias, directory));
+		if (!info.isSymbolicLink()) return directory;
+		const aliasTarget = resolve(dirname(alias), await readlink(alias));
+		if (aliasTarget !== target) return directory;
+		return join(target, relative(alias, directory));
 	}
 	return directory;
 }
 
 export async function ensureSecureSocketDirectory(publicPath: string): Promise<string> {
 	const directory = await normalizeDarwinSystemAlias(resolve(dirname(publicPath)));
+	if (PROTECTED_SOCKET_DIRECTORIES[directory] === true)
+		throw new Error(`appserver socket directory must not be a shared system directory: ${directory}`);
 	const parts = directory.split(sep).filter(Boolean);
 	let current = directory.startsWith(sep) ? sep : "";
 	for (const part of parts) {

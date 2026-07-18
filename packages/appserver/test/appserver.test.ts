@@ -237,6 +237,14 @@ describe("appserver lifecycle", () => {
 		await expect(stat(socketPath)).rejects.toThrow();
 		for (const child of factory.children) expect(child.killed).toBe(true);
 	});
+	test("rejects shared system socket roots before changing their modes", async () => {
+		if (process.platform === "win32") return;
+		for (const directory of ["/", "/tmp", "/var", "/private/tmp", "/private/var"]) {
+			await expect(ensureSecureSocketDirectory(join(directory, "appserver.sock"))).rejects.toThrow(
+				"appserver socket directory must not be a shared system directory",
+			);
+		}
+	});
 	test("rejects user-controlled symlink components below the system temp root", async () => {
 		const root = await mkdtemp(join(tmpdir(), "omp-appserver-symlink-"));
 		const target = join(root, "target");
