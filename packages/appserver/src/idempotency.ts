@@ -2,13 +2,13 @@ import { createHash } from "node:crypto";
 import type { CommandId, ServerFrame } from "@oh-my-pi/app-wire";
 import type { CommandOutcome } from "./types.ts";
 
-function semantic(value: unknown, omitEnvelopeRequestId = false): unknown {
+function semantic(value: unknown, omitEnvelopeIdentifiers = false): unknown {
 	if (Array.isArray(value)) return value.map(item => semantic(item));
 	if (!value || typeof value !== "object") return value;
 	const object = value as Record<string, unknown>;
 	return Object.fromEntries(
 		Object.keys(object)
-			.filter(key => !omitEnvelopeRequestId || key !== "requestId")
+			.filter(key => !omitEnvelopeIdentifiers || (key !== "requestId" && key !== "confirmationId"))
 			.sort()
 			.map(key => [key, semantic(object[key])]),
 	);

@@ -2406,6 +2406,81 @@ describe("live Unix websocket protocol", () => {
 			await appserver.stop();
 		}
 	});
+	test("keeps agent cancellation durable across requester disconnect", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory);
+		const sender = await readyClient(path, ["sessions.read", "agents.control"]);
+		let reconnectedClient: RawUdsWebSocket | undefined;
+		try {
+			const child = await startIdleSessionRuntime(sender.client, factory, "state-s1");
+			sender.client.sendJson(
+				command("cancel-disconnect", "cancel-disconnect", "agent.cancel", "s1", { agentId: "Worker" }),
+			);
+			const challenge = await sender.client.nextServer();
+			expect(challenge.type).toBe("confirmation");
+			if (challenge.type !== "confirmation") throw new Error("agent cancel confirmation missing");
+			sender.client.sendJson(
+				confirmFrame(
+					"cancel-disconnect-confirm",
+					String(challenge.confirmationId),
+					"cancel-disconnect",
+					"approve",
+					"s1",
+				),
+			);
+			const cancelled = await waitForRpcWrite(child, "cancel_subagent");
+			sender.client.destroy();
+			await sender.client.closed();
+
+			child.push({
+				type: "subagent_lifecycle",
+				payload: {
+					id: "Worker",
+					index: 0,
+					agent: "task",
+					status: "aborted",
+					lastUpdate: 100,
+				},
+			});
+			child.push({
+				type: "response",
+				id: cancelled.frame.id,
+				command: "cancel_subagent",
+				success: true,
+				data: { cancelled: true },
+			});
+
+			reconnectedClient = (await readyClient(path, ["sessions.read", "agents.control"])).client;
+			reconnectedClient.sendJson(
+				command("cancel-disconnect", "cancel-disconnect", "agent.cancel", "s1", {
+					agentId: "Worker",
+				}),
+			);
+			const replayChallenge = await reconnectedClient.nextServer();
+			expect(replayChallenge.type).toBe("confirmation");
+			if (replayChallenge.type !== "confirmation") throw new Error("agent cancel replay confirmation missing");
+			reconnectedClient.sendJson(
+				confirmFrame(
+					"cancel-disconnect-replay-confirm",
+					String(replayChallenge.confirmationId),
+					"cancel-disconnect",
+					"approve",
+					"s1",
+				),
+			);
+			expect(await reconnectedClient.nextServer()).toMatchObject({
+				type: "response",
+				requestId: rid("cancel-disconnect"),
+				ok: true,
+				result: { cancelled: true },
+			});
+			expect(child.writes.filter(value => JSON.parse(value).type === "cancel_subagent")).toHaveLength(1);
+		} finally {
+			sender.client.destroy();
+			if (reconnectedClient) await closeClients([reconnectedClient]);
+			await appserver.stop();
+		}
+	});
 	test("cancelling root A preserves a queued cross-client follow-up B until its exact durable entry", async () => {
 		const factory = new LiveFactory();
 		const { appserver, path } = await liveServer(factory, [record("s1")]);
