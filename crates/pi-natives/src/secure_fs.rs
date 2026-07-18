@@ -213,6 +213,7 @@ mod unix {
 			*libc::__errno_location() = 0;
 		}
 		#[cfg(target_os = "macos")]
+		// SAFETY: libc exposes the thread-local errno slot for this process.
 		unsafe {
 			*libc::__error() = 0;
 		}
