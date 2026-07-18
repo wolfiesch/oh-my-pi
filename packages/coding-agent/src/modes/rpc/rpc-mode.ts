@@ -57,6 +57,7 @@ import type { EventBus } from "../../utils/event-bus";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
+import { claimRpcInput } from "./rpc-input";
 import { resolveRpcPromptImages } from "./rpc-prompt-images";
 import { registerRpcSessionTeardown } from "./rpc-session-teardown";
 import { RPC_SUBAGENT_TRANSCRIPT_MAX_BYTES, RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
@@ -1198,6 +1199,7 @@ export async function runRpcMode(
 	session: AgentSession,
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	eventBus?: EventBus,
+	input: ReadableStream<Uint8Array> = claimRpcInput(),
 ): Promise<never> {
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
@@ -2095,7 +2097,10 @@ export async function runRpcMode(
 							return (await uiCtx.input(prompt.message, prompt.placeholder, { timeout: 600_000 })) ?? "";
 						},
 					});
-					await session.modelRegistry.refresh();
+					// Provider-scoped online refresh so the just-persisted credential
+					// re-runs discovery instead of reusing a fresh authoritative cache
+					// row (#5780).
+					await session.modelRegistry.refreshProvider(command.providerId, "online");
 					return success(id, "login", { providerId: command.providerId });
 				} catch (err: unknown) {
 					return error(id, "login", err instanceof Error ? err.message : String(err));
@@ -2144,7 +2149,7 @@ export async function runRpcMode(
 	// line is reported as an error frame and the loop keeps running instead of
 	// throwing out of the generator and killing the whole process (issue #5194).
 	const decoder = new TextDecoder();
-	for await (const line of readLines(Bun.stdin.stream())) {
+	for await (const line of readLines(input ?? Bun.stdin.stream())) {
 		const text = decoder.decode(line).trim();
 		if (!text) continue;
 		let parsed: unknown;

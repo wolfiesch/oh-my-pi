@@ -208,6 +208,8 @@ import type {
 } from "./types";
 import { UiHelpers } from "./utils/ui-helpers";
 
+const STILL_CLOSING_DELAY_MS = 3_000;
+
 const HINT_SHIMMER_PALETTE: ShimmerPalette = {
 	low: "dim",
 	mid: "muted",
@@ -451,6 +453,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	vibeModeEnabled = false;
 	planModePlanFilePath: string | undefined = undefined;
 	loopModeEnabled = false;
+	loopModePaused = false;
 	loopPrompt: string | undefined = undefined;
 	loopLimit: LoopLimitRuntime | undefined = undefined;
 	#loopAutoSubmitTimer: NodeJS.Timeout | undefined;
@@ -696,6 +699,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.errorBannerContainer = new AnchoredLiveContainer();
 		this.modelCycleContainer = new AnchoredLiveContainer();
 		this.editor = new CustomEditor(getEditorTheme());
+		this.ui.enableScopedInputRender(this.editor);
 		this.editor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
 		this.editor.setImeSafeCursorLayout(settings.get("tui.imeSafeCursor"));
 		this.editor.setAutocompleteMaxVisible(settings.get("autocompleteMaxVisible"));
@@ -1349,6 +1353,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.disableLoopMode("Loop limit reached. Loop mode disabled.");
 			return;
 		}
+		this.#syncLoopModeStatus();
 
 		if (action === "compact") {
 			await this.handleCompactCommand();
@@ -1358,17 +1363,34 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#submitLoopPromptWhenReady(prompt);
 	}
 
+	#syncLoopModeStatus(): void {
+		const state: "waiting" | "running" | "paused" = this.loopModePaused
+			? "paused"
+			: this.loopPrompt
+				? "running"
+				: "waiting";
+		this.statusLine.setLoopModeStatus(this.loopModeEnabled ? { state, limit: this.loopLimit } : undefined);
+		this.ui.requestRender();
+	}
+
 	disableLoopMode(message = "Loop mode disabled."): void {
 		const wasEnabled = this.loopModeEnabled;
 		this.loopModeEnabled = false;
+		this.loopModePaused = false;
 		this.loopPrompt = undefined;
 		this.loopLimit = undefined;
 		this.#cancelLoopAutoSubmit();
-		this.statusLine.setLoopModeStatus(undefined);
-		this.ui.requestRender();
+		this.#syncLoopModeStatus();
 		if (wasEnabled) {
 			this.showStatus(message);
 		}
+	}
+
+	setLoopPrompt(prompt: string): void {
+		if (!this.loopModeEnabled) return;
+		this.loopPrompt = prompt;
+		this.loopModePaused = false;
+		this.#syncLoopModeStatus();
 	}
 
 	/**
@@ -1378,7 +1400,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	 */
 	pauseLoop(): void {
 		this.loopPrompt = undefined;
+		this.loopModePaused = true;
 		this.#cancelLoopAutoSubmit();
+		this.#syncLoopModeStatus();
 	}
 
 	async handleLoopCommand(args = ""): Promise<string | undefined> {
@@ -1392,10 +1416,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			return undefined;
 		}
 		this.loopModeEnabled = true;
+		this.loopModePaused = false;
 		this.loopPrompt = undefined;
 		this.loopLimit = createLoopLimitRuntime(parsed.limit);
-		this.statusLine.setLoopModeStatus({ enabled: true });
-		this.ui.requestRender();
+		this.#syncLoopModeStatus();
 		const limitSuffix = parsed.limit ? ` Limited to ${describeLoopLimit(parsed.limit)}.` : "";
 		const remainingSuffix = this.loopLimit ? ` ${describeLoopLimitRuntime(this.loopLimit)}.` : "";
 		const tail = parsed.prompt ? "Repeating it after each turn." : "Your next prompt will repeat after each turn.";
@@ -3746,10 +3770,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		// first runs the work, the other awaits the same settled promise.
 		// The teardown is registered lazily in `init()` — a `/exit` reached
 		// before `init()` completed falls back to a direct dispose.
-		if (this.#signalTeardown) {
-			await this.#signalTeardown();
-		} else {
-			await this.session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
+		const stillClosingTimer = setTimeout(() => {
+			this.showStatus("Still closing… (flushing memory backend / network)");
+		}, STILL_CLOSING_DELAY_MS);
+		try {
+			if (this.#signalTeardown) {
+				await this.#signalTeardown();
+			} else {
+				await this.session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
+			}
+		} finally {
+			clearTimeout(stillClosingTimer);
 		}
 
 		// Do not force a final render during teardown: disposed session/UI state can
@@ -3794,6 +3825,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const nextEditor = factory
 			? factory(this.ui, getEditorTheme(), this.keybindings)
 			: new CustomEditor(getEditorTheme());
+		if (!factory) this.ui.enableScopedInputRender(nextEditor);
 
 		nextEditor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
 		nextEditor.setImeSafeCursorLayout(this.settings.get("tui.imeSafeCursor"));

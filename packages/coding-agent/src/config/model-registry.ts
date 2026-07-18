@@ -857,6 +857,18 @@ export class ModelRegistry {
 			}
 		}
 		await this.#refreshRuntimeDiscoveries(strategy, new Set([providerId]));
+		// #reloadStaticModels above may have rebuilt #models from static sources,
+		// dropping models previously discovered by OTHER runtime providers (their
+		// fetchDynamicModels results live only in #models + the SQLite cache, not
+		// in #loadModels' static inputs). Restore them from cache with the default
+		// online-if-uncached strategy: no network while their cached row is
+		// fresh, so the scoped refresh above stays the only forced fetch.
+		const otherRuntimeProviderIds = new Set(
+			[...this.#runtimeModelManagers.keys()].filter(runtimeId => runtimeId !== providerId),
+		);
+		if (otherRuntimeProviderIds.size > 0) {
+			await this.#refreshRuntimeDiscoveries("online-if-uncached", otherRuntimeProviderIds);
+		}
 	}
 
 	/**
@@ -1105,9 +1117,33 @@ export class ModelRegistry {
 			if (cache.fresh && cache.authoritative) {
 				authoritativeFreshProviders.add(providerId);
 			}
-			const models = cache.models.map(model =>
-				model.provider === providerId ? model : { ...model, provider: providerId },
-			);
+			// The v10 model cache never persists request headers (#5780): restore
+			// them from the bundled static catalog, and drop cached rows whose
+			// headers cannot be rebuilt so the bundled fallback (which still
+			// carries its headers) wins the startup merge instead of a cached
+			// model with required transport headers missing.
+			const omittedHeaderIds = new Set(cache.headerOmittedModelIds);
+			const unrestorableHeaderIds = new Set(cache.unrestorableHeaderModelIds);
+			const bundledById =
+				omittedHeaderIds.size > 0
+					? new Map(
+							(getBundledModels(providerId as Parameters<typeof getBundledModels>[0]) as Model<Api>[]).map(
+								bundledModel => [bundledModel.id, bundledModel],
+							),
+						)
+					: undefined;
+			const models: ModelSpec<Api>[] = [];
+			for (const cachedModel of cache.models) {
+				const spec = cachedModel.provider === providerId ? cachedModel : { ...cachedModel, provider: providerId };
+				if (!omittedHeaderIds.has(spec.id)) {
+					models.push(spec);
+					continue;
+				}
+				if (unrestorableHeaderIds.has(spec.id)) continue;
+				const bundledHeaders = bundledById?.get(spec.id)?.headers;
+				if (!bundledHeaders) continue;
+				models.push({ ...spec, headers: bundledHeaders });
+			}
 			const providerOverride = this.#providerOverrides.get(providerId);
 			const withTransport = providerOverride
 				? models.map(model => this.#applyProviderTransportOverride(model, providerOverride))
@@ -1145,13 +1181,20 @@ export class ModelRegistry {
 				continue;
 			}
 			const configStale = this.#isDiscoveryCacheOlderThanModelsConfig(cache.updatedAt);
+			// Cached rows never persist headers (#5780); models that had live
+			// headers cannot be rebuilt here, so exclude them and mark the
+			// discovery stale to force a refetch instead of returning models
+			// missing required transport headers.
+			const omittedHeaderIds = new Set(cache.headerOmittedModelIds);
+			const usableCacheModels =
+				omittedHeaderIds.size > 0 ? cache.models.filter(model => !omittedHeaderIds.has(model.id)) : cache.models;
 			const models = this.#applyProviderModelOverrides(
 				providerConfig.provider,
 				this.#normalizeDiscoverableModels(
 					providerConfig,
 					this.#applyProviderCompat(
 						providerConfig.compat,
-						cache.models.map(model => buildModel(model)),
+						usableCacheModels.map(model => buildModel(model)),
 					),
 				),
 			);
@@ -1160,7 +1203,12 @@ export class ModelRegistry {
 				provider: providerConfig.provider,
 				status: "cached",
 				optional: providerConfig.optional ?? false,
-				stale: providerConfig.discovery.type === "llama.cpp" || !cache.fresh || !cache.authoritative || configStale,
+				stale:
+					providerConfig.discovery.type === "llama.cpp" ||
+					!cache.fresh ||
+					!cache.authoritative ||
+					configStale ||
+					omittedHeaderIds.size > 0,
 				fetchedAt: cache.updatedAt,
 				models: models.map(model => model.id),
 			});
@@ -1593,6 +1641,7 @@ export class ModelRegistry {
 		providerId: string,
 		strategy: ModelRefreshStrategy,
 		cacheProviderId: string,
+		authoritative: boolean,
 	): Promise<string | undefined> {
 		const peekedKey = await this.#peekApiKeyForProvider(providerId);
 		if (isAuthenticated(peekedKey) || strategy === "offline") {
@@ -1602,7 +1651,13 @@ export class ModelRegistry {
 		if (oauthCredentials.length === 0) {
 			return peekedKey;
 		}
-		if (strategy === "online-if-uncached") {
+		// Authoritative providers prune bundled models only when their manager is
+		// actually constructed, which needs an authenticated key. A fresh cache does
+		// not let us skip the refresh here: with an expired OAuth token peekedKey is
+		// undefined, the manager is never added, and stale bundled models survive the
+		// full cache TTL. So only take the no-refresh shortcut for non-authoritative
+		// providers, whose bundled models stay visible regardless.
+		if (strategy === "online-if-uncached" && !authoritative) {
 			// Mirror shouldFetchRemoteSources: built-in managers use the catalog's
 			// default TTL, so only refresh when the manager will actually fetch.
 			const cache = readModelCache<Api>(
@@ -1634,11 +1689,13 @@ export class ModelRegistry {
 	): Promise<ModelManagerOptions<Api>[]> {
 		const specialProviderDescriptors: Array<{
 			providerId: string;
+			authoritative: boolean;
 			resolveKey: (value: string | undefined) => string | undefined;
 			createOptions: (key: string) => ModelManagerOptions<Api>;
 		}> = [
 			{
 				providerId: "google-antigravity",
+				authoritative: false,
 				resolveKey: extractGoogleOAuthToken,
 				createOptions: oauthToken =>
 					googleAntigravityModelManagerOptions({
@@ -1649,6 +1706,7 @@ export class ModelRegistry {
 			},
 			{
 				providerId: "google-gemini-cli",
+				authoritative: false,
 				resolveKey: extractGoogleOAuthToken,
 				createOptions: oauthToken =>
 					googleGeminiCliModelManagerOptions({
@@ -1659,12 +1717,14 @@ export class ModelRegistry {
 			},
 			{
 				providerId: "openai-codex",
+				authoritative: true,
 				resolveKey: value => value,
 				createOptions: accessToken => {
 					const accountId = resolveOAuthAccountIdForAccessToken(this.authStorage, "openai-codex", accessToken);
 					return openaiCodexModelManagerOptions({
 						accessToken,
 						accountId,
+						fetch: this.#fetch,
 					});
 				},
 			},
@@ -1689,12 +1749,22 @@ export class ModelRegistry {
 				const cacheProviderId =
 					descriptor.createModelManagerOptions({ baseUrl: discoveryBaseUrl, fetch: this.#fetch })
 						.cacheProviderId ?? descriptor.providerId;
-				return this.#resolveBuiltInDiscoveryApiKey(descriptor.providerId, strategy, cacheProviderId);
+				return this.#resolveBuiltInDiscoveryApiKey(
+					descriptor.providerId,
+					strategy,
+					cacheProviderId,
+					descriptor.dynamicModelsAuthoritative ?? false,
+				);
 			}),
 		);
 		const specialKeys = await Promise.all(
 			enabledSpecialProviderDescriptors.map(descriptor =>
-				this.#resolveBuiltInDiscoveryApiKey(descriptor.providerId, strategy, descriptor.providerId),
+				this.#resolveBuiltInDiscoveryApiKey(
+					descriptor.providerId,
+					strategy,
+					descriptor.providerId,
+					descriptor.authoritative,
+				),
 			),
 		);
 		const options: ModelManagerOptions<Api>[] = [];
@@ -1984,6 +2054,17 @@ export class ModelRegistry {
 			this.#keylessProviders.has(model.provider) ||
 			this.authStorage.hasAuth(model.provider)
 		);
+	}
+
+	/**
+	 * Whether the provider's configured API key is resolved from a command.
+	 *
+	 * Callers use this to distinguish the registry's command-first resolver
+	 * path from lower-priority credentials in {@link authStorage}.
+	 */
+	hasCommandBackedApiKey(provider: string): boolean {
+		const keyConfig = this.#customProviderApiKeys.get(provider);
+		return isCommandConfigValue(keyConfig);
 	}
 
 	getDiscoverableProviders(): string[] {

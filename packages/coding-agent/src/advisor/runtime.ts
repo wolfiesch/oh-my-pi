@@ -2,6 +2,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { type CursorExecResolvedCarrier, kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { logger } from "@oh-my-pi/pi-utils";
 import { obfuscateToolArguments, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatSessionHistoryMarkdown, PRIMARY_CONTEXT_CUSTOM_TYPES } from "../session/session-history-format";
@@ -129,7 +130,20 @@ export function quarantineAdvisorUnsafeOutput(
 	const unavailableToolNames = new Set<string>();
 	const generatedParts: string[] = [];
 	for (const block of message.content) {
-		if (block.type === "toolCall" && !availableToolNames.has(block.name)) unavailableToolNames.add(block.name);
+		// Cursor exec-channel native blocks (bash/read/grep/...) are stamped
+		// kCursorExecResolved: they already ran server-side through the
+		// advisor-scoped CursorExecHandlers bridge, which rejects ungranted
+		// tools in-band ("Tool not available") and lets the model self-correct.
+		// Quarantining them would discard the legitimate advise emitted in the
+		// same turn (issue #5900). The scoped bridge is the grant gate here, not
+		// this pre-dispatch check.
+		if (
+			block.type === "toolCall" &&
+			!availableToolNames.has(block.name) &&
+			(block as CursorExecResolvedCarrier)[kCursorExecResolved] !== true
+		) {
+			unavailableToolNames.add(block.name);
+		}
 		if (block.type === "toolCall" && block.name === "advise" && typeof block.arguments.note === "string") {
 			generatedParts.push(block.arguments.note);
 		}
@@ -219,8 +233,7 @@ interface PendingDelta {
 
 interface CatchupWaiter {
 	threshold: number;
-	resolve: () => void;
-	finish: () => void;
+	finish: (caughtUp: boolean) => void;
 	timer?: NodeJS.Timeout;
 }
 
@@ -366,7 +379,13 @@ export class AdvisorRuntime {
 		}
 	}
 
-	waitForCatchup(maxMs: number, threshold: number, signal?: AbortSignal): Promise<void> {
+	/**
+	 * Wait until the advisor backlog falls below `threshold`.
+	 *
+	 * Returns `false` when the deadline, abort signal, or a runtime failure releases
+	 * the waiter before the requested backlog was drained.
+	 */
+	waitForCatchup(maxMs: number, threshold: number, signal?: AbortSignal): Promise<boolean> {
 		if (
 			this.disposed ||
 			signal?.aborted ||
@@ -378,21 +397,26 @@ export class AdvisorRuntime {
 			// primary would otherwise park for the full catch-up budget.
 			this.#failing
 		)
-			return Promise.resolve();
-		const { promise, resolve } = Promise.withResolvers<void>();
+			return Promise.resolve(this.#backlog < threshold);
+		const { promise, resolve } = Promise.withResolvers<boolean>();
 		let waiter!: CatchupWaiter;
-		const finish = (): void => {
+		const finish = (caughtUp: boolean): void => {
 			const idx = this.#waiters.indexOf(waiter);
 			if (idx >= 0) this.#waiters.splice(idx, 1);
 			clearTimeout(waiter.timer);
-			signal?.removeEventListener("abort", finish);
-			resolve();
+			signal?.removeEventListener("abort", abort);
+			resolve(caughtUp);
 		};
-		waiter = { threshold, resolve, finish, timer: setTimeout(finish, maxMs) };
+		const abort = (): void => finish(false);
+		waiter = {
+			threshold,
+			finish,
+			timer: setTimeout(abort, maxMs),
+		};
 		this.#waiters.push(waiter);
-		signal?.addEventListener("abort", finish, { once: true });
+		signal?.addEventListener("abort", abort, { once: true });
 		if (signal?.aborted) {
-			finish();
+			abort();
 		}
 		return promise;
 	}
@@ -571,14 +595,14 @@ export class AdvisorRuntime {
 		for (let i = this.#waiters.length - 1; i >= 0; i--) {
 			const w = this.#waiters[i];
 			if (this.#backlog < w.threshold) {
-				w.finish();
+				w.finish(true);
 			}
 		}
 	}
 
 	#wakeAllWaiters(): void {
 		for (const w of [...this.#waiters]) {
-			w.finish();
+			w.finish(false);
 		}
 	}
 

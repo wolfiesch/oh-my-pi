@@ -3918,7 +3918,8 @@ function redactHeaders(headers: Headers): Record<string, string> {
 	return redacted;
 }
 
-function resolveCodexResponsesUrl(baseUrl: string | undefined): string {
+/** Resolve a Codex Responses endpoint exactly as the chat and compaction transports do. */
+export function resolveCodexResponsesUrl(baseUrl: string | undefined): string {
 	const raw = baseUrl && baseUrl.trim().length > 0 ? baseUrl : CODEX_BASE_URL;
 	const normalized = raw.replace(/\/+$/, "");
 	if (normalized.endsWith("/codex/responses")) return normalized;

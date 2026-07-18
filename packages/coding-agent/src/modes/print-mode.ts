@@ -6,7 +6,7 @@
  * - `omp --mode json "prompt"` - JSON event stream
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { type AgentSession, type AgentSessionEvent, SHUTDOWN_CONSOLIDATE_BUDGET_MS } from "../session/agent-session";
 import { isSilentAbort } from "../session/messages";
@@ -28,6 +28,11 @@ export interface PrintModeOptions {
 	/** If true, include thinking blocks in text output */
 	printThoughts?: boolean;
 }
+
+/** Matches the longest built-in provider request deadline while bounding tool-loop stalls. */
+export const PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS = 10 * 60_000;
+/** Error exits cannot hold automation for the full normal drain budget. */
+export const PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS = 30_000;
 
 /** Drop the provider-opaque replay payload (e.g. encrypted reasoning items) before printing. */
 function stripProviderPayload<T extends AgentMessage>(message: T): T {
@@ -130,14 +135,19 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		await logger.time("print:prompt:next", () => session.prompt(message));
 	}
 
+	// From this point onward a late blocker must be recorded without starting a
+	// primary turn whose response print mode would never emit.
+	session.prepareForHeadlessAdvisorDrain();
+
 	// In text mode, output final response
 	if (mode === "text") {
-		const state = session.state;
-		const lastMessage = state.messages[state.messages.length - 1];
+		// Read via the session accessor, not the raw state tail: a classifier
+		// refusal is pruned from active context at settle, and an aborted turn
+		// can trail synthetic tool results — both would hide the terminal
+		// assistant message (and its error) from a last-element read.
+		const assistantMsg = session.getLastAssistantMessage();
 
-		if (lastMessage?.role === "assistant") {
-			const assistantMsg = lastMessage as AssistantMessage;
-
+		if (assistantMsg) {
 			// Check for error/aborted — skip silent-abort (plan-mode compaction transition)
 			if (
 				(assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") &&
@@ -151,6 +161,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 				// `dispose()` (releaseTabsForOwner) actually runs — otherwise an
 				// OMP-owned Chromium survives this exit (issue #5643). `dispose()`
 				// is idempotent, so the unreachable call below is a harmless no-op.
+				await session.waitForAdvisorCatchup(PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS);
 				await flushTelemetryExport();
 				await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
 				const flushed = process.stderr.write(`${errorLine}\n`);
@@ -180,14 +191,15 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		}
 	}
 
-	// Ensure stdout is fully flushed before returning
-	// This prevents race conditions where the process exits before all output is written
+	await session.waitForAdvisorCatchup(PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS);
+
+	// Ensure stdout, including late JSON advisor events, is fully flushed before returning.
+	// This prevents race conditions where the process exits before all output is written.
 	await new Promise<void>((resolve, reject) => {
 		process.stdout.write("", err => {
 			if (err) reject(err);
 			else resolve();
 		});
 	});
-
 	await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
 }

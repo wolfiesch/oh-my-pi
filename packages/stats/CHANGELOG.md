@@ -5,6 +5,12 @@
 ### Fixed
 
 - Fixed session sync visiting session files in filesystem-dependent order. Files now sync in deterministic name order, so a forked session's copied entries always land after the filename-timestamped original and stay attributed to the parent session instead of whichever file happened to sync first.
+## [17.0.5] - 2026-07-18
+
+### Fixed
+
+- Fixed an EADDRINUSE error by properly reusing the live stats dashboard on the requested port and reclaiming stale listeners (#5970).
+
 ## [17.0.2] - 2026-07-17
 
 ### Fixed

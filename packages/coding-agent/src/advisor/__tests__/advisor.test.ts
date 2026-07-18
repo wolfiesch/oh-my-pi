@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "bun:test";
 import type { AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import type { TUI } from "@oh-my-pi/pi-tui";
 import { type } from "arktype";
 import type { ModelRegistry } from "../../config/model-registry";
@@ -519,6 +520,58 @@ describe("advisor", () => {
 			expect(message.content).toBe(originalContent);
 		});
 
+		it("keeps advise when Cursor emits exec-resolved native tools outside the grant (issue #5900)", () => {
+			const message = {
+				role: "assistant",
+				content: [
+					{ type: "text", text: "Investigating the networking design." },
+					{
+						type: "toolCall",
+						id: "tc-grep",
+						name: "grep",
+						arguments: { pattern: "backoff" },
+						[kCursorExecResolved]: true,
+					},
+					{
+						type: "toolCall",
+						id: "tc-bash",
+						name: "bash",
+						arguments: { command: "ls" },
+						[kCursorExecResolved]: true,
+					},
+					{
+						type: "toolCall",
+						id: "tc-advise",
+						name: "advise",
+						arguments: { note: "The retry backoff looks unbounded." },
+					},
+				],
+				stopReason: "toolUse",
+			} as unknown as AssistantMessage;
+			const originalContent = message.content;
+
+			// Grant is `advise` only (WATCHDOG.yml `tools: []`). The native grep/bash
+			// frames already ran server-side through the advisor-scoped bridge, which
+			// rejected them in-band; they must not discard the legitimate advise.
+			expect(quarantineAdvisorUnsafeOutput(message, new Set(["advise"]))).toBeUndefined();
+			expect(message.stopReason).toBe("toolUse");
+			expect(message.content).toBe(originalContent);
+			expect(JSON.stringify(message)).toContain("unbounded");
+		});
+
+		it("still quarantines an ungranted native tool that was not exec-resolved", () => {
+			const message = {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "tc-bash", name: "bash", arguments: { command: "ls" } }],
+				stopReason: "toolUse",
+			} as unknown as AssistantMessage;
+
+			expect(quarantineAdvisorUnsafeOutput(message, new Set(["advise"]))).toBe(
+				"Advisor response quarantined: requested unavailable tool bash",
+			);
+			expect(message.stopReason).toBe("error");
+		});
+
 		it("sanitizes destructive advise notes even when advise is an allowed tool", () => {
 			const message = {
 				role: "assistant",
@@ -863,6 +916,65 @@ describe("advisor", () => {
 			await secondPromptDone;
 			expect(promptInputs).toHaveLength(2);
 			expect(promptInputs[1]).toContain("second");
+		});
+
+		it("waits for an in-flight review within the catch-up deadline", async () => {
+			const promptStarted = Promise.withResolvers<void>();
+			const releasePrompt = Promise.withResolvers<void>();
+			const messages: AgentMessage[] = [{ role: "user", content: "first", timestamp: 1 } as AgentMessage];
+			const agent: AdvisorAgent = {
+				prompt: async () => {
+					promptStarted.resolve();
+					await releasePrompt.promise;
+				},
+				abort: () => {},
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const runtime = new AdvisorRuntime(agent, {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+			});
+
+			runtime.onTurnEnd();
+			await promptStarted.promise;
+			let settled = false;
+			const catchup = runtime.waitForCatchup(1000, 1).then(caughtUp => {
+				settled = true;
+				return caughtUp;
+			});
+			await Promise.resolve();
+			expect(settled).toBe(false);
+
+			releasePrompt.resolve();
+			expect(await catchup).toBe(true);
+		});
+
+		it("reports an in-flight review that exceeds the catch-up deadline", async () => {
+			const promptStarted = Promise.withResolvers<void>();
+			const releasePrompt = Promise.withResolvers<void>();
+			const messages: AgentMessage[] = [{ role: "user", content: "first", timestamp: 1 } as AgentMessage];
+			const agent: AdvisorAgent = {
+				prompt: async () => {
+					promptStarted.resolve();
+					await releasePrompt.promise;
+				},
+				abort: () => {},
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const runtime = new AdvisorRuntime(agent, {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+			});
+
+			runtime.onTurnEnd();
+			await promptStarted.promise;
+			expect(await runtime.waitForCatchup(20, 1)).toBe(false);
+			expect(runtime.backlog).toBe(1);
+
+			releasePrompt.resolve();
+			await settleUntil(() => runtime.backlog === 0);
 		});
 
 		it("preserves the next user turn when an accepted empty stop is pruned", async () => {
@@ -3779,6 +3891,44 @@ describe("advisor", () => {
 	// or it strands and #drainStrandedQueuedMessages auto-resumes it. Do not swap
 	// the call site back to session `isStreaming`.
 	describe("resolveAdvisorDeliveryChannel", () => {
+		it("preserves every severity when a headless drain forbids primary turns", () => {
+			for (const severity of [undefined, "nit", "concern", "blocker"] as const) {
+				expect(
+					resolveAdvisorDeliveryChannel({
+						severity,
+						autoResumeSuppressed: false,
+						streaming: false,
+						aborting: false,
+						terminalAnswerNoQueuedWork: true,
+						preserveOnly: true,
+					}),
+				).toBe("preserve");
+			}
+		});
+
+		it("keeps live headless advice on normal delivery channels until the primary finishes", () => {
+			expect(
+				resolveAdvisorDeliveryChannel({
+					severity: "nit",
+					autoResumeSuppressed: false,
+					streaming: true,
+					aborting: false,
+					preserveOnly: true,
+				}),
+			).toBe("aside");
+			for (const severity of ["concern", "blocker"] as const) {
+				expect(
+					resolveAdvisorDeliveryChannel({
+						severity,
+						autoResumeSuppressed: false,
+						streaming: true,
+						aborting: false,
+						preserveOnly: true,
+					}),
+				).toBe("steer");
+			}
+		});
+
 		it("routes a non-interrupting nit to the aside queue regardless of state", () => {
 			expect(
 				resolveAdvisorDeliveryChannel({

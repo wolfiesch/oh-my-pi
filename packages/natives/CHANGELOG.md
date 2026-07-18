@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [17.0.5] - 2026-07-18
+
+### Added
+
+- Added optional PTY start callbacks that report the spawned child PID before command completion.
+
 ## [17.0.3] - 2026-07-17
 
 ### Fixed

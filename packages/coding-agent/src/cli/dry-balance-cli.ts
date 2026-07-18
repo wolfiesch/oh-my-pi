@@ -585,6 +585,7 @@ async function resolveDryBalanceModel(
 		const resolved = resolveCliModel({
 			cliModel: modelSelector,
 			modelRegistry,
+			settings,
 			preferences,
 		});
 		if (resolved.error) throw new Error(resolved.error);

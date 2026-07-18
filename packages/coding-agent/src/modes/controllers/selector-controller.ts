@@ -442,13 +442,20 @@ export class SelectorController {
 				break;
 
 			// Settings with UI side effects
-			case "showImages":
+			case "terminal.showImages":
+			case "showImages": {
+				const visible = value as boolean;
 				for (const child of this.ctx.chatContainer.children) {
 					if (child instanceof ToolExecutionComponent) {
-						child.setShowImages(value as boolean);
+						child.setShowImages(visible);
+					} else if (child instanceof AssistantMessageComponent) {
+						child.setImagesVisible(visible);
 					}
 				}
+				if (!visible) this.ctx.ui.clearInlineImages();
+				this.ctx.ui.resetDisplay();
 				break;
+			}
 			case "hideThinkingBlock":
 				this.ctx.hideThinkingBlock = value as boolean;
 				for (const child of this.ctx.chatContainer.children) {
@@ -1130,7 +1137,7 @@ export class SelectorController {
 				tree,
 				realLeafId,
 				this.ctx.ui.terminal.rows,
-				async entryId => {
+				async (entryId, options) => {
 					// Selecting the current leaf is a no-op (already there)
 					if (entryId === realLeafId) {
 						done();
@@ -1141,13 +1148,15 @@ export class SelectorController {
 					// Ask about summarization
 					done(); // Close selector first
 
-					// Loop until user makes a complete choice or cancels to tree
-					let wantsSummary = false;
+					// Loop until user makes a complete choice or cancels to tree.
+					// Shift+Enter in the tree selector pre-answers "Summarize" and
+					// skips the prompt entirely.
+					let wantsSummary = options.summarize;
 					let customInstructions: string | undefined;
 
 					const branchSummariesEnabled = settings.get("branchSummary.enabled");
 
-					while (branchSummariesEnabled) {
+					while (!wantsSummary && branchSummariesEnabled) {
 						const summaryChoice = await this.ctx.showHookSelector("Summarize branch?", [
 							"No summary",
 							"Summarize",
@@ -1476,7 +1485,14 @@ export class SelectorController {
 				// focus (#5339).
 				onManualCodeInput: useManualInput ? () => dialog.showManualInput(MANUAL_LOGIN_PROMPT) : undefined,
 			});
-			this.ctx.session.modelRegistry.refreshInBackground();
+			// Scope the post-login refresh to the just-authenticated provider with an
+			// `online` strategy: the default all-provider `online-if-uncached` reuses
+			// a fresh authoritative cache row (e.g. an empty result fetched before
+			// login), so newly persisted credentials would never re-run discovery and
+			// models would stay unavailable in-session (#5780). Unrelated providers
+			// are left untouched. `refreshProvider` swallows discovery failures, so
+			// awaiting cannot reject the login.
+			await this.ctx.session.modelRegistry.refreshProvider(providerId, "online");
 			const block = new TranscriptBlock();
 			// Name the account (and Anthropic organization) that was stored so a
 			// login that lands on an unintended account/subscription is visible
@@ -1516,7 +1532,12 @@ export class SelectorController {
 				return;
 			}
 
-			await this.ctx.session.modelRegistry.refresh();
+			// Provider-scoped online refresh so the removed credential's stale
+			// endpoint/deployment models are invalidated deterministically; the
+			// default all-provider `online-if-uncached` would reuse the fresh
+			// authoritative cache row and keep showing models the credential
+			// unlocked (#5780). Other providers are left untouched.
+			await this.ctx.session.modelRegistry.refreshProvider(providerId, "online");
 			const block = new TranscriptBlock();
 			block.addChild(
 				new Text(

@@ -42,7 +42,13 @@ import {
 import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { callWithCopilotModelRetry } from "../utils/retry";
-import { adaptSchemaForStrict, NO_STRICT, normalizeSchemaForMoonshot, toolWireSchema } from "../utils/schema";
+import {
+	adaptSchemaForStrict,
+	NO_STRICT,
+	normalizeSchemaForMoonshot,
+	sanitizeSchemaForGrammar,
+	toolWireSchema,
+} from "../utils/schema";
 import {
 	type HealedToolCall,
 	StreamMarkupHealing,
@@ -671,7 +677,7 @@ const streamOpenAICompletionsOnce = (
 				}
 				activeReasoningEffortFallbackKey = reasoningEffortFallbackKey;
 				activeRequestParams = params;
-				options?.onPayload?.(params);
+				options?.onPayload?.(params, model);
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,
@@ -1431,6 +1437,20 @@ function dropOpenRouterKimiForcedToolReasoning(
 	}
 }
 
+function hasActiveNativeKimiK3Reasoning(
+	model: Model<"openai-completions">,
+	options: OpenAICompletionsOptions | undefined,
+): boolean {
+	if (model.provider !== "kimi-code" || model.id.toLowerCase() !== "k3" || !model.reasoning) return false;
+	if (options?.reasoning === undefined || options.disableReasoning) return false;
+	try {
+		const url = new URL(model.baseUrl);
+		return url.hostname === "api.kimi.com" && (url.pathname === "/coding" || url.pathname.startsWith("/coding/"));
+	} catch {
+		return false;
+	}
+}
+
 function buildParams(
 	model: Model<"openai-completions">,
 	context: Context,
@@ -1518,6 +1538,20 @@ function buildParams(
 	) {
 		params.tool_choice = "required";
 	}
+	const forcedToolName =
+		typeof params.tool_choice === "object" && params.tool_choice !== null && "function" in params.tool_choice
+			? params.tool_choice.function.name
+			: undefined;
+	if (
+		forcedToolName !== undefined &&
+		Array.isArray(params.tools) &&
+		params.tools.some(tool => tool.type === "function" && tool.function.name === forcedToolName) &&
+		hasActiveNativeKimiK3Reasoning(model, options)
+	) {
+		// Native K3 reasoning is incompatible with selecting a specific function.
+		// Preserve the hard tool-use contract while letting K3 choose among tools.
+		params.tool_choice = "required";
+	}
 	if (isForcedToolChoice(params.tool_choice) && !initialCompat.supportsForcedToolChoice) {
 		// Some thinking-required OpenAI-compatible models reject forced
 		// `tool_choice` while still accepting tools with the default auto
@@ -1537,10 +1571,6 @@ function buildParams(
 		delete params.tool_choice;
 	}
 
-	const forcedToolName =
-		typeof params.tool_choice === "object" && params.tool_choice !== null && "function" in params.tool_choice
-			? params.tool_choice.function.name
-			: undefined;
 	if (
 		forcedToolName !== undefined &&
 		(!Array.isArray(params.tools) ||
@@ -2205,10 +2235,16 @@ function convertTools(
 					description: tool.description || "",
 					// Moonshot/Kimi native hosts validate against the stricter MFJS subset
 					// (const→enum, typed enums, no validators) and 400 otherwise.
+					// Grammar-constrained local backends (llama.cpp, LM Studio, vLLM)
+					// build a GBNF grammar from the schema and 400 with
+					// `Unrecognized schema: true` on the bare boolean subschema
+					// `toolWireSchema` emits for open fields (issue #5914).
 					parameters:
 						compat.toolSchemaFlavor === "moonshot-mfjs"
 							? (normalizeSchemaForMoonshot(wireParameters) as Record<string, unknown>)
-							: wireParameters,
+							: compat.toolSchemaFlavor === "grammar"
+								? sanitizeSchemaForGrammar(wireParameters)
+								: wireParameters,
 					// Only include strict if provider supports it. Some reject unknown fields.
 					...(includeStrict ? { strict: true } : includeExplicitFalse ? { strict: false } : {}),
 				},

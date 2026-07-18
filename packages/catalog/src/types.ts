@@ -310,16 +310,29 @@ export interface OpenAICompat {
 	supportsStrictMode?: boolean;
 	/**
 	 * Tool-schema dialect the endpoint validates `tools.function.parameters`
-	 * against. `"moonshot-mfjs"` triggers Moonshot Flavored JSON Schema
-	 * normalization (collapse `const`→`enum`, infer `type` on bare enums, strip
-	 * unsupported validators/`prefixItems`) because Moonshot/Kimi native hosts
-	 * reject standard JSON Schema constructs with HTTP 400. Default:
-	 * auto-detected — Moonshot native hosts (api.moonshot.ai / api.kimi.com)
-	 * and Kimi-family model ids on any host, since proxies (OpenRouter, custom
-	 * gateways) forward schemas to Moonshot verbatim. Set `"none"` to opt a
-	 * host out.
+	 * against.
+	 *
+	 * `"moonshot-mfjs"` triggers Moonshot Flavored JSON Schema normalization
+	 * (collapse `const`→`enum`, infer `type` on bare enums, strip unsupported
+	 * validators/`prefixItems`) because Moonshot/Kimi native hosts reject
+	 * standard JSON Schema constructs with HTTP 400.
+	 *
+	 * `"grammar"` triggers grammar-sampler normalization (widen bare boolean
+	 * `true`/`{}` subschemas in genuine subschema slots into a value-accepting
+	 * union of primitives) because grammar-constrained backends (llama.cpp, LM
+	 * Studio, vLLM) build a GBNF grammar from the JSON Schema and 400 with
+	 * `Unrecognized schema: true` on a bare boolean subschema (issue #5914).
+	 * Boolean `additionalProperties`/`unevaluatedProperties` are preserved — the
+	 * grammar converter reads them as closed/open-object semantics, and
+	 * `additionalProperties: false` pins the strict object shape.
+	 *
+	 * Default: auto-detected — `"moonshot-mfjs"` on Moonshot native hosts
+	 * (api.moonshot.ai / api.kimi.com) and Kimi-family model ids on any host,
+	 * since proxies (OpenRouter, custom gateways) forward schemas to Moonshot
+	 * verbatim; `"grammar"` on local OpenAI-compatible backends. Set `"none"`
+	 * to opt a host out.
 	 */
-	toolSchemaFlavor?: "moonshot-mfjs" | "none";
+	toolSchemaFlavor?: "moonshot-mfjs" | "grammar" | "none";
 	/**
 	 * Stream-watchdog idle-timeout floor in ms for slow reasoning hosts.
 	 * Default: auto-detected (GLM coding-plan hosts, direct DeepSeek reasoning).
@@ -418,6 +431,11 @@ export interface AnthropicCompat {
 	 * auto-detected (Z.AI hosts).
 	 */
 	requiresToolResultId?: boolean;
+	/**
+	 * Allow configured Claude Code fingerprint headers to replace generated
+	 * OAuth defaults on non-official Anthropic endpoints.
+	 */
+	allowAnthropicHeaderOverrides?: boolean;
 	/**
 	 * Replay unsigned `thinking` blocks from prior assistant turns as native
 	 * thinking instead of demoting them to text. Official Anthropic enforces

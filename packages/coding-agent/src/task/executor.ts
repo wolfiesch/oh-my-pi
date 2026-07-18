@@ -15,6 +15,7 @@ import {
 	formatModelSelectorValue,
 	formatModelStringWithRouting,
 	resolveAgentPrewalkPattern,
+	resolveConfiguredModelPatterns,
 	resolveModelOverride,
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
@@ -161,22 +162,44 @@ function resolveSubagentRetryFallbackCandidates(
 	return candidates;
 }
 
+function resolveSubagentDefaultRetryFallbackChain(settings: Settings): string[] | undefined {
+	const fallbackChain = settings.get("retry.fallbackChains")?.default;
+	if (
+		!Array.isArray(fallbackChain) ||
+		fallbackChain.length === 0 ||
+		!fallbackChain.every(entry => typeof entry === "string")
+	) {
+		return undefined;
+	}
+	return fallbackChain;
+}
+
 function installSubagentRetryFallbackChain(args: {
 	settings: Settings;
 	id: string;
 	candidates: SubagentRetryFallbackCandidate[];
+	defaultFallbackChain: string[] | undefined;
 	model: Model<Api> | undefined;
 	authFallbackUsed: boolean;
 }): string | undefined {
-	const { settings, id, candidates, model, authFallbackUsed } = args;
-	if (!model || authFallbackUsed || candidates.length <= 1) return undefined;
+	const { settings, id, candidates, defaultFallbackChain, model, authFallbackUsed } = args;
+	if (!model || authFallbackUsed || candidates.length === 0) return undefined;
 
 	const selectedIndex = candidates.findIndex(
 		candidate => candidate.model.provider === model.provider && candidate.model.id === model.id,
 	);
 	if (selectedIndex < 0) return undefined;
 	const fallbackSelectors = candidates.slice(selectedIndex + 1).map(candidate => candidate.selector);
-	if (fallbackSelectors.length === 0) return undefined;
+	const existingFallbackChains = settings.get("retry.fallbackChains");
+	// A single explicit model may reuse a configured default chain, but never an implicit parent fallback.
+	const fallbackChain = fallbackSelectors.length > 0 ? fallbackSelectors : defaultFallbackChain;
+	if (
+		!Array.isArray(fallbackChain) ||
+		fallbackChain.length === 0 ||
+		!fallbackChain.every(entry => typeof entry === "string")
+	) {
+		return undefined;
+	}
 
 	const role = `${SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX}${id}`;
 	const modelRoles: Record<string, string> = {};
@@ -189,10 +212,10 @@ function installSubagentRetryFallbackChain(args: {
 	}
 	modelRoles[role] = candidates[selectedIndex].selector;
 	settings.override("modelRoles", modelRoles);
+	// Insert the task-specific role first so another role assigned to the same model cannot capture fallback routing.
 	const fallbackChains: Record<string, string[]> = {
-		[role]: fallbackSelectors,
+		[role]: fallbackChain,
 	};
-	const existingFallbackChains = settings.get("retry.fallbackChains");
 	for (const existingRole in existingFallbackChains) {
 		if (existingRole !== role) {
 			fallbackChains[existingRole] = existingFallbackChains[existingRole];
@@ -922,7 +945,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	const finalOutputChunks: string[] = [];
 	const RECENT_OUTPUT_TAIL_BYTES = 8 * 1024;
 	let recentOutputTail = "";
-	let tailLastLineRepresentable = false;
+	let recentOutputDirty = false;
 	let resolved = false;
 	let abortSent = false;
 	let abortReason: AbortReason | undefined;
@@ -1062,7 +1085,22 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let lastProgressEmitMs = 0;
 	let progressTimeoutId: NodeJS.Timeout | null = null;
 
+	// Recompute progress.recentOutput from the capped tail. Deferred: text_delta
+	// appends only extend the tail and mark it dirty; the (up to 8KB) split/filter
+	// runs synchronously here, immediately before the ONLY places the progress
+	// object is snapshotted ({...progress} for onProgress and the eventBus
+	// progress channel, both inside emitProgressNow — including the
+	// scheduleProgress(flush) finalize/error/cancel paths). Observers therefore
+	// always see exact state; no staleness beyond the existing 150ms coalescing.
+	const refreshRecentOutput = () => {
+		if (!recentOutputDirty) return;
+		recentOutputDirty = false;
+		const filtered = recentOutputTail.split("\n").filter(line => line.trim());
+		progress.recentOutput = filtered.slice(-8).reverse();
+	};
+
 	const emitProgressNow = () => {
+		refreshRecentOutput();
 		progress.durationMs = Date.now() - startTime;
 		onProgress?.({ ...progress });
 		const activityGist =
@@ -1145,36 +1183,16 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		return message.usage;
 	};
 
-	const updateRecentOutputLines = () => {
-		const lines = recentOutputTail.split("\n");
-		const filtered = lines.filter(line => line.trim());
-		progress.recentOutput = filtered.slice(-8).reverse();
-		// The tail's last raw segment (after its final newline) is "represented"
-		// in recentOutput only when it trims non-empty — an empty/whitespace-only
-		// trailing segment is filtered out, so recentOutput[0] is then the line
-		// before it, not the tail's true last line.
-		tailLastLineRepresentable = lines[lines.length - 1].trim().length > 0;
-	};
-
 	const appendRecentOutputTail = (text: string) => {
 		if (!text) return;
 		recentOutputTail += text;
-		const truncated = recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES;
-		if (truncated) {
+		if (recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES) {
 			recentOutputTail = recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES);
 		}
-		// Fast path: a token without a newline only extends the current last line.
-		// This runs on every text_delta token (hundreds/thousands per second while
-		// streaming), so skip re-splitting the whole (up to 8KB) tail unless the line
-		// structure actually changed. Requires no truncation AND the tail's last line
-		// already represented (trims non-empty) — otherwise boundaries shift and a
-		// full recompute is required. Appending to a non-empty line keeps it non-empty,
-		// so the flag stays valid across consecutive fast-path tokens.
-		if (truncated || text.includes("\n") || !tailLastLineRepresentable || progress.recentOutput.length === 0) {
-			updateRecentOutputLines();
-		} else {
-			progress.recentOutput = [progress.recentOutput[0] + text, ...progress.recentOutput.slice(1)];
-		}
+		// O(chunk) hot path: this runs on every text_delta token (hundreds/
+		// thousands per second while streaming). Line reconstruction is deferred
+		// to refreshRecentOutput() at the emit boundary.
+		recentOutputDirty = true;
 	};
 
 	const replaceRecentOutputFromContent = (content: unknown[]) => {
@@ -1189,12 +1207,12 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				recentOutputTail = recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES);
 			}
 		}
-		updateRecentOutputLines();
+		recentOutputDirty = true;
 	};
 
 	const resetRecentOutput = () => {
 		recentOutputTail = "";
-		tailLastLineRepresentable = false;
+		recentOutputDirty = false;
 		progress.recentOutput = [];
 	};
 
@@ -2327,6 +2345,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 			checkAbort();
 
+			const configuredModelPatterns = resolveConfiguredModelPatterns(modelPatterns, settings);
+			const defaultRetryFallbackChain =
+				configuredModelPatterns.length === 1
+					? resolveSubagentDefaultRetryFallbackChain(subagentSettings)
+					: undefined;
 			const {
 				model,
 				thinkingLevel: resolvedThinkingLevel,
@@ -2360,6 +2383,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				settings: subagentSettings,
 				id,
 				candidates: resolveSubagentRetryFallbackCandidates(modelPatterns, modelRegistry, settings),
+				defaultFallbackChain: defaultRetryFallbackChain,
 				model,
 				authFallbackUsed,
 			});
@@ -2487,6 +2511,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,
 				modelPatternFallbackRole:
 					model || modelOverride === undefined ? undefined : `${SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX}${id}`,
+				modelPatternDefaultFallbackChain:
+					model || modelOverride === undefined ? undefined : defaultRetryFallbackChain,
 				thinkingLevel: effectiveThinkingLevel,
 				toolNames,
 				outputSchema,

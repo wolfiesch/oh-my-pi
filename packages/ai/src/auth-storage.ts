@@ -73,6 +73,15 @@ function fingerprintOAuthBearer(bearer: string): string {
 	return createHash("sha256").update(bearer).digest("base64url");
 }
 const SESSION_STICKY_CACHE_PREFIX = "session:sticky:";
+/**
+ * Anthropic-only idle window after which a session's pinned credential no
+ * longer suppresses usage-based re-ranking. Anthropic caps OAuth prompt-cache
+ * retention at `ttl: "1h"` (ephemeral ~5min otherwise), so after this long
+ * without an Anthropic resolve the conversation-prefix cache is no longer
+ * guaranteed warm. Other providers retain indefinite stickiness until their
+ * own cache lifetimes are verified.
+ */
+const ANTHROPIC_SESSION_STICKY_CACHE_WARM_MS = 60 * 60_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Credential Types
@@ -1137,7 +1146,10 @@ export class AuthStorage {
 	/** Tracks next credential index per provider:type key for round-robin distribution (non-session use). */
 	#providerRoundRobinIndex: Map<string, number> = new Map();
 	/** Tracks the last used credential per provider for a session (used for rate-limit switching). */
-	#sessionLastCredential: Map<string, Map<string, { type: AuthCredential["type"]; index: number }>> = new Map();
+	#sessionLastCredential: Map<
+		string,
+		Map<string, { type: AuthCredential["type"]; index: number; lastUsedAtMs?: number }>
+	> = new Map();
 	/** Recent bearer fingerprints resolved for each durable OAuth row; used only for delayed usage-limit attribution. */
 	#oauthBearerFingerprints: Map<string, Map<number, string[]>> = new Map();
 	/** Maps provider:type -> credentialIndex -> blockedUntilMs for temporary backoff. */
@@ -1685,17 +1697,18 @@ export class AuthStorage {
 		index: number,
 	): void {
 		if (!sessionId) return;
+		const nowMs = Date.now();
 		const sessionMap = this.#sessionLastCredential.get(provider) ?? new Map();
-		sessionMap.set(sessionId, { type, index });
+		sessionMap.set(sessionId, { type, index, lastUsedAtMs: nowMs });
 		this.#sessionLastCredential.set(provider, sessionMap);
 
 		try {
 			const credentialId = this.#getStoredCredentials(provider)[index]?.id;
 			if (credentialId !== undefined) {
 				const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
-				const cacheValue = JSON.stringify({ type, index, credentialId });
+				const cacheValue = JSON.stringify({ type, index, credentialId, lastUsedAtMs: nowMs });
 				// Expires in 30 days
-				const expiresAtSec = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+				const expiresAtSec = Math.floor(nowMs / 1000) + 30 * 24 * 60 * 60;
 				this.#store.setCache(cacheKey, cacheValue, expiresAtSec);
 			}
 		} catch (err) {
@@ -1707,7 +1720,7 @@ export class AuthStorage {
 	#getSessionCredential(
 		provider: string,
 		sessionId: string | undefined,
-	): { type: AuthCredential["type"]; index: number } | undefined {
+	): { type: AuthCredential["type"]; index: number; lastUsedAtMs?: number } | undefined {
 		if (!sessionId) return undefined;
 		let sessionMap = this.#sessionLastCredential.get(provider);
 		if (sessionMap?.has(sessionId)) {
@@ -1717,7 +1730,12 @@ export class AuthStorage {
 			const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
 			const raw = this.#store.getCache(cacheKey);
 			if (raw) {
-				const val = JSON.parse(raw) as { type: AuthCredential["type"]; index: number; credentialId?: number };
+				const val = JSON.parse(raw) as {
+					type: AuthCredential["type"];
+					index: number;
+					credentialId?: number;
+					lastUsedAtMs?: number;
+				};
 
 				if (val.credentialId !== undefined) {
 					const stored = this.#getStoredCredentials(provider);
@@ -1737,7 +1755,7 @@ export class AuthStorage {
 					sessionMap = new Map();
 					this.#sessionLastCredential.set(provider, sessionMap);
 				}
-				const sessionVal = { type: val.type, index: val.index };
+				const sessionVal = { type: val.type, index: val.index, lastUsedAtMs: val.lastUsedAtMs };
 				sessionMap.set(sessionId, sessionVal);
 				return sessionVal;
 			}
@@ -3886,16 +3904,15 @@ export class AuthStorage {
 	 * how fast the window's remaining quota must be consumed to fully use it
 	 * before it resets and expires. Higher = more headroom at risk of expiring
 	 * unused = ranked first, so selection chases quota that is about to be
-	 * wasted ("use it or lose it"). Without a reset clock the headroom
-	 * fraction alone is returned, degrading to most-headroom-first.
+	 * wasted ("use it or lose it"). Without a reset clock, the full window
+	 * duration is assumed to remain so clocked and clockless scores stay comparable.
 	 */
 	#computeWindowRequiredDrain(limit: UsageLimit | undefined, nowMs: number, fallbackDurationMs: number): number {
 		const headroom = 1 - this.#normalizeUsageFraction(limit);
 		if (headroom <= 0) return 0;
 		const resetAt = this.#resolveWindowResetAt(limit?.window);
-		if (resetAt === undefined) return headroom;
 		const durationMs = limit?.window?.durationMs ?? fallbackDurationMs;
-		let remainingMs = resetAt - nowMs;
+		let remainingMs = resetAt === undefined ? durationMs : resetAt - nowMs;
 		if (Number.isFinite(durationMs) && durationMs > 0) {
 			remainingMs = Math.min(remainingMs, durationMs);
 		}
@@ -4135,16 +4152,39 @@ export class AuthStorage {
 			sessionPreferredCredential !== undefined &&
 			(sessionPreferredCredential.refresh.trim().length > 0 ||
 				Date.now() + OAUTH_REFRESH_SKEW_MS < sessionPreferredCredential.expires);
-		// Skip ranking only when the session already has a working preferred credential — re-ranking
-		// mid-session causes account switches that cold-start the server-side prompt cache. New sessions
-		// (no preference) and sessions whose preferred is blocked still rank, so we pick the account
-		// with the most headroom proactively and fall back intelligently when rate-limited.
+		// Skip ranking when the session already has a working preferred credential and its prompt
+		// cache may still be warm. Only Anthropic has a verified idle boundary here; unverified
+		// providers retain indefinite stickiness rather than risk switching while their prompt cache
+		// remains warm. New Anthropic sessions (no preference), sessions whose preferred is blocked,
+		// and sessions idle past {@link ANTHROPIC_SESSION_STICKY_CACHE_WARM_MS} still rank. Legacy
+		// pins predating `lastUsedAtMs` count as warm until the next resolve rewrites the row.
+		const sessionPreferredLastUsedAtMs =
+			sessionCredential?.type === "oauth" ? sessionCredential.lastUsedAtMs : undefined;
+		const sessionPreferredIsWarm =
+			provider !== "anthropic" ||
+			sessionPreferredLastUsedAtMs === undefined ||
+			Date.now() - sessionPreferredLastUsedAtMs < ANTHROPIC_SESSION_STICKY_CACHE_WARM_MS;
 		const sessionPreferredIsAvailable =
 			sessionPreferredIndex !== undefined &&
 			sessionPreferredCanRefreshOrUse &&
 			!this.#isCredentialBlocked(provider, providerKey, sessionPreferredIndex, blockScope);
-		const shouldRank = checkUsage && (!sessionPreferredIsAvailable || hasPlanRequirement);
-		const rankingOrder = shouldRank && sessionId ? credentials.map((_credential, index) => index) : order;
+		const shouldRank = checkUsage && (!sessionPreferredIsAvailable || !sessionPreferredIsWarm || hasPlanRequirement);
+		// When ranking, seed the pinned credential first in the evaluation order so it wins genuine
+		// ties (the ranked comparator falls back to `orderPos`) without overriding a strictly-better
+		// sibling — this respects the residual value of a same-account shared static prefix that other
+		// workspace traffic may have kept warm, while still rotating away from a clearly-worse account.
+		const baseRankingOrder = credentials.map((_credential, index) => index);
+		let rankingOrder = shouldRank && sessionId ? baseRankingOrder : order;
+		const sessionPreferredRankingPos =
+			shouldRank && sessionId && sessionPreferredIndex !== undefined && !hasPlanRequirement
+				? credentials.findIndex(entry => entry.index === sessionPreferredIndex)
+				: -1;
+		if (sessionPreferredRankingPos > 0) {
+			rankingOrder = [
+				sessionPreferredRankingPos,
+				...baseRankingOrder.filter(index => index !== sessionPreferredRankingPos),
+			];
+		}
 		const candidates = shouldRank
 			? await this.#rankOAuthSelections({
 					providerKey,
@@ -4162,7 +4202,10 @@ export class AuthStorage {
 					.filter((selection): selection is { credential: OAuthCredential; index: number } => Boolean(selection))
 					.map(selection => ({ selection, usage: null, usageChecked: false }));
 
-		if (sessionPreferredIndex !== undefined && !hasPlanRequirement) {
+		// On the warm skip path the candidate list follows the round-robin `order`, not the pin, so
+		// hoist the pinned credential to the front to actually reuse it. When ranking ran, the pin is
+		// already a mere tie-break via `rankingOrder`; do not override the ranked result here.
+		if (!shouldRank && sessionPreferredIndex !== undefined && !hasPlanRequirement) {
 			const sessionPreferredCandidate = candidates.findIndex(
 				candidate =>
 					!this.#isCredentialBlocked(provider, providerKey, candidate.selection.index, blockScope) &&
@@ -4248,6 +4291,29 @@ export class AuthStorage {
 		const enforcePlanRequirement =
 			hasPlanRequirement &&
 			candidates.some(candidate => getOpenAICodexPlanEligibility(candidate.usage, planRequirement) === true);
+
+		// Plan-gated Codex models rank on every resolve to re-verify account tiers,
+		// so the drain-urgency order can flip between two eligible accounts as their
+		// usage headroom shifts. Promote the session-preferred credential back to the
+		// front while it is unblocked and still plan-eligible (or the requirement is
+		// unenforced and the pin is not known-ineligible) so an active session never
+		// silently migrates accounts mid-conversation; blocked, exhausted, or
+		// known-ineligible pins still fall through to the ranked sibling.
+		if (hasPlanRequirement && sessionPreferredIndex !== undefined) {
+			const sessionPreferredCandidate = candidates.findIndex(
+				candidate =>
+					!this.#isCredentialBlocked(provider, providerKey, candidate.selection.index, blockScope) &&
+					candidate.selection.index === sessionPreferredIndex,
+			);
+			if (sessionPreferredCandidate > 0) {
+				const preferred = candidates[sessionPreferredCandidate]!;
+				const planEligibility = getOpenAICodexPlanEligibility(preferred.usage, planRequirement);
+				if (planEligibility === true || (!enforcePlanRequirement && planEligibility !== false)) {
+					candidates.splice(sessionPreferredCandidate, 1);
+					candidates.unshift(preferred);
+				}
+			}
+		}
 
 		const passes: Array<{ allowBlocked: boolean; enforcePlanRequirement: boolean }> = [
 			{ allowBlocked: false, enforcePlanRequirement },

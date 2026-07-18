@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [17.0.5] - 2026-07-18
+
+### Added
+
+- Added an Anthropic compatibility flag to allow non-official OAuth endpoints to opt into configured Claude Code fingerprint header overrides.
+
+### Fixed
+
+- Fixed a security issue where sensitive provider-defined request headers (such as API keys or credentials) were serialized in plaintext within the model cache (models.db). The cache now omits these headers, securely invalidates older cached rows, and restores or refetches them dynamically.
+- Fixed OpenAI Codex discovery to respect caller-supplied fetch configurations (such as proxies or custom CAs) and correctly replace stale bundled models with the authenticated account catalog.
+- Fixed stream timeouts and retry loops during long prefills on local loopback or RFC1918 backends (such as litellm proxies fronting local servers) by applying the local stream-timeout floor to these backends.
+- Fixed Kimi K3 models served through generic OpenAI-compatible routes exposing unsupported reasoning efforts instead of the mandatory low/high/max scale.
+
 ## [17.0.4] - 2026-07-18
 
 ### Changed

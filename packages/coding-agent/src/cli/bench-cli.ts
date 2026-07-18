@@ -443,9 +443,7 @@ function resolveBenchModels(
 	const resolved: BenchTarget[] = [];
 	const errors: string[] = [];
 	for (const selector of selectors) {
-		const configuredRoleSelector = settings?.getModelRole(selector.trim())?.trim();
-		const effectiveSelector = configuredRoleSelector || selector;
-		const result = resolveCliModel({ cliModel: effectiveSelector, modelRegistry, preferences });
+		const result = resolveCliModel({ cliModel: selector, modelRegistry, settings, preferences });
 		if (result.error) {
 			errors.push(`${selector}: ${result.error}`);
 			continue;
@@ -456,8 +454,9 @@ function resolveBenchModels(
 		}
 		if (result.warning) writeStderr(`${chalk.yellow(`Warning: ${result.warning}`)}\n`);
 		let model = result.model;
+		const authSelector = result.configuredPatterns?.[result.configuredPatternIndex ?? 0] ?? selector;
 		const authenticated = resolveAuthenticatedAlternative(
-			effectiveSelector,
+			authSelector,
 			model,
 			modelRegistry,
 			preferences.providerOrder,

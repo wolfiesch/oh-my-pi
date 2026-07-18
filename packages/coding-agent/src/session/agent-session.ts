@@ -63,6 +63,7 @@ import {
 	estimateTokens,
 	generateBranchSummary,
 	generateHandoffFromContext,
+	invalidateMessageCache,
 	prepareCompaction,
 	renderHandoffPrompt,
 	resolveBudgetReserveTokens,
@@ -121,6 +122,7 @@ import {
 } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { GeminiHeaderRunDetector, isGeminiThinkingModel } from "@oh-my-pi/pi-ai/utils/thinking-loop";
 import { type RepeatedToolCallDetection, ToolCallLoopGuard } from "@oh-my-pi/pi-ai/utils/tool-call-loop-guard";
@@ -137,6 +139,7 @@ import {
 	getInstallId,
 	isBunTestRuntime,
 	isEnoent,
+	isInteractiveHost,
 	logger,
 	postmortem,
 	prompt,
@@ -1928,6 +1931,8 @@ export class AgentSession {
 	 *  suppresses advisor concern/blocker auto-resume until the user next resumes.
 	 *  Advisor advice is still recorded into the transcript, just not auto-run. */
 	#advisorAutoResumeSuppressed = false;
+	/** Print-mode sessions preserve advisor notes without starting hidden primary turns. */
+	#preserveAdvisorAdvice = false;
 	#advisorPrimaryTurnsCompleted = 0;
 	#advisorInterruptImmuneTurnStart: number | undefined;
 	#planModeState: PlanModeState | undefined;
@@ -2067,6 +2072,8 @@ export class AgentSession {
 	#turnIndex = 0;
 	#messageEndPersistenceTail: Promise<void> = Promise.resolve();
 	#pendingMessageEndPersistence = new Map<string, Promise<void>>();
+	/** Async lifecycle handlers for visible advisor cards emitted outside the primary loop. */
+	#pendingAdvisorCardEvents = new Set<Promise<void>>();
 	#persistedMessageKeys: { anchor: string; keys: Set<string> } | undefined;
 	#activeAssistantStreamId: string | undefined;
 
@@ -2564,7 +2571,13 @@ export class AgentSession {
 		const isPlanNudge = (m: AgentMessage): boolean =>
 			m.role === "custom" && m.customType === PREWALK_PLAN_MESSAGE_TYPE;
 		for (let i = liveMessages.length - 1; i >= 0; i--) {
-			if (isPlanNudge(liveMessages[i])) liveMessages.splice(i, 1);
+			if (isPlanNudge(liveMessages[i])) {
+				// Interior removal on the live array: drop the scrubbed message from
+				// the convert/estimate caches so the next convert can't reuse a prefix
+				// that still carries its fragment (the array shrinks in place).
+				invalidateMessageCache(liveMessages[i]);
+				liveMessages.splice(i, 1);
+			}
 		}
 		const stateMessages = this.agent.state.messages;
 		const filtered = stateMessages.filter(m => !isPlanNudge(m));
@@ -3406,6 +3419,7 @@ export class AgentSession {
 		const channel = resolveAdvisorDeliveryChannel({
 			severity,
 			autoResumeSuppressed: this.#advisorAutoResumeSuppressed,
+			preserveOnly: this.#preserveAdvisorAdvice,
 			// Key on the live agent-core loop, not session `isStreaming` (which also
 			// counts `#promptInFlightCount` during post-turn unwind). Only a running
 			// loop consumes a steer at its next boundary.
@@ -4205,30 +4219,58 @@ export class AgentSession {
 		return queued;
 	}
 
+	/**
+	 * Orders subscriber fan-out across concurrent `#emitSessionEvent` calls.
+	 * Extension emits only await when the event type has handlers, so an event
+	 * with no handlers could otherwise overtake an earlier event still inside
+	 * its extension emit — an instant refusal delivered its assistant
+	 * `message_end` to the TUI before its own `message_start`, skipping the
+	 * turn-ending error render entirely.
+	 */
+	#subscriberEmitGate: Promise<void> = Promise.resolve();
+
 	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
 		if (event.type === "message_update") {
 			this.#emit(event);
 			void this.#queueExtensionEvent(event);
 			return;
 		}
-		await this.#emitExtensionEvent(event);
-		// Hold the wire-level agent_end until in-flight prompts unwind. Subscribers
-		// (rpc-mode, ACP, Cursor) treat agent_end as the "session is idle" signal;
-		// emitting while #promptInFlightCount > 0 lets a client fire its next
-		// `prompt` into a session that still reports isStreaming === true. Flush
-		// happens in #endInFlight / #resetInFlight. A later agent_end (e.g. from
-		// an auto-compaction turn that starts before the original prompt unwinds)
-		// supersedes the pending one, which is what subscribers want — they only
-		// care about the final settle.
-		if (event.type === "agent_end" && this.#promptInFlightCount > 0) {
-			this.#pendingAgentEndEmit = event;
-			return;
+		// Take a FIFO ticket before the extension emit: extension deliveries for
+		// consecutive events still run concurrently, but subscriber fan-out waits
+		// for every earlier event's fan-out (or deferral) to happen first.
+		const previousGate = this.#subscriberEmitGate;
+		const { promise: gate, resolve: releaseGate } = Promise.withResolvers<void>();
+		this.#subscriberEmitGate = gate;
+		try {
+			await this.#emitExtensionEvent(event);
+			await previousGate;
+			// Hold the wire-level agent_end until in-flight prompts unwind. Subscribers
+			// (rpc-mode, ACP, Cursor) treat agent_end as the "session is idle" signal;
+			// emitting while #promptInFlightCount > 0 lets a client fire its next
+			// `prompt` into a session that still reports isStreaming === true. Flush
+			// happens in #endInFlight / #resetInFlight. A later agent_end (e.g. from
+			// an auto-compaction turn that starts before the original prompt unwinds)
+			// supersedes the pending one, which is what subscribers want — they only
+			// care about the final settle.
+			if (event.type === "agent_end" && this.#promptInFlightCount > 0) {
+				this.#pendingAgentEndEmit = event;
+				return;
+			}
+			this.#emit(event);
+		} finally {
+			releaseGate();
 		}
-		this.#emit(event);
 	}
 
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
+	/**
+	 * Classifier-refusal turn pruned from active context at settle (#3591).
+	 * Retained until the next run starts so post-settle readers
+	 * ({@link getLastAssistantMessage}: print mode, task executor) still see
+	 * the terminal error instead of a silently successful-looking state.
+	 */
+	#prunedTerminalRefusal: AssistantMessage | undefined = undefined;
 
 	/** Internal handler for agent events - shared by subscribe and reconnect.
 	 *
@@ -4246,7 +4288,12 @@ export class AgentSession {
 	 * everything it schedules — settles. */
 	#handleAgentEvent = async (event: AgentEvent): Promise<void> => {
 		if (event.type !== "agent_end") {
-			return this.#processAgentEvent(event);
+			const processing = this.#processAgentEvent(event);
+			if ((event.type === "message_start" || event.type === "message_end") && isAdvisorCard(event.message)) {
+				this.#pendingAdvisorCardEvents.add(processing);
+				void processing.finally(() => this.#pendingAdvisorCardEvents.delete(processing)).catch(() => {});
+			}
+			return processing;
 		}
 		const { promise, resolve } = Promise.withResolvers<void>();
 		this.#trackPostPromptTask(promise);
@@ -4515,6 +4562,11 @@ export class AgentSession {
 	}
 
 	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
+		// A fresh run supersedes the previously settled (and pruned) refusal
+		// turn: state-based lookups take over again.
+		if (event.type === "agent_start") {
+			this.#prunedTerminalRefusal = undefined;
+		}
 		// This must run before the first await in the handler. Agent-core invokes
 		// listeners fire-and-forget, so later lifecycle handlers can otherwise race
 		// ahead while extension hooks are pending.
@@ -4537,6 +4589,19 @@ export class AgentSession {
 			} else if (!isError && MID_RUN_TODO_NUDGE_MUTATING_TOOLS[toolName]) {
 				this.#mutationsSinceLastTodoTouch++;
 			}
+			// A tool actually ran. Clear the post-reminder suppression synchronously
+			// too: the settle check (`#checkTodoCompletion` in agent_end maintenance)
+			// can otherwise read the stale flag when a tool result and the terminal
+			// stop land in the same tick, swallowing the earned re-escalation.
+			this.#todoReminderAwaitingProgress = false;
+		}
+		// Track the settled assistant turn synchronously as well: agent_end
+		// maintenance reads `#lastAssistantMessage`, and when a turn's events all
+		// land in one tick its handler can run before this handler's post-emit
+		// bookkeeping — leaving maintenance looking at the previous (e.g.
+		// toolUse) assistant message and skipping settle-only work.
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			this.#lastAssistantMessage = event.message;
 		}
 		// Plan-mode internal transition: stamp `SILENT_ABORT_MARKER` on the
 		// persisted message BEFORE the obfuscator's display-side copy below.
@@ -4760,9 +4825,7 @@ export class AgentSession {
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
-			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
-				this.#lastAssistantMessage = event.message;
 				const assistantMsg = event.message as AssistantMessage;
 				// Fold this turn's timing into per-model perf aggregates (drives the
 				// /models TPS/TTFT display). Errored turns measure nothing; aborted
@@ -4832,10 +4895,6 @@ export class AgentSession {
 				const details = isRecord(event.message.details) ? event.message.details : undefined;
 				const semanticResult = semanticToolResult(toolName, event.message);
 				const semanticDetails = isRecord(semanticResult?.details) ? semanticResult.details : undefined;
-				// A tool actually ran. Clear the post-reminder suppression: the agent did
-				// productive work in response to the prior nudge, so the next text-only stop
-				// is allowed to escalate to the next reminder if todos remain incomplete.
-				this.#todoReminderAwaitingProgress = false;
 				// Invalidate streaming edit cache when edit tool completes to prevent stale data
 				const editedPath = details ? getStringProperty(details, "path") : undefined;
 				if (toolName === "edit" && editedPath) {
@@ -5061,8 +5120,12 @@ export class AgentSession {
 					return;
 				}
 			}
-			if (this.#isRetryableError(msg)) {
-				const didRetry = await this.#handleRetryableError(msg);
+			const resumeCursorStreamStall = this.#canResumeCursorStreamStall(msg);
+			if (resumeCursorStreamStall || this.#isRetryableError(msg)) {
+				const didRetry = await this.#handleRetryableError(
+					msg,
+					resumeCursorStreamStall ? { preserveFailedTurn: true } : undefined,
+				);
 				if (didRetry) {
 					await emitAgentEndNotification({ willContinue: true });
 					return;
@@ -5081,10 +5144,14 @@ export class AgentSession {
 			}
 			// Classifier refusals are persisted-skipped above; also prune the trailing
 			// stub from active context so the next turn's prompt does not replay it.
+			// Keep a reference for post-settle readers (print mode, task executor via
+			// getLastAssistantMessage) — pruning made the terminal error invisible to
+			// anything inspecting agent state after prompt() resolved.
 			// Fall through to the standard error tail so `session_stop` hooks (block,
 			// continue, telemetry) still fire — matching the pre-fix flow for
 			// `stopReason === "error"`.
 			if (this.#isClassifierRefusal(msg)) {
+				this.#prunedTerminalRefusal = msg;
 				this.#removeAssistantMessageFromActiveContext(msg);
 			}
 			this.#resolveRetry();
@@ -6907,6 +6974,83 @@ export class AgentSession {
 		return this.#disposeCall;
 	}
 
+	async #disposeOwnedAsyncJobs(): Promise<void> {
+		this.#cancelOwnAsyncJobs();
+		const manager = this.#ownedAsyncJobManager;
+		if (!manager) return;
+
+		try {
+			const drained = await manager.dispose({ timeoutMs: 3_000 });
+			const deliveryState = manager.getDeliveryState();
+			if (drained === false && deliveryState) {
+				logger.warn("Async job completion deliveries still pending during dispose", { ...deliveryState });
+			}
+		} finally {
+			if (AsyncJobManager.instance() === manager) {
+				AsyncJobManager.setInstance(undefined);
+			}
+		}
+	}
+
+	async #disposeEvalKernels(): Promise<void> {
+		const settled = await this.#prepareEvalExecutionsForDispose();
+		if (!settled) {
+			logger.warn("Detaching retained eval-kernel ownership during dispose while eval execution is still active");
+		}
+
+		const results = await Promise.allSettled([
+			disposeKernelSessionsByOwner(this.#evalKernelOwnerId),
+			disposeRubyKernelSessionsByOwner(this.#evalKernelOwnerId),
+			disposeJuliaKernelSessionsByOwner(this.#evalKernelOwnerId),
+		]);
+		const errors: unknown[] = [];
+		for (const result of results) {
+			if (result.status === "rejected") errors.push(result.reason);
+		}
+		if (errors.length > 0) throw new AggregateError(errors, "Failed to dispose one or more eval kernels");
+	}
+
+	async #releaseOwnedBrowserTabs(ownerId: string | undefined): Promise<void> {
+		if (!ownerId) return;
+		try {
+			const released = await withTimeout(
+				releaseTabsForOwner(ownerId, { kill: true }),
+				3_000,
+				"Timed out releasing owned browser tabs during dispose",
+			);
+			if (released > 0) {
+				logger.debug("Released owned browser tabs during dispose", { ownerId, released });
+			}
+		} catch (error) {
+			logger.warn("Failed to release owned browser tabs during dispose", { error: String(error) });
+		}
+	}
+
+	async #disconnectOwnedMcp(): Promise<void> {
+		if (!this.#disconnectOwnedMcpManager) return;
+		try {
+			await withTimeout(
+				this.#disconnectOwnedMcpManager(),
+				3_000,
+				"Timed out disconnecting owned MCP manager during dispose",
+			);
+		} catch (error) {
+			logger.warn("Failed to disconnect owned MCP manager during dispose", { error: String(error) });
+		}
+	}
+
+	async #disposeMnemopi(
+		state: MnemopiSessionState | undefined,
+		consolidateTimeoutMs: number | undefined,
+	): Promise<void> {
+		try {
+			await state?.dispose({ timeoutMs: consolidateTimeoutMs });
+		} finally {
+			// Consolidation may embed final memories, so terminate its worker only afterward.
+			await shutdownMnemopiEmbedClient();
+		}
+	}
+
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
 		this.beginDispose();
 		this.#recordSessionExit(options.reason ?? "dispose");
@@ -6919,124 +7063,50 @@ export class AgentSession {
 		} catch (error) {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
-		// Clear any timers extensions scheduled via `ctx.setInterval`/`ctx.setTimeout`
-		// so their background work does not outlive the session (issue #5664).
-		// Optional-called: hosts and tests may inject partial runner facades that
-		// implement only the dispatch surface.
+
+		// Stop extension timers before aborting deferred work they could enqueue.
 		this.#extensionRunner?.clearManagedTimers?.();
 		this.#fallbackExtensionTimers?.clearAll();
-		// Abort post-prompt work so the drain below can complete. Without this, a
-		// deferred-handoff task that has already advanced into
-		// `await this.handoff(...) → generateHandoff(...)` keeps awaiting a live LLM stream
-		// — Promise.allSettled() in #cancelPostPromptTasks then waits forever, freezing
-		// /exit and Ctrl+C-double-tap. The post-prompt task's own AbortSignal does not
-		// propagate into the inner handoff/compaction controllers, so we abort them
-		// explicitly. agent.abort() is needed for an agent.continue() that may have
-		// raced the deferred handoff (its streaming loop is awaited by the wrapper IIFE).
-		//
-		// Tool work (bash/eval/python) is NOT aborted here — those have their own
-		// dispose paths and shared kernels are contractually allowed to survive a
-		// session's dispose.
 		this.abortRetry();
 		this.abortCompaction();
 		const postPromptDrain = this.#cancelPostPromptTasks();
 		this.agent.abort();
-		await postPromptDrain;
+		try {
+			await withTimeout(postPromptDrain, 5_000, "Timed out draining post-prompt tasks during dispose");
+		} catch (error) {
+			logger.warn("Post-prompt tasks still draining at dispose deadline", { error: String(error) });
+		}
 		await this.#drainAutolearnCapture();
-		// Cancel jobs this agent registered so a subagent's teardown doesn't
-		// leak its background bash/task work into the parent's manager. Only
-		// the session that owns the manager goes on to dispose it (which itself
-		// nukes any leftover jobs and pending deliveries).
-		this.#cancelOwnAsyncJobs();
-		const ownedAsyncManager = this.#ownedAsyncJobManager;
-		if (ownedAsyncManager) {
-			const drained = await ownedAsyncManager.dispose({ timeoutMs: 3_000 });
-			const deliveryState = ownedAsyncManager.getDeliveryState();
-			if (drained === false && deliveryState) {
-				logger.warn("Async job completion deliveries still pending during dispose", { ...deliveryState });
-			}
-			if (AsyncJobManager.instance() === ownedAsyncManager) {
-				AsyncJobManager.setInstance(undefined);
-			}
-		}
-		const evalExecutionsSettled = await this.#prepareEvalExecutionsForDispose();
-		if (!evalExecutionsSettled) {
-			logger.warn("Detaching retained eval-kernel ownership during dispose while eval execution is still active");
-		}
-		await disposeKernelSessionsByOwner(this.#evalKernelOwnerId);
-		await disposeRubyKernelSessionsByOwner(this.#evalKernelOwnerId);
-		await disposeJuliaKernelSessionsByOwner(this.#evalKernelOwnerId);
-		// Release headless / spawned Chromium and worker tabs this session
-		// opened via the browser tool. The tool's `tabs`/`browsers` maps are
-		// module-global — subagents and future sessions share them — so we
-		// walk by `ownerSessionId` (assigned at `acquireTab` creation, never on
-		// reuse) and touch only what THIS session created. Bounded so a broken
-		// CDP close cannot stall `/exit`; mirrors the async-job/MCP pattern.
-		// (Issue #3963.)
-		const browserOwnerId = this.sessionManager.getSessionId();
-		if (browserOwnerId) {
-			try {
-				const released = await withTimeout(
-					releaseTabsForOwner(browserOwnerId, { kill: true }),
-					3_000,
-					"Timed out releasing owned browser tabs during dispose",
-				);
-				if (released > 0) {
-					logger.debug("Released owned browser tabs during dispose", { ownerId: browserOwnerId, released });
-				}
-			} catch (error) {
-				logger.warn("Failed to release owned browser tabs during dispose", { error: String(error) });
+
+		const hindsightState = this.getHindsightSessionState();
+		const mnemopiState = setMnemopiSessionState(this, undefined);
+		const advisorRecorderClosed = this.#advisorRecorderClosed;
+		const results = await Promise.allSettled([
+			this.#disposeOwnedAsyncJobs(),
+			this.#disposeEvalKernels(),
+			this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId()),
+			shutdownTinyTitleClient(),
+			this.#disconnectOwnedMcp(),
+			advisorRecorderClosed,
+			hindsightState?.flushRetainQueue() ?? Promise.resolve(),
+			this.#disposeMnemopi(mnemopiState, options.mnemopiConsolidateTimeoutMs),
+		]);
+		for (const result of results) {
+			if (result.status === "rejected") {
+				logger.warn("Session dispose subsystem failed during parallel teardown", {
+					error: String(result.reason),
+				});
 			}
 		}
-		await shutdownTinyTitleClient();
+
 		this.#releasePowerAssertion();
-		// Clean up an empty session created by this session's /move so it doesn't accumulate.
 		await cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile);
 		this.#movedFromEmptySessionFile = undefined;
+		// All teardown branches that can append session entries have settled.
 		await this.sessionManager.close();
-		// beginDispose() stopped the advisor and captured its recorder close; await
-		// it so the final advisor turn is flushed before the process may exit.
-		await this.#advisorRecorderClosed;
 		this.#closeAllProviderSessions("dispose");
-		// Disconnect the MCP manager this session OWNS so its stdio servers are
-		// not orphaned at exit. Best-effort: a failure here must never throw out
-		// of dispose. Only owning (top-level) sessions provide this callback;
-		// subagents reuse a parent's manager and must not tear it down. Idempotent
-		// with the deferred-discovery disconnect in `createAgentSession`.
-		//
-		// BOUNDED: an owned manager may hold an HTTP/SSE server whose session-
-		// termination DELETE blocks up to the MCP request timeout (30s default,
-		// unbounded when OMP_MCP_TIMEOUT_MS=0), so awaiting `disconnectAll()`
-		// unbounded would stall /exit and print-mode shutdown on a broken remote
-		// endpoint. Race it against a short deadline — stdio close (the subprocess
-		// reap this targets) completes well within the bound; a slow transport
-		// close is left to finish detached. Mirrors the bounded async-job teardown.
-		if (this.#disconnectOwnedMcpManager) {
-			try {
-				await withTimeout(
-					this.#disconnectOwnedMcpManager(),
-					3_000,
-					"Timed out disconnecting owned MCP manager during dispose",
-				);
-			} catch (error) {
-				logger.warn("Failed to disconnect owned MCP manager during dispose", { error: String(error) });
-			}
-		}
-		// Flush the retain queue BEFORE clearing the session's pointer so
-		// `HindsightRetainQueue.#doFlush` still sees `session.getHindsightSessionState() === state`.
-		// Reversed, the spliced batch survives just long enough to fail the
-		// identity check and get dropped with a `session vanished` warning.
-		const hindsightState = this.getHindsightSessionState();
-		await hindsightState?.flushRetainQueue();
 		this.setHindsightSessionState(undefined);
 		hindsightState?.dispose();
-		const mnemopiState = setMnemopiSessionState(this, undefined);
-		await mnemopiState?.dispose({ timeoutMs: options.mnemopiConsolidateTimeoutMs });
-		// Tear down the embeddings subprocess AFTER mnemopi state.dispose:
-		// consolidate-on-dispose may still call `embed()` to store the final
-		// memories, and that round-trips through the worker we are about to
-		// hard-kill (issue #3031).
-		await shutdownMnemopiEmbedClient();
 		this.#disconnectFromAgent();
 		if (this.#unsubscribeAppendOnly) {
 			this.#unsubscribeAppendOnly();
@@ -7137,6 +7207,53 @@ export class AgentSession {
 		await this.agent.waitForIdle();
 		await this.#waitForPostPromptRecovery();
 	}
+	/**
+	 * Prevent advisor notes from starting hidden primary turns while a headless
+	 * caller prints and drains the final primary response.
+	 */
+	prepareForHeadlessAdvisorDrain(): void {
+		this.#preserveAdvisorAdvice = true;
+	}
+
+	async #waitForPendingAdvisorCardEvents(timeoutMs: number): Promise<boolean> {
+		const deadline = Date.now() + Math.max(0, timeoutMs);
+		while (this.#pendingAdvisorCardEvents.size > 0) {
+			const remainingMs = deadline - Date.now();
+			if (remainingMs <= 0) return false;
+			const settled = Promise.allSettled([...this.#pendingAdvisorCardEvents]).then(() => true as const);
+			const { promise: timedOut, resolve } = Promise.withResolvers<false>();
+			const timer = setTimeout(() => resolve(false), remainingMs);
+			try {
+				if (!(await Promise.race([settled, timedOut]))) return false;
+			} finally {
+				clearTimeout(timer);
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Wait for active advisor reviews and their emitted card events before a
+	 * headless caller disposes the session. Returns `false` and logs work disposal
+	 * will abandon when the shared deadline expires or an advisor fails.
+	 */
+	async waitForAdvisorCatchup(timeoutMs: number): Promise<boolean> {
+		const deadline = Date.now() + timeoutMs;
+		const results = await Promise.all(this.#advisors.map(advisor => advisor.runtime.waitForCatchup(timeoutMs, 1)));
+		const cardEventsCaughtUp = await this.#waitForPendingAdvisorCardEvents(Math.max(0, deadline - Date.now()));
+		const abandoned = this.#advisors.filter(
+			(advisor, index) => results[index] === false && advisor.runtime.backlog > 0,
+		);
+		if (abandoned.length > 0 || !cardEventsCaughtUp) {
+			logger.warn("advisor shutdown drain incomplete; disposal will abandon reviews or cards", {
+				timeoutMs,
+				advisors: abandoned.map(advisor => ({ name: advisor.name, backlog: advisor.runtime.backlog })),
+				pendingAdvisorCards: this.#pendingAdvisorCardEvents.size,
+			});
+			return false;
+		}
+		return true;
+	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {
 		const manager = this.#asyncJobManager;
@@ -7155,9 +7272,14 @@ export class AgentSession {
 		}
 	}
 
-	/** Most recent assistant message in agent state. */
+	/**
+	 * Most recent settled assistant message. A classifier-refusal turn pruned
+	 * from active context at settle is still reported until the next run
+	 * starts, so terminal-outcome consumers (print mode, task executor) see
+	 * the refusal error rather than the previous turn — or nothing.
+	 */
 	getLastAssistantMessage(): AssistantMessage | undefined {
-		return this.#findLastAssistantMessage();
+		return this.#prunedTerminalRefusal ?? this.#findLastAssistantMessage();
 	}
 	/** Current effective system prompt blocks (includes any per-turn extension modifications) */
 	get systemPrompt(): string[] {
@@ -7886,6 +8008,12 @@ export class AgentSession {
 	 */
 	get hasPostPromptWork(): boolean {
 		return this.#postPromptTasks.size > 0;
+	}
+
+	/** Register post-prompt work in tests without driving a full agent turn. */
+	trackPostPromptTaskForTests(task: Promise<unknown>): void {
+		if (!isBunTestRuntime()) throw new Error("trackPostPromptTaskForTests is test-only");
+		this.#trackPostPromptTask(task);
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
@@ -9804,6 +9932,13 @@ export class AgentSession {
 	}
 
 	#scheduleReplanTitleRefresh(): void {
+		// Headless subagent sessions have no operator-visible title, so a todo-init
+		// replan refresh only burns a tiny-model call whose result lands in JSONL
+		// and is never shown (issue #5910). In an interactive host the operator can
+		// focus a live subagent from the Agent Hub, where the status line renders
+		// its session name — so keep the refresh there and only skip subagents when
+		// no focusable UI exists (print/RPC/ACP/eval/SDK/CI).
+		if (this.#agentKind === "sub" && !isInteractiveHost()) return;
 		if (this.#replanTitleRefreshInFlight) return;
 		if (!this.settings.get("title.refreshOnReplan")) return;
 		if (this.sessionManager.titleSource === "user") return;
@@ -12274,7 +12409,8 @@ export class AgentSession {
 		this.#emptyStopRetryCount++;
 		if (this.#emptyStopRetryCount > EMPTY_STOP_MAX_RETRIES) {
 			const attempts = this.#emptyStopRetryCount - 1;
-			const finalError = "Assistant returned empty stop after retry cap";
+			const finalError =
+				"Assistant returned empty stop after retry cap; try switching models or `/shake images` to remove archived frames";
 			logger.warn(finalError, {
 				attempts,
 				model: assistantMessage.model,
@@ -12289,11 +12425,11 @@ export class AgentSession {
 			this.#clearPendingRecoveredRetryErrors();
 			this.#retryAttempt = 0;
 			this.#resolveRetry();
-			// Tool-use orphans corrupt Anthropic message history (tool_result without
-			// matching tool_use). Always remove them even when the retry cap is hit.
-			if (assistantMessage.stopReason === "toolUse") {
-				this.#discardAssistantTurn(assistantMessage);
-			}
+			// A zero-content turn carries no transcript value, while its provider usage
+			// can anchor the next prompt at the full failed-request size and re-trigger
+			// compaction at the same boundary. Remove every capped empty stop; toolUse
+			// orphans still need this for Anthropic message-history validity.
+			await this.#dropPersistedAssistantTurn(assistantMessage);
 			return false;
 		}
 		this.#discardAssistantTurn(assistantMessage);
@@ -14103,35 +14239,80 @@ export class AgentSession {
 				this.#getCompactionModelCandidates(availableModels),
 				this.sessionId,
 			);
-			const preparation = prepareCompaction(pathEntries, compactionSettings, autoCompactionCandidates);
+			let pathEntriesForCompaction = pathEntries;
+			let preparation = prepareCompaction(pathEntriesForCompaction, compactionSettings, autoCompactionCandidates);
 			if (!preparation) {
-				await this.#emitSessionEvent({
-					type: "auto_compaction_end",
-					action,
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					skipped: true,
-				});
-				const noProgressDeadEnd = reason !== "idle";
-				let continuationScheduled = false;
-				if (!suppressContinuation && this.agent.hasQueuedMessages()) {
-					this.#scheduleAgentContinue({
-						delayMs: 100,
-						generation,
-						shouldContinue: () => this.agent.hasQueuedMessages(),
+				// prepareCompaction found nothing to summarize because the kept region
+				// is a single oversized recent turn — findCutPoint never cuts inside a
+				// tool result, so a huge tool-result / fenced block tail leaves nothing
+				// on the summarizable side and summary compaction cannot even start.
+				// That is exactly the dead-end the elide shake rescues: it reaches
+				// INSIDE the tail and offloads heavy content to an artifact placeholder,
+				// shrinking the tail so findCutPoint can then move the cut and leave
+				// older turns to summarize. Run the same tiered rescue the
+				// post-maintenance guard uses (elide, then image drop), with progress
+				// defined as "prepareCompaction now succeeds on the rewritten branch",
+				// and fall through to the normal compaction body when it does (writing
+				// a compaction entry anchors the stale billed usage so the
+				// auto-continue re-check cannot re-trip and loop the warning — issue
+				// #4786). `skipElide` when we already fell through from a shake
+				// strategy pass (it tried and found nothing); skip entirely on the
+				// idle timer (it re-checks usage on its own cadence).
+				let rescueRewroteHistory = false;
+				if (reason !== "idle") {
+					await this.#rescueCompactionDeadEnd(autoCompactionSignal, {
+						skipElide: fallbackFromShake,
+						hasProgress: () => {
+							// Only reached when a tier actually freed something, so the
+							// branch has been rewritten either way.
+							rescueRewroteHistory = true;
+							pathEntriesForCompaction = this.sessionManager.getBranch();
+							preparation = prepareCompaction(
+								pathEntriesForCompaction,
+								compactionSettings,
+								autoCompactionCandidates,
+							);
+							return preparation !== undefined;
+						},
 					});
-					continuationScheduled = true;
 				}
-				if (noProgressDeadEnd) {
-					this.emitNotice(
-						"warning",
-						compactionDeadEndWarning("shrink it (e.g. clear large tool output)"),
-						"compaction",
-					);
+				if (!preparation) {
+					await this.#emitSessionEvent({
+						type: "auto_compaction_end",
+						action,
+						result: undefined,
+						aborted: false,
+						willRetry: false,
+						skipped: true,
+					});
+					const noProgressDeadEnd = reason !== "idle";
+					let continuationScheduled = false;
+					if (!suppressContinuation && this.agent.hasQueuedMessages()) {
+						this.#scheduleAgentContinue({
+							delayMs: 100,
+							generation,
+							shouldContinue: () => this.agent.hasQueuedMessages(),
+						});
+						continuationScheduled = true;
+					}
+					if (noProgressDeadEnd) {
+						this.emitNotice(
+							"warning",
+							compactionDeadEndWarning("shrink it (e.g. clear large tool output)"),
+							"compaction",
+						);
+					}
+					// A rescue that offloaded content but still could not produce a
+					// preparation rewrote the branch; flag it so the overflow-recovery
+					// rollback does not re-restore the just-failed assistant turn on top
+					// of the elided tail.
+					const base = continuationScheduled
+						? COMPACTION_CHECK_CONTINUATION
+						: noProgressDeadEnd
+							? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION
+							: COMPACTION_CHECK_NONE;
+					return rescueRewroteHistory ? { ...base, historyRewritten: true } : base;
 				}
-				if (continuationScheduled) return COMPACTION_CHECK_CONTINUATION;
-				return noProgressDeadEnd ? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION : COMPACTION_CHECK_NONE;
 			}
 
 			let hookCompaction: CompactionResult | undefined;
@@ -14143,7 +14324,7 @@ export class AgentSession {
 				const hookResult = (await this.#extensionRunner.emit({
 					type: "session_before_compact",
 					preparation,
-					branchEntries: pathEntries,
+					branchEntries: pathEntriesForCompaction,
 					customInstructions: undefined,
 					signal: autoCompactionSignal,
 				})) as SessionBeforeCompactResult | undefined;
@@ -14857,6 +15038,50 @@ export class AgentSession {
 		if (this.#isClassifierRefusal(message)) return true;
 		return AIError.retriable(id, { replayUnsafe: this.#hasReplayUnsafeToolOutput(message) });
 	}
+
+	/**
+	 * Resume a stalled Cursor turn after every server-executed tool has produced
+	 * a result. The failed assistant/tool-result pair must stay in context: it
+	 * records completed side effects and lets the next request continue from
+	 * them instead of replaying the original turn.
+	 */
+	#canResumeCursorStreamStall(message: AssistantMessage): boolean {
+		if (
+			message.provider !== "cursor" ||
+			message.stopReason !== "error" ||
+			!message.errorMessage?.toLowerCase().includes("stream stall")
+		) {
+			return false;
+		}
+		const id = this.#classifyRetryMessage(message);
+		if (!AIError.retriable(id)) return false;
+
+		const resolvedToolCallIds: string[] = [];
+		for (const block of message.content) {
+			if (block.type !== "toolCall") continue;
+			if (!(kCursorExecResolved in block) || block[kCursorExecResolved] !== true) return false;
+			resolvedToolCallIds.push(block.id);
+		}
+		if (resolvedToolCallIds.length === 0) return false;
+
+		const messages = this.agent.state.messages;
+		let assistantIndex = -1;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const candidate = messages[i];
+			if (candidate.role === "assistant" && this.#isSameAssistantMessage(candidate, message)) {
+				assistantIndex = i;
+				break;
+			}
+		}
+		if (assistantIndex < 0) return false;
+
+		const unresolvedToolCallIds = new Set(resolvedToolCallIds);
+		for (let i = assistantIndex + 1; i < messages.length; i++) {
+			const candidate = messages[i];
+			if (candidate.role === "toolResult") unresolvedToolCallIds.delete(candidate.toolCallId);
+		}
+		return unresolvedToolCallIds.size === 0;
+	}
 	/**
 	 * Retried turns remove the failed assistant message from active context.
 	 * Text/thinking-only partials are safe to discard and replay. Retained
@@ -15434,7 +15659,12 @@ export class AgentSession {
 	 */
 	async #handleRetryableError(
 		message: AssistantMessage,
-		options?: { allowModelFallback?: boolean; fireworksFastFallback?: boolean; hardErrorFallback?: boolean },
+		options?: {
+			allowModelFallback?: boolean;
+			fireworksFastFallback?: boolean;
+			hardErrorFallback?: boolean;
+			preserveFailedTurn?: boolean;
+		},
 	): Promise<boolean> {
 		const retrySettings = this.settings.getGroup("retry");
 		// The Fireworks Fast→base degrade is an intrinsic model-selection safety net,
@@ -15625,8 +15855,11 @@ export class AgentSession {
 			errorId: message.errorId,
 		});
 
-		// Remove the failed assistant message from active context before retrying.
-		this.#removeAssistantMessageFromActiveContext(message, "auto-retry");
+		// Cursor exec-channel tools have already run and emitted results. Keep that
+		// failed turn intact so continuation cannot repeat their side effects.
+		if (!options?.preserveFailedTurn) {
+			this.#removeAssistantMessageFromActiveContext(message, "auto-retry");
+		}
 
 		// A thinking/response loop retried into identical context loops again. Inject a
 		// hidden redirect so the retried turn sees a directive to break the repeated
