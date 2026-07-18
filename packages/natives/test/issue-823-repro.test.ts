@@ -157,6 +157,26 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 		expect(candidates.indexOf(leafBaseline)).toBeLessThan(candidates.indexOf(coreBaseline));
 	});
 
+	it("prefers freshly built core candidates over leaf packages in workspace development", () => {
+		const leafPackageDir = "/repo/node_modules/@oh-my-pi/pi-natives-linux-x64";
+		const nativeDir = "/repo/packages/natives/native";
+		const candidates = resolveLoaderCandidates({
+			addonFilenames: getAddonFilenames({ tag: "linux-x64", arch: "x64", variant: "baseline" }),
+			isCompiledBinary: false,
+			leafPackageDir,
+			nativeDir,
+			execDir: "/repo/node_modules/.bin",
+			versionedDir: "/home/u/.omp/natives/15.5.15",
+			userDataDir: "/home/u/.local/bin",
+		});
+
+		const leafBaseline = path.join(leafPackageDir, "pi_natives.linux-x64-baseline.node");
+		const coreBaseline = path.join(nativeDir, "pi_natives.linux-x64-baseline.node");
+		expect(candidates).toContain(coreBaseline);
+		expect(candidates).toContain(leafBaseline);
+		expect(candidates.indexOf(coreBaseline)).toBeLessThan(candidates.indexOf(leafBaseline));
+	});
+
 	it("keeps Windows staging ahead of leaf package and core nativeDir candidates", () => {
 		const versionedDir = "/home/u/.omp/natives/15.5.15";
 		const leafPackageDir = "/app/node_modules/@oh-my-pi/pi-natives-win32-x64";

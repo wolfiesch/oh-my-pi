@@ -123,13 +123,14 @@ export function getAddonFilenames({ tag, arch, variant }) {
  * @param {{ platform: NodeJS.Platform | string; isCompiledBinary: boolean; nativeDir: string }} input
  * @returns {boolean}
  */
+function isNodeModulesPath(value) {
+	return value.includes("\\node_modules\\") || value.includes("/node_modules/");
+}
+
 export function shouldStageNodeModulesAddon({ platform, isCompiledBinary, nativeDir }) {
 	if (platform !== "win32") return false;
 	if (isCompiledBinary) return false;
-	// Check both separators independently of the host's `path.sep`: this helper
-	// is shared by the loader (running on Windows with `\`) and the test suite
-	// (typically running on POSIX hosts when CI executes the regression test).
-	return nativeDir.includes("\\node_modules\\") || nativeDir.includes("/node_modules/");
+	return isNodeModulesPath(nativeDir);
 }
 
 /**
@@ -170,8 +171,13 @@ export function resolveLoaderCandidates({
 		releaseCandidates = [...compiledCandidates, ...baseReleaseCandidates];
 	} else if (stageFromNodeModules) {
 		releaseCandidates = [...stagedCandidates, ...leafCandidates, ...baseReleaseCandidates];
-	} else {
+	} else if (isNodeModulesPath(nativeDir)) {
 		releaseCandidates = [...leafCandidates, ...baseReleaseCandidates];
+	} else {
+		// Workspace builds must win over optional platform packages installed by
+		// bun; otherwise a freshly built addon is silently shadowed by the
+		// published binary from the lockfile.
+		releaseCandidates = [...baseReleaseCandidates, ...leafCandidates];
 	}
 	return [...new Set(releaseCandidates)];
 }

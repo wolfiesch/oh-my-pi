@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed workspace native builds being shadowed at runtime by an older optional platform package from `node_modules`.
+
 ## [17.0.0] - 2026-07-15
 
 ### Fixed
