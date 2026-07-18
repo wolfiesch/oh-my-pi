@@ -246,8 +246,10 @@ export class RpcChildSupervisor {
 		// interactive UI's "stop until the next explicit prompt" latch.
 		return this.call({ type: "abort", resumeQueuedMessages: true }, id);
 	}
-	async cancelSubagent(agentId: unknown, id: string, signal?: AbortSignal): Promise<RpcResponse> {
-		return this.call({ type: "cancel_subagent", agentId }, id, signal, undefined, false);
+	async cancelSubagent(agentId: unknown, id: string): Promise<RpcResponse> {
+		// This is accepted work after confirmation, so it deliberately has no
+		// caller abort signal. A disconnect cannot revoke it after dispatch.
+		return this.call({ type: "cancel_subagent", agentId }, id, undefined, undefined, false);
 	}
 	async respondUi(
 		requestId: string,

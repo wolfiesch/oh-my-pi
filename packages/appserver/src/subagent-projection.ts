@@ -283,7 +283,9 @@ export class SubagentProjection {
 			startedAt: timestamp(input.startedAt, current?.startedAt ?? timestamp(input.lastUpdate, now)),
 			lastActivityAt: timestamp(input.lastUpdate, now),
 			model: modelText(input.model),
-			resumable: input.resumable === true || hasStatus(RESUMABLE_STATUS, nextStatus) || current?.resumable === true,
+			resumable:
+				nextStatus !== "cancelled" &&
+				(input.resumable === true || hasStatus(RESUMABLE_STATUS, nextStatus) || current?.resumable === true),
 			progress: text(input.progress),
 			evidence: text(input.evidence),
 			currentTool: text(input.currentTool, 128),

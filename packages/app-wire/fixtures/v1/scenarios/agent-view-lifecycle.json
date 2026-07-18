@@ -133,7 +133,7 @@
         "index": 0,
         "startedAt": "1970-01-01T00:00:01.000Z",
         "lastActivityAt": "1970-01-01T00:00:06.000Z",
-        "resumable": true,
+        "resumable": false,
         "model": "openai/gpt-5.6-sol:high",
         "progress": "Checking fixture parity",
         "evidence": "Parity frame emitted",

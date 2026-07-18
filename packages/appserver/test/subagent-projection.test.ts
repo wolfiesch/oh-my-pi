@@ -99,6 +99,12 @@ describe("appserver subagent projection", () => {
 			payload: { id: "WorkerA", index: 0, agent: "task", status: "started" },
 		});
 		expect(resumed).toMatchObject({ state: "started", detail: { resumable: true } });
+		expect(
+			projection.applyFrame({
+				type: "subagent_lifecycle",
+				payload: { id: "WorkerA", index: 0, agent: "task", status: "aborted", resumable: true },
+			}),
+		).toMatchObject({ state: "cancelled", detail: { resumable: false } });
 	});
 
 	test("matches the frozen Agent View lifecycle corpus", async () => {

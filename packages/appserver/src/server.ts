@@ -1559,7 +1559,10 @@ export class LocalAppserver implements AppserverHandle {
 				}
 			} else if (command.command === AGENT_CANCEL_COMMAND) {
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
-				const result = await supervisor.cancelSubagent(command.args.agentId, command.requestId, controller.signal);
+				// Confirmation makes cancellation accepted work. Once dispatched, a
+				// client disconnect must not replace the child's durable result with
+				// an aborted command outcome.
+				const result = await supervisor.cancelSubagent(command.args.agentId, command.requestId);
 				if (!result.success) {
 					outcome = {
 						frame: response(this.hostId, command, false, undefined, {
