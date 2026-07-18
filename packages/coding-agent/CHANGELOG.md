@@ -21,6 +21,7 @@
 
 ### Fixed
 
+- Fixed macOS appserver startup rejecting Node's `/var/folders` temporary paths because `/var` is a system symlink, while retaining rejection of nested user-controlled symlinks.
 - Fixed appserver durable tool results dropping structured content, renderer details, and error state. Bounded, redacted canonical fields now survive transcript projection without embedding image bytes, while legacy text output remains available.
 - Fixed image-bearing appserver sessions losing their RPC child when inline image payloads made a lifecycle or durable-entry notification exceed the one MiB line ceiling. Managed children now omit only redundant image bytes from their internal stdout notifications and mark the frame, while the full images remain unchanged in OMP's session and model context; even tiny canonical image payloads are externalized for transcript reads.
 - Fixed large appserver turns losing their terminal event when the redundant aggregate `agent_end` exceeded the RPC child's line or bounded-JSON structural limits. RPC now keeps a valid newest-message suffix with the original count and terminal status after durable entries; reader failures reap their child; crashes remain closed until child exit, then become restartable without a state probe; confirmed close settles transient state, waits for child exit, and is idempotent; and the desktop catalog exposes that close command.

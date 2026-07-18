@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DESKTOP_CATALOG_COMMANDS, type DurableEntry, hostId, projectId, sessionId } from "@oh-my-pi/app-wire";
 import { completeAttachOutput, prepareAttachOutput } from "../src/attach-output.ts";
 import { IdempotencyStore } from "../src/idempotency.ts";
+import { ensureSecureSocketDirectory } from "../src/ownership.ts";
 import { SessionProjection } from "../src/projection.ts";
 import { appserverSupportedCapabilities, appserverSupportedFeatures, createAppserver } from "../src/server.ts";
 import { SubagentProjection } from "../src/subagent-projection.ts";
@@ -235,5 +236,27 @@ describe("appserver lifecycle", () => {
 		await appserver.stop();
 		await expect(stat(socketPath)).rejects.toThrow();
 		for (const child of factory.children) expect(child.killed).toBe(true);
+	});
+	test("rejects shared system socket roots before changing their modes", async () => {
+		if (process.platform === "win32") return;
+		for (const directory of ["/", "/tmp", "/var", "/private/tmp", "/private/var"]) {
+			await expect(ensureSecureSocketDirectory(join(directory, "appserver.sock"))).rejects.toThrow(
+				"appserver socket directory must not be a shared system directory",
+			);
+		}
+	});
+	test("rejects user-controlled symlink components below the system temp root", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-appserver-symlink-"));
+		const target = join(root, "target");
+		const alias = join(root, "alias");
+		try {
+			await mkdir(target);
+			await symlink(target, alias);
+			await expect(ensureSecureSocketDirectory(join(alias, "run", "appserver.sock"))).rejects.toThrow(
+				"appserver socket directory is a symlink",
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 });
