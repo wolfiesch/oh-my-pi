@@ -188,6 +188,7 @@ export class RpcChildSupervisor {
 		requestId: string,
 		signal?: AbortSignal,
 		onDispatched?: (internalId: string) => void,
+		abortChild = true,
 	): Promise<RpcResponse> {
 		if (!this.#child || this.#closed || !this.#ready) throw new Error("rpc child unavailable");
 		// A caller can disconnect while the supervisor is still starting. Do not
@@ -202,7 +203,7 @@ export class RpcChildSupervisor {
 			this.#pending.delete(internalId);
 			this.#ignoredResponses.add(internalId);
 			pending.reject(new Error("rpc call aborted"));
-			void this.cancel(`${requestId}:cancel`).catch(() => undefined);
+			if (abortChild) void this.cancel(`${requestId}:cancel`).catch(() => undefined);
 		};
 		if (signal?.aborted) onAbort();
 		else signal?.addEventListener("abort", onAbort, { once: true });
@@ -244,6 +245,11 @@ export class RpcChildSupervisor {
 		// Resume those messages after aborting the root instead of applying the
 		// interactive UI's "stop until the next explicit prompt" latch.
 		return this.call({ type: "abort", resumeQueuedMessages: true }, id);
+	}
+	async cancelSubagent(agentId: unknown, id: string): Promise<RpcResponse> {
+		// This is accepted work after confirmation, so it deliberately has no
+		// caller abort signal. A disconnect cannot revoke it after dispatch.
+		return this.call({ type: "cancel_subagent", agentId }, id, undefined, undefined, false);
 	}
 	async respondUi(
 		requestId: string,

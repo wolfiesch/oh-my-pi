@@ -121,6 +121,7 @@ const DIRECT_SESSION_RPC_COMMANDS: ReadonlySet<string> = new Set([
 	"session.fast.set",
 ]);
 const SESSION_CANCEL_COMMAND = "session.cancel";
+const AGENT_CANCEL_COMMAND = "agent.cancel";
 const OBSERVER_READ_COMMANDS = new Set([
 	"session.attach",
 	"session.image.read",
@@ -497,6 +498,7 @@ export function appserverSupportedCapabilities(
 		"sessions.manage",
 		"sessions.prompt",
 		"sessions.control",
+		"agents.control",
 		...operationCapabilities(options.operationsAuthority),
 	]);
 	if (options.usageAuthority?.read) implemented.add("usage.read");
@@ -646,6 +648,7 @@ export class LocalAppserver implements AppserverHandle {
 			"sessions.manage",
 			"sessions.prompt",
 			"sessions.control",
+			"agents.control",
 			...operationCapabilities(options.operationsAuthority),
 		]);
 		if (options.usageAuthority?.read) implemented.add("usage.read");
@@ -662,7 +665,10 @@ export class LocalAppserver implements AppserverHandle {
 		if (command === "usage.read") return this.#usageAuthority !== undefined;
 		if (this.#operations?.hasCommand(command)) return true;
 		return (
-			this.#handlers.has(command) || DIRECT_SESSION_RPC_COMMANDS.has(command) || command === SESSION_CANCEL_COMMAND
+			this.#handlers.has(command) ||
+			DIRECT_SESSION_RPC_COMMANDS.has(command) ||
+			command === SESSION_CANCEL_COMMAND ||
+			command === AGENT_CANCEL_COMMAND
 		);
 	}
 	async start(): Promise<void> {
@@ -1550,6 +1556,35 @@ export class LocalAppserver implements AppserverHandle {
 					};
 					if (this.#hasMessageLifecycle(command.sessionId!, lifecycle))
 						this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId, true);
+				}
+			} else if (command.command === AGENT_CANCEL_COMMAND) {
+				const supervisor = await this.ensureSupervisor(command.sessionId!);
+				// Confirmation makes cancellation accepted work. Once dispatched, a
+				// client disconnect must not replace the child's durable result with
+				// an aborted command outcome.
+				const result = await supervisor.cancelSubagent(command.args.agentId, command.requestId);
+				if (!result.success) {
+					outcome = {
+						frame: response(this.hostId, command, false, undefined, {
+							code: "child_error",
+							message: "subagent cancellation failed",
+						}),
+					};
+				} else {
+					try {
+						outcome = {
+							frame: response(this.hostId, command, true, {
+								cancelled: childBoolean("data" in result ? result.data : undefined, "cancelled"),
+							}),
+						};
+					} catch {
+						outcome = {
+							frame: response(this.hostId, command, false, undefined, {
+								code: "child_error",
+								message: "subagent cancellation failed",
+							}),
+						};
+					}
 				}
 			} else if (command.command === SESSION_CANCEL_COMMAND) {
 				// Capture the exact root before the first yield. A root which settles

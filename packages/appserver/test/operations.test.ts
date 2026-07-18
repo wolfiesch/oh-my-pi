@@ -51,7 +51,6 @@ function authority(overrides: Partial<DesktopOperationsAuthority> = {}): Desktop
 		filesPatch: async () => ({}),
 		reviewRead: async () => ({}),
 		reviewApply: async () => ({}),
-		agentCancel: async () => ({ cancelled: true }),
 		bashRun: async () => ({}),
 		termOpen: async () => ({ terminalId: "term-1" }),
 		catalogGet: async () => ({ items: [] }),
@@ -81,7 +80,6 @@ describe("desktop operation dispatcher", () => {
 			"files.patch",
 			"review.read",
 			"review.apply",
-			"agent.cancel",
 			"bash.run",
 			"catalog.get",
 			"settings.read",
@@ -101,13 +99,11 @@ describe("desktop operation dispatcher", () => {
 					}
 				: name.startsWith("review.")
 					? { reviewId: "review-1" }
-					: name === "agent.cancel"
-						? { agentId: "agent-1" }
-						: name.startsWith("preview.") && ["preview.launch", "preview.navigate"].includes(name)
-							? { url: "http://localhost" }
-							: name === "bash.run"
-								? { command: "structured" }
-								: {};
+					: name.startsWith("preview.") && ["preview.launch", "preview.navigate"].includes(name)
+						? { url: "http://localhost" }
+						: name === "bash.run"
+							? { command: "structured" }
+							: {};
 			const hostCommand = [
 				"catalog.get",
 				"settings.read",

@@ -77,7 +77,9 @@ export class AgentLifecycleManager {
 			current.#adopted.clear();
 			current.#revivals.clear();
 			current.#parks.clear();
+			current.#releases.clear();
 			current.#persistedReviverFactory = undefined;
+			current.#persistedReviveTtlMs = 0;
 		}
 		AgentLifecycleManager.#global = undefined;
 	}
@@ -91,6 +93,8 @@ export class AgentLifecycleManager {
 	readonly #parks = new Map<string, ParkInFlight>();
 	/** In-flight revives, so concurrent {@link ensureLive} calls coalesce. */
 	readonly #revivals = new Map<string, Promise<AgentSession>>();
+	/** In-flight hard releases, so park/revive cannot restore a cancelled agent. */
+	readonly #releases = new Map<string, Promise<void>>();
 	#unsubscribe: (() => void) | undefined;
 	#persistedReviverFactory: PersistedSubagentReviverFactory | undefined;
 	/** TTL applied when a cold-revived ref is adopted on demand. */
@@ -164,9 +168,9 @@ export class AgentLifecycleManager {
 	 * arrives before detach cancels the park and keeps the live session.
 	 */
 	async park(id: string): Promise<void> {
+		if (this.#releases.has(id)) return;
 		const existing = this.#parks.get(id);
 		if (existing) return existing.promise;
-
 		const adopted = this.#adopted.get(id);
 		if (!adopted) return;
 		const ref = this.#registry.get(id);
@@ -236,6 +240,7 @@ export class AgentLifecycleManager {
 	 * cancelled (session still live) or awaited to completion before revive.
 	 */
 	async ensureLive(id: string): Promise<AgentSession> {
+		if (this.#releases.has(id)) throw new Error(`Agent "${id}" has been released.`);
 		const park = this.#parks.get(id);
 		if (park) {
 			const ref = this.#registry.get(id);
@@ -310,6 +315,18 @@ export class AgentLifecycleManager {
 
 	/** Hard removal: dispose if live, unregister from registry, drop timers. */
 	async release(id: string): Promise<void> {
+		const inflight = this.#releases.get(id);
+		if (inflight) return inflight;
+		const releasing = this.#release(id);
+		this.#releases.set(id, releasing);
+		try {
+			await releasing;
+		} finally {
+			if (this.#releases.get(id) === releasing) this.#releases.delete(id);
+		}
+	}
+
+	async #release(id: string): Promise<void> {
 		const adopted = this.#adopted.get(id);
 		clearTimeout(adopted?.timer);
 		this.#adopted.delete(id);
@@ -319,6 +336,14 @@ export class AgentLifecycleManager {
 			// Prefer cancel when the session is still live so release owns dispose.
 			if (!park.detached) park.cancel();
 			await park.promise;
+		}
+		const revival = this.#revivals.get(id);
+		if (revival) {
+			try {
+				await revival;
+			} catch {
+				// A release intentionally invalidates an in-flight revival.
+			}
 		}
 
 		const ref = this.#registry.get(id);
@@ -336,15 +361,24 @@ export class AgentLifecycleManager {
 	async dispose(): Promise<void> {
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
-		const ids = [...new Set([...this.#adopted.keys(), ...this.#parks.keys()])];
+		const ids = [...new Set([...this.#adopted.keys(), ...this.#parks.keys(), ...this.#revivals.keys()])];
 		await Promise.all(ids.map(id => this.release(id)));
 		this.#revivals.clear();
 		this.#parks.clear();
+		this.#releases.clear();
 		this.#persistedReviverFactory = undefined;
 	}
 
 	async #revive(id: string, revive: AgentReviver, sessionFile: string | null): Promise<AgentSession> {
 		const session = await revive();
+		if (this.#releases.has(id)) {
+			try {
+				await session.dispose();
+			} catch (error) {
+				logger.warn("AgentLifecycleManager.revive: released session dispose failed", { id, error: String(error) });
+			}
+			throw new Error(`Agent "${id}" has been released.`);
+		}
 		this.#registry.attachSession(id, session, sessionFile);
 		// Emits status_changed → "idle", which re-arms the TTL timer below.
 		this.#registry.setStatus(id, "idle");

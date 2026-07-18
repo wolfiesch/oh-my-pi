@@ -37,18 +37,25 @@ describe("bounded idempotency outcomes", () => {
 		expect(store.begin(id, { ...payload, args: { a: 2, b: 2 } })).toMatchObject({ kind: "conflict" });
 	});
 
-	test("ignores only the envelope request id, not a nested UI response target", () => {
+	test("ignores transport and confirmation envelope ids, not nested UI response targets", () => {
 		const store = new IdempotencyStore();
 		const id = commandId("nested-request-id");
 		const payload = {
 			requestId: "transport-first",
+			confirmationId: "confirmation-first",
 			command: "session.ui.respond",
 			args: { requestId: "ui-request-one", confirmed: true },
 		};
 		expect(store.begin(id, payload).kind).toBe("new");
 		store.complete(id, payload, outcome("completed"));
 
-		expect(store.begin(id, { ...payload, requestId: "transport-retry" }).kind).toBe("replay");
+		expect(
+			store.begin(id, {
+				...payload,
+				requestId: "transport-retry",
+				confirmationId: "confirmation-retry",
+			}).kind,
+		).toBe("replay");
 		expect(
 			store.begin(id, {
 				...payload,
