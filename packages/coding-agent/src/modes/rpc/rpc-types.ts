@@ -38,6 +38,7 @@ export type RpcCommand =
 	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "abort"; resumeQueuedMessages?: boolean }
+	| { id?: string; type: "cancel_subagent"; agentId: string }
 	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "new_session"; parentSession?: string }
 	| { id?: string; type: "retry" }
@@ -253,6 +254,7 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "follow_up"; success: true }
 	| { id?: string; type: "response"; command: "abort"; success: true }
 	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
+	| { id?: string; type: "response"; command: "cancel_subagent"; success: true; data: { cancelled: boolean } }
 	| { id?: string; type: "response"; command: "retry"; success: true; data: { retried: boolean } }
 	| { id?: string; type: "response"; command: "pause"; success: true; data: { paused: boolean; changed: boolean } }
 	| { id?: string; type: "response"; command: "resume"; success: true; data: { paused: boolean; resumed: boolean } }
