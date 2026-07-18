@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [17.0.4] - 2026-07-18
+
+### Fixed
+
+- Rejected `DEL N:` headers with a trailing colon instead of silently tolerating the colon, so delete-with-body mistakes surface the corrective "has no colon" guidance.
+
 ## [17.0.0] - 2026-07-15
 
 ### Added

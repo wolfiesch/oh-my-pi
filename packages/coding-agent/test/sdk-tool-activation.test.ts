@@ -5,8 +5,10 @@ import * as path from "node:path";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import {
 	type CreateAgentSessionOptions,
+	type CustomTool,
 	createAgentSession,
 	discoverAuthStorage,
 	type ExtensionFactory,
@@ -37,6 +39,16 @@ const toolActivationExtension: ExtensionFactory = pi => {
 		},
 	});
 };
+
+const sdkCustomTool = {
+	name: "sdk_custom_tool",
+	label: "SDK Custom Tool",
+	description: "SDK-provided custom tool used to verify activation boundaries.",
+	parameters: type({}),
+	async execute() {
+		return { content: [{ type: "text", text: "sdk custom" }] };
+	},
+} satisfies CustomTool;
 
 describe("createAgentSession defaultInactive tool activation", () => {
 	const tempDirs: string[] = [];
@@ -124,6 +136,41 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
+	it("forwards built-in and external xd:// devices to Cursor provider contexts", async () => {
+		const tempDir = makeTempDir();
+		const cursorModel = getBundledModel("cursor", "composer-1.5");
+		if (!cursorModel) throw new Error("expected bundled Cursor model");
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			model: cursorModel,
+		});
+		const externalMcpTool: CustomTool = {
+			name: "mcp__fixture_report",
+			label: "fixture/report",
+			description: "Report a fixture result.",
+			parameters: type({}),
+			strict: true,
+			mcpServerName: "fixture",
+			mcpToolName: "report",
+			async execute() {
+				return { content: [{ type: "text", text: "reported" }] };
+			},
+		};
+
+		try {
+			await session.refreshMCPTools([externalMcpTool]);
+			const deviceNames = session.getXdevToolEntries().map(entry => entry.name);
+			expect(deviceNames).toEqual(expect.arrayContaining(["ast_edit", "mcp__fixture_report"]));
+			expect(session.getActiveToolNames()).not.toContain("mcp__fixture_report");
+
+			const context = await session.agent.buildSideRequestContext([]);
+			const providerToolNames = context.tools?.map(tool => tool.name);
+			expect(providerToolNames).toEqual(expect.arrayContaining(["ast_edit", "mcp__fixture_report"]));
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("allows explicitly requested defaultInactive extension tools into the initial active set", async () => {
 		const tempDir = makeTempDir();
 
@@ -135,8 +182,11 @@ describe("createAgentSession defaultInactive tool activation", () => {
 
 		try {
 			expect(session.getActiveToolNames()).toEqual(
-				expect.arrayContaining(["read", "default_active_tool", "default_inactive_tool"]),
+				expect.arrayContaining(["read", "default_inactive_tool", "write"]),
 			);
+			expect(session.getActiveToolNames()).not.toContain("default_active_tool");
+			expect(session.getXdevToolEntries().map(entry => entry.name)).toContain("default_active_tool");
+			expect(session.getXdevToolEntries().map(entry => entry.name)).not.toContain("default_inactive_tool");
 			expect(session.systemPrompt.join("\n")).toContain("default_inactive_tool");
 		} finally {
 			await session.dispose();
@@ -225,6 +275,36 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
+	it("does not activate write merely because plan mode is available", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			toolNames: ["read"],
+		});
+
+		try {
+			await session.setActiveToolsByName(["read"]);
+			expect(session.getActiveToolNames()).not.toContain("write");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("preserves write explicitly selected by a runtime caller", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			toolNames: ["read"],
+		});
+
+		try {
+			await session.setActiveToolsByName(["read", "write"]);
+			await session.refreshMCPTools([]);
+			expect(session.getActiveToolNames()).toContain("write");
+		} finally {
+			await session.dispose();
+		}
+	});
 	it("registers vibe tools only during explicit vibe activation", async () => {
 		const tempDir = makeTempDir();
 		const { session } = await createAgentSession(baseOptions(tempDir));
@@ -280,6 +360,121 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			// tts is a discoverable custom tool → mounted as an xd:// device, not top-level.
 			expect(session.getXdevToolEntries().map(entry => entry.name)).toContain("tts");
 			expect(session.getActiveToolNames()).not.toContain("tts");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("keeps restricted host tool lists isolated from configured custom capabilities", async () => {
+		const restrictedDir = makeTempDir();
+		const normalDir = makeTempDir();
+		const configuredSettings = () =>
+			Settings.isolated({
+				"providers.image": "openai",
+				"generate_image.enabled": true,
+				"speechgen.enabled": true,
+				"memory.backend": "hindsight",
+				"autolearn.enabled": true,
+			});
+
+		const inheritedManager = {
+			getServerInstructions: () => new Map([["private-server", "must not reach restricted child"]]),
+		} as unknown as MCPManager;
+
+		const { session: restricted } = await createAgentSession({
+			...baseOptions(restrictedDir),
+			settings: configuredSettings(),
+			extensions: [toolActivationExtension],
+			customTools: [sdkCustomTool],
+			toolNames: ["read", "lsp", "hub"],
+			requireYieldTool: true,
+			restrictToolNames: true,
+			enableMCP: true,
+			mcpManager: inheritedManager,
+			enableLsp: true,
+			enableIrc: true,
+		});
+
+		try {
+			expect(restricted.getAllToolNames()).toEqual(["read", "yield"]);
+			expect(restricted.getActiveToolNames()).toEqual(["read", "yield"]);
+			for (const name of [
+				"generate_image",
+				"tts",
+				"recall",
+				"retain",
+				"reflect",
+				"learn",
+				"manage_skill",
+				"default_active_tool",
+				"default_inactive_tool",
+				"sdk_custom_tool",
+				"lsp",
+				"hub",
+			]) {
+				expect(restricted.getToolByName(name)).toBeUndefined();
+			}
+			expect(restricted.getXdevToolEntries()).toEqual([]);
+			expect(restricted.systemPrompt.join("\n")).not.toContain("private-server");
+			expect(restricted.systemPrompt.join("\n")).not.toContain("MCP Server Instructions");
+		} finally {
+			await restricted.dispose();
+		}
+
+		const { session: normal } = await createAgentSession({
+			...baseOptions(normalDir),
+			settings: configuredSettings(),
+			extensions: [toolActivationExtension],
+			customTools: [sdkCustomTool],
+			toolNames: ["read", "generate_image"],
+			requireYieldTool: true,
+			restrictToolNames: false,
+		});
+
+		try {
+			const activeToolNames = normal.getActiveToolNames();
+			expect(activeToolNames).toEqual(
+				expect.arrayContaining(["read", "yield", "generate_image", "learn", "manage_skill", "write"]),
+			);
+			for (const name of ["tts", "default_active_tool", "sdk_custom_tool"]) {
+				expect(activeToolNames).not.toContain(name);
+			}
+			expect(normal.getXdevToolEntries().map(entry => entry.name)).toEqual(
+				expect.arrayContaining(["tts", "default_active_tool", "sdk_custom_tool"]),
+			);
+			expect(normal.getAllToolNames()).toEqual(
+				expect.arrayContaining([
+					"generate_image",
+					"read",
+					"yield",
+					"tts",
+					"default_active_tool",
+					"sdk_custom_tool",
+					"recall",
+					"retain",
+					"reflect",
+				]),
+			);
+		} finally {
+			await normal.dispose();
+		}
+	});
+
+	it("ignores an inherited MCP manager when MCP is disabled", async () => {
+		const tempDir = makeTempDir();
+		const inheritedManager = {
+			getServerInstructions: () => new Map([["private-server", "must not reach restricted child"]]),
+		} as unknown as MCPManager;
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			enableMCP: false,
+			mcpManager: inheritedManager,
+		});
+
+		try {
+			expect(session.systemPrompt.join("\n")).not.toContain("private-server");
+			expect(session.systemPrompt.join("\n")).not.toContain("MCP Server Instructions");
 		} finally {
 			await session.dispose();
 		}

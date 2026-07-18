@@ -36,7 +36,7 @@ import {
 import { normalizeToLF } from "../edit/normalize";
 import { isNotebookPath, readEditableNotebookText } from "../edit/notebook";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
-import { InternalUrlRouter, resolveLocalUrlToFile } from "../internal-urls";
+import { InternalUrlRouter, resolveLocalUrlToFile, resolveLocalUrlToPath } from "../internal-urls";
 import { type ResolvedArtifactFile, resolveArtifactFile } from "../internal-urls/artifact-protocol";
 import { parseInternalUrl } from "../internal-urls/parse";
 import type { InternalUrl } from "../internal-urls/types";
@@ -62,7 +62,7 @@ import {
 	MAX_IMAGE_INPUT_BYTES,
 	webpExclusionForModel,
 } from "../utils/image-loading";
-import { convertFileWithMarkit } from "../utils/markit";
+import { CONVERTIBLE_EXTENSIONS, convertFileWithMarkit } from "../utils/markit";
 import { type ArchiveReader, formatArchiveEntryLines, openArchive, parseArchivePathCandidates } from "../utils/zip";
 import { buildDirectoryTree, type DirectoryTree } from "../workspace-tree";
 import {
@@ -78,7 +78,7 @@ import {
 } from "./conflict-detect";
 import {
 	executeReadUrl,
-	loadReadUrlCacheEntry,
+	fetchReadUrl,
 	parseReadUrlTarget,
 	type ReadUrlToolDetails,
 	renderReadUrlCall,
@@ -150,9 +150,6 @@ function getSummaryParseCache(session: object): LRUCache<string, SummaryResult |
 	}
 	return cache;
 }
-
-// Document types converted to markdown via markit.
-const CONVERTIBLE_EXTENSIONS = new Set([".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".rtf", ".epub"]);
 
 const MAX_SUMMARY_BYTES = 2 * 1024 * 1024;
 const MAX_SUMMARY_LINES = 20_000;
@@ -918,6 +915,32 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
 			INSPECT_IMAGE_ENABLED: this.#inspectImageEnabled,
 		});
+	}
+
+	/**
+	 * Recover the active approved plan when a model rewrites its `local://` URL
+	 * as a same-basename path in the working-directory root.
+	 *
+	 * Only missing cwd-root paths qualify, so a real working-tree file always
+	 * wins and unrelated paths cannot escape into the session artifact sandbox.
+	 */
+	#approvedPlanAlias(missingAbsolutePath: string): string | undefined {
+		const planReferencePath = this.session.getPlanReferencePath?.();
+		if (!planReferencePath?.startsWith("local:")) return undefined;
+
+		const requestedPath = path.resolve(missingAbsolutePath);
+		if (path.dirname(requestedPath) !== path.resolve(this.session.cwd)) return undefined;
+
+		const localProtocolOptions = this.session.localProtocolOptions ?? {
+			getArtifactsDir: () => this.session.getArtifactsDir?.() ?? null,
+			getSessionId: () => this.session.getSessionId?.() ?? null,
+		};
+		try {
+			const approvedPlanPath = resolveLocalUrlToPath(planReferencePath, localProtocolOptions);
+			return path.basename(requestedPath) === path.basename(approvedPlanPath) ? approvedPlanPath : undefined;
+		} catch {
+			return undefined;
+		}
 	}
 
 	async #tryReadDelimitedPaths(
@@ -2141,15 +2164,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			const urlRaw = parsedUrlTarget.raw;
 			const urlRanges = parsedUrlTarget.ranges;
 			if (urlRanges !== undefined && urlRanges.length > 1) {
-				const cached = await loadReadUrlCacheEntry(
-					this.session,
-					{ path: parsedUrlTarget.path, raw: urlRaw },
-					signal,
-					{ ensureArtifact: true, preferCached: true },
-				);
-				return this.#buildInMemoryMultiRangeResult(cached.output, urlRanges, {
-					details: { ...cached.details },
-					sourceUrl: cached.details.finalUrl,
+				const entry = await fetchReadUrl(this.session, { path: parsedUrlTarget.path, raw: urlRaw }, signal, {
+					ensureArtifact: true,
+				});
+				return this.#buildInMemoryMultiRangeResult(entry.output, urlRanges, {
+					details: { ...entry.details },
+					sourceUrl: entry.details.finalUrl,
 					entityLabel: "URL output",
 					raw: urlRaw,
 					immutable: true,
@@ -2158,18 +2178,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			const urlOffset = parsedUrlTarget.offset;
 			const urlLimit = parsedUrlTarget.limit;
 			if (urlOffset !== undefined || urlLimit !== undefined) {
-				const cached = await loadReadUrlCacheEntry(
-					this.session,
-					{ path: parsedUrlTarget.path, raw: urlRaw },
-					signal,
-					{
-						ensureArtifact: true,
-						preferCached: true,
-					},
-				);
-				return this.#buildInMemoryTextResult(cached.output, urlOffset, urlLimit, {
-					details: { ...cached.details },
-					sourceUrl: cached.details.finalUrl,
+				const entry = await fetchReadUrl(this.session, { path: parsedUrlTarget.path, raw: urlRaw }, signal, {
+					ensureArtifact: true,
+				});
+				return this.#buildInMemoryTextResult(entry.output, urlOffset, urlLimit, {
+					details: { ...entry.details },
+					sourceUrl: entry.details.finalUrl,
 					entityLabel: "URL output",
 					raw: urlRaw,
 					immutable: true,
@@ -2292,7 +2306,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			isDirectory = stat.isDirectory();
 		} catch (error) {
 			if (isNotFoundError(error)) {
-				// Attempt unique suffix resolution before falling back to fuzzy suggestions
+				// Attempt unique suffix resolution before falling back to the approved-plan
+				// alias or fuzzy suggestions. Existing workspace files retain precedence.
 				if (!isRemoteMountPath(absolutePath)) {
 					const suffixMatch = await this.#findSuffixMatchCached(suffixCache, localReadPath, signal);
 					if (suffixMatch) {
@@ -2303,12 +2318,30 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							isDirectory = retryStat.isDirectory();
 							suffixResolution = { from: localReadPath, to: suffixMatch.displayPath };
 						} catch {
-							// Suffix match candidate no longer stats — fall through to error path
+							// Suffix match candidate no longer stats — continue through
+							// approved-plan recovery and the original not-found error.
 						}
 					}
 				}
 
+				let recoveredApprovedPlan = false;
 				if (!suffixResolution) {
+					const approvedPlanPath = this.#approvedPlanAlias(absolutePath);
+					if (approvedPlanPath) {
+						try {
+							const approvedPlanStat = await Bun.file(approvedPlanPath).stat();
+							absolutePath = approvedPlanPath;
+							fileSize = approvedPlanStat.size;
+							isDirectory = approvedPlanStat.isDirectory();
+							recoveredApprovedPlan = true;
+						} catch {
+							// The referenced plan disappeared after resolution; continue through
+							// the ordinary delimited-path fallback and not-found error.
+						}
+					}
+				}
+
+				if (!recoveredApprovedPlan && !suffixResolution) {
 					const delimitedResult = await this.#tryReadDelimitedPaths(readPath, signal);
 					if (delimitedResult) return delimitedResult;
 					throw new ToolError(`Path '${localReadPath}' not found`);

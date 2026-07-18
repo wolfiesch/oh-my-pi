@@ -601,6 +601,20 @@ describe("Coding Agent Tools", () => {
 			expect(output).not.toContain("Cannot read binary file");
 		});
 
+		it("does not route a legacy .xls through markit's unsupported-format error", async () => {
+			// `.xls` was advertised as convertible but markit only registers the
+			// OOXML `.xlsx` converter, so reading a legacy `.xls` surfaced
+			// "Unsupported format: .xls" instead of falling through to normal
+			// file handling (issue #5808). An OLE2 header (`D0 CF 11 E0`) is a
+			// binary blob, so the read tool now refuses it as binary.
+			const xlsFile = path.join(testDir, "legacy.xls");
+			fs.writeFileSync(xlsFile, Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]));
+
+			const output = getTextOutput(await readTool.execute("test-call-legacy-xls", { path: xlsFile }));
+			expect(output).not.toContain("Unsupported format");
+			expect(output).toContain("Cannot read binary file");
+		});
+
 		it("should reject malformed internal-URL selectors instead of dumping the whole resource", async () => {
 			await expect(readTool.execute("test-call-bad-internal-sel", { path: "artifact://3:-100" })).rejects.toThrow(
 				/Invalid selector ':-100'/,
@@ -734,6 +748,20 @@ describe("Coding Agent Tools", () => {
 			{
 				label: ".zip",
 				path: "fixture-subpath.zip",
+				create: (entries: ArchiveFixtureEntry[]) => createZipArchive(entries),
+			},
+			{
+				// `.jar`/`.war` are ZIP containers under a different extension.
+				// Regression: archiveFormatFromPath / parseArchivePathCandidates
+				// previously excluded them, so `read lib.jar:member` failed with
+				// path-not-found (issue #5808).
+				label: ".jar",
+				path: "fixture-subpath.jar",
+				create: (entries: ArchiveFixtureEntry[]) => createZipArchive(entries),
+			},
+			{
+				label: ".war",
+				path: "fixture-subpath.war",
 				create: (entries: ArchiveFixtureEntry[]) => createZipArchive(entries),
 			},
 		]) {
@@ -1328,10 +1356,10 @@ function b() {
 
 		it("should write truncated output to artifacts", async () => {
 			const result = await bashTool.execute("test-call-8-artifact", {
-				// A single line past the 768-byte column cap is the minimal output
-				// that trips truncation + artifact spill; the old 60K-arg brace
-				// expansion paid ~60ms of shell time to prove the same path.
-				command: "printf 'a%.0s' {1..2000}",
+				// Emit well past the ~50KB inline window across many lines so the
+				// output is genuinely window-truncated (not merely column-capped),
+				// which is what allocates the spill artifact.
+				command: "seq 1 30000",
 			});
 
 			const artifactId = result.details?.meta?.truncation?.artifactId;
@@ -1520,10 +1548,14 @@ function b() {
 		it("should respect timeout", async () => {
 			// Reduce the effective timeout through the production clamp seam; the
 			// real subprocess kill-on-timeout path is still exercised, just faster.
+			// Timeouts settle as a flagged result (rendered as a warning) rather
+			// than a thrown error since #5546; ACP keeps its rejection semantics.
 			vi.spyOn(toolTimeouts, "clampTimeout").mockReturnValue(0.05);
-			await expect(bashTool.execute("test-call-10", { command: "sleep 5", timeout: 1 })).rejects.toThrow(
-				/timed out/i,
-			);
+			const result = await bashTool.execute("test-call-10", { command: "sleep 5", timeout: 1 });
+			expect(result.isError).toBe(true);
+			expect((result.details as { timedOut?: boolean } | undefined)?.timedOut).toBe(true);
+			const text = result.content.find(c => c.type === "text")?.text ?? "";
+			expect(text).toMatch(/timed out/i);
 		});
 
 		it("should abort and recover for subsequent commands", async () => {

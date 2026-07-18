@@ -47,6 +47,8 @@ export interface BashResult {
 	output: string;
 	exitCode: number | undefined;
 	cancelled: boolean;
+	/** True when the command was killed by its timeout deadline (not a user abort). */
+	timedOut?: boolean;
 	truncated: boolean;
 	totalLines: number;
 	totalBytes: number;
@@ -71,6 +73,9 @@ const shellSessionsInUse = new Set<string>();
  * kill-on-drop, so they still die when the harness tears the Shell down on exit.
  */
 const retainedShells = new Set<Shell>();
+// Native cancellation may spend two seconds unwinding the shell before its
+// N-API chunk bridge drains. The JS watchdog must not race that teardown.
+const NATIVE_TIMEOUT_FALLBACK_GRACE_MS = 5_000;
 
 /**
  * One serialized background-job poll chain per Shell. A completed command
@@ -364,16 +369,18 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	const nativeTimeoutMs = requestedTimeoutMs !== undefined && requestedTimeoutMs > 0 ? requestedTimeoutMs : undefined;
 	const nativeOwnsTimeout = nativeTimeoutMs !== undefined;
 	if (deadlineTimeoutMs !== undefined) {
+		const fallbackTimeoutMs = nativeOwnsTimeout
+			? deadlineTimeoutMs + NATIVE_TIMEOUT_FALLBACK_GRACE_MS
+			: deadlineTimeoutMs;
 		timeoutTimer = setTimeout(() => {
-			// Explicit timeouts are already enforced inside pi-natives via
-			// `timeoutMs`. Do not also abort the JS AbortSignal here: on Windows,
-			// aborting that signal while a piped command is still forwarding output
-			// can terminate the Bun host before the native timeout result resolves.
+			// Explicit timeouts are enforced inside pi-natives via `timeoutMs`.
+			// Give native cancellation time to flush pipeline output and drain the
+			// N-API bridge before this result-only watchdog quarantines the run.
 			if (!nativeOwnsTimeout) {
 				abortCurrentExecution();
 			}
 			timeoutDeferred.resolve("timeout");
-		}, deadlineTimeoutMs);
+		}, fallbackTimeoutMs);
 	}
 
 	let resetSession = false;
@@ -415,6 +422,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			return {
 				exitCode: undefined,
 				cancelled: true,
+				...(winner.kind === "timeout" ? { timedOut: true } : {}),
 				...(await sink.dump(
 					winner.kind === "timeout" && deadlineTimeoutMs !== undefined
 						? `Command timed out after ${Math.round(deadlineTimeoutMs / 1000)} seconds`
@@ -439,6 +447,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			return {
 				exitCode: undefined,
 				cancelled: true,
+				timedOut: true,
 				...(await sink.dump(annotation)),
 			};
 		}

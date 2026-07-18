@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [17.0.2] - 2026-07-17
+
+### Fixed
+
+- Improved error visibility in interactive clients by surfacing provider stream failures through the assistant message lifecycle, preventing silent loading spinners.
+- Fixed an issue where Cursor provider contexts omitted host-supplied MCP tools from main and side-channel requests.
+
 ## [17.0.0] - 2026-07-15
 
 ### Breaking Changes

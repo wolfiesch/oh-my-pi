@@ -13,7 +13,6 @@ import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
 import {
 	isInsideTerminalMultiplexer,
-	isInsideTmux,
 	NotifyProtocol,
 	setCellDimensions,
 	setOsc99Supported,
@@ -45,7 +44,6 @@ export function resolveHangulCompatibilityJamoWidthFromTerminalIdentity(
 }
 
 function shouldEnableModifyOtherKeysFallback(env: NodeJS.ProcessEnv = Bun.env): boolean {
-	if (isInsideTmux(env)) return false;
 	if (!env.SSH_CONNECTION && !env.SSH_TTY && !env.SSH_CLIENT) return true;
 	return TERMINAL.id !== "base" && TERMINAL.id !== "trueColor";
 }
@@ -339,8 +337,8 @@ export function emergencyTerminalRestore(): void {
 /** Terminal-reported appearance (dark/light mode). */
 export type TerminalAppearance = "dark" | "light";
 export interface Terminal {
-	// Start the terminal with input and resize handlers
-	start(onInput: (data: string) => void, onResize: () => void): void;
+	// Start the terminal with input, resize, and host-disconnect handlers.
+	start(onInput: (data: string) => void, onResize: () => void, onDisconnect?: () => void): void;
 
 	// Stop the terminal and restore state
 	stop(): void;
@@ -404,13 +402,25 @@ export interface Terminal {
 	 * already-detected appearance so late subscribers never miss it.
 	 */
 	onAppearanceChange(callback: (appearance: TerminalAppearance) => void): void;
+	/**
+	 * Issue a single OSC 11 background-color re-query, driving the appearance
+	 * callbacks through the same parse/dedup pipeline used at startup and on Mode
+	 * 2031 notifications. Bounded: one probe per call, no timers. Invoked on the
+	 * user's explicit display-reset gesture (Ctrl+L) so terminals that cannot
+	 * deliver end-to-end Mode 2031 notifications still pick up a light/dark switch
+	 * without a restart. Optional so custom Terminals built against older pi-tui
+	 * versions keep working.
+	 */
+	refreshAppearance?(): void;
 	/** The last detected terminal appearance, or undefined if not yet known. */
 	get appearance(): TerminalAppearance | undefined;
 	/**
 	 * Register a callback fired once per DEC private mode when its DECRQM support
-	 * status resolves. Optional: only real terminals implement capability probing.
+	 * status resolves. `confirmed` is false when the terminal answered the DA1
+	 * sentinel without answering DECRQM, which proves only that querying support
+	 * is unavailable — not that the private mode itself is unsupported.
 	 */
-	onPrivateModeReport?(callback: (mode: number, supported: boolean) => void): void;
+	onPrivateModeReport?(callback: (mode: number, supported: boolean, confirmed?: boolean) => void): void;
 }
 
 /**
@@ -473,6 +483,16 @@ export class ProcessTerminal implements Terminal {
 	#modifyOtherKeysTimeout?: Timer;
 	#stdinBuffer?: StdinBuffer;
 	#stdinDataHandler?: (data: string) => void;
+	#disconnectHandler?: () => void;
+	#stdinEndHandler = () => {
+		this.#markTerminalDisconnected("stdin ended");
+	};
+	#stdinCloseHandler = () => {
+		this.#markTerminalDisconnected("stdin closed");
+	};
+	#stdinErrorHandler = (err: Error) => {
+		this.#markTerminalDisconnected("stdin failed", err);
+	};
 	#dead = false;
 	// Captured at construction and re-read at start(): when true, every real
 	// terminal side effect (writes, probes, raw mode, SIGWINCH, timers) is
@@ -481,7 +501,7 @@ export class ProcessTerminal implements Terminal {
 	#writeLogPath = $env.PI_TUI_WRITE_LOG || "";
 	#stdoutErrorCleanup?: () => void;
 	#stdoutErrorHandler = (err: Error) => {
-		this.#markTerminalWriteFailed(err);
+		this.#markTerminalDisconnected("stdout failed", err);
 	};
 
 	#windowsVTInputRestore?: () => void;
@@ -498,7 +518,7 @@ export class ProcessTerminal implements Terminal {
 	#da1SentinelOwners: Da1SentinelOwner[] = [];
 	/** Resolved DECRQM support per private mode (mode → supported). */
 	#privateModeSupport = new Map<number, boolean>();
-	#privateModeCallbacks: Array<(mode: number, supported: boolean) => void> = [];
+	#privateModeCallbacks: Array<(mode: number, supported: boolean, confirmed: boolean) => void> = [];
 	/** Whether DEC 2048 in-band resize notifications are currently enabled. */
 	#inBandResizeActive = false;
 	/** Reassembly buffer for a DEC 2048 in-band resize report split across stdin reads. */
@@ -550,13 +570,27 @@ export class ProcessTerminal implements Terminal {
 		}
 	}
 
-	onPrivateModeReport(callback: (mode: number, supported: boolean) => void): void {
+	/**
+	 * Re-query the terminal background via a single OSC 11 probe. Reuses the
+	 * startup query path — same DA1-sentinel FIFO, pending/queued gating, parsing,
+	 * dedup, and appearance callbacks — so a light/dark switch is picked up
+	 * without a restart on terminals lacking end-to-end Mode 2031 notifications.
+	 * Bounded to one probe per call; no timers are armed. Suppressed while headless
+	 * or after the terminal is torn down.
+	 */
+	refreshAppearance(): void {
+		if (this.#headless || this.#dead) return;
+		this.#queryBackgroundColor();
+	}
+
+	onPrivateModeReport(callback: (mode: number, supported: boolean, confirmed?: boolean) => void): void {
 		this.#privateModeCallbacks.push(callback);
 	}
 
-	start(onInput: (data: string) => void, onResize: () => void): void {
+	start(onInput: (data: string) => void, onResize: () => void, onDisconnect?: () => void): void {
 		this.#inputHandler = onInput;
 		this.#resizeHandler = onResize;
+		this.#disconnectHandler = onDisconnect;
 
 		// Headless (tests): suppress every real-terminal side effect. Skip raw
 		// mode, stdin listeners, capability probes, SIGWINCH, and emergency-restore
@@ -581,6 +615,9 @@ export class ProcessTerminal implements Terminal {
 			process.stdin.setRawMode(true);
 		}
 		process.stdin.setEncoding("utf8");
+		process.stdin.on("end", this.#stdinEndHandler);
+		process.stdin.on("close", this.#stdinCloseHandler);
+		process.stdin.on("error", this.#stdinErrorHandler);
 		process.stdin.resume();
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
@@ -891,8 +928,10 @@ export class ProcessTerminal implements Terminal {
 						break;
 					}
 					case "privateMode": {
-						// DA1 beat the DECRPM reply for this mode → treat as unsupported.
-						this.#resolvePrivateMode(owner.mode, false);
+						// DA1 beat the DECRPM reply. The terminal cannot report this
+						// capability, but may still implement it; keep that distinction
+						// so static terminal detection is not incorrectly downgraded.
+						this.#resolvePrivateMode(owner.mode, false, false);
 						break;
 					}
 					case "keyboard": {
@@ -1158,7 +1197,7 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	#handlePrivateModeReport(mode: number, status: string): void {
-		this.#resolvePrivateMode(mode, isPrivateModeSupported(status));
+		this.#resolvePrivateMode(mode, isPrivateModeSupported(status), true);
 		if (isXtermScrollToBottomMode(mode) && isPrivateModeSet(status)) {
 			this.#disableXtermScrollToBottomMode(mode);
 		}
@@ -1166,15 +1205,16 @@ export class ProcessTerminal implements Terminal {
 
 	/**
 	 * Record DECRQM support for a private mode (idempotent — first result wins)
-	 * and notify subscribers. Enables DEC 2048 in-band resize when 2048 resolves
-	 * supported.
+	 * and notify subscribers. `confirmed` distinguishes an explicit DECRPM
+	 * unsupported response from an absent response followed by the DA1 sentinel.
+	 * Enables DEC 2048 in-band resize only after positive confirmation.
 	 */
-	#resolvePrivateMode(mode: number, supported: boolean): void {
+	#resolvePrivateMode(mode: number, supported: boolean, confirmed: boolean): void {
 		if (this.#privateModeSupport.has(mode)) return;
 		this.#privateModeSupport.set(mode, supported);
 		for (const cb of this.#privateModeCallbacks) {
 			try {
-				cb(mode, supported);
+				cb(mode, supported, confirmed);
 			} catch {
 				// Ignore subscriber errors — capability reporting must not crash input.
 			}
@@ -1399,6 +1439,10 @@ export class ProcessTerminal implements Terminal {
 			process.stdin.removeListener("data", this.#stdinDataHandler);
 			this.#stdinDataHandler = undefined;
 		}
+		process.stdin.removeListener("end", this.#stdinEndHandler);
+		process.stdin.removeListener("close", this.#stdinCloseHandler);
+		process.stdin.removeListener("error", this.#stdinErrorHandler);
+		this.#disconnectHandler = undefined;
 		this.#inputHandler = undefined;
 		this.#appearance = undefined;
 		if (this.#stdoutResizeListener) {
@@ -1424,10 +1468,26 @@ export class ProcessTerminal implements Terminal {
 		this.#stdoutErrorCleanup ??= registerStdoutErrorHandler(this.#stdoutErrorHandler);
 	}
 
-	#markTerminalWriteFailed(err: unknown): void {
+	#markTerminalDisconnected(reason: string, err?: unknown): void {
 		if (this.#dead) return;
 		this.#dead = true;
-		logger.warn("terminal write failed; disabling terminal rendering", { err });
+		logger.warn("terminal disconnected; stopping interactive rendering", { reason, err });
+
+		const disconnectHandler = this.#disconnectHandler;
+		this.#disconnectHandler = undefined;
+		if (!disconnectHandler) return;
+		disconnectHandler();
+
+		if (process.platform === "win32") {
+			void postmortem.quit(129);
+			return;
+		}
+		try {
+			process.kill(process.pid, "SIGHUP");
+		} catch (signalErr) {
+			logger.error("Failed to deliver terminal disconnect signal; exiting directly", { err: signalErr });
+			void postmortem.quit(129);
+		}
 	}
 
 	write(data: string): void {
@@ -1474,7 +1534,7 @@ export class ProcessTerminal implements Terminal {
 				process.stdout.write(data);
 			}
 		} catch (err) {
-			this.#markTerminalWriteFailed(err);
+			this.#markTerminalDisconnected("stdout failed", err);
 		}
 	}
 

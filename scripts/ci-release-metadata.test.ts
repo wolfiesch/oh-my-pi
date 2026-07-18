@@ -336,47 +336,47 @@ describe("release metadata", () => {
 			await git(canonicalWork, ["config", "user.name", "test"]);
 			await git(canonicalWork, ["config", "user.email", "test@example.invalid"]);
 			await git(canonicalWork, ["commit", "--allow-empty", "-qm", "official base"]);
-			await git(canonicalWork, ["tag", "-am", "official release", "v17.0.0"]);
+			await git(canonicalWork, ["tag", "-am", "official release", "v17.0.4"]);
 			await git(root, ["clone", "--bare", "-q", canonicalWork, canonicalBare]);
 			await git(root, ["clone", "-q", canonicalBare, product]);
-			const officialTagObject = await gitOutput(product, ["rev-parse", "refs/tags/v17.0.0"]);
+			const officialTagObject = await gitOutput(product, ["rev-parse", "refs/tags/v17.0.4"]);
 			await git(product, ["config", "user.name", "test"]);
 			await git(product, ["config", "user.email", "test@example.invalid"]);
 			await git(product, ["commit", "--allow-empty", "-qm", "T4 product"]);
-			await git(product, ["tag", "t4code-17.0.0-appserver-1"]);
+			await git(product, ["tag", "t4code-17.0.4-appserver-1"]);
 
 			const valid = await runMetadataCli(product, canonicalBare, outputPath);
 			expect(valid).toMatchObject({ exitCode: 0, stderr: "" });
 			expect(await Bun.file(outputPath).text()).toContain("release-kind=t4code");
 
-			await git(product, ["tag", "-d", "v17.0.0"]);
+			await git(product, ["tag", "-d", "v17.0.4"]);
 			const missing = await runMetadataCli(product, canonicalBare, outputPath);
 			expect(missing.exitCode).not.toBe(0);
-			expect(missing.stderr).toContain("Required official base tag v17.0.0 is missing");
+			expect(missing.stderr).toContain("Required official base tag v17.0.4 is missing");
 
 			await git(product, ["tag", "v16.5.1", "HEAD~1"]);
 			const wrong = await runMetadataCli(product, canonicalBare, outputPath);
 			expect(wrong.exitCode).not.toBe(0);
-			expect(wrong.stderr).toContain("v17.0.0 does not match available official tag(s): v16.5.1");
+			expect(wrong.stderr).toContain("v17.0.4 does not match available official tag(s): v16.5.1");
 
-			await git(product, ["tag", "-f", "v17.0.0", "HEAD"]);
+			await git(product, ["tag", "-f", "v17.0.4", "HEAD"]);
 			const counterfeit = await runMetadataCli(product, canonicalBare, outputPath);
 			expect(counterfeit.exitCode).not.toBe(0);
-			expect(counterfeit.stderr).toContain("Local official base tag v17.0.0 does not match can1357/oh-my-pi");
+			expect(counterfeit.stderr).toContain("Local official base tag v17.0.4 does not match can1357/oh-my-pi");
 
-			await git(product, ["update-ref", "refs/tags/v17.0.0", officialTagObject]);
-			await git(product, ["tag", "-d", "t4code-17.0.0-appserver-1"]);
+			await git(product, ["update-ref", "refs/tags/v17.0.4", officialTagObject]);
+			await git(product, ["tag", "-d", "t4code-17.0.4-appserver-1"]);
 			await git(product, ["switch", "--orphan", "disconnected"]);
 			await git(product, ["commit", "--allow-empty", "-qm", "unrelated T4 product"]);
-			await git(product, ["tag", "t4code-17.0.0-appserver-1"]);
+			await git(product, ["tag", "t4code-17.0.4-appserver-1"]);
 			const nonAncestor = await runMetadataCli(product, canonicalBare, outputPath);
 			expect(nonAncestor.exitCode).not.toBe(0);
-			expect(nonAncestor.stderr).toContain("does not descend from official base tag v17.0.0");
+			expect(nonAncestor.stderr).toContain("does not descend from official base tag v17.0.4");
 
-			await git(canonicalBare, ["tag", "-d", "v17.0.0"]);
+			await git(canonicalBare, ["tag", "-d", "v17.0.4"]);
 			const canonicalMissing = await runMetadataCli(product, canonicalBare, outputPath);
 			expect(canonicalMissing.exitCode).not.toBe(0);
-			expect(canonicalMissing.stderr).toContain("Canonical repository is missing official base tag v17.0.0");
+			expect(canonicalMissing.stderr).toContain("Canonical repository is missing official base tag v17.0.4");
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

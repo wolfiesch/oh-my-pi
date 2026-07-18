@@ -558,4 +558,38 @@ mod tests {
 			.expect("shell run should return");
 		assert!(result.cancelled);
 	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn timeout_drains_pipeline_output_before_stopping_reader() {
+		let shell = CoreShell::new(None);
+		let (tx, rx) = flume::unbounded::<String>();
+		// `tail` runs as an in-process builtin, so cancellation kills only the
+		// external `yes`; tail then sees EOF and flushes its final 5 lines into
+		// the post-cancel reader grace window. The deadline must be generous
+		// enough that `yes` has demonstrably spawned and produced before the
+		// timeout fires — a 50ms budget lost that race on cold CI runners and
+		// tail flushed an empty ring buffer.
+		const TIMEOUT_MS: u32 = 750;
+		let result = shell
+			.run(
+				CoreShellRunOptions {
+					command:    "yes x | tail -5".to_string(),
+					cwd:        None,
+					env:        None,
+					timeout_ms: Some(TIMEOUT_MS),
+				},
+				Some(tx),
+				CancelToken::new(Some(TIMEOUT_MS)),
+			)
+			.await
+			.expect("shell run");
+
+		let mut output = String::new();
+		while let Ok(chunk) = rx.recv_async().await {
+			output.push_str(&chunk);
+		}
+
+		assert!(result.timed_out);
+		assert_eq!(output.lines().filter(|line| *line == "x").count(), 5);
+	}
 }

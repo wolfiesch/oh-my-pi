@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+## [17.0.2] - 2026-07-17
+
+### Added
+
+- Added a structured log sink API (`registerLogSink`, `LogEvent`, `LogLevel`) to the centralized logger, enabling out-of-band consumers (such as OpenTelemetry) to receive log events without affecting local file or console logging.
+
+### Changed
+
+- Bounded default `ptree.ChildProcess` stderr retention to a 32 KiB tail to prevent memory leaks in long-lived subprocesses. Full stderr capture must now be explicitly requested at spawn time using `{ stderr: "full" }` on `spawn` or `exec`.
+
+### Fixed
+
+- Fixed fatal cleanup failing to reach `process.exit()` when terminal stderr is revoked.
+- Isolated rotating log files and audit state per process to prevent concurrent instances from racing during compression and rotation.
+
+## [17.0.1] - 2026-07-16
+
+### Fixed
+
+- Added scoped graceful handling for stdio-write EPIPE rejections so protocol servers can await postmortem cleanup when their peer disconnects ([#4788](https://github.com/can1357/oh-my-pi/issues/4788)).
+
 ## [17.0.0] - 2026-07-15
 
 ### Fixed
