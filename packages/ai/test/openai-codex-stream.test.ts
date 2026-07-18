@@ -3156,6 +3156,7 @@ describe("openai-codex streaming", () => {
 		});
 		expect(stats?.lastTurn?.request.inputJsonBytes).toBeGreaterThan(0);
 		expect(stats?.lastTurn?.request.inputJsonBytes).toBeLessThan(1000);
+		expect(stats?.inputJsonBytes).toBeGreaterThan(stats?.lastTurn?.request.inputJsonBytes ?? 0);
 		expect(stats?.lastTurn?.usage).toEqual({
 			rawInputTokens: 132278,
 			rawCachedTokens: 124416,

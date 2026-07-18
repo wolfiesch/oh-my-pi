@@ -5,6 +5,7 @@
 ### Added
 
 - Add a frozen Agent View lifecycle corpus covering started, running, completed, parked, resumed, and cancelled worker states for cross-client compatibility verification.
+- Add strict, redacted provider transport diagnostics to additive live session state for capability-aware desktop clients.
 
 ## [0.5.8] - 2026-07-16
 

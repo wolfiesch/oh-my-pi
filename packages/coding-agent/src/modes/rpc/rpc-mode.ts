@@ -26,7 +26,12 @@ import {
 	utf8ByteLength,
 } from "@oh-my-pi/app-wire";
 import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
+import type { Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import {
+	getOpenAICodexTransportDetails,
+	getOpenAICodexWebSocketDebugStats,
+} from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isRecord, postmortem, readLines, Snowflake } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../../capability";
@@ -1700,6 +1705,39 @@ export async function runRpcMode(
 				const queued = session.getQueuedMessages();
 				const model = session.model;
 				const thinkingLevels = [...session.getAvailableThinkingLevels()];
+				let providerTransport: RpcSessionState["providerTransport"];
+				if (model?.api === "openai-codex-responses") {
+					const codexModel = model as Model<"openai-codex-responses">;
+					const details = getOpenAICodexTransportDetails(codexModel, {
+						sessionId: session.sessionId,
+						preferWebsockets: session.preferWebsockets,
+						providerSessionState: session.providerSessionState,
+					});
+					const stats = getOpenAICodexWebSocketDebugStats(codexModel, {
+						sessionId: session.sessionId,
+						providerSessionState: session.providerSessionState,
+					});
+					providerTransport = {
+						provider: "openai-codex",
+						configuredPolicy:
+							session.preferWebsockets === true ? "on" : session.preferWebsockets === false ? "off" : "auto",
+						websocketPreferred: details.websocketPreferred,
+						...(details.lastTransport ? { lastTransport: details.lastTransport } : {}),
+						websocketDisabled: details.websocketDisabled,
+						websocketConnected: details.websocketConnected,
+						fallbackCount: details.fallbackCount,
+						canAppend: details.canAppend,
+						prewarmed: details.prewarmed,
+						hasSessionState: details.hasSessionState,
+						hasTurnState: details.hasTurnState,
+						fullContextRequests: stats?.fullContextRequests ?? 0,
+						deltaRequests: stats?.deltaRequests ?? 0,
+						inputJsonBytes: stats?.inputJsonBytes ?? 0,
+						...(stats?.lastTurn?.request.inputJsonBytes === undefined
+							? {}
+							: { lastInputJsonBytes: stats.lastTurn.request.inputJsonBytes }),
+					};
+				}
 				const state: RpcSessionState = {
 					model: model
 						? {
@@ -1742,6 +1780,7 @@ export async function runRpcMode(
 						examples: tool.examples,
 					})),
 					contextUsage: session.getContextUsage(),
+					...(providerTransport ? { providerTransport } : {}),
 				};
 				return success(id, "get_state", state);
 			}

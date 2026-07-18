@@ -365,6 +365,7 @@ export interface OpenAICodexTurnDiagnostics {
 export interface OpenAICodexWebSocketDebugStats {
 	fullContextRequests: number;
 	deltaRequests: number;
+	inputJsonBytes: number;
 	lastInputItems: number;
 	lastDeltaInputItems?: number;
 	lastPreviousResponseId?: string;
@@ -2652,6 +2653,7 @@ function getCodexWebSocketSessionState(
 		stats: {
 			fullContextRequests: 0,
 			deltaRequests: 0,
+			inputJsonBytes: 0,
 			lastInputItems: 0,
 		},
 	};
@@ -2975,6 +2977,7 @@ function recordCodexTurnRequestDiagnostics(
 	state.stats.lastTurn = {
 		request: buildCodexTurnRequestDiagnostics(request, transport, canAppendBeforeRequest),
 	};
+	state.stats.inputJsonBytes += state.stats.lastTurn.request.inputJsonBytes;
 	CODEX_DEBUG && logger.debug("[codex] codex turn request diagnostics", { diagnostics: state.stats.lastTurn.request });
 }
 
