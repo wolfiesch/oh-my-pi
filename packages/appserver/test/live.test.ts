@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -5568,7 +5568,10 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 			);
 			const outcome = await untilResponse(client.client, "create-alias");
 			expect(outcome.response.ok).toBe(true);
-			await expect(authority.created.promise).resolves.toEqual({ cwd: projectRoot, title: undefined });
+			await expect(authority.created.promise).resolves.toEqual({
+				cwd: await realpath(projectRoot),
+				title: undefined,
+			});
 			await closeClients([client.client]);
 		} finally {
 			await appserver.stop();

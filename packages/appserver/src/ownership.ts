@@ -77,8 +77,24 @@ export function sameIdentity(
 	return a.device === b.device && a.inode === b.inode;
 }
 
+const DARWIN_SYSTEM_ALIASES = [
+	{ alias: "/tmp", target: "private/tmp" },
+	{ alias: "/var", target: "private/var" },
+] as const;
+
+async function normalizeDarwinSystemAlias(directory: string): Promise<string> {
+	if (process.platform !== "darwin") return directory;
+	for (const { alias, target } of DARWIN_SYSTEM_ALIASES) {
+		if (directory !== alias && !directory.startsWith(`${alias}${sep}`)) continue;
+		const info = await lstat(alias);
+		if (!info.isSymbolicLink() || (await readlink(alias)) !== target) return directory;
+		return join(sep, target, relative(alias, directory));
+	}
+	return directory;
+}
+
 export async function ensureSecureSocketDirectory(publicPath: string): Promise<string> {
-	const directory = resolve(dirname(publicPath));
+	const directory = await normalizeDarwinSystemAlias(resolve(dirname(publicPath)));
 	const parts = directory.split(sep).filter(Boolean);
 	let current = directory.startsWith(sep) ? sep : "";
 	for (const part of parts) {
