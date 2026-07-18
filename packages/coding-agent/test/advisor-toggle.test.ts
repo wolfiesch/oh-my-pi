@@ -107,6 +107,18 @@ describe("AgentSession advisor toggle", () => {
 		);
 	});
 
+	it("re-evaluates automatic activation when its settings change", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.setThinkingLevel(ThinkingLevel.Low);
+		expect(session.isAdvisorActive()).toBe(false);
+
+		session.settings.set("advisor.autoEnableFor", `${model.provider}/${model.id}:low`);
+		expect(session.isAdvisorActive()).toBe(true);
+
+		session.settings.set("advisor.autoEnableFor", `${replacementModel.provider}/${replacementModel.id}`);
+		expect(session.isAdvisorActive()).toBe(false);
+	});
+
 	it("keeps routed automatic selectors scoped to the selected upstream", async () => {
 		const available = modelRegistry.getAvailable();
 		const cerebras = parseModelPattern("openrouter/z-ai/glm-4.7@cerebras", available).model;

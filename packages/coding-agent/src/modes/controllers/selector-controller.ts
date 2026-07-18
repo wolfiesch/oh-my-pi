@@ -433,7 +433,6 @@ export class SelectorController {
 				break;
 			case "advisor.enabled":
 			case "advisor.autoEnableFor":
-				this.ctx.session.refreshAdvisorActivation();
 				this.ctx.statusLine.invalidate();
 				break;
 			case "personality":

@@ -194,6 +194,7 @@ import { buildServiceTierByFamily, serviceTierForAllFamilies, serviceTierSetting
 import type { Settings, SkillsSettings } from "../config/settings";
 import {
 	getDefault,
+	onAdvisorActivationChanged,
 	onAppendOnlyModeChanged,
 	onModelRolesChanged,
 	validateProviderMaxInFlightRequests,
@@ -1883,6 +1884,7 @@ export class AgentSession {
 	#unsubscribeAgent?: () => void;
 	#cancelExitRecorder?: () => void;
 	#exitRecorded = false;
+	#unsubscribeAdvisorActivation?: () => void;
 	#unsubscribeAppendOnly?: () => void;
 	#unsubscribeModelRoles?: () => void;
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
@@ -2895,6 +2897,10 @@ export class AgentSession {
 		this.#unsubscribeAgent = this.agent.subscribe(this.#handleAgentEvent);
 		// Re-evaluate append-only context mode when the setting changes at runtime.
 		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
+		this.#unsubscribeAdvisorActivation = onAdvisorActivationChanged(() => {
+			if (this.#isDisposed) return;
+			this.#syncAdvisorActivation(true);
+		});
 		this.#unsubscribeModelRoles = onModelRolesChanged(() => {
 			if (this.#isDisposed) return;
 			this.#syncAdvisorActivation(true);
@@ -6896,6 +6902,10 @@ export class AgentSession {
 		// hard-kill (issue #3031).
 		await shutdownMnemopiEmbedClient();
 		this.#disconnectFromAgent();
+		if (this.#unsubscribeAdvisorActivation) {
+			this.#unsubscribeAdvisorActivation();
+			this.#unsubscribeAdvisorActivation = undefined;
+		}
 		if (this.#unsubscribeAppendOnly) {
 			this.#unsubscribeAppendOnly();
 			this.#unsubscribeAppendOnly = undefined;
