@@ -99,11 +99,11 @@ describe("desktop operation dispatcher", () => {
 					}
 				: name.startsWith("review.")
 					? { reviewId: "review-1" }
-				: name.startsWith("preview.") && ["preview.launch", "preview.navigate"].includes(name)
-					? { url: "http://localhost" }
-					: name === "bash.run"
-						? { command: "structured" }
-						: {};
+					: name.startsWith("preview.") && ["preview.launch", "preview.navigate"].includes(name)
+						? { url: "http://localhost" }
+						: name === "bash.run"
+							? { command: "structured" }
+							: {};
 			const hostCommand = [
 				"catalog.get",
 				"settings.read",
