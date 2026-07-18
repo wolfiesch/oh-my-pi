@@ -1,6 +1,6 @@
 {
   "name": "@oh-my-pi/app-wire",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "type": "module",
   "description": "Dependency-free omp app protocol frames and bounded decoders",
   "license": "MIT",

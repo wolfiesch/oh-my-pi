@@ -67,6 +67,16 @@ describe("app-wire authority", () => {
 			else expect(isServerFrame(value)).toBe(true);
 		}
 	});
+	test("Agent View lifecycle corpus decodes through the public server guard", async () => {
+		const scenario = (await fixture("scenarios/agent-view-lifecycle.json")) as {
+			schema: unknown;
+			frames: unknown;
+		};
+		expect(scenario.schema).toBe("agent-view/1");
+		expect(Array.isArray(scenario.frames)).toBe(true);
+		if (!Array.isArray(scenario.frames)) throw new Error("Agent View fixture frames must be an array");
+		expect(scenario.frames.map(frame => decodeServerFrame(frame).type)).toEqual(Array(6).fill("agent"));
+	});
 	test("session list metadata remains bounded at the wire cap", () => {
 		const sessions = Array.from({ length: 1_000 }, (_, index) => ({
 			hostId: "h",
