@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Changed Agent Hub to default to running-agent visibility, archive parked and aborted agents, and expose live runtime metadata with structured activity ([#5251](https://github.com/can1357/oh-my-pi/pull/5251) by [@wolfiesch](https://github.com/wolfiesch)).
+
 ## [17.0.3] - 2026-07-17
 
 ### Changed
@@ -405,9 +409,6 @@
 
 - Fixed PageUp/PageDown in the model browser wrapping past the list edges instead of clamping
 - Fixed the hover highlight sticking to the last hovered model row when the pointer moved into the provider sidebar
-### Changed
-
-- Changed Agent Hub to default to running-agent visibility, archive parked and aborted agents, and expose live runtime metadata with structured activity ([#5251](https://github.com/can1357/oh-my-pi/pull/5251) by [@wolfiesch](https://github.com/wolfiesch)).
 
 ## [16.4.6] - 2026-07-12
 
