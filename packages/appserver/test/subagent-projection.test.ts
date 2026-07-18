@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { hostId, sessionId } from "@oh-my-pi/app-wire";
+import { type AgentFrame, hostId, sessionId } from "@oh-my-pi/app-wire";
 import { SubagentProjection } from "../src/subagent-projection.ts";
 
 const host = hostId("subagent-host");
@@ -104,7 +104,7 @@ describe("appserver subagent projection", () => {
 	test("matches the frozen Agent View lifecycle corpus", async () => {
 		const corpus = (await Bun.file(
 			new URL("../../app-wire/fixtures/v1/scenarios/agent-view-lifecycle.json", import.meta.url),
-		).json()) as { frames: unknown[] };
+		).json()) as { frames: AgentFrame[] };
 		let now = 1_000;
 		const projection = new SubagentProjection(hostId("agent-view-host"), sessionId("agent-view-session"), () => now);
 		const at = (milliseconds: number, frame: Record<string, unknown>) => {
