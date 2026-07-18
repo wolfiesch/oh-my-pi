@@ -172,6 +172,8 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 
 		const leafBaseline = path.join(leafPackageDir, "pi_natives.linux-x64-baseline.node");
 		const coreBaseline = path.join(nativeDir, "pi_natives.linux-x64-baseline.node");
+		expect(candidates).toContain(coreBaseline);
+		expect(candidates).toContain(leafBaseline);
 		expect(candidates.indexOf(coreBaseline)).toBeLessThan(candidates.indexOf(leafBaseline));
 	});
 
