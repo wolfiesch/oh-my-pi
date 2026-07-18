@@ -2514,6 +2514,14 @@ describe("openai-codex streaming", () => {
 		expect(fallbackDetails.lastTransport).toBe("sse");
 		expect(fallbackDetails.websocketDisabled).toBe(true);
 		expect(fallbackDetails.fallbackCount).toBe(1);
+		const stats = getOpenAICodexWebSocketDebugStats(model, {
+			sessionId: "ws-session",
+			providerSessionState,
+		});
+		expect(stats?.fullContextRequests).toBe(1);
+		expect(stats?.deltaRequests).toBe(0);
+		expect(stats?.lastTurn?.request.transport).toBe("sse");
+		expect(stats?.inputJsonBytes).toBe(stats?.lastTurn?.request.inputJsonBytes);
 	});
 
 	it("carries fatal websocket fallback into isolated compaction transport", async () => {
