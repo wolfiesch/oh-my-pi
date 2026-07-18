@@ -1,6 +1,7 @@
 import { type Cursor, decodeCursor } from "./cursor.js";
 import { fail } from "./errors.js";
 import {
+	bool,
 	boundedArray,
 	boundedMap,
 	boundedMetadata,
@@ -31,6 +32,25 @@ export interface ContextUsage {
 }
 export type SessionObserverLockStatus = "live" | "suspect" | "malformed";
 export type SessionObserverTranscript = "live" | "snapshot";
+export type ProviderTransportPolicy = "auto" | "on" | "off";
+export type ProviderTransportKind = "websocket" | "sse";
+export interface ProviderTransportState {
+	provider: "openai-codex";
+	configuredPolicy: ProviderTransportPolicy;
+	websocketPreferred: boolean;
+	lastTransport?: ProviderTransportKind;
+	websocketDisabled: boolean;
+	websocketConnected: boolean;
+	fallbackCount: number;
+	canAppend: boolean;
+	prewarmed: boolean;
+	hasSessionState: boolean;
+	hasTurnState: boolean;
+	fullContextRequests: number;
+	deltaRequests: number;
+	inputJsonBytes: number;
+	lastInputJsonBytes?: number;
+}
 export type SessionControlState =
 	| {
 			mode: "observer";
@@ -43,6 +63,7 @@ export type SessionControlState =
 	  };
 export interface SessionLiveState {
 	sessionControl?: SessionControlState;
+	providerTransport?: ProviderTransportState;
 	[key: string]: unknown;
 }
 export interface SessionRef {
@@ -97,6 +118,54 @@ function decodeSessionControl(value: unknown, path: string): SessionControlState
 	}
 	fail("INVALID_FRAME", "invalid session control mode", `${path}.mode`);
 }
+const PROVIDER_TRANSPORT_KEYS = new Set([
+	"provider",
+	"configuredPolicy",
+	"websocketPreferred",
+	"lastTransport",
+	"websocketDisabled",
+	"websocketConnected",
+	"fallbackCount",
+	"canAppend",
+	"prewarmed",
+	"hasSessionState",
+	"hasTurnState",
+	"fullContextRequests",
+	"deltaRequests",
+	"inputJsonBytes",
+	"lastInputJsonBytes",
+]);
+export function decodeProviderTransportState(value: unknown, path: string): ProviderTransportState {
+	const raw = boundedMap(value, path);
+	for (const key of Object.keys(raw))
+		if (!PROVIDER_TRANSPORT_KEYS.has(key))
+			fail("INVALID_FRAME", "unknown provider transport field", `${path}.${key}`);
+	if (raw.provider !== "openai-codex")
+		fail("INVALID_FRAME", "invalid provider transport provider", `${path}.provider`);
+	if (raw.configuredPolicy !== "auto" && raw.configuredPolicy !== "on" && raw.configuredPolicy !== "off")
+		fail("INVALID_FRAME", "invalid provider transport policy", `${path}.configuredPolicy`);
+	if (raw.lastTransport !== undefined && raw.lastTransport !== "websocket" && raw.lastTransport !== "sse")
+		fail("INVALID_FRAME", "invalid provider transport kind", `${path}.lastTransport`);
+	return {
+		provider: raw.provider,
+		configuredPolicy: raw.configuredPolicy,
+		websocketPreferred: bool(raw.websocketPreferred, `${path}.websocketPreferred`),
+		...(raw.lastTransport === undefined ? {} : { lastTransport: raw.lastTransport }),
+		websocketDisabled: bool(raw.websocketDisabled, `${path}.websocketDisabled`),
+		websocketConnected: bool(raw.websocketConnected, `${path}.websocketConnected`),
+		fallbackCount: safeSeq(raw.fallbackCount, `${path}.fallbackCount`),
+		canAppend: bool(raw.canAppend, `${path}.canAppend`),
+		prewarmed: bool(raw.prewarmed, `${path}.prewarmed`),
+		hasSessionState: bool(raw.hasSessionState, `${path}.hasSessionState`),
+		hasTurnState: bool(raw.hasTurnState, `${path}.hasTurnState`),
+		fullContextRequests: safeSeq(raw.fullContextRequests, `${path}.fullContextRequests`),
+		deltaRequests: safeSeq(raw.deltaRequests, `${path}.deltaRequests`),
+		inputJsonBytes: safeSeq(raw.inputJsonBytes, `${path}.inputJsonBytes`),
+		...(raw.lastInputJsonBytes === undefined
+			? {}
+			: { lastInputJsonBytes: safeSeq(raw.lastInputJsonBytes, `${path}.lastInputJsonBytes`) }),
+	};
+}
 function decodeListMetadata(
 	value: Record<string, unknown>,
 	path: string,
@@ -132,6 +201,8 @@ export function decodeSessionRef(value: unknown, path: string): SessionRef {
 		const liveState = session.liveState as Record<string, unknown>;
 		if (liveState.sessionControl !== undefined)
 			decodeSessionControl(liveState.sessionControl, `${path}.liveState.sessionControl`);
+		if (liveState.providerTransport !== undefined)
+			decodeProviderTransportState(liveState.providerTransport, `${path}.liveState.providerTransport`);
 	}
 	if (session.model !== undefined) controlFree(session.model, `${path}.model`, 256);
 	if (session.thinking !== undefined) controlFree(session.thinking, `${path}.thinking`, 256);

@@ -4,6 +4,8 @@
  * Commands are sent as JSON lines on stdin.
  * Responses and events are emitted as JSON lines on stdout.
  */
+
+import type { ProviderTransportState } from "@oh-my-pi/app-wire";
 import type { AgentEvent, AgentMessage, AgentToolResult, ThinkingLevel, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
@@ -145,6 +147,8 @@ export interface RpcSessionState {
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
 	/** Current context window usage. */
 	contextUsage?: ContextUsage;
+	/** Redacted provider transport state for diagnostics. */
+	providerTransport?: ProviderTransportState;
 }
 
 export interface RpcAvailableSlashCommand {

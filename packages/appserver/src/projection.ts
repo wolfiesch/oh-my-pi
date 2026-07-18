@@ -4,6 +4,7 @@ import {
 	decodeTranscriptImageMetadataList,
 	type EntryId,
 	type HostId,
+	type ProviderTransportState,
 	revision,
 	type ServerFrame,
 	type SessionControlState,
@@ -294,6 +295,7 @@ export class SessionProjection {
 		state: SessionStateResult,
 		statusOverride?: SessionRef["status"],
 		recoverClosedStatus = false,
+		providerTransport?: ProviderTransportState,
 	): ServerFrame | undefined {
 		const next: SessionRef = { ...this.value.ref };
 		const liveState = { ...(next.liveState ?? {}) };
@@ -309,6 +311,8 @@ export class SessionProjection {
 		delete liveState.fast;
 		delete liveState.fastAvailable;
 		delete liveState.fastActive;
+		delete liveState.providerTransport;
+		if (providerTransport) liveState.providerTransport = providerTransport;
 		if (state.queuedMessages) liveState.queuedMessages = state.queuedMessages;
 		else delete liveState.queuedMessages;
 		if (state.sessionName !== undefined) next.title = state.sessionName;

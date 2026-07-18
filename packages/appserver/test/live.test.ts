@@ -2868,6 +2868,23 @@ describe("live Unix websocket protocol", () => {
 				queuedMessageCount: 2,
 				queuedMessages: { steering: ["steer"], followUp: ["follow"] },
 				contextUsage: { tokens: 123, contextWindow: 1_000 },
+				providerTransport: {
+					provider: "openai-codex",
+					configuredPolicy: "on",
+					websocketPreferred: true,
+					lastTransport: "websocket",
+					websocketDisabled: false,
+					websocketConnected: true,
+					fallbackCount: 0,
+					canAppend: true,
+					prewarmed: true,
+					hasSessionState: true,
+					hasTurnState: true,
+					fullContextRequests: 2,
+					deltaRequests: 19,
+					inputJsonBytes: 78_297,
+					lastInputJsonBytes: 126,
+				},
 			},
 		});
 		const state = await untilResponse(client.client, "state");
@@ -2888,6 +2905,15 @@ describe("live Unix websocket protocol", () => {
 				sessionName: "Renamed",
 				queuedMessages: { steering: ["steer"], followUp: ["follow"] },
 				contextUsage: { used: 123, limit: 1_000 },
+			},
+		});
+		expect(appserver.snapshot(sid("s1"))?.ref.liveState).toMatchObject({
+			providerTransport: {
+				provider: "openai-codex",
+				configuredPolicy: "on",
+				lastTransport: "websocket",
+				deltaRequests: 19,
+				inputJsonBytes: 78_297,
 			},
 		});
 
@@ -2991,6 +3017,44 @@ describe("live Unix websocket protocol", () => {
 		await appserver.stop();
 	});
 
+	test("drops malformed provider diagnostics without blocking the state refresh", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory, [record("s1")]);
+		const client = await readyClient(path, ["sessions.read"]);
+		client.client.sendJson(command("malformed-diagnostics", "malformed-diagnostics", "session.state.get", "s1", {}));
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		const stateCommand = JSON.parse(child.writes[0] ?? "{}") as Record<string, unknown>;
+		child.push({
+			type: "response",
+			id: stateCommand.id,
+			command: "get_state",
+			success: true,
+			data: {
+				isStreaming: false,
+				isCompacting: false,
+				isPaused: false,
+				messageCount: 3,
+				queuedMessageCount: 0,
+				steeringMode: "one-at-a-time",
+				followUpMode: "all",
+				interruptMode: "wait",
+				sessionName: "State still refreshed",
+				providerTransport: {
+					provider: "openai-codex",
+					configuredPolicy: "future-policy",
+				},
+			},
+		});
+		const result = await untilResponse(client.client, "malformed-diagnostics");
+		expect(result.response).toMatchObject({
+			ok: true,
+			result: { messageCount: 3, sessionName: "State still refreshed" },
+		});
+		expect(appserver.snapshot(sid("s1"))?.ref.liveState?.providerTransport).toBeUndefined();
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
 	test("projects live subagent progress and replays current agent state on attach", async () => {
 		const factory = new LiveFactory();
 		const { appserver, path } = await liveServer(factory, [record("s1")]);

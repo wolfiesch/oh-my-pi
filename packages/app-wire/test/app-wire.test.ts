@@ -453,6 +453,23 @@ describe("app-wire authority", () => {
 		expect(APP_WIRE_VERSION).toBe(metadata.version);
 	});
 	test("session project wire data is opaque and live state is secret-free", () => {
+		const providerTransport = {
+			provider: "openai-codex",
+			configuredPolicy: "auto",
+			websocketPreferred: true,
+			lastTransport: "websocket",
+			websocketDisabled: false,
+			websocketConnected: true,
+			fallbackCount: 0,
+			canAppend: true,
+			prewarmed: true,
+			hasSessionState: true,
+			hasTurnState: true,
+			fullContextRequests: 2,
+			deltaRequests: 19,
+			inputJsonBytes: 78_297,
+			lastInputJsonBytes: 126,
+		};
 		const session = {
 			hostId: "h",
 			sessionId: "s",
@@ -461,10 +478,11 @@ describe("app-wire authority", () => {
 			title: "Demo",
 			status: "idle",
 			updatedAt: "now",
-			liveState: { phase: "work", phaseLabel: "human" },
+			liveState: { phase: "work", phaseLabel: "human", providerTransport },
 		};
 		const frame = { v: "omp-app/1", type: "sessions", cursor: { epoch: "e", seq: 1 }, sessions: [session] };
 		const decoded = decodeServerFrame(frame);
+		expect(decoded).toMatchObject({ sessions: [{ liveState: { providerTransport } }] });
 		expect(JSON.stringify(decoded)).not.toContain("canonicalCwd");
 		expect(
 			JSON.stringify(decodeCommandResult("session.list", { cursor: { epoch: "e", seq: 1 }, sessions: [session] })),
@@ -477,6 +495,23 @@ describe("app-wire authority", () => {
 		).toThrow(AppWireError);
 		expect(() =>
 			decodeServerFrame({ ...frame, sessions: [{ ...session, liveState: { nested: { "session.key": "x" } } }] }),
+		).toThrow(AppWireError);
+		expect(() =>
+			decodeServerFrame({
+				...frame,
+				sessions: [
+					{
+						...session,
+						liveState: { providerTransport: { ...providerTransport, configuredPolicy: "sometimes" } },
+					},
+				],
+			}),
+		).toThrow(AppWireError);
+		expect(() =>
+			decodeServerFrame({
+				...frame,
+				sessions: [{ ...session, liveState: { providerTransport: { ...providerTransport, accessToken: "x" } } }],
+			}),
 		).toThrow(AppWireError);
 	});
 	test("session observer control is additive, categorical, and exact", () => {

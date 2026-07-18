@@ -11,6 +11,7 @@ import {
 	decodeClientFrame,
 	decodeCommandArguments,
 	decodeCursor,
+	decodeProviderTransportState,
 	decodeSessionPromptArguments,
 	decodeSessionStateResult,
 	decodeUsageReadResult,
@@ -19,6 +20,7 @@ import {
 	IMAGE_UPLOAD_CHUNK_BYTES,
 	type ImageId,
 	type PromptImageMimeType,
+	type ProviderTransportState,
 	parseBounded,
 	projectId,
 	type ResultFrame,
@@ -367,6 +369,18 @@ function safeSessionState(value: unknown): SessionStateResult {
 		...(queued ? { queuedMessages: { steering: queued.steering, followUp: queued.followUp } } : {}),
 	};
 	return decodeSessionStateResult(state);
+}
+function safeProviderTransport(value: unknown): ProviderTransportState | undefined {
+	const raw =
+		value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+	if (raw?.providerTransport === undefined) return undefined;
+	try {
+		return decodeProviderTransportState(raw.providerTransport, "rpc.providerTransport");
+	} catch {
+		// Diagnostics are additive. A malformed or future shape must not block
+		// the authoritative state refresh that carries session controls.
+		return undefined;
+	}
 }
 function childBoolean(value: unknown, key: string): boolean {
 	const record =
@@ -2231,6 +2245,7 @@ export class LocalAppserver implements AppserverHandle {
 		const result = await supervisor.call({ type: "get_state" }, `${requestId}:state`, signal);
 		if (!result.success || !("data" in result)) throw new Error("rpc state query failed");
 		const state = safeSessionState(result.data);
+		const providerTransport = safeProviderTransport(result.data);
 		const projection = this.#projections.get(sessionId);
 		if (!projection) throw new Error("unknown session");
 		if (this.#stateRefreshGenerations.get(sessionId) !== generation) return state;
@@ -2239,7 +2254,12 @@ export class LocalAppserver implements AppserverHandle {
 			: this.#pendingMessageCount(sessionId) > 0
 				? "active"
 				: undefined;
-		const frame = projection.updateState(state, statusOverride, !this.#closedSessions.has(sessionId));
+		const frame = projection.updateState(
+			state,
+			statusOverride,
+			!this.#closedSessions.has(sessionId),
+			providerTransport,
+		);
 		if (frame) await this.broadcastIndex(frame);
 		return state;
 	}
