@@ -1002,7 +1002,9 @@ export class SessionManager {
 		const persist = options?.persist ?? this.#persist;
 		const clone = new SessionManager(this.#cwd, this.#sessionDir, persist, this.#storage);
 		clone.#suppressBreadcrumb = true;
-		clone.restoreState(this.captureState());
+		// The source manager still owns an on-disk session here. The detached
+		// clone acquires that lock lazily if it becomes the late result writer.
+		clone.restoreState(this.captureState(), { acquireLock: false });
 		if (!persist) {
 			clone.#sessionFile = undefined;
 			clone.#fileIsCurrent = false;
@@ -1012,10 +1014,11 @@ export class SessionManager {
 		return clone;
 	}
 
-	restoreState(snapshot: SessionManagerStateSnapshot): void {
+	restoreState(snapshot: SessionManagerStateSnapshot, options?: { acquireLock?: boolean }): void {
 		const activeFile = this.#sessionFile;
 		let nextLock = this.#sessionLock;
 		if (
+			options?.acquireLock !== false &&
 			snapshot.onDisk &&
 			snapshot.sessionFile &&
 			(!this.#sessionLock || path.resolve(snapshot.sessionFile) !== path.resolve(activeFile ?? ""))

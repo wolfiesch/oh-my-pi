@@ -721,7 +721,7 @@ jobs:
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
            with:
               path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock', 'patches/**/*.patch') }}
          - run: bun install --frozen-lockfile
          - name: Resolve native artifact run
            id: native-source
@@ -918,7 +918,7 @@ jobs:
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
            with:
               path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock', 'patches/**/*.patch') }}
          - run: bun install --frozen-lockfile
          # The pi-coding-agent prepack executes workspace code (bundle-dist
          # imports the pi-utils barrel, which loads the pi-natives addon), so

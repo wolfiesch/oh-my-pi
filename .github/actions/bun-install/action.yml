@@ -47,7 +47,7 @@ runs:
         uses: actions/cache@v4
         with:
            path: ~/.bun/install/cache
-           key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+           key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock', 'patches/**/*.patch') }}
 
       # On-infra (omp-kata): the pod mounts a shared PVC at bun's store path.
       - name: Prepare mounted bun store

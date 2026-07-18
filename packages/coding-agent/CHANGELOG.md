@@ -37,6 +37,8 @@
 - Fixed one malformed or crash-truncated transcript entry hiding an otherwise valid session from appserver discovery.
 - Fixed concurrent Time-Traveling Stream Rules attaching AST reminders to the wrong tool result when multiple tool calls completed together.
 - Fixed explicit session rewrites and stale-lock takeover failures retaining lock ownership after the write or cleanup failed.
+- Fixed detached and clone session managers releasing another manager's live writer lock after restoring shared session state; the source keeps ownership until normal disposal, and the clone acquires the lock only if it becomes the late result writer.
+- Included dependency patch files in Bun CI cache keys so a changed patch cannot reuse stale unpatched packages.
 - Fixed appserver discovery counting nested advisor and subagent transcripts as main sessions.
 - Fixed remote fast-mode changes bypassing the controller-lease checks used by other session mutations.
 - Fixed desktop session lifecycle races by fencing mutations before asynchronous work, refusing active or queued sessions, closing owned terminals and RPC children before removal, and keeping host-wide session indexes in sync with external transcript changes.
