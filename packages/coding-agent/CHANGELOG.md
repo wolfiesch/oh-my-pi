@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added optional session-wide spawn, request, and counted-token budgets for task trees, with atomic batch rejection, graceful descendant aborts, and budget usage telemetry ([#5177](https://github.com/can1357/oh-my-pi/pull/5177) by [@wolfiesch](https://github.com/wolfiesch)).
+
 ## [17.0.3] - 2026-07-17
 ### Breaking Changes
 
@@ -10,7 +14,6 @@
 ### Added
 
 - Added `auto` as a valid `thinking-level` in agent frontmatter; the bundled `task` subagent now defaults to it. An explicit `:level` suffix on a resolved model pattern takes precedence over an agent-definition default.
-- Added optional session-wide spawn, request, and counted-token budgets for task trees, with atomic batch rejection, graceful descendant aborts, and budget usage telemetry.
 
 ### Changed
 

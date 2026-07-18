@@ -334,7 +334,7 @@ export interface ExecutorOptions {
 	 */
 	restrictToolNames?: boolean;
 	signal?: AbortSignal;
-	/** Mark a reserved spawn consumed after the initial cancellation precheck. */
+	/** Mark a reserved spawn consumed after setup succeeds and before the first turn. */
 	beforeRun?: () => void;
 	onProgress?: (progress: AgentProgress) => void;
 	/**
@@ -2249,7 +2249,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			abortReason: "Cancelled before start",
 		};
 	}
-	options.beforeRun?.();
 
 	// Set up artifact paths and write input file upfront if artifacts dir provided
 	let subtaskSessionFile: string | undefined;
@@ -2805,6 +2804,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 			}
 
+			// Model, session, tool, extension, and autoload setup has completed.
+			// Consume a reserved spawn only at the point where the child can start
+			// its first turn; setup failures must leave capacity available.
+			checkAbort();
+			options.beforeRun?.();
 			readyAt = performance.now();
 			const outcome = await driveSessionToYield(session, monitor, task);
 			exitCode = outcome.exitCode;

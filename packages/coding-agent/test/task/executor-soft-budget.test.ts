@@ -287,4 +287,79 @@ describe("runSubprocess soft request budget", () => {
 		expect(receipt.error).toMatch(/hard-aborted/);
 		expect(receipt.error).toMatch(new RegExp(`history://${id}`));
 	});
+
+	it("releases a reserved spawn when session setup fails before the first turn", async () => {
+		const treeBudget = new TaskTreeBudget({ maxSpawns: 1 });
+		expect(treeBudget.reserveSpawns(1)).toBeUndefined();
+		let reservationSettled = false;
+		let consumeCalls = 0;
+		const releaseReservation = () => {
+			if (reservationSettled) return;
+			reservationSettled = true;
+			treeBudget.releaseSpawns(1);
+		};
+		const createAgentSessionSpy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockRejectedValueOnce(new Error("session setup failed"));
+
+		const failed = await runSubprocess({
+			...baseOptions("setup-failed"),
+			taskTreeBudget: treeBudget,
+			beforeRun: () => {
+				consumeCalls += 1;
+				reservationSettled = true;
+			},
+		});
+
+		expect(failed.exitCode).toBe(1);
+		expect(consumeCalls).toBe(0);
+		releaseReservation();
+		expect(treeBudget.snapshot().spawns).toBe(0);
+
+		const handle = createMockSession(({ emit, pushMessage }) => {
+			const yieldMessage = {
+				role: "assistant" as const,
+				content: [
+					{
+						type: "toolCall" as const,
+						id: "tool-retry-yield",
+						name: "yield",
+						arguments: { result: { data: { ok: true } } },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			pushMessage(yieldMessage);
+			emit({ type: "message_end", message: yieldMessage } as unknown as AgentSessionEvent);
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-retry-yield",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			} as AgentSessionEvent);
+		});
+		createAgentSessionSpy.mockResolvedValueOnce({
+			session: handle.session,
+			extensionsResult: {} as unknown as LoadExtensionsResult,
+			setToolUIContext: () => {},
+			eventBus: new EventBus(),
+		} satisfies CreateAgentSessionResult);
+		expect(treeBudget.reserveSpawns(1)).toBeUndefined();
+		const retried = await runSubprocess({
+			...baseOptions("setup-retry"),
+			taskTreeBudget: treeBudget,
+			beforeRun: () => {
+				consumeCalls += 1;
+				reservationSettled = true;
+			},
+		});
+
+		expect(retried.exitCode).toBe(0);
+		expect(consumeCalls).toBe(1);
+		expect(treeBudget.snapshot().spawns).toBe(1);
+	});
 });
