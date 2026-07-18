@@ -1445,7 +1445,6 @@ async function openCodexWebSocketTransport(
 	if (replacementWebsocketRequest !== undefined) {
 		websocketRequest = replacementWebsocketRequest as typeof websocketRequest;
 	}
-	recordCodexTurnRequestDiagnostics(websocketState, websocketRequest, "websocket", canAppendBeforeRequest);
 	const websocketHeaders = createCodexHeaders(
 		requestContext.requestHeaders,
 		requestContext.accountId,
@@ -1494,6 +1493,7 @@ async function openCodexWebSocketTransport(
 		},
 		requestSetup.requestSignal,
 		onSseEvent,
+		() => recordCodexTurnRequestDiagnostics(websocketState, websocketRequest, "websocket", canAppendBeforeRequest),
 	);
 	return {
 		eventStream,
@@ -3297,6 +3297,7 @@ class CodexWebSocketConnection {
 		timeouts: CodexWebSocketRequestTimeouts,
 		signal?: AbortSignal,
 		onSseEvent?: (event: RawSseEvent) => void,
+		onRequestSent?: () => void,
 	): AsyncGenerator<Record<string, unknown>> {
 		if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
 			throw new CodexWebSocketTransportError(`websocket connection is unavailable`);
@@ -3349,6 +3350,7 @@ class CodexWebSocketConnection {
 			}
 			try {
 				socket.send(requestPayload);
+				onRequestSent?.();
 			} catch (error) {
 				throw new CodexWebSocketTransportError(
 					`websocket send failed: ${error instanceof Error ? error.message : String(error)}`,
