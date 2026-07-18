@@ -75,7 +75,18 @@ describe("app-wire authority", () => {
 		expect(scenario.schema).toBe("agent-view/1");
 		expect(Array.isArray(scenario.frames)).toBe(true);
 		if (!Array.isArray(scenario.frames)) throw new Error("Agent View fixture frames must be an array");
-		expect(scenario.frames.map(frame => decodeServerFrame(frame).type)).toEqual(Array(6).fill("agent"));
+		const frames = scenario.frames.map(frame => decodeServerFrame(frame));
+		expect(frames.map(frame => frame.type)).toEqual(Array(6).fill("agent"));
+		expect(
+			frames.map(frame => (frame.type === "agent" ? [frame.agentId, frame.state, frame.detail.resumable] : null)),
+		).toEqual([
+			["WorkerA", "started", false],
+			["WorkerA", "running", false],
+			["WorkerA", "completed", false],
+			["WorkerA", "parked", true],
+			["WorkerA", "started", true],
+			["WorkerA", "cancelled", false],
+		]);
 	});
 	test("session list metadata remains bounded at the wire cap", () => {
 		const sessions = Array.from({ length: 1_000 }, (_, index) => ({
