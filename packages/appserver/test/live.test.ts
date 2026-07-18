@@ -2301,6 +2301,111 @@ describe("live Unix websocket protocol", () => {
 		await closeClients([client.client]);
 		await appserver.stop();
 	});
+	test("routes agent cancellation only to the target session RPC child and reflects its result", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory);
+		const client = await readyClient(path, ["sessions.read", "agents.control"]);
+		try {
+			const first = await startIdleSessionRuntime(client.client, factory, "state-s1");
+			client.client.sendJson(command("state-s2", "state-s2", "session.state.get", "s2", {}));
+			const second = await factory.childAt(1);
+			const secondState = await waitForRpcWrite(second, "get_state");
+			respondState(second, secondState.frame);
+			expect((await untilResponse(client.client, "state-s2")).response.ok).toBe(true);
+			client.client.sendJson(command("attach-s2", "attach-s2", "session.attach", "s2", {}));
+			await responseAndSnapshot(client.client, "attach-s2");
+
+			client.client.sendJson(command("cancel-true", "cancel-true", "agent.cancel", "s2", { agentId: "Worker" }));
+			const trueChallenge = await client.client.nextServer();
+			expect(trueChallenge.type).toBe("confirmation");
+			if (trueChallenge.type !== "confirmation") throw new Error("agent cancel confirmation missing");
+			client.client.sendJson(
+				confirmFrame("cancel-true-confirm", String(trueChallenge.confirmationId), "cancel-true", "approve", "s2"),
+			);
+			const cancelled = await waitForRpcWrite(second, "cancel_subagent");
+			expect(cancelled.frame).toMatchObject({ agentId: "Worker" });
+			expect(first.writes.map(value => JSON.parse(value)).some(frame => frame.type === "cancel_subagent")).toBe(
+				false,
+			);
+			second.push({
+				type: "subagent_lifecycle",
+				payload: {
+					id: "Worker",
+					index: 0,
+					agent: "task",
+					status: "aborted",
+					lastUpdate: 100,
+				},
+			});
+			second.push({
+				type: "response",
+				id: cancelled.frame.id,
+				command: "cancel_subagent",
+				success: true,
+				data: { cancelled: true },
+			});
+			const cancelResult = await untilResponse(client.client, "cancel-true");
+			expect(cancelResult.response).toMatchObject({ ok: true, result: { cancelled: true } });
+			expect(cancelResult.frames).toContainEqual(
+				expect.objectContaining({ type: "agent", agentId: "Worker", state: "cancelled" }),
+			);
+
+			client.client.sendJson(command("cancel-false", "cancel-false", "agent.cancel", "s2", { agentId: "Gone" }));
+			const falseChallenge = await client.client.nextServer();
+			expect(falseChallenge.type).toBe("confirmation");
+			if (falseChallenge.type !== "confirmation") throw new Error("agent cancel confirmation missing");
+			client.client.sendJson(
+				confirmFrame(
+					"cancel-false-confirm",
+					String(falseChallenge.confirmationId),
+					"cancel-false",
+					"approve",
+					"s2",
+				),
+			);
+			const missing = await waitForRpcWrite(second, "cancel_subagent", cancelled.index + 1);
+			second.push({
+				type: "response",
+				id: missing.frame.id,
+				command: "cancel_subagent",
+				success: true,
+				data: { cancelled: false },
+			});
+			expect((await untilResponse(client.client, "cancel-false")).response).toMatchObject({
+				ok: true,
+				result: { cancelled: false },
+			});
+
+			client.client.sendJson(command("cancel-error", "cancel-error", "agent.cancel", "s2", { agentId: "Main" }));
+			const errorChallenge = await client.client.nextServer();
+			expect(errorChallenge.type).toBe("confirmation");
+			if (errorChallenge.type !== "confirmation") throw new Error("agent cancel confirmation missing");
+			client.client.sendJson(
+				confirmFrame(
+					"cancel-error-confirm",
+					String(errorChallenge.confirmationId),
+					"cancel-error",
+					"approve",
+					"s2",
+				),
+			);
+			const rejected = await waitForRpcWrite(second, "cancel_subagent", missing.index + 1);
+			second.push({
+				type: "response",
+				id: rejected.frame.id,
+				command: "cancel_subagent",
+				success: false,
+				error: "only subagents can be cancelled",
+			});
+			expect((await untilResponse(client.client, "cancel-error")).response).toMatchObject({
+				ok: false,
+				error: { code: "child_error" },
+			});
+		} finally {
+			await closeClients([client.client]);
+			await appserver.stop();
+		}
+	});
 	test("cancelling root A preserves a queued cross-client follow-up B until its exact durable entry", async () => {
 		const factory = new LiveFactory();
 		const { appserver, path } = await liveServer(factory, [record("s1")]);

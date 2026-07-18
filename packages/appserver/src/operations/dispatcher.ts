@@ -35,7 +35,6 @@ export interface DesktopOperationsAuthority {
 	filesPatch?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	reviewRead?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	reviewApply?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
-	agentCancel?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	bashRun?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	termOpen?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	catalogGet?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
@@ -80,7 +79,6 @@ const OPERATION_METHOD_BY_COMMAND: Readonly<Record<string, keyof DesktopOperatio
 	"files.patch": "filesPatch",
 	"review.read": "reviewRead",
 	"review.apply": "reviewApply",
-	"agent.cancel": "agentCancel",
 	"bash.run": "bashRun",
 	"term.open": "termOpen",
 	"catalog.get": "catalogGet",

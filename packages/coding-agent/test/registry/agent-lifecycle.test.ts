@@ -250,6 +250,64 @@ describe("AgentLifecycleManager", () => {
 		expect(registry.get("6-Sub")).toBeUndefined();
 	});
 
+	it("release invalidates an in-flight revival without restoring a live agent", async () => {
+		const gate = deferred();
+		const revived = makeSessionStub();
+		registry.register({
+			id: "reviving-Sub",
+			displayName: "task",
+			kind: "sub",
+			session: null,
+			sessionFile: "/tmp/reviving-Sub.jsonl",
+			status: "parked",
+		});
+		lifecycle.adopt("reviving-Sub", {
+			idleTtlMs: 0,
+			revive: async () => {
+				await gate.promise;
+				return revived.session;
+			},
+		});
+		const statuses: string[] = [];
+		registry.onChange(event => {
+			if (event.type === "status_changed") statuses.push(event.ref.status);
+		});
+
+		const revival = lifecycle.ensureLive("reviving-Sub");
+		await Promise.resolve();
+		registry.setStatus("reviving-Sub", "aborted");
+		const release = lifecycle.release("reviving-Sub");
+		await expect(lifecycle.ensureLive("reviving-Sub")).rejects.toThrow("has been released");
+		gate.resolve();
+
+		await expect(revival).rejects.toThrow("has been released");
+		await release;
+		expect(revived.disposeCalls()).toBe(1);
+		expect(registry.get("reviving-Sub")).toBeUndefined();
+		expect(statuses).toEqual(["aborted"]);
+	});
+
+	it("release waits for an in-flight park without regressing aborted to parked", async () => {
+		const gate = deferred();
+		const stub = makeSessionStub(() => gate.promise);
+		registerIdleSub("parking-Sub", stub.session);
+		lifecycle.adopt("parking-Sub", { idleTtlMs: 0 });
+		const statuses: string[] = [];
+		registry.onChange(event => {
+			if (event.type === "status_changed") statuses.push(event.ref.status);
+		});
+
+		const parking = lifecycle.park("parking-Sub");
+		registry.setStatus("parking-Sub", "aborted");
+		const release = lifecycle.release("parking-Sub");
+		gate.resolve();
+		await Promise.all([parking, release]);
+
+		expect(stub.disposeCalls()).toBe(1);
+		expect(registry.get("parking-Sub")).toBeUndefined();
+		expect(statuses).toEqual(["aborted"]);
+	});
+
 	it("adopt(Main) is a no-op: Main is never adopted or parked", async () => {
 		vi.useFakeTimers();
 		const stub = makeSessionStub();

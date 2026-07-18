@@ -41,6 +41,8 @@ import {
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
+import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
+import { AgentRegistry } from "../../registry/agent-registry";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
@@ -125,6 +127,29 @@ export const RPC_AGENT_END_MAX_BYTES = MAX_INPUT_BYTES - MAX_STRING_BYTES;
 const rpcTextEncoder = new TextEncoder();
 
 export const RPC_INLINE_IMAGE_DATA_ENV = "OMP_APP_RPC_INLINE_IMAGE_DATA";
+
+const MAX_RPC_SUBAGENT_ID_BYTES = 256;
+
+export async function cancelRpcSubagent(
+	agentId: unknown,
+	registry: Pick<AgentRegistry, "get" | "setStatus"> = AgentRegistry.global(),
+	lifecycle: Pick<AgentLifecycleManager, "release"> = AgentLifecycleManager.global(),
+): Promise<boolean> {
+	if (
+		typeof agentId !== "string" ||
+		agentId.trim().length === 0 ||
+		utf8ByteLength(agentId) > MAX_RPC_SUBAGENT_ID_BYTES ||
+		/[\u0000-\u001f\u007f]/.test(agentId)
+	)
+		throw new Error("subagent ID is invalid");
+	const ref = registry.get(agentId);
+	if (!ref || ref.status === "aborted") return false;
+	if (ref.kind !== "sub") throw new Error("only subagents can be cancelled");
+	if (ref.status === "running" && ref.session) await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
+	registry.setStatus(agentId, "aborted");
+	await lifecycle.release(agentId);
+	return true;
+}
 
 export type RpcTransportFrame<T extends object = object> = T & {
 	/** The full image bytes remain in the OMP transcript but were omitted from this JSONL notification. */
@@ -1614,6 +1639,13 @@ export async function runRpcMode(
 					resumeQueuedMessages: command.resumeQueuedMessages === true,
 				});
 				return success(id, "abort");
+			}
+			case "cancel_subagent": {
+				try {
+					return success(id, "cancel_subagent", { cancelled: await cancelRpcSubagent(command.agentId) });
+				} catch (cause) {
+					return error(id, "cancel_subagent", cause instanceof Error ? cause.message : String(cause));
+				}
 			}
 			case "retry": {
 				const retried = await session.retry();
