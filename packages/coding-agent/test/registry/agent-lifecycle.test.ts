@@ -188,6 +188,27 @@ describe("AgentLifecycleManager", () => {
 		expect(revived.disposeCalls()).toBe(1);
 	});
 
+	it("resetGlobalForTests clears the persisted reviver on retained managers", async () => {
+		let factoryCalls = 0;
+		lifecycle.setPersistedSubagentReviverFactory(async () => {
+			factoryCalls++;
+			return async () => makeSessionStub().session;
+		}, TTL);
+		registry.register({
+			id: "reset-Sub",
+			displayName: "task",
+			kind: "sub",
+			session: null,
+			sessionFile: "/tmp/reset-Sub.jsonl",
+			status: "parked",
+		});
+
+		AgentLifecycleManager.resetGlobalForTests();
+
+		await expect(lifecycle.ensureLive("reset-Sub")).rejects.toThrow(/cannot be revived.*no reviver registered/);
+		expect(factoryCalls).toBe(0);
+	});
+
 	it("a persisted factory that declines leaves the parked ref transcript-only", async () => {
 		registry.register({
 			id: "7-Sub",

@@ -29,6 +29,29 @@ describe("cancelRpcSubagent", () => {
 		expect(registry.get("Worker")).toBeUndefined();
 	});
 
+	test("hard-releases the subagent when session abort fails", async () => {
+		const { registry, lifecycle } = registryAndLifecycle();
+		const events: string[] = [];
+		const session = {
+			abort: async () => {
+				throw new Error("abort failed");
+			},
+			dispose: async () => {},
+		} as unknown as AgentSession;
+		registry.register({
+			id: "FailingWorker",
+			displayName: "Failing worker",
+			kind: "sub",
+			session,
+			status: "running",
+		});
+		registry.onChange(event => events.push(`${event.type}:${event.ref.status}`));
+
+		await expect(cancelRpcSubagent("FailingWorker", registry, lifecycle)).rejects.toThrow("abort failed");
+		expect(events).toEqual(["status_changed:aborted", "removed:aborted"]);
+		expect(registry.get("FailingWorker")).toBeUndefined();
+	});
+
 	test("publishes an aborted state before releasing an idle subagent", async () => {
 		const { registry, lifecycle } = registryAndLifecycle();
 		const events: string[] = [];
@@ -57,6 +80,7 @@ describe("cancelRpcSubagent", () => {
 		await expect(cancelRpcSubagent("Main", registry, lifecycle)).rejects.toThrow("only subagents");
 		await expect(cancelRpcSubagent("Advisor", registry, lifecycle)).rejects.toThrow("only subagents");
 		await expect(cancelRpcSubagent("x".repeat(257), registry, lifecycle)).rejects.toThrow("subagent ID is invalid");
+		await expect(cancelRpcSubagent(" Main ", registry, lifecycle)).rejects.toThrow("subagent ID is invalid");
 		expect(registry.get("Main")).toBeDefined();
 		expect(registry.get("Advisor")).toBeDefined();
 	});

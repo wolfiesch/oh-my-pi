@@ -138,6 +138,7 @@ export async function cancelRpcSubagent(
 	if (
 		typeof agentId !== "string" ||
 		agentId.trim().length === 0 ||
+		agentId !== agentId.trim() ||
 		utf8ByteLength(agentId) > MAX_RPC_SUBAGENT_ID_BYTES ||
 		/[\u0000-\u001f\u007f]/.test(agentId)
 	)
@@ -145,9 +146,12 @@ export async function cancelRpcSubagent(
 	const ref = registry.get(agentId);
 	if (!ref || ref.status === "aborted") return false;
 	if (ref.kind !== "sub") throw new Error("only subagents can be cancelled");
-	if (ref.status === "running" && ref.session) await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
-	registry.setStatus(agentId, "aborted");
-	await lifecycle.release(agentId);
+	try {
+		if (ref.status === "running" && ref.session) await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
+	} finally {
+		registry.setStatus(agentId, "aborted");
+		await lifecycle.release(agentId);
+	}
 	return true;
 }
 

@@ -79,6 +79,7 @@ export class AgentLifecycleManager {
 			current.#parks.clear();
 			current.#releases.clear();
 			current.#persistedReviverFactory = undefined;
+			current.#persistedReviveTtlMs = 0;
 		}
 		AgentLifecycleManager.#global = undefined;
 	}
