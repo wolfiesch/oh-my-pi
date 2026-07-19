@@ -71,6 +71,7 @@ import {
 	DesktopOperationDispatcher,
 	type OperationContext,
 	operationCapabilities,
+	operationFeatures,
 } from "./operations/dispatcher.ts";
 import {
 	ensureSecureSocketDirectory,
@@ -153,6 +154,8 @@ const OBSERVER_READ_COMMANDS = new Set([
 	"review.read",
 	"preview.state",
 	"preview.capture",
+	"preview.capture.read",
+	"preview.policy.check",
 	"transcript.context",
 ]);
 const SUBAGENT_TRANSCRIPT_RPC_BYTES = 384 * 1024;
@@ -551,8 +554,7 @@ export function appserverSupportedFeatures(
 		implementedFeatures.add("terminal.io");
 	if (authority?.filesList) implementedFeatures.add("files.list");
 	if (authority?.filesDiff) implementedFeatures.add("files.diff");
-	if (authority?.previewLaunch && authority.previewState && authority.previewNavigate && authority.previewCapture)
-		implementedFeatures.add("preview.control");
+	for (const feature of operationFeatures(authority)) implementedFeatures.add(feature);
 	return [...(options.supportedFeatures ?? implementedFeatures)].filter(
 		feature => implementedFeatures.has(feature) && !unsupportedAdditiveFeatures.has(feature),
 	);

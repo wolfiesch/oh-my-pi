@@ -44,8 +44,26 @@ export interface DesktopOperationsAuthority {
 	configWrite?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	previewLaunch?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	previewState?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewActivate?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	previewNavigate?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewBack?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewForward?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewReload?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewClose?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	previewCapture?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewCaptureRead?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewClick?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewFill?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewScroll?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewType?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewSelect?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewPress?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewUpload?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewPolicyCheck?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewLeaseAcquire?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewLeaseRenew?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewLeaseRelease?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
+	previewHandoff?(args: CommandResult, context: OperationContext): Promise<CommandResult>;
 	terminalInput?(frame: TerminalClientFrame, context: OperationContext): Promise<void>;
 	terminalResize?(frame: TerminalClientFrame, context: OperationContext): Promise<void>;
 	terminalClose?(frame: TerminalClientFrame, context: OperationContext): Promise<void>;
@@ -88,8 +106,26 @@ const OPERATION_METHOD_BY_COMMAND: Readonly<Record<string, keyof DesktopOperatio
 	"config.write": "configWrite",
 	"preview.launch": "previewLaunch",
 	"preview.state": "previewState",
+	"preview.activate": "previewActivate",
 	"preview.navigate": "previewNavigate",
+	"preview.back": "previewBack",
+	"preview.forward": "previewForward",
+	"preview.reload": "previewReload",
+	"preview.close": "previewClose",
 	"preview.capture": "previewCapture",
+	"preview.capture.read": "previewCaptureRead",
+	"preview.click": "previewClick",
+	"preview.fill": "previewFill",
+	"preview.scroll": "previewScroll",
+	"preview.type": "previewType",
+	"preview.select": "previewSelect",
+	"preview.press": "previewPress",
+	"preview.upload": "previewUpload",
+	"preview.policy.check": "previewPolicyCheck",
+	"preview.lease.acquire": "previewLeaseAcquire",
+	"preview.lease.renew": "previewLeaseRenew",
+	"preview.lease.release": "previewLeaseRelease",
+	"preview.handoff": "previewHandoff",
 };
 
 /**
@@ -112,6 +148,11 @@ export const COMMAND_FEATURE_BY_COMMAND: Readonly<Record<string, string>> = {
 	"session.image.read": "transcript.images",
 	"transcript.search": "transcript.search",
 	"transcript.context": "transcript.search",
+	...Object.fromEntries(
+		Object.keys(COMMAND_DESCRIPTORS)
+			.filter(command => command.startsWith("preview."))
+			.map(command => [command, "preview.control"]),
+	),
 };
 
 export function commandFeature(command: string): string | undefined {
@@ -145,6 +186,18 @@ export function operationCapabilities(authority: DesktopOperationsAuthority | un
 		result.add("term.input");
 		result.add("term.resize");
 	}
+	return result;
+}
+
+export function operationFeatures(authority: DesktopOperationsAuthority | undefined): Set<string> {
+	const result = new Set<string>();
+	if (
+		authority &&
+		Object.keys(OPERATION_METHOD_BY_COMMAND).some(
+			command => command.startsWith("preview.") && commandIsRoutable(authority, command),
+		)
+	)
+		result.add("preview.control");
 	return result;
 }
 
@@ -260,7 +313,7 @@ export class DesktopOperationDispatcher implements OperationCommandHandler {
 	async dispatch(command: CommandFrame, context: OperationContext): Promise<CommandResult> {
 		const descriptor = COMMAND_DESCRIPTORS[command.command];
 		const required = CAPABILITY_BY_COMMAND[command.command];
-		if (commandFeature(command.command))
+		if (commandFeature(command.command) && !OPERATION_METHOD_BY_COMMAND[command.command])
 			throw Object.assign(new Error("negotiated feature is unavailable"), { code: "UNSUPPORTED_FEATURE" });
 		if (!descriptor || !required || !OPERATION_METHOD_BY_COMMAND[command.command])
 			throw Object.assign(new Error("operation is unsupported"), { code: "UNSUPPORTED" });
