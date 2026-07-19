@@ -55,6 +55,20 @@ async function fixture(): Promise<{ root: string; transcript: string; index: Tra
 	return { root, transcript, index };
 }
 
+function cursorError(run: () => unknown): TranscriptSearchError {
+	try {
+		run();
+	} catch (error) {
+		if (error instanceof TranscriptSearchError) return error;
+		throw error;
+	}
+	throw new Error("Expected transcript search to reject the cursor");
+}
+
+function encodeCursor(value: unknown): string {
+	return Buffer.from(JSON.stringify(value)).toString("base64url");
+}
+
 describe("searchable transcript extraction", () => {
 	test("keeps visible message text and summaries but excludes hidden and tool content", () => {
 		expect(extractSearchableTranscriptFragment(message("u1", "user", "choose the durable cache"))).toMatchObject({
@@ -138,6 +152,40 @@ describe("searchable transcript extraction", () => {
 });
 
 describe("TranscriptSearchIndex", () => {
+	test("requires a platform-absolute database path", () => {
+		expect(() => new TranscriptSearchIndex("relative/search.sqlite")).toThrow(
+			"Transcript search database path must be absolute",
+		);
+		expect(() => new TranscriptSearchIndex(join(tmpdir(), "omp-absolute-search.sqlite"))).not.toThrow();
+	});
+
+	test("rejects symlinked database directories and files before SQLite opens", async () => {
+		const root = await fs.mkdtemp(join(tmpdir(), "omp-transcript-search-symlink-"));
+		try {
+			const realDirectory = join(root, "real");
+			await fs.mkdir(realDirectory);
+			const linkedDirectory = join(root, "linked");
+			await fs.symlink(realDirectory, linkedDirectory, process.platform === "win32" ? "junction" : "dir");
+			const directoryIndex = new TranscriptSearchIndex(join(linkedDirectory, "search.sqlite"));
+			await expect(directoryIndex.initialize()).rejects.toThrow(
+				"Transcript search database directory symlink rejected",
+			);
+			expect(await fs.readdir(realDirectory)).toEqual([]);
+
+			const safeDirectory = join(root, "safe");
+			await fs.mkdir(safeDirectory);
+			const protectedFile = join(root, "protected.txt");
+			await fs.writeFile(protectedFile, "protected");
+			const linkedDatabase = join(safeDirectory, "search.sqlite");
+			await fs.symlink(protectedFile, linkedDatabase, "file");
+			const databaseIndex = new TranscriptSearchIndex(linkedDatabase);
+			await expect(databaseIndex.initialize()).rejects.toThrow("Transcript search database symlink rejected");
+			expect(await fs.readFile(protectedFile, "utf8")).toBe("protected");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("indexes, filters, paginates, and returns bounded context", async () => {
 		const { root, transcript, index } = await fixture();
 		try {
@@ -221,23 +269,37 @@ describe("TranscriptSearchIndex", () => {
 			await index.reconcile([record("session-one", transcript)]);
 			const first = index.search({ query: "alpha", limit: 1 });
 			expect(first.nextCursor).toBeDefined();
-			expect(() => index.search({ query: "beta", limit: 1, cursor: first.nextCursor })).toThrow(
-				TranscriptSearchError,
+			expect(cursorError(() => index.search({ query: "beta", limit: 1, cursor: first.nextCursor })).code).toBe(
+				"transcript_cursor_stale",
 			);
+
+			for (const malformed of [
+				"not-json",
+				encodeCursor(null),
+				encodeCursor([]),
+				encodeCursor({}),
+				encodeCursor({ generation: "0", offset: 1, fingerprint: "wrong" }),
+				encodeCursor({ generation: 0, offset: -1, fingerprint: "wrong" }),
+				encodeCursor({ generation: 0, offset: 1 }),
+			]) {
+				expect(cursorError(() => index.search({ query: "alpha", limit: 1, cursor: malformed })).code).toBe(
+					"transcript_cursor_invalid",
+				);
+			}
 
 			await fs.appendFile(transcript, message("a4", "assistant", "alpha fourth decision"));
 			await index.reconcile([record("session-one", transcript)]);
-			expect(() => index.search({ query: "alpha", limit: 1, cursor: first.nextCursor })).toThrow(
-				TranscriptSearchError,
+			expect(cursorError(() => index.search({ query: "alpha", limit: 1, cursor: first.nextCursor })).code).toBe(
+				"transcript_cursor_stale",
 			);
 
 			index.close();
 			const reopened = new TranscriptSearchIndex(join(root, "private", "search.sqlite"));
 			await reopened.initialize();
 			try {
-				expect(() => reopened.search({ query: "alpha", limit: 1, cursor: first.nextCursor })).toThrow(
-					TranscriptSearchError,
-				);
+				expect(
+					cursorError(() => reopened.search({ query: "alpha", limit: 1, cursor: first.nextCursor })).code,
+				).toBe("transcript_cursor_stale");
 			} finally {
 				reopened.close();
 			}

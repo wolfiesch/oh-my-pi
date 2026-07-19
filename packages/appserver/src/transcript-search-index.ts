@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import {
 	entryId,
 	projectId,
@@ -83,6 +83,41 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
 		? (value as Record<string, unknown>)
 		: undefined;
+}
+
+async function lstatIfExists(path: string): Promise<Stats | undefined> {
+	try {
+		return await fs.lstat(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+type SearchCursor = { generation: number; offset: number; fingerprint: string };
+
+function decodeSearchCursor(value: string): SearchCursor {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as unknown;
+	} catch {
+		throw new TranscriptSearchError("transcript_cursor_invalid");
+	}
+	const cursor = asRecord(parsed);
+	if (
+		!cursor ||
+		!Number.isSafeInteger(cursor.generation) ||
+		(cursor.generation as number) < 0 ||
+		!Number.isSafeInteger(cursor.offset) ||
+		(cursor.offset as number) < 0 ||
+		typeof cursor.fingerprint !== "string"
+	)
+		throw new TranscriptSearchError("transcript_cursor_invalid");
+	return {
+		generation: cursor.generation as number,
+		offset: cursor.offset as number,
+		fingerprint: cursor.fingerprint,
+	};
 }
 
 function timestampOf(raw: Record<string, unknown>, message?: Record<string, unknown>): string {
@@ -254,13 +289,12 @@ export class TranscriptSearchIndex {
 	#generation = 0;
 
 	constructor(databasePath: string) {
-		if (!databasePath.startsWith("/")) throw new Error("Transcript search database path must be absolute");
+		if (!isAbsolute(databasePath)) throw new Error("Transcript search database path must be absolute");
 		this.#databasePath = databasePath;
 	}
 
 	async initialize(): Promise<void> {
-		await fs.mkdir(dirname(this.#databasePath), { recursive: true, mode: 0o700 });
-		await fs.chmod(dirname(this.#databasePath), 0o700);
+		await this.#prepareStoragePath();
 		try {
 			this.#openDatabase();
 		} catch {
@@ -271,10 +305,27 @@ export class TranscriptSearchIndex {
 				fs.rm(`${this.#databasePath}-wal`, { force: true }),
 				fs.rm(`${this.#databasePath}-shm`, { force: true }),
 			]);
+			await this.#prepareStoragePath();
 			this.#openDatabase();
 		}
 		await fs.chmod(this.#databasePath, 0o600);
 		this.#refreshStatus();
+	}
+
+	async #prepareStoragePath(): Promise<void> {
+		const directory = dirname(this.#databasePath);
+		const existingDirectory = await lstatIfExists(directory);
+		if (existingDirectory?.isSymbolicLink()) throw new Error("Transcript search database directory symlink rejected");
+		if (existingDirectory && !existingDirectory.isDirectory())
+			throw new Error("Transcript search database directory is not a directory");
+		if (!existingDirectory) await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+		const directoryInfo = await fs.lstat(directory);
+		if (directoryInfo.isSymbolicLink()) throw new Error("Transcript search database directory symlink rejected");
+		if (!directoryInfo.isDirectory()) throw new Error("Transcript search database directory is not a directory");
+		await fs.chmod(directory, 0o700);
+		const databaseInfo = await lstatIfExists(this.#databasePath);
+		if (databaseInfo?.isSymbolicLink()) throw new Error("Transcript search database symlink rejected");
+		if (databaseInfo && !databaseInfo.isFile()) throw new Error("Transcript search database is not a file");
 	}
 
 	#openDatabase(): void {
@@ -635,24 +686,10 @@ export class TranscriptSearchIndex {
 		const fingerprint = searchFingerprint(input, tokens, limit);
 		let offset = 0;
 		if (input.cursor) {
-			try {
-				const cursor = JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8")) as {
-					generation?: number;
-					offset?: number;
-					fingerprint?: string;
-				};
-				if (
-					cursor.generation !== this.#generation ||
-					cursor.fingerprint !== fingerprint ||
-					!Number.isSafeInteger(cursor.offset) ||
-					(cursor.offset ?? -1) < 0
-				)
-					throw new TranscriptSearchError("transcript_cursor_stale");
-				offset = cursor.offset ?? 0;
-			} catch (error) {
-				if (error instanceof TranscriptSearchError) throw error;
-				throw new TranscriptSearchError("transcript_cursor_invalid");
-			}
+			const cursor = decodeSearchCursor(input.cursor);
+			if (cursor.generation !== this.#generation || cursor.fingerprint !== fingerprint)
+				throw new TranscriptSearchError("transcript_cursor_stale");
+			offset = cursor.offset;
 		}
 		const clauses = ["docs_fts MATCH ?"];
 		const bindings: Array<string | number> = [ftsExpression(tokens)];
