@@ -15,6 +15,7 @@ import {
 	decodeEntry,
 	decodeServerFrame,
 	decodeSessionListResult,
+	decodeSessionRef,
 	deviceToken,
 	IMAGE_UPLOAD_CHUNK_BYTES,
 	inputObject,
@@ -109,6 +110,86 @@ describe("app-wire authority", () => {
 		expect(result.totalCount).toBe(5_000);
 		expect(result.truncated).toBe(true);
 		expect((result as unknown as Record<string, unknown>).future).toBe("keep");
+	});
+	test("session attention is a strict bounded additive contract", () => {
+		const base = {
+			hostId: "h",
+			sessionId: "s",
+			project: { projectId: "p" },
+			revision: "r",
+			title: "Task",
+			status: "idle",
+			updatedAt: "2026-07-18T12:00:00.000Z",
+		};
+		const attention = {
+			pending: [
+				{
+					kind: "approval",
+					id: "approval-1",
+					title: "Run command",
+					summary: "Approve the safe operation",
+					requestedAt: "2026-07-18T12:01:00.000Z",
+				},
+				{
+					kind: "question",
+					id: "question-1",
+					question: "Which option?",
+					options: [{ id: "one", label: "One" }],
+					allowText: true,
+					requestedAt: "2026-07-18T12:02:00.000Z",
+				},
+			],
+			pendingCount: 3,
+			truncated: true,
+			latestOutcome: {
+				id: "agent-end:2026-07-18T12:00:00.000Z",
+				kind: "completed",
+				at: "2026-07-18T12:00:00.000Z",
+				summary: "Agent completed work.",
+			},
+		};
+		expect(decodeSessionRef({ ...base, attention }, "session")).toMatchObject({ attention });
+
+		for (const invalid of [
+			{ ...attention, pendingCount: 1 },
+			{ ...attention, pendingCount: 2, truncated: true },
+			{ ...attention, pendingCount: 3, truncated: false },
+			{
+				...attention,
+				pending: [{ ...attention.pending[0], requestedAt: "2026-07-18T12:01:00Z" }],
+				pendingCount: 1,
+				truncated: false,
+			},
+			{
+				...attention,
+				pending: [attention.pending[0], { ...attention.pending[1], id: "approval-1" }],
+				pendingCount: 2,
+				truncated: false,
+			},
+			{ ...attention, credential: "must-not-cross" },
+		])
+			expect(() => decodeSessionRef({ ...base, attention: invalid }, "session")).toThrow(AppWireError);
+
+		expect(() =>
+			decodeSessionRef(
+				{
+					...base,
+					attention: {
+						pending: Array.from({ length: 9 }, (_, index) => ({
+							kind: "question",
+							id: `q-${index}`,
+							question: "Question",
+							options: [],
+							allowText: true,
+							requestedAt: "2026-07-18T12:00:00.000Z",
+						})),
+						pendingCount: 9,
+						truncated: false,
+					},
+				},
+				"session",
+			),
+		).toThrow(AppWireError);
 	});
 	test("hello and durable lineage decode in string and parsed modes", () => {
 		expect(decodeClientFrame(hello).type).toBe("hello");

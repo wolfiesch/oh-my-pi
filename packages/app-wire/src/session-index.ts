@@ -22,6 +22,55 @@ import {
 	sessionId,
 } from "./ids.js";
 import { PROTOCOL_VERSION } from "./limits.js";
+
+export const ATTENTION_MAX_PENDING_ITEMS = 8;
+export const ATTENTION_MAX_QUESTION_OPTIONS = 32;
+export const ATTENTION_MAX_ID_BYTES = 256;
+export const ATTENTION_MAX_TITLE_BYTES = 256;
+export const ATTENTION_MAX_SUMMARY_BYTES = 2_048;
+
+export interface AttentionOption {
+	id: string;
+	label: string;
+}
+
+export type PendingAttentionItem =
+	| {
+			kind: "approval";
+			id: string;
+			title: string;
+			summary: string;
+			requestedAt: string;
+	  }
+	| {
+			kind: "question";
+			id: string;
+			question: string;
+			options: AttentionOption[];
+			allowText: boolean;
+			requestedAt: string;
+	  }
+	| {
+			kind: "plan";
+			id: string;
+			title: string;
+			summary: string;
+			requestedAt: string;
+	  };
+
+export interface AttentionOutcome {
+	id: string;
+	kind: "completed" | "failed" | "cancelled";
+	at: string;
+	summary: string;
+}
+
+export interface SessionAttentionState {
+	pending: PendingAttentionItem[];
+	pendingCount: number;
+	truncated: boolean;
+	latestOutcome?: AttentionOutcome;
+}
 export interface ProjectIdentity {
 	projectId: ProjectId;
 	name?: string;
@@ -82,6 +131,7 @@ export interface SessionRef {
 	pendingUserInput?: boolean;
 	proposedPlan?: string;
 	contextUsage?: ContextUsage;
+	attention?: SessionAttentionState;
 }
 export interface SessionListResult {
 	cursor: Cursor;
@@ -179,6 +229,99 @@ function decodeListMetadata(
 	if (truncated !== totalCount > sessionCount) fail("INVALID_FRAME", "truncated does not match totalCount", path);
 	return { totalCount, truncated };
 }
+
+function exactKeys(value: Record<string, unknown>, allowed: readonly string[], path: string): void {
+	const allowedKeys = new Set(allowed);
+	for (const key of Object.keys(value))
+		if (!allowedKeys.has(key) || isSecretLikeKey(key))
+			fail("INVALID_FRAME", "unknown attention field", `${path}.${key}`);
+}
+
+function canonicalTimestamp(value: unknown, path: string): string {
+	const timestamp = controlFree(value, path, 128);
+	const milliseconds = Date.parse(timestamp);
+	if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== timestamp)
+		fail("INVALID_FRAME", "timestamp must be canonical ISO", path);
+	return timestamp;
+}
+
+function decodeAttentionOption(value: unknown, path: string): AttentionOption {
+	const option = boundedMap(value, path);
+	exactKeys(option, ["id", "label"], path);
+	return {
+		id: controlFree(option.id, `${path}.id`, ATTENTION_MAX_ID_BYTES),
+		label: controlFree(option.label, `${path}.label`, ATTENTION_MAX_TITLE_BYTES),
+	};
+}
+
+function decodePendingAttentionItem(value: unknown, path: string): PendingAttentionItem {
+	const item = boundedMap(value, path);
+	if (item.kind === "approval" || item.kind === "plan") {
+		exactKeys(item, ["kind", "id", "title", "summary", "requestedAt"], path);
+		return {
+			kind: item.kind,
+			id: controlFree(item.id, `${path}.id`, ATTENTION_MAX_ID_BYTES),
+			title: controlFree(item.title, `${path}.title`, ATTENTION_MAX_TITLE_BYTES),
+			summary: controlFree(item.summary, `${path}.summary`, ATTENTION_MAX_SUMMARY_BYTES),
+			requestedAt: canonicalTimestamp(item.requestedAt, `${path}.requestedAt`),
+		};
+	}
+	if (item.kind === "question") {
+		exactKeys(item, ["kind", "id", "question", "options", "allowText", "requestedAt"], path);
+		const options = boundedArray(item.options, `${path}.options`, ATTENTION_MAX_QUESTION_OPTIONS).map(
+			(option, index) => decodeAttentionOption(option, `${path}.options[${index}]`),
+		);
+		if (new Set(options.map(option => option.id)).size !== options.length)
+			fail("INVALID_FRAME", "duplicate attention option id", `${path}.options`);
+		return {
+			kind: "question",
+			id: controlFree(item.id, `${path}.id`, ATTENTION_MAX_ID_BYTES),
+			question: controlFree(item.question, `${path}.question`, ATTENTION_MAX_SUMMARY_BYTES),
+			options,
+			allowText: bool(item.allowText, `${path}.allowText`),
+			requestedAt: canonicalTimestamp(item.requestedAt, `${path}.requestedAt`),
+		};
+	}
+	fail("INVALID_FRAME", "invalid pending attention kind", `${path}.kind`);
+}
+
+function decodeAttentionOutcome(value: unknown, path: string): AttentionOutcome {
+	const outcome = boundedMap(value, path);
+	exactKeys(outcome, ["id", "kind", "at", "summary"], path);
+	if (outcome.kind !== "completed" && outcome.kind !== "failed" && outcome.kind !== "cancelled")
+		fail("INVALID_FRAME", "invalid attention outcome kind", `${path}.kind`);
+	return {
+		id: controlFree(outcome.id, `${path}.id`, ATTENTION_MAX_ID_BYTES),
+		kind: outcome.kind,
+		at: canonicalTimestamp(outcome.at, `${path}.at`),
+		summary: controlFree(outcome.summary, `${path}.summary`, ATTENTION_MAX_SUMMARY_BYTES),
+	};
+}
+
+export function decodeSessionAttentionState(value: unknown, path: string): SessionAttentionState {
+	const attention = boundedMap(value, path);
+	exactKeys(attention, ["pending", "pendingCount", "truncated", "latestOutcome"], path);
+	const pending = boundedArray(attention.pending, `${path}.pending`, ATTENTION_MAX_PENDING_ITEMS).map((item, index) =>
+		decodePendingAttentionItem(item, `${path}.pending[${index}]`),
+	);
+	if (new Set(pending.map(item => item.id)).size !== pending.length)
+		fail("INVALID_FRAME", "duplicate pending attention id", `${path}.pending`);
+	const pendingCount = safeSeq(attention.pendingCount, `${path}.pendingCount`);
+	if (pendingCount < pending.length)
+		fail("INVALID_FRAME", "pendingCount cannot be less than pending length", `${path}.pendingCount`);
+	const truncated = bool(attention.truncated, `${path}.truncated`);
+	if (truncated !== pendingCount > pending.length)
+		fail("INVALID_FRAME", "attention truncated does not match pendingCount", path);
+	return {
+		pending,
+		pendingCount,
+		truncated,
+		...(attention.latestOutcome === undefined
+			? {}
+			: { latestOutcome: decodeAttentionOutcome(attention.latestOutcome, `${path}.latestOutcome`) }),
+	};
+}
+
 export function decodeSessionRef(value: unknown, path: string): SessionRef {
 	const session = boundedMap(value, path);
 	hostId(session.hostId, `${path}.hostId`);
@@ -224,6 +367,7 @@ export function decodeSessionRef(value: unknown, path: string): SessionRef {
 		)
 			fail("BOUNDS", "invalid context usage", `${path}.contextUsage`);
 	}
+	if (session.attention !== undefined) decodeSessionAttentionState(session.attention, `${path}.attention`);
 	return session as unknown as SessionRef;
 }
 export function decodeSessionListResult(value: unknown): SessionListResult {

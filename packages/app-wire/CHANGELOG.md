@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add the strict, bounded `SessionRef.attention` summary for cross-session pending questions, approvals, plan reviews, and latest root outcomes.
+
 ## [0.5.10] - 2026-07-18
 
 ### Added

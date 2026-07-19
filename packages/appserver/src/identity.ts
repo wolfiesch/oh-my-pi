@@ -12,6 +12,9 @@ export function createHostId(value?: string): HostId {
 export function createEpoch(value?: string): string {
 	return value ?? `epoch-${randomUUID()}`;
 }
+export function defaultHostIdPath(home = process.env.HOME || homedir()): string {
+	return join(home, ".omp", "agent", "appserver", "host-id");
+}
 export function defaultSocketPath(
 	platform = process.platform,
 	home = homedir(),
@@ -41,9 +44,7 @@ export function profileSocketPath(
 	const digest = createHash("sha256").update(profile).digest("hex").slice(0, 24);
 	return join(dirname(defaultSocketPath(platform, home, runtime)), `appserver-profile-${digest}.sock`);
 }
-export async function loadPersistentHostId(
-	path = join(process.env.HOME || homedir(), ".omp", "agent", "appserver", "host-id"),
-): Promise<HostId> {
+export async function loadPersistentHostId(path = defaultHostIdPath()): Promise<HostId> {
 	try {
 		const value = (await readFile(path, "utf8")).trim();
 		if (value) return hostId(value);

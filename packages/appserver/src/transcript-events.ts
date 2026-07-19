@@ -1,4 +1,9 @@
-import type { DurableEntry, SessionEvent } from "@oh-my-pi/app-wire";
+import {
+	ATTENTION_MAX_QUESTION_OPTIONS,
+	type DurableEntry,
+	type PendingAttentionItem,
+	type SessionEvent,
+} from "@oh-my-pi/app-wire";
 import type { RpcSessionEventFrame, RpcSubagentEventFrame } from "../../coding-agent/src/modes/rpc/rpc-types.ts";
 import type { AgentSessionEvent } from "../../coding-agent/src/session/agent-session.ts";
 import { cleanText, projectToolArguments, projectToolResultDetails } from "./discovery.ts";
@@ -192,7 +197,9 @@ export type AppserverEvent =
 	| ApprovalRequestEvent
 	| AskResolvedEvent
 	| ApprovalResolvedEvent;
-export type PendingUiRequest = { kind: "ask" | "approval"; id: string };
+export type PendingUiRequest =
+	| { kind: "ask"; id: string; attention: Extract<PendingAttentionItem, { kind: "question" }> }
+	| { kind: "approval"; id: string; attention: Extract<PendingAttentionItem, { kind: "approval" }> };
 interface MessageSnapshot {
 	text: string;
 	reasoning: string;
@@ -211,6 +218,7 @@ interface ToolState {
 interface UiState {
 	kind: "ask" | "approval";
 	at: string;
+	attention: Extract<PendingAttentionItem, { kind: "question" | "approval" }>;
 }
 export type AppserverRpcFrameDisposition = "translated" | "separately-projected" | "intentionally-internal";
 type AgentSessionEventType = AgentSessionEvent["type"];
@@ -297,6 +305,16 @@ function safeDisplay(value: unknown, limit = 512): string {
 function safeOptionalDisplay(value: unknown, limit = MAX_EVENT_LABEL_BYTES): string | undefined {
 	const output = safeDisplay(value, limit);
 	return output.length > 0 ? output : undefined;
+}
+export function safeAttentionDisplay(value: unknown, limit: number, fallback: string): string {
+	const withoutUrls = typeof value === "string" ? value.replace(/\bhttps?:\/\/[^\s]+/giu, "[url]") : value;
+	const safe = safeDisplay(withoutUrls, limit);
+	return safe || fallback;
+}
+function safeRpcUiId(value: unknown): string | undefined {
+	if (typeof value !== "string" || value.length === 0 || new TextEncoder().encode(value).byteLength > 256)
+		return undefined;
+	return /[\u0000-\u001f\u007f]/u.test(value) ? undefined : value;
 }
 function safeInteger(value: unknown, fallback = 0, max = MAX_EVENT_COUNT): number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? Math.min(value, max) : fallback;
@@ -393,7 +411,7 @@ function turnErrorEvent(
 	if (message.role !== "assistant" || message.stopReason !== "error") return undefined;
 	const output: Extract<TranscriptEvent, { type: "turn.error" }> = {
 		type: "turn.error",
-		message: safeOptionalDisplay(message.errorMessage, 1_024) ?? "The turn stopped with an error.",
+		message: safeAttentionDisplay(message.errorMessage, 1_024, "The turn stopped with an error."),
 		at,
 	};
 	const errorStatus = optionalSafeInteger(message.errorStatus, 999);
@@ -641,14 +659,16 @@ export class TranscriptEventTranslator {
 		return stableTimestamp(this.#now(), () => new Date(0).toISOString());
 	}
 	pendingUiRequests(): PendingUiRequest[] {
-		return [...this.#pendingUi].map(([id, value]) => ({ id, kind: value.kind }));
+		return [...this.#pendingUi].map(
+			([id, value]) => ({ id, kind: value.kind, attention: value.attention }) as PendingUiRequest,
+		);
 	}
 	observeKnownEntries(entries: readonly DurableEntry[]): void {
 		for (const entry of entries) this.#knownDurableEntryIds.add(entry.id);
 	}
 	pendingUiRequest(id: string): PendingUiRequest | undefined {
 		const pending = this.#pendingUi.get(id);
-		return pending ? { id, kind: pending.kind } : undefined;
+		return pending ? ({ id, kind: pending.kind, attention: pending.attention } as PendingUiRequest) : undefined;
 	}
 	resolveUiRequest(id: string): AskResolvedEvent | ApprovalResolvedEvent | undefined {
 		const pending = this.#pendingUi.get(id);
@@ -675,7 +695,7 @@ export class TranscriptEventTranslator {
 		const at = this.#nowIso();
 		const error: Extract<TranscriptEvent, { type: "turn.error" }> = {
 			type: "turn.error",
-			message: safeOptionalDisplay(frame.error, 1_024) ?? "The prompt stopped with an error.",
+			message: safeAttentionDisplay(frame.error, 1_024, "The prompt stopped with an error."),
 			at,
 		};
 		if (this.#turnAt === undefined) return [error];
@@ -773,7 +793,7 @@ export class TranscriptEventTranslator {
 		return [output];
 	}
 	private extensionUi(frame: Record<string, unknown>): AppserverEvent[] {
-		const id = asString(frame.id);
+		const id = safeRpcUiId(frame.id);
 		const method = asString(frame.method);
 		if (!id || !method) return [];
 		if (method === "cancel") {
@@ -792,50 +812,82 @@ export class TranscriptEventTranslator {
 				if (typeof option !== "string") return [];
 				const label = safeDisplay(option, 256);
 				if (!label) return [];
-				const optionId = option.length <= 256 && !/[\u0000-\u001f\u007f]/.test(option) ? option : `option-${index}`;
+				const optionId = safeRpcUiId(option) ?? `option-${index}`;
 				return [{ id: optionId, label }];
 			});
-			this.#pendingUi.set(id, { kind: "ask", at });
-			return [
-				{
-					type: "ask.request",
-					askId: id,
-					question: safeDisplay(frame.title),
-					options,
+			const event: AskRequestEvent = {
+				type: "ask.request",
+				askId: id,
+				question: safeDisplay(frame.title) || "Agent needs an answer.",
+				options,
+				allowText: false,
+				responseKind: "value",
+				source: "rpc-ui",
+				at,
+			};
+			this.#pendingUi.set(id, {
+				kind: "ask",
+				at,
+				attention: {
+					kind: "question",
+					id,
+					question: safeAttentionDisplay(frame.title, 2_048, "Agent needs an answer."),
+					options: options.slice(0, ATTENTION_MAX_QUESTION_OPTIONS).map(option => ({
+						id: option.id,
+						label: safeAttentionDisplay(option.label, 256, "Option"),
+					})),
 					allowText: false,
-					responseKind: "value",
-					source: "rpc-ui",
-					at,
+					requestedAt: at,
 				},
-			];
+			});
+			return [event];
 		}
 		if (method === "input" || method === "editor") {
-			this.#pendingUi.set(id, { kind: "ask", at });
-			return [
-				{
-					type: "ask.request",
-					askId: id,
-					question: safeDisplay(frame.title),
+			const event: AskRequestEvent = {
+				type: "ask.request",
+				askId: id,
+				question: safeDisplay(frame.title) || "Agent needs an answer.",
+				allowText: true,
+				responseKind: "value",
+				source: "rpc-ui",
+				at,
+			};
+			this.#pendingUi.set(id, {
+				kind: "ask",
+				at,
+				attention: {
+					kind: "question",
+					id,
+					question: safeAttentionDisplay(frame.title, 2_048, "Agent needs an answer."),
+					options: [],
 					allowText: true,
-					responseKind: "value",
-					source: "rpc-ui",
-					at,
+					requestedAt: at,
 				},
-			];
+			});
+			return [event];
 		}
 		if (method === "confirm") {
-			this.#pendingUi.set(id, { kind: "approval", at });
-			return [
-				{
-					type: "approval.request",
-					approvalId: id,
-					title: safeDisplay(frame.title),
-					message: safeDisplay(frame.message),
-					responseKind: "confirmed",
-					source: "rpc-ui",
-					at,
+			const event: ApprovalRequestEvent = {
+				type: "approval.request",
+				approvalId: id,
+				title: safeDisplay(frame.title) || "Approval requested",
+				message: safeDisplay(frame.message),
+				responseKind: "confirmed",
+				source: "rpc-ui",
+				at,
+			};
+			this.#pendingUi.set(id, {
+				kind: "approval",
+				at,
+				attention: {
+					kind: "approval",
+					id,
+					title: safeAttentionDisplay(frame.title, 256, "Approval requested"),
+					summary: safeAttentionDisplay(frame.message, 2_048, event.title),
+					requestedAt: at,
 				},
-			];
+			});
+			return [event];
 		}
 		return [];
 	}

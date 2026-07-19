@@ -163,6 +163,64 @@ describe("projection and replay", () => {
 		expect(projection.value.indexCursor.seq).toBe(1);
 		expect(projection.replay({ epoch: "epoch-a", seq: 0 })).toEqual([first, second]);
 	});
+	test("projects bounded pending attention and the latest root outcome", () => {
+		const projection = new SessionProjection(host, record("s"), "epoch-a");
+		for (let index = 0; index < 10; index++)
+			projection.setPendingAttention({
+				kind: index % 2 === 0 ? "approval" : "plan",
+				id: `pending-${index}`,
+				title: `Pending ${index}`,
+				summary: "Safe summary",
+				requestedAt: new Date(index).toISOString(),
+			});
+		expect(projection.value.ref).toMatchObject({
+			pendingApproval: true,
+			attention: { pendingCount: 10, truncated: true },
+		});
+		expect(projection.value.ref.attention?.pending).toHaveLength(8);
+
+		projection.removePendingAttention("pending-0");
+		expect(projection.value.ref.attention).toMatchObject({ pendingCount: 9, truncated: true });
+		const outcome = {
+			id: "agent:completed:2026-07-18T12:00:00.000Z",
+			kind: "completed" as const,
+			at: "2026-07-18T12:00:00.000Z",
+			summary: "Agent completed work.",
+		};
+		projection.settleAttentionOutcome(outcome);
+		expect(projection.value.ref).toMatchObject({
+			attention: { pending: [], pendingCount: 0, truncated: false, latestOutcome: outcome },
+		});
+		expect(projection.value.ref.pendingApproval).toBeUndefined();
+	});
+	test("clears live attention on lifecycle loss but retains the latest outcome", () => {
+		const projection = new SessionProjection(host, record("s"), "epoch-a");
+		projection.setLatestOutcome({
+			id: "agent:failed:2026-07-18T12:00:00.000Z",
+			kind: "failed",
+			at: "2026-07-18T12:00:00.000Z",
+			summary: "Agent stopped with an error.",
+		});
+		projection.setPendingAttention({
+			kind: "question",
+			id: "question-1",
+			question: "Continue?",
+			options: [],
+			allowText: true,
+			requestedAt: "2026-07-18T12:01:00.000Z",
+		});
+		projection.markRuntimeCrashed();
+		expect(projection.value.ref).toMatchObject({
+			status: "closed",
+			attention: {
+				pending: [],
+				pendingCount: 0,
+				truncated: false,
+				latestOutcome: { kind: "failed" },
+			},
+		});
+		expect(projection.value.ref.pendingUserInput).toBeUndefined();
+	});
 });
 describe("idempotency", () => {
 	test("same payload replays and changed payload conflicts", () => {

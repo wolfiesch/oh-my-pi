@@ -492,6 +492,7 @@ async function liveServer(
 	ringSize = 256,
 	transcriptImageRoot?: string,
 	clock?: Clock,
+	attentionOutcomePath?: string,
 ): Promise<{ appserver: LocalAppserver; root: string; path: string }> {
 	const root = await mkdtemp(join(tmpdir(), "omp-appserver-live-"));
 	const path = join(root, "run", "app.sock");
@@ -504,6 +505,7 @@ async function liveServer(
 		ringSize,
 		transcriptImageRoot,
 		clock,
+		attentionOutcomePath,
 	});
 	await appserver.start();
 	return { appserver, root, path };
@@ -1256,6 +1258,7 @@ describe("live Unix websocket protocol", () => {
 			"event",
 			"event",
 			"event",
+			"session.delta",
 			"response",
 		]);
 		const replayClient = await readyClient(path, ["sessions.read"]);
@@ -1348,6 +1351,10 @@ describe("live Unix websocket protocol", () => {
 		child.push({ type: "agent_end", messages: [] });
 		child.push({ type: "prompt_result", id: promptA.id, agentInvoked: true });
 		expect(await allowed.client.nextServer()).toMatchObject({ type: "event", event: { type: "agent.end" } });
+		expect(await allowed.client.nextServer()).toMatchObject({
+			type: "session.delta",
+			upsert: { attention: { latestOutcome: { kind: "completed" } } },
+		});
 		expect(await allowed.client.nextServer()).toMatchObject({
 			type: "event",
 			event: { type: "message.discarded", reason: "completed-without-entry" },
@@ -2767,7 +2774,7 @@ describe("live Unix websocket protocol", () => {
 		child.push({
 			type: "prompt_result",
 			id: prompt.id,
-			error: "Bearer abcdefghijklmnop failed at /home/tester/private token=plaintext",
+			error: "Bearer abcdefghijklmnop failed at /home/tester/private token=plaintext https://signed.example/download?signature=url-secret",
 		});
 		const terminalState = await waitForRpcWriteId(child, "get_state", `${prompt.id}:terminal:state`);
 		respondState(child, terminalState.frame);
@@ -2775,11 +2782,18 @@ describe("live Unix websocket protocol", () => {
 		const failure = terminal.frames.find(frame => frame.type === "event" && frame.event.type === "turn.error");
 		expect(failure).toMatchObject({
 			type: "event",
-			event: { type: "turn.error", message: "Bearer [redacted] failed at [path] token=[redacted]" },
+			event: { type: "turn.error", message: "Bearer [redacted] failed at [path] token=[redacted] [url]" },
 		});
 		expect(JSON.stringify(terminal.frames)).not.toContain("abcdefghijklmnop");
 		expect(JSON.stringify(terminal.frames)).not.toContain("/home/tester");
 		expect(JSON.stringify(terminal.frames)).not.toContain("plaintext");
+		expect(JSON.stringify(terminal.frames)).not.toContain("signed.example");
+		expect(JSON.stringify(terminal.frames)).not.toContain("url-secret");
+		expect(appserver.snapshot(sid("s1"))?.ref.attention?.latestOutcome?.summary).toBe(
+			"Bearer [redacted] failed at [path] token=[redacted] [url]",
+		);
+		expect(appserver.snapshot(sid("s1"))?.ref.attention?.latestOutcome?.summary).not.toContain("signed.example");
+		expect(appserver.snapshot(sid("s1"))?.ref.attention?.latestOutcome?.summary).not.toContain("url-secret");
 		expect(appserver.snapshot(sid("s1"))?.ref.status).toBe("idle");
 
 		client.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "after-prompt-error", timestamp: stamp });
@@ -2928,6 +2942,17 @@ describe("live Unix websocket protocol", () => {
 			type: "event",
 			event: { type: "ask.request", askId: "ask-1", responseKind: "value" },
 		});
+		expect(await client.client.nextServer()).toMatchObject({
+			type: "session.delta",
+			upsert: {
+				pendingUserInput: true,
+				attention: {
+					pending: [{ kind: "question", id: "ask-1", question: "Your answer" }],
+					pendingCount: 1,
+					truncated: false,
+				},
+			},
+		});
 		client.client.sendJson(
 			command("ui-answer", "ui-answer", "session.ui.respond", "s1", {
 				requestId: "ask-1",
@@ -2945,6 +2970,11 @@ describe("live Unix websocket protocol", () => {
 			type: "event",
 			event: { type: "ask.resolved", askId: "ask-1" },
 		});
+		const answeredDelta = answered.frames.filter(frame => frame.type === "session.delta").at(-1);
+		expect(answeredDelta?.type).toBe("session.delta");
+		if (answeredDelta?.type !== "session.delta" || !answeredDelta.upsert) throw new Error("missing answer delta");
+		expect(answeredDelta.upsert.attention).toBeUndefined();
+		expect(answeredDelta.upsert.pendingUserInput).toBeUndefined();
 		expect(answered.response).toMatchObject({ ok: true, result: { accepted: true } });
 
 		client.client.sendJson(
@@ -2972,6 +3002,13 @@ describe("live Unix websocket protocol", () => {
 			type: "event",
 			event: { type: "approval.request", approvalId: "approval-1" },
 		});
+		expect(await client.client.nextServer()).toMatchObject({
+			type: "session.delta",
+			upsert: {
+				pendingApproval: true,
+				attention: { pending: [{ kind: "approval", id: "approval-1" }], pendingCount: 1 },
+			},
+		});
 		client.client.sendJson(
 			command("ui-wrong-kind", "ui-wrong-kind", "session.ui.respond", "s1", {
 				requestId: "approval-1",
@@ -2996,6 +3033,10 @@ describe("live Unix websocket protocol", () => {
 			type: "event",
 			event: { type: "approval.resolved", approvalId: "approval-1" },
 		});
+		const confirmedDelta = confirmed.frames.filter(frame => frame.type === "session.delta").at(-1);
+		expect(confirmedDelta?.type).toBe("session.delta");
+		if (confirmedDelta?.type !== "session.delta" || !confirmedDelta.upsert) throw new Error("missing approval delta");
+		expect(confirmedDelta.upsert.attention).toBeUndefined();
 		expect(confirmed.response.ok).toBe(true);
 		child.push({
 			type: "thinking_level_changed",
@@ -3015,6 +3056,105 @@ describe("live Unix websocket protocol", () => {
 		});
 		await closeClients([client.client]);
 		await appserver.stop();
+	});
+	test("publishes attention to an unattached index client and ignores stale diagnostic failures", async () => {
+		const factory = new LiveFactory();
+		const { appserver, path } = await liveServer(factory, [record("s1")]);
+		const client = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+		client.client.sendJson(command("state-unattached", "state-unattached", "session.state.get", "s1", {}));
+		const child = await factory.child();
+		await child.waitForWrites(1);
+		respondState(child, JSON.parse(child.writes[0] ?? "{}") as Record<string, unknown>);
+		await untilResponse(client.client, "state-unattached");
+
+		child.push({
+			type: "extension_ui_request",
+			id: "ask-cold",
+			method: "input",
+			title: "Use token=secret at https://example.test/private from /Users/name/project?",
+		});
+		expect(await client.client.nextServer()).toMatchObject({
+			type: "session.delta",
+			upsert: {
+				attention: {
+					pending: [
+						{
+							kind: "question",
+							id: "ask-cold",
+							question: "Use token=[redacted] at [url] from [path]",
+						},
+					],
+					pendingCount: 1,
+					truncated: false,
+				},
+			},
+		});
+
+		child.push({ type: "agent_end", status: "completed", messageCount: 1 });
+		expect(await client.client.nextServer()).toMatchObject({
+			type: "session.delta",
+			upsert: {
+				attention: {
+					pending: [],
+					pendingCount: 0,
+					latestOutcome: { kind: "completed", summary: "Agent completed work." },
+				},
+			},
+		});
+		const completed = appserver.snapshot(sid("s1"))?.ref.attention?.latestOutcome;
+
+		child.push({ type: "prompt_result", id: "stale-prompt", error: "stale failure" });
+		client.client.sendJson({ v: "omp-app/1", type: "ping", nonce: "after-stale", timestamp: stamp });
+		const frames = await untilPong(client.client, "after-stale");
+		expect(frames).toEqual([expect.objectContaining({ type: "pong", nonce: "after-stale" })]);
+		expect(appserver.snapshot(sid("s1"))?.ref.attention?.latestOutcome).toEqual(completed);
+
+		await closeClients([client.client]);
+		await appserver.stop();
+	});
+	test("restores latest outcomes after restart without restoring live requests", async () => {
+		const ledgerRoot = await mkdtemp(join(tmpdir(), "omp-attention-restart-"));
+		const ledgerPath = join(ledgerRoot, "profile", "agent", "appserver", "attention-outcomes.json");
+		const firstFactory = new LiveFactory();
+		const first = await liveServer(firstFactory, [record("s1")], 256, undefined, undefined, ledgerPath);
+		const firstClient = await readyClient(first.path, ["sessions.read", "sessions.prompt"]);
+		firstClient.client.sendJson(command("state-persist", "state-persist", "session.state.get", "s1", {}));
+		const child = await firstFactory.child();
+		await child.waitForWrites(1);
+		respondState(child, JSON.parse(child.writes[0] ?? "{}") as Record<string, unknown>);
+		await untilResponse(firstClient.client, "state-persist");
+		child.push({
+			type: "extension_ui_request",
+			id: "not-durable",
+			method: "confirm",
+			title: "Temporary approval",
+			message: "Do not restore this request",
+		});
+		expect(await firstClient.client.nextServer()).toMatchObject({
+			type: "session.delta",
+			upsert: { attention: { pendingCount: 1 } },
+		});
+		child.push({ type: "agent_end", status: "completed", messageCount: 1 });
+		expect(await firstClient.client.nextServer()).toMatchObject({
+			type: "session.delta",
+			upsert: { attention: { pendingCount: 0, latestOutcome: { kind: "completed" } } },
+		});
+		const persisted = first.appserver.snapshot(sid("s1"))?.ref.attention?.latestOutcome;
+		await closeClients([firstClient.client]);
+		await first.appserver.stop();
+
+		const second = await liveServer(new LiveFactory(), [record("s1")], 256, undefined, undefined, ledgerPath);
+		const secondClient = await readyClient(second.path, ["sessions.read"]);
+		expect(secondClient.sessions.sessions[0]?.attention).toEqual({
+			pending: [],
+			pendingCount: 0,
+			truncated: false,
+			latestOutcome: persisted,
+		});
+		expect(secondClient.sessions.sessions[0]?.pendingApproval).toBeUndefined();
+		await closeClients([secondClient.client]);
+		await second.appserver.stop();
+		await rm(ledgerRoot, { recursive: true, force: true });
 	});
 
 	test("drops malformed provider diagnostics without blocking the state refresh", async () => {
@@ -4324,6 +4464,10 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 
 		child.push({ type: "agent_end", messages: [] });
 		expect(await client.client.nextServer()).toMatchObject({ type: "event", event: { type: "agent.end" } });
+		expect(await client.client.nextServer()).toMatchObject({
+			type: "session.delta",
+			upsert: { attention: { latestOutcome: { kind: "completed" } } },
+		});
 		const agentEndState = await waitForRpcWriteId(child, "get_state", "agent-end:state");
 		respondState(child, agentEndState.frame);
 		expect(await client.client.nextServer()).toMatchObject({

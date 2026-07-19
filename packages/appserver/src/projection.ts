@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
 import {
+	ATTENTION_MAX_PENDING_ITEMS,
+	type AttentionOutcome,
 	type DurableEntry,
 	decodeTranscriptImageMetadataList,
 	type EntryId,
 	type HostId,
+	type PendingAttentionItem,
 	type ProviderTransportState,
 	revision,
 	type ServerFrame,
@@ -47,6 +50,11 @@ function settledRuntimeRef(current: SessionRef, status: SessionRef["status"]): S
 	const next: SessionRef = { ...current, status };
 	delete next.pendingApproval;
 	delete next.pendingUserInput;
+	if (current.attention) {
+		const attention = { ...current.attention, pending: [], pendingCount: 0, truncated: false };
+		if (attention.latestOutcome) next.attention = attention;
+		else delete next.attention;
+	}
 	if (current.liveState) {
 		const liveState: Record<string, unknown> = {
 			...current.liveState,
@@ -70,6 +78,7 @@ export class SessionProjection {
 	#byId = new Map<string, DurableEntry>();
 	#ringSize: number;
 	#revisionHash = createHash("sha256");
+	#pendingAttention = new Map<string, PendingAttentionItem>();
 	constructor(host: HostId, record: SessionRecord, epoch: string, ringSize = 256) {
 		this.#ringSize = ringSize;
 		for (const entry of record.entries) {
@@ -114,6 +123,7 @@ export class SessionProjection {
 	}
 	updateStatus(status: SessionRef["status"]): ServerFrame | undefined {
 		const current = this.value.ref;
+		if (status === "closed") this.#pendingAttention.clear();
 		const next: SessionRef = status === "closed" ? settledRuntimeRef(current, status) : { ...current, status };
 		if (status === "idle" && current.liveState?.isStreaming === true) {
 			next.liveState = { ...current.liveState, isStreaming: false };
@@ -125,9 +135,11 @@ export class SessionProjection {
 		if (JSON.stringify(next) === JSON.stringify(current)) return undefined;
 		return this.updateRef(next, `status:${status}`);
 	}
-	markRuntimeCrashed(): ServerFrame | undefined {
+	markRuntimeCrashed(outcome?: AttentionOutcome): ServerFrame | undefined {
 		const current = this.value.ref;
+		this.#pendingAttention.clear();
 		const next = settledRuntimeRef(current, "closed");
+		if (outcome) next.attention = { pending: [], pendingCount: 0, truncated: false, latestOutcome: outcome };
 		next.liveState = { ...(next.liveState ?? {}), runtimeCrashed: true };
 		if (JSON.stringify(next) === JSON.stringify(current)) return undefined;
 		return this.updateRef(next, "runtime:crashed");
@@ -374,6 +386,53 @@ export class SessionProjection {
 		else delete next.liveState;
 		if (JSON.stringify(next) === JSON.stringify(current)) return undefined;
 		return this.updateRef(next, `pending-prompts:${pendingPrompts.map(pending => pending.entryId).join(",")}`);
+	}
+	setPendingAttention(item: PendingAttentionItem): ServerFrame | undefined {
+		const previous = this.#pendingAttention.get(item.id);
+		if (previous && JSON.stringify(previous) === JSON.stringify(item)) return undefined;
+		this.#pendingAttention.set(item.id, item);
+		return this.#updateAttentionRef(`attention:pending:${item.kind}:${item.id}`);
+	}
+	removePendingAttention(id: string): ServerFrame | undefined {
+		if (!this.#pendingAttention.delete(id)) return undefined;
+		return this.#updateAttentionRef(`attention:resolved:${id}`);
+	}
+	clearPendingAttention(): ServerFrame | undefined {
+		if (this.#pendingAttention.size === 0) return undefined;
+		this.#pendingAttention.clear();
+		return this.#updateAttentionRef("attention:pending:clear");
+	}
+	setLatestOutcome(outcome: AttentionOutcome): ServerFrame | undefined {
+		if (JSON.stringify(this.value.ref.attention?.latestOutcome) === JSON.stringify(outcome)) return undefined;
+		return this.#updateAttentionRef(`attention:outcome:${outcome.id}`, outcome);
+	}
+	settleAttentionOutcome(outcome: AttentionOutcome): ServerFrame | undefined {
+		const unchangedOutcome = JSON.stringify(this.value.ref.attention?.latestOutcome) === JSON.stringify(outcome);
+		if (this.#pendingAttention.size === 0 && unchangedOutcome) return undefined;
+		this.#pendingAttention.clear();
+		return this.#updateAttentionRef(`attention:settled:${outcome.id}`, outcome);
+	}
+	#updateAttentionRef(marker: string, latestOutcome = this.value.ref.attention?.latestOutcome): ServerFrame {
+		const current = this.value.ref;
+		const allPending = [...this.#pendingAttention.values()].sort(
+			(a, b) => a.requestedAt.localeCompare(b.requestedAt) || a.id.localeCompare(b.id),
+		);
+		const pending = allPending.slice(0, ATTENTION_MAX_PENDING_ITEMS);
+		const pendingCount = this.#pendingAttention.size;
+		const next: SessionRef = { ...current };
+		if (pendingCount > 0 || latestOutcome) {
+			next.attention = {
+				pending,
+				pendingCount,
+				truncated: pendingCount > pending.length,
+				...(latestOutcome ? { latestOutcome } : {}),
+			};
+		} else delete next.attention;
+		if (allPending.some(item => item.kind === "approval")) next.pendingApproval = true;
+		else delete next.pendingApproval;
+		if (allPending.some(item => item.kind === "question")) next.pendingUserInput = true;
+		else delete next.pendingUserInput;
+		return this.updateRef(next, marker);
 	}
 	addPendingPrompt(pending: PendingPromptProjection): ServerFrame | undefined {
 		const current = this.pendingPrompts();

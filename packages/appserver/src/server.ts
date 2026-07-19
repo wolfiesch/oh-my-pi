@@ -2,8 +2,9 @@ import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
 import { chmod, stat as fsStat, lstat, open, readlink, realpath, rename, symlink, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
+	type AttentionOutcome,
 	COMMAND_DESCRIPTORS,
 	type CommandFrame,
 	type ConfirmationChallenge,
@@ -19,6 +20,7 @@ import {
 	type HostId,
 	IMAGE_UPLOAD_CHUNK_BYTES,
 	type ImageId,
+	type PendingAttentionItem,
 	type PromptImageMimeType,
 	type ProviderTransportState,
 	parseBounded,
@@ -40,6 +42,7 @@ import type {
 } from "../../coding-agent/src/modes/rpc/rpc-types.ts";
 import { AgentTranscriptProjection } from "./agent-transcript-projection.ts";
 import { completeAttachOutput, prepareAttachOutput } from "./attach-output.ts";
+import { AttentionOutcomeStore } from "./attention-outcome-store.ts";
 import { AppserverCommandHandlers } from "./command-handler.ts";
 import {
 	compareSessionRecords,
@@ -52,7 +55,14 @@ import {
 	stableProjectId,
 } from "./discovery.ts";
 import { IdempotencyStore, payloadHash } from "./idempotency.ts";
-import { createEpoch, createHostId, defaultSocketPath, loadPersistentHostId, unixSocketActive } from "./identity.ts";
+import {
+	createEpoch,
+	createHostId,
+	defaultHostIdPath,
+	defaultSocketPath,
+	loadPersistentHostId,
+	unixSocketActive,
+} from "./identity.ts";
 import { ImageUploadError, ImageUploadStore } from "./image-upload-store.ts";
 import {
 	commandFeature,
@@ -76,7 +86,12 @@ import { BunRemoteListener, createListenerPlan, createServeProxyPlan } from "./r
 import type { RemoteConnection, RemoteListenerConfig } from "./remote/types.ts";
 import { BunRpcChildFactory, RpcChildSupervisor } from "./rpc-child.ts";
 import { SubagentProjection, subagentIdFromFrame } from "./subagent-projection.ts";
-import { asAppWireEvent, TranscriptEventTranslator } from "./transcript-events.ts";
+import {
+	type AppserverEvent,
+	asAppWireEvent,
+	safeAttentionDisplay,
+	TranscriptEventTranslator,
+} from "./transcript-events.ts";
 import { TranscriptImageError, TranscriptImageReader } from "./transcript-image-reader.ts";
 import type {
 	AppserverDrainBusy,
@@ -150,6 +165,8 @@ const MAX_PENDING_PROMPTS = 16;
 // reduced, with an explicit count/truncation marker for clients.
 const SESSION_LIST_PENDING_PROMPT_BYTES = 256 * 1024;
 const SESSION_LIST_PENDING_PROMPT_ENTRIES = 512;
+const SESSION_LIST_ATTENTION_BYTES = 256 * 1024;
+const SESSION_LIST_ATTENTION_ENTRIES = 512;
 const SESSION_LIST_REFS_BYTES = 768 * 1024;
 const SESSION_LIST_REF_NODES = 16_000;
 const textEncoder = new TextEncoder();
@@ -157,6 +174,8 @@ const textEncoder = new TextEncoder();
 interface SessionListBudget {
 	pendingBytes: number;
 	pendingEntries: number;
+	attentionBytes: number;
+	attentionEntries: number;
 }
 
 function encodedJsonBytes(value: unknown): number {
@@ -211,6 +230,30 @@ function projectSessionListPendingPrompts(ref: SessionRef, budget: SessionListBu
 	if (retained.length > 0) liveState.pendingPrompts = retained;
 	else delete liveState.pendingPrompts;
 	return { ...ref, liveState };
+}
+
+function projectSessionListAttention(ref: SessionRef, budget: SessionListBudget): SessionRef {
+	const attention = ref.attention;
+	if (!attention || attention.pending.length === 0) return ref;
+	const retained: PendingAttentionItem[] = [];
+	for (const pending of attention.pending) {
+		if (budget.attentionEntries >= SESSION_LIST_ATTENTION_ENTRIES) break;
+		const separatorBytes = retained.length === 0 ? 0 : 1;
+		const bytes = encodedJsonBytes(pending) + separatorBytes;
+		if (budget.attentionBytes + bytes > SESSION_LIST_ATTENTION_BYTES) break;
+		retained.push(pending);
+		budget.attentionBytes += bytes;
+		budget.attentionEntries += 1;
+	}
+	if (retained.length === attention.pending.length) return ref;
+	return {
+		...ref,
+		attention: {
+			...attention,
+			pending: retained,
+			truncated: attention.pendingCount > retained.length,
+		},
+	};
 }
 
 async function boundedRemoteTransform<T>(operation: Promise<T> | T): Promise<T> {
@@ -585,6 +628,7 @@ export class LocalAppserver implements AppserverHandle {
 	#stopping = false;
 	#hostProvided: boolean;
 	#hostIdPath?: string;
+	#attentionOutcomes?: AttentionOutcomeStore;
 	#ownerLock = false;
 	#ownerId?: string;
 	#ownerPaths?: OwnerPaths;
@@ -604,6 +648,12 @@ export class LocalAppserver implements AppserverHandle {
 		this.#hostProvided = Boolean(options.hostId);
 		this.hostId = options.hostId ?? createHostId();
 		this.#hostIdPath = options.hostIdPath;
+		if (options.attentionOutcomePath || !options.hostId) {
+			const hostIdPath = options.hostIdPath ?? defaultHostIdPath();
+			this.#attentionOutcomes = new AttentionOutcomeStore(
+				options.attentionOutcomePath ?? join(dirname(hostIdPath), "attention-outcomes.json"),
+			);
+		}
 		this.epoch = createEpoch(options.epoch);
 		this.socketPath = options.socketPath ?? defaultSocketPath();
 		this.#remotePolicy = options.remotePolicy;
@@ -691,6 +741,7 @@ export class LocalAppserver implements AppserverHandle {
 		this.#draining = false;
 		this.#closedSessions.clear();
 		if (!this.#hostProvided) this.hostId = await loadPersistentHostId(this.#hostIdPath);
+		await this.#attentionOutcomes?.load();
 		this.#records.clear();
 		this.#projections.clear();
 		await this.loadSessions();
@@ -866,6 +917,7 @@ export class LocalAppserver implements AppserverHandle {
 			this.#agentTranscripts.clear();
 			await Promise.allSettled([...this.#startPromises.values()]);
 			this.#startPromises.clear();
+			await this.#attentionOutcomes?.flush().catch(() => undefined);
 			this.#started = false;
 			const identity = this.#runIdentity;
 			if (identity) await this.cleanupOwned(identity);
@@ -1427,7 +1479,10 @@ export class LocalAppserver implements AppserverHandle {
 				else throw new Error("UI response kind does not match the pending request");
 				await supervisor.respondUi(requestId, payload);
 				const resolved = transcript.resolveUiRequest(requestId);
-				if (resolved) this.broadcast(command.sessionId!, projection!.appendEvent(asAppWireEvent(resolved)));
+				if (resolved) {
+					this.broadcast(command.sessionId!, projection!.appendEvent(asAppWireEvent(resolved)));
+					this.#projectAttentionEvent(command.sessionId!, transcript, resolved);
+				}
 				outcome = { frame: response(this.hostId, command, true, { accepted: true }) };
 			} else if (DIRECT_SESSION_RPC_COMMANDS.has(command.command)) {
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
@@ -1891,6 +1946,8 @@ export class LocalAppserver implements AppserverHandle {
 		this.#stateRefreshGenerations.delete(sessionId);
 		this.#transcripts.delete(sessionId);
 		this.disposeSubagentState(sessionId);
+		const cleared = this.#projections.get(sessionId)?.clearPendingAttention();
+		if (cleared) this.broadcast(sessionId, cleared);
 		return true;
 	}
 	private releaseSupervisorAfterExit(sessionId: SessionId, supervisor: RpcChildSupervisor): void {
@@ -1898,6 +1955,10 @@ export class LocalAppserver implements AppserverHandle {
 			if (this.#supervisors.get(sessionId) !== supervisor) return;
 			this.#supervisors.delete(sessionId);
 			if (this.#stopping || this.#closedSessions.has(sessionId)) return;
+			this.#transcripts.delete(sessionId);
+			this.disposeSubagentState(sessionId);
+			const cleared = this.#projections.get(sessionId)?.clearPendingAttention();
+			if (cleared) this.broadcast(sessionId, cleared);
 			const restartable = this.#projections.get(sessionId)?.markRuntimeRestartable();
 			if (restartable) this.broadcast(sessionId, restartable);
 		};
@@ -1909,7 +1970,19 @@ export class LocalAppserver implements AppserverHandle {
 		if (this.#supervisors.get(sessionId) !== supervisor) return;
 		this.advanceStateRefreshGeneration(sessionId);
 		this.#releaseAllMessageLifecycles(sessionId, "failed");
-		const crashed = this.#projections.get(sessionId)?.markRuntimeCrashed();
+		const at = this.#clock.now().toISOString();
+		const crashed = this.#projections.get(sessionId)?.markRuntimeCrashed({
+			id: `runtime:failed:${at}`,
+			kind: "failed",
+			at,
+			summary: "Agent runtime stopped unexpectedly.",
+		});
+		this.#persistAttentionOutcome(sessionId, {
+			id: `runtime:failed:${at}`,
+			kind: "failed",
+			at,
+			summary: "Agent runtime stopped unexpectedly.",
+		});
 		if (crashed) this.broadcast(sessionId, crashed);
 		this.#stateRefreshGenerations.delete(sessionId);
 		this.#transcripts.delete(sessionId);
@@ -2059,6 +2132,7 @@ export class LocalAppserver implements AppserverHandle {
 			await this.broadcastIndex(projection.remove());
 			this.#records.delete(sessionId);
 			this.#projections.delete(sessionId);
+			await this.#attentionOutcomes?.delete(sessionId);
 			this.#closedSessions.delete(sessionId);
 			this.#releaseAllMessageLifecycles(sessionId, "completed-without-entry");
 			this.#stateRefreshGenerations.delete(sessionId);
@@ -2234,6 +2308,70 @@ export class LocalAppserver implements AppserverHandle {
 		const frame = this.#projections.get(sessionId)?.updateStatus(status);
 		if (frame) this.broadcast(sessionId, frame);
 	}
+	#projectAttentionEvent(
+		sessionId: SessionId,
+		transcript: TranscriptEventTranslator,
+		event: AppserverEvent,
+		authoritativeTurnError = false,
+	): void {
+		const projection = this.#projections.get(sessionId);
+		if (!projection) return;
+		let frame: ServerFrame | undefined;
+		if (event.type === "ask.request") {
+			const pending = transcript.pendingUiRequest(event.askId);
+			frame = projection.setPendingAttention(
+				pending?.attention ?? {
+					kind: "question",
+					id: event.askId,
+					question: event.question,
+					options: event.options ?? [],
+					allowText: event.allowText,
+					requestedAt: event.at,
+				},
+			);
+		} else if (event.type === "approval.request") {
+			const pending = transcript.pendingUiRequest(event.approvalId);
+			frame = projection.setPendingAttention(
+				pending?.attention ?? {
+					kind: "approval",
+					id: event.approvalId,
+					title: event.title,
+					summary: event.message || event.title,
+					requestedAt: event.at,
+				},
+			);
+		} else if (event.type === "ask.resolved") frame = projection.removePendingAttention(event.askId);
+		else if (event.type === "approval.resolved") frame = projection.removePendingAttention(event.approvalId);
+		else if (event.type === "agent.end") {
+			const summary =
+				event.status === "completed"
+					? "Agent completed work."
+					: event.status === "cancelled"
+						? "Agent work was cancelled."
+						: "Agent stopped with an error.";
+			const outcome: AttentionOutcome = {
+				id: `agent:${event.status}:${event.at}`,
+				kind: event.status,
+				at: event.at,
+				summary,
+			};
+			frame = projection.settleAttentionOutcome(outcome);
+			this.#persistAttentionOutcome(sessionId, outcome);
+		} else if (event.type === "turn.error" && authoritativeTurnError) {
+			const outcome: AttentionOutcome = {
+				id: `turn:failed:${event.at}`,
+				kind: "failed",
+				at: event.at,
+				summary: safeAttentionDisplay(event.message, 1_024, "The turn stopped with an error."),
+			};
+			frame = projection.settleAttentionOutcome(outcome);
+			this.#persistAttentionOutcome(sessionId, outcome);
+		}
+		if (frame) this.broadcast(sessionId, frame);
+	}
+	#persistAttentionOutcome(sessionId: SessionId, outcome: AttentionOutcome): void {
+		void this.#attentionOutcomes?.set(sessionId, outcome).catch(() => undefined);
+	}
 	private async refreshState(
 		sessionId: SessionId,
 		supervisor: RpcChildSupervisor,
@@ -2388,6 +2526,12 @@ export class LocalAppserver implements AppserverHandle {
 					const currentPromptResult = terminalLifecycle !== undefined;
 					for (const event of transcript.translate(frame, { currentPromptResult })) {
 						this.broadcast(sessionId, projection.appendEvent(asAppWireEvent(event)));
+						this.#projectAttentionEvent(
+							sessionId,
+							transcript,
+							event,
+							frame.type === "turn_end" || (frame.type === "prompt_result" && currentPromptResult),
+						);
 						if (event.type === "turn.start" || event.type === "agent.start")
 							this.updateStatus(sessionId, "active");
 					}
@@ -2913,10 +3057,10 @@ export class LocalAppserver implements AppserverHandle {
 		for (const record of records) {
 			if (this.#records.has(record.sessionId)) throw new Error(`duplicate session id: ${record.sessionId}`);
 			this.#records.set(record.sessionId, record);
-			this.#projections.set(
-				record.sessionId,
-				new SessionProjection(this.hostId, record, this.epoch, this.#ringSize),
-			);
+			const projection = new SessionProjection(this.hostId, record, this.epoch, this.#ringSize);
+			const outcome = this.#attentionOutcomes?.get(record.sessionId);
+			if (outcome) projection.setLatestOutcome(outcome);
+			this.#projections.set(record.sessionId, projection);
 		}
 	}
 	private refreshSessions(): Promise<void> {
@@ -2944,6 +3088,8 @@ export class LocalAppserver implements AppserverHandle {
 			const projection = this.#projections.get(record.sessionId);
 			if (!projection) {
 				const inserted = new SessionProjection(this.hostId, record, this.epoch, this.#ringSize);
+				const outcome = this.#attentionOutcomes?.get(record.sessionId);
+				if (outcome) inserted.setLatestOutcome(outcome);
 				this.#projections.set(record.sessionId, inserted);
 				await this.broadcastIndex(inserted.indexUpsert());
 			} else {
@@ -2968,6 +3114,7 @@ export class LocalAppserver implements AppserverHandle {
 				await this.#imageUploads.cleanupSession(sessionId);
 				this.#records.delete(sessionId);
 				this.#projections.delete(sessionId);
+				await this.#attentionOutcomes?.delete(sessionId);
 				this.#stateRefreshGenerations.delete(sessionId);
 			}
 		}
@@ -2992,6 +3139,7 @@ export class LocalAppserver implements AppserverHandle {
 				await this.#imageUploads.cleanupSession(sessionId);
 				this.#records.delete(sessionId);
 				this.#projections.delete(sessionId);
+				await this.#attentionOutcomes?.delete(sessionId);
 				this.#closedSessions.delete(sessionId);
 				this.#releaseAllMessageLifecycles(sessionId, "completed-without-entry");
 				this.#stateRefreshGenerations.delete(sessionId);
@@ -3217,12 +3365,20 @@ export class LocalAppserver implements AppserverHandle {
 			return 0;
 		});
 		const totalCount = allSessions.length;
-		const pendingBudget: SessionListBudget = { pendingBytes: 0, pendingEntries: 0 };
+		const pendingBudget: SessionListBudget = {
+			pendingBytes: 0,
+			pendingEntries: 0,
+			attentionBytes: 0,
+			attentionEntries: 0,
+		};
 		const sessions: SessionRef[] = [];
 		let refsBytes = 2; // JSON array brackets
 		let refNodes = 1; // JSON array node
 		for (const current of allSessions.slice(0, 1000)) {
-			const ref = projectSessionListPendingPrompts(current, pendingBudget);
+			const ref = projectSessionListAttention(
+				projectSessionListPendingPrompts(current, pendingBudget),
+				pendingBudget,
+			);
 			const separatorBytes = sessions.length === 0 ? 0 : 1;
 			const bytes = encodedJsonBytes(ref) + separatorBytes;
 			const nodes = jsonNodeCount(ref, SESSION_LIST_REF_NODES - refNodes);
