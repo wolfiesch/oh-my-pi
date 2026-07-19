@@ -7,6 +7,8 @@ import {
 	decodeClientFrame,
 	decodeServerFrame,
 	hostId,
+	type PreviewCaptureId,
+	type PreviewSnapshot,
 	type ResultFrame,
 	requestId,
 	type TranscriptContextResult,
@@ -38,7 +40,13 @@ void COMMAND_DESCRIPTORS["session.create"];
 void COMMAND_DESCRIPTORS["usage.read"];
 void COMMAND_DESCRIPTORS["transcript.search"];
 void COMMAND_DESCRIPTORS["transcript.context"];
+void COMMAND_DESCRIPTORS["preview.capture.read"];
+void COMMAND_DESCRIPTORS["preview.handoff"];
 declare const searchResult: TranscriptSearchResult;
 declare const contextResult: TranscriptContextResult;
+declare const preview: PreviewSnapshot;
+declare const captureId: PreviewCaptureId;
 void searchResult.index.generation;
 void contextResult.rows[contextResult.anchorIndex];
+void preview.availableActions?.includes("handoff");
+void captureId;

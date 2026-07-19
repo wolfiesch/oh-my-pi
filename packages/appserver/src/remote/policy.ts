@@ -160,6 +160,9 @@ function commandFeature(command: string): string | undefined {
 	if (command.startsWith("preview.")) return "preview.control";
 	return undefined;
 }
+function serverLeaseCommand(command: string): boolean {
+	return command.startsWith("controller.lease.") || command.startsWith("prompt.lease.");
+}
 function frameFeature(frame: ClientFrame): string | undefined {
 	if (frame.type === "command") return commandFeature(frame.command);
 	if (frame.type === "terminal.input" || frame.type === "terminal.resize" || frame.type === "terminal.close")
@@ -647,11 +650,7 @@ export class TailscaleRemotePolicy implements RemoteConnectionPolicy {
 			state.justPaired ||
 			feature === undefined ||
 			!state.features.includes(feature) ||
-			!(
-				frame.command.endsWith(".lease.acquire") ||
-				frame.command.endsWith(".lease.renew") ||
-				frame.command.endsWith(".lease.release")
-			)
+			!serverLeaseCommand(frame.command)
 		)
 			return undefined;
 		const cached = state.idempotency.get(String(frame.commandId));

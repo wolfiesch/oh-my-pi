@@ -420,6 +420,10 @@ test("prompt lease release remains authorized by the default guard before revoca
 });
 test("preview commands require negotiated preview.control and preview capability", () => {
 	const registry = new Registry();
+	registry.current = {
+		...registry.current,
+		capabilities: [...registry.current.capabilities, "preview.control", "preview.input"],
+	};
 	const policy = new TailscaleRemotePolicy({ registry, supportedFeatures: ["preview.control"] });
 	const connectionValue = connection("preview", { count: 0 });
 	policy.authenticate(connectionValue, hello("preview", ["preview.read"], []));
@@ -435,6 +439,25 @@ test("preview commands require negotiated preview.control and preview capability
 			peer: negotiated.peer,
 		}),
 	).toBe(true);
+	const inputOnly = connection("preview-input", { count: 0 });
+	policy.authenticate(inputOnly, hello("preview-input", ["preview.input"], ["preview.control"]));
+	const click = command("preview-click", "preview.click", "session", {
+		previewId: "preview-1",
+		selector: "button",
+	});
+	expect(policy.authorize(inputOnly, click, { connectionId: "preview-input", peer: inputOnly.peer })).toBe(true);
+	expect(
+		policy.authorize(negotiated, { ...click, requestId: "request-preview-click-denied" } as CommandFrame, {
+			connectionId: "preview-ready",
+			peer: negotiated.peer,
+		}),
+	).toBe(false);
+
+	const control = connection("preview-control", { count: 0 });
+	policy.authenticate(control, hello("preview-control", ["preview.control"], ["preview.control"]));
+	const acquire = command("preview-lease", "preview.lease.acquire", "session", { previewId: "preview-1" });
+	expect(policy.authorize(control, acquire, { connectionId: "preview-control", peer: control.peer })).toBe(true);
+	expect(policy.handleCommand(control, acquire)).toBeUndefined();
 	policy.close();
 });
 

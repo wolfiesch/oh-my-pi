@@ -249,6 +249,18 @@ describe("appserver lifecycle", () => {
 			appserverSupportedFeatures({ supportedFeatures: ["transcript.images"], transcriptImageRoot: undefined }),
 		).not.toContain("transcript.images");
 	});
+	test("advertises preview feature and capabilities from the authority methods actually present", () => {
+		const stateOnly = { previewState: async () => ({ previews: [] }) };
+		expect(appserverSupportedFeatures({ operationsAuthority: stateOnly })).toContain("preview.control");
+		expect(appserverSupportedCapabilities({ operationsAuthority: stateOnly })).toContain("preview.read");
+		expect(appserverSupportedCapabilities({ operationsAuthority: stateOnly })).not.toContain("preview.control");
+		expect(appserverSupportedCapabilities({ operationsAuthority: stateOnly })).not.toContain("preview.input");
+
+		const inputOnly = { previewClick: async () => ({ preview: {} }) };
+		expect(appserverSupportedFeatures({ operationsAuthority: inputOnly })).toContain("preview.control");
+		expect(appserverSupportedCapabilities({ operationsAuthority: inputOnly })).toContain("preview.input");
+		expect(appserverSupportedCapabilities({ operationsAuthority: inputOnly })).not.toContain("preview.read");
+	});
 	test("advertises usage reads only when a concrete read authority exists", () => {
 		expect(appserverSupportedCapabilities({})).not.toContain("usage.read");
 		expect(

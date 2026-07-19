@@ -22,6 +22,7 @@ export const DEVICE_CAPABILITIES = [
 	"usage.read",
 	"preview.read",
 	"preview.control",
+	"preview.input",
 ] as const;
 export type DeviceCapability = (typeof DEVICE_CAPABILITIES)[number];
 export const PROTOCOL_FEATURES = [

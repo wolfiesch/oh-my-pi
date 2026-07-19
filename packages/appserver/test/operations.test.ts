@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	COMMAND_DESCRIPTORS,
 	commandId,
 	DEVICE_CAPABILITIES,
 	decodeCommand,
@@ -14,8 +15,80 @@ import {
 	type DesktopOperationsAuthority,
 	type OperationContext,
 	operationCapabilities,
+	operationFeatures,
 	TerminalOwnerRegistry,
 } from "../src/operations/dispatcher.ts";
+
+const previewSnapshot = {
+	previewId: "preview-1",
+	state: "ready",
+	url: "http://localhost",
+	revision: "preview-revision",
+	cursor: { epoch: "preview-epoch", seq: 1 },
+};
+
+const PREVIEW_METHOD_BY_COMMAND = {
+	"preview.launch": "previewLaunch",
+	"preview.state": "previewState",
+	"preview.activate": "previewActivate",
+	"preview.navigate": "previewNavigate",
+	"preview.back": "previewBack",
+	"preview.forward": "previewForward",
+	"preview.reload": "previewReload",
+	"preview.close": "previewClose",
+	"preview.capture": "previewCapture",
+	"preview.capture.read": "previewCaptureRead",
+	"preview.click": "previewClick",
+	"preview.fill": "previewFill",
+	"preview.scroll": "previewScroll",
+	"preview.type": "previewType",
+	"preview.select": "previewSelect",
+	"preview.press": "previewPress",
+	"preview.upload": "previewUpload",
+	"preview.policy.check": "previewPolicyCheck",
+	"preview.lease.acquire": "previewLeaseAcquire",
+	"preview.lease.renew": "previewLeaseRenew",
+	"preview.lease.release": "previewLeaseRelease",
+	"preview.handoff": "previewHandoff",
+} as const satisfies Readonly<Record<string, keyof DesktopOperationsAuthority>>;
+
+function previewArgs(name: string): Record<string, unknown> {
+	if (name === "preview.launch") return { url: "http://localhost" };
+	if (name === "preview.state") return {};
+	if (name === "preview.navigate") return { previewId: "preview-1", url: "http://localhost/next" };
+	if (name === "preview.capture.read") return { previewId: "preview-1", captureId: "capture-1", offset: 0 };
+	if (name === "preview.click") return { previewId: "preview-1", selector: "button" };
+	if (name === "preview.fill" || name === "preview.type") return { previewId: "preview-1", text: "hello" };
+	if (name === "preview.scroll") return { previewId: "preview-1", deltaX: 0, deltaY: 10 };
+	if (name === "preview.select") return { previewId: "preview-1", selector: "select", value: "one" };
+	if (name === "preview.press") return { previewId: "preview-1", key: "Enter" };
+	if (name === "preview.upload") return { previewId: "preview-1", selector: "input", path: "upload.txt" };
+	if (name === "preview.policy.check") return { action: "navigate", url: "http://localhost" };
+	if (name === "preview.lease.acquire") return { previewId: "preview-1" };
+	if (name === "preview.lease.renew" || name === "preview.lease.release")
+		return { previewId: "preview-1", leaseId: "preview-lease-1" };
+	if (name === "preview.handoff") return { previewId: "preview-1", message: "Continue manually" };
+	return { previewId: "preview-1" };
+}
+
+function previewResult(name: string): Record<string, unknown> {
+	if (name === "preview.state") return { previews: [previewSnapshot] };
+	if (name === "preview.capture.read")
+		return {
+			previewId: "preview-1",
+			captureId: "capture-1",
+			size: 1,
+			offset: 0,
+			nextOffset: 1,
+			complete: true,
+			content: "eA==",
+		};
+	if (name === "preview.policy.check") return { allowed: true, confirmationRequired: false };
+	if (name === "preview.lease.acquire" || name === "preview.lease.renew")
+		return { previewId: "preview-1", leaseId: "preview-lease-1", expiresAt: 1_000 };
+	if (name === "preview.lease.release") return { previewId: "preview-1", released: true };
+	return { preview: previewSnapshot };
+}
 
 const context: OperationContext = {
 	hostId: hostId("host-1"),
@@ -58,10 +131,10 @@ function authority(overrides: Partial<DesktopOperationsAuthority> = {}): Desktop
 		brokerStatus: async () => ({ state: "local", generation: 1 }),
 		settingsWrite: async () => ({}),
 		configWrite: async () => ({}),
-		previewLaunch: async () => ({}),
-		previewState: async () => ({}),
-		previewNavigate: async () => ({}),
-		previewCapture: async () => ({ content: "" }),
+		previewLaunch: async () => ({ preview: previewSnapshot }),
+		previewState: async () => ({ previews: [previewSnapshot] }),
+		previewNavigate: async () => ({ preview: previewSnapshot }),
+		previewCapture: async () => ({ preview: previewSnapshot }),
 		terminalInput: async () => {},
 		terminalResize: async () => {},
 		terminalClose: async () => {},
@@ -91,16 +164,16 @@ describe("desktop operation dispatcher", () => {
 			"preview.navigate",
 			"preview.capture",
 		]) {
-			const args = name.startsWith("files.")
-				? {
-						path: "src/a.txt",
-						...(name === "files.write" ? { content: "x" } : {}),
-						...(name === "files.patch" ? { patch: "x" } : {}),
-					}
-				: name.startsWith("review.")
-					? { reviewId: "review-1" }
-					: name.startsWith("preview.") && ["preview.launch", "preview.navigate"].includes(name)
-						? { url: "http://localhost" }
+			const args = name.startsWith("preview.")
+				? previewArgs(name)
+				: name.startsWith("files.")
+					? {
+							path: "src/a.txt",
+							...(name === "files.write" ? { content: "x" } : {}),
+							...(name === "files.patch" ? { patch: "x" } : {}),
+						}
+					: name.startsWith("review.")
+						? { reviewId: "review-1" }
 						: name === "bash.run"
 							? { command: "structured" }
 							: {};
@@ -118,6 +191,30 @@ describe("desktop operation dispatcher", () => {
 				}),
 			).resolves.toBeObject();
 		}
+	});
+	test("routes every declared preview command only to its matching optional authority method", async () => {
+		const declared = Object.keys(COMMAND_DESCRIPTORS)
+			.filter(name => name.startsWith("preview."))
+			.sort();
+		expect(Object.keys(PREVIEW_METHOD_BY_COMMAND).sort()).toEqual(declared);
+		for (const [name, method] of Object.entries(PREVIEW_METHOD_BY_COMMAND)) {
+			const calls: string[] = [];
+			const previewAuthority = {
+				[method]: async () => {
+					calls.push(method);
+					return previewResult(name);
+				},
+			} as DesktopOperationsAuthority;
+			const dispatcher = new DesktopOperationDispatcher(previewAuthority);
+			await expect(dispatcher.dispatch(command(name, previewArgs(name)), context)).resolves.toBeObject();
+			expect(calls).toEqual([method]);
+		}
+	});
+	test("advertises only the preview capability and feature backed by an optional method", () => {
+		const stateOnly: DesktopOperationsAuthority = { previewState: async () => ({ previews: [] }) };
+		expect(operationCapabilities(stateOnly)).toEqual(new Set(["preview.read"]));
+		expect(operationFeatures(stateOnly)).toEqual(new Set(["preview.control"]));
+		expect(operationFeatures(undefined)).toEqual(new Set());
 	});
 	test("rejects wrong host/scope, stale revision, abort, missing capability, and redacts authority errors", async () => {
 		const dispatcher = new DesktopOperationDispatcher(
