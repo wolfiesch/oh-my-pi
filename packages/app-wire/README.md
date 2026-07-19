@@ -25,6 +25,8 @@ The appserver consumes child-RPC `prompt_result` frames internally instead of fo
 
 The exact device capability set and command mapping are exported. Destructive confirmation is separate from one-time `pair.start`/`pair.ok` pairing. File and review paths, plus known file-command arguments, must be safe relative POSIX paths. Remote-only transport supervision and terminal scraping remain outside this wire package.
 
+`preview.control` is negotiated. Clients may expose browser preview only when the welcome frame advertises the feature and the matching `preview.read`, `preview.control`, or `preview.input` capability. The command family covers launch and tab state, bounded capture chunks, navigation, input, uploads, policy checks, leases, and human handoff. Each command keeps its own capability, revision, and confirmation policy.
+
 ## Revision ownership
 
 Every command descriptor declares both its revision policy and its owner:
