@@ -6122,6 +6122,59 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		}
 	});
 
+	test("reveals a canonical local project without returning its absolute path", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-reveal-project-live-"));
+		const projectRoot = join(root, "project");
+		const projectAlias = join(root, "project-alias");
+		await mkdir(projectRoot);
+		await symlink(projectRoot, projectAlias);
+		const revealed: string[] = [];
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: join(root, "app.sock"),
+			projectRootForProject: () => projectAlias,
+			projectRevealer: async project => {
+				revealed.push(project);
+				return true;
+			},
+		});
+		try {
+			await appserver.start();
+			const unnegotiated = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage"]);
+			unnegotiated.client.sendJson(
+				hostCommand("reveal-unnegotiated", "reveal-unnegotiated", "project.reveal", {
+					projectId: stableProjectId(projectAlias),
+				}),
+			);
+			const denied = await untilResponse(unnegotiated.client, "reveal-unnegotiated");
+			expect(denied.response).toMatchObject({
+				ok: false,
+				error: { code: "UNSUPPORTED_FEATURE", details: { feature: "project.reveal" } },
+			});
+			expect(revealed).toEqual([]);
+
+			const client = await readyClient(
+				appserver.socketPath,
+				["sessions.read", "sessions.manage"],
+				["resume", "project.reveal"],
+			);
+			client.client.sendJson(
+				hostCommand("reveal-project", "reveal-project", "project.reveal", {
+					projectId: stableProjectId(projectAlias),
+				}),
+			);
+			const outcome = await untilResponse(client.client, "reveal-project");
+			expect(outcome.response).toMatchObject({ ok: true, result: { revealed: true } });
+			expect(outcome.response).not.toHaveProperty("result.path");
+			expect(revealed).toEqual([await realpath(projectRoot)]);
+			await closeClients([unnegotiated.client, client.client]);
+		} finally {
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("created sessions publish project names and live fallback and explicit titles", async () => {
 		const authority = new FakeAuthority();
 		const factory = new LiveFactory();

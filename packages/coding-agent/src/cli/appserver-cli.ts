@@ -327,6 +327,14 @@ async function defaultCreateAppserver(
 		discovery: runtime.discovery,
 		operationsAuthority: runtime.operationsAuthority,
 		projectRootForProject: runtime.projectRootForProject,
+		...(process.platform === "darwin"
+			? {
+					projectRevealer: async (root: string): Promise<boolean> => {
+						const child = Bun.spawn(["open", "-R", root], { stderr: "ignore", stdout: "ignore" });
+						return (await child.exited) === 0;
+					},
+				}
+			: {}),
 		usageAuthority: runtime.usageAuthority,
 		transcriptSearchAuthority: runtime.transcriptSearchAuthority,
 		lockCheck: runtime.lockCheck,

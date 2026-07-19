@@ -532,7 +532,12 @@ async function publishOwnerAtomic(
 export function appserverSupportedFeatures(
 	options: Pick<
 		AppserverOptions,
-		"operationsAuthority" | "supportedFeatures" | "transcriptImageRoot" | "transcriptSearchAuthority"
+		| "operationsAuthority"
+		| "projectRevealer"
+		| "projectRootForProject"
+		| "supportedFeatures"
+		| "transcriptImageRoot"
+		| "transcriptSearchAuthority"
 	> & {
 		readonly remotePolicy?: AppserverOptions["remotePolicy"];
 	},
@@ -547,6 +552,8 @@ export function appserverSupportedFeatures(
 	const authority = options.operationsAuthority;
 	if (options.transcriptImageRoot) implementedFeatures.add("transcript.images");
 	if (options.transcriptSearchAuthority) implementedFeatures.add("transcript.search");
+	if (!includeRemotePolicy && options.projectRootForProject && options.projectRevealer)
+		implementedFeatures.add("project.reveal");
 	if (authority?.catalogGet) implementedFeatures.add("catalog.metadata");
 	if (authority?.settingsRead) implementedFeatures.add("settings.metadata");
 	if (authority?.termOpen && authority.terminalInput && authority.terminalResize && authority.terminalClose)
@@ -661,6 +668,7 @@ export class LocalAppserver implements AppserverHandle {
 	#remoteSupportedFeatures: Set<string>;
 	#supportedCapabilities: Set<string>;
 	#projectRootForProject?: AppserverOptions["projectRootForProject"];
+	#projectRevealer?: AppserverOptions["projectRevealer"];
 	constructor(options: AppserverOptions = {}) {
 		this.#hostProvided = Boolean(options.hostId);
 		this.hostId = options.hostId ?? createHostId();
@@ -691,6 +699,7 @@ export class LocalAppserver implements AppserverHandle {
 		this.#usageAuthority = options.usageAuthority;
 		this.#transcriptSearch = options.transcriptSearchAuthority;
 		this.#projectRootForProject = options.projectRootForProject;
+		this.#projectRevealer = options.projectRevealer;
 		this.#discovery = options.discovery ?? options.sessionAuthority ?? { list: async () => [] };
 		this.#imageUploads = new ImageUploadStore({ root: `${this.socketPath}.images` });
 		this.#transcriptImages = options.transcriptImageRoot
@@ -738,6 +747,8 @@ export class LocalAppserver implements AppserverHandle {
 			throw new Error("unsupported capability has no handler");
 		this.#supportedCapabilities = new Set(requested);
 		this.#handlers.register("session.create", command => this.handleCreate(command));
+		if (this.#projectRootForProject && this.#projectRevealer)
+			this.#handlers.register("project.reveal", command => this.handleProjectReveal(command));
 		this.#handlers.register("session.close", command => this.handleClose(command));
 		this.#handlers.register("session.archive", command => this.handleArchive(command));
 		this.#handlers.register("session.restore", command => this.handleRestore(command));
@@ -1856,22 +1867,7 @@ export class LocalAppserver implements AppserverHandle {
 	}
 	private async createSession(args: Record<string, unknown>): Promise<Record<string, unknown>> {
 		if (!this.#authority) throw new Error("session creation is unavailable");
-		if (!this.#projectRootForProject) throw new Error("session project resolver is unavailable");
-		const requestedProjectId = args.projectId;
-		if (typeof requestedProjectId !== "string") throw new Error("session projectId is invalid");
-		const requestedProject = projectId(requestedProjectId);
-		const requestedCwd = await this.#projectRootForProject(requestedProject);
-		if (typeof requestedCwd !== "string" || !requestedCwd.startsWith("/"))
-			throw new Error("project resolver returned an invalid local root");
-		let canonical: string;
-		try {
-			canonical = await realpath(requestedCwd);
-			if (!(await fsStat(canonical)).isDirectory()) throw new Error("not a directory");
-		} catch {
-			throw new Error("project resolver returned an unavailable local root");
-		}
-		if (stableProjectId(canonical) !== requestedProject)
-			throw new Error("project resolver returned a mismatched local root");
+		const canonical = await this.resolveProjectRoot(args.projectId);
 		const title = typeof args.title === "string" ? args.title : undefined;
 		const created = await this.#authority.create(canonical, title);
 		const timestamp = this.#clock.now().toISOString();
@@ -1890,6 +1886,30 @@ export class LocalAppserver implements AppserverHandle {
 		this.#projections.set(record.sessionId, new SessionProjection(this.hostId, record, this.epoch, this.#ringSize));
 		this.#createdPending.set(record.sessionId, { record, refreshesRemaining: 1 });
 		return { sessionId: record.sessionId };
+	}
+	private async resolveProjectRoot(value: unknown): Promise<string> {
+		if (!this.#projectRootForProject) throw new Error("project resolver is unavailable");
+		if (typeof value !== "string") throw new Error("projectId is invalid");
+		const requestedProject = projectId(value);
+		const requestedCwd = await this.#projectRootForProject(requestedProject);
+		if (typeof requestedCwd !== "string" || !requestedCwd.startsWith("/"))
+			throw new Error("project resolver returned an invalid local root");
+		let canonical: string;
+		try {
+			canonical = await realpath(requestedCwd);
+			if (!(await fsStat(canonical)).isDirectory()) throw new Error("not a directory");
+		} catch {
+			throw new Error("project resolver returned an unavailable local root");
+		}
+		if (stableProjectId(canonical) !== requestedProject)
+			throw new Error("project resolver returned a mismatched local root");
+		return canonical;
+	}
+	private async handleProjectReveal(command: CommandFrame): Promise<CommandOutcome> {
+		if (!this.#projectRevealer) throw new Error("project reveal is unavailable");
+		const root = await this.resolveProjectRoot(command.args.projectId);
+		const revealed = await this.#projectRevealer(root);
+		return { frame: response(this.hostId, command, true, { revealed }) };
 	}
 	private async handleCreate(command: CommandFrame): Promise<CommandOutcome> {
 		const created = await this.createSession(command.args);

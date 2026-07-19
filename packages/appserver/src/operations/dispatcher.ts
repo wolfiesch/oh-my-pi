@@ -148,6 +148,7 @@ export const COMMAND_FEATURE_BY_COMMAND: Readonly<Record<string, string>> = {
 	"session.image.read": "transcript.images",
 	"transcript.search": "transcript.search",
 	"transcript.context": "transcript.search",
+	"project.reveal": "project.reveal",
 	...Object.fromEntries(
 		Object.keys(COMMAND_DESCRIPTORS)
 			.filter(command => command.startsWith("preview."))

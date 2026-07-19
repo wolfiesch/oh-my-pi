@@ -428,6 +428,12 @@ describe("app-wire authority", () => {
 		expect(() =>
 			decodeClientFrame({ ...base, command: "session.create", args: { projectId: "project-1" } }),
 		).not.toThrow();
+		expect(() =>
+			decodeClientFrame({ ...base, command: "project.reveal", args: { projectId: "project-1" } }),
+		).not.toThrow();
+		expect(() => decodeClientFrame({ ...base, command: "project.reveal", args: { cwd: "/tmp/project" } })).toThrow(
+			AppWireError,
+		);
 		expect(() => decodeClientFrame({ ...base, command: "session.create", args: { cwd: "/tmp/project" } })).toThrow(
 			AppWireError,
 		);
@@ -440,6 +446,14 @@ describe("app-wire authority", () => {
 			AppWireError,
 		);
 		expect(COMMAND_DESCRIPTORS["session.create"]).toEqual({
+			capability: "sessions.manage",
+			scope: "host",
+			revision: "none",
+			revisionOwner: "none",
+			confirmation: "none",
+			desktopCatalog: true,
+		});
+		expect(COMMAND_DESCRIPTORS["project.reveal"]).toEqual({
 			capability: "sessions.manage",
 			scope: "host",
 			revision: "none",
@@ -1014,6 +1028,7 @@ describe("app-wire authority", () => {
 			"session.list": "none",
 			"transcript.search": "none",
 			"transcript.context": "none",
+			"project.reveal": "none",
 			"session.create": "none",
 			"session.attach": "none",
 			"audit.read": "none",
@@ -1034,6 +1049,7 @@ describe("app-wire authority", () => {
 	test("desktop catalog commands are an explicit canonical descriptor subset", () => {
 		const expected = [
 			"broker.status",
+			"project.reveal",
 			"session.create",
 			"session.rename",
 			"session.archive",
