@@ -249,6 +249,17 @@ describe("appserver lifecycle", () => {
 			appserverSupportedFeatures({ supportedFeatures: ["transcript.images"], transcriptImageRoot: undefined }),
 		).not.toContain("transcript.images");
 	});
+	test("advertises native project reveal only to local clients with both required authorities", () => {
+		const options = {
+			projectRootForProject: () => "/tmp/project",
+			projectRevealer: async () => true,
+		};
+		expect(appserverSupportedFeatures(options)).toContain("project.reveal");
+		expect(appserverSupportedFeatures(options, true)).not.toContain("project.reveal");
+		expect(appserverSupportedFeatures({ projectRootForProject: options.projectRootForProject })).not.toContain(
+			"project.reveal",
+		);
+	});
 	test("advertises preview feature and capabilities from the authority methods actually present", () => {
 		const stateOnly = { previewState: async () => ({ previews: [] }) };
 		expect(appserverSupportedFeatures({ operationsAuthority: stateOnly })).toContain("preview.control");
@@ -282,6 +293,8 @@ describe("appserver lifecycle", () => {
 			usageAuthority: {
 				read: async () => ({ generatedAt: 0, reports: [], accountsWithoutUsage: [], capacity: {} }),
 			},
+			projectRootForProject: () => "/tmp/project",
+			projectRevealer: async () => true,
 		});
 		const unhandled = DESKTOP_CATALOG_COMMANDS.filter(command => !appserver.hasDesktopCatalogCommandHandler(command));
 		expect(unhandled).toEqual([]);

@@ -119,6 +119,14 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		revisionOwner: "none",
 		confirmation: "none",
 	},
+	"project.reveal": {
+		capability: "sessions.manage",
+		scope: "host",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "none",
+		desktopCatalog: true,
+	},
 	"session.create": {
 		capability: "sessions.manage",
 		scope: "host",
@@ -1318,6 +1326,11 @@ export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown)
 	"session.list": args,
 	"transcript.search": value => decodeTranscriptSearchArguments(value) as unknown as CommandArguments,
 	"transcript.context": value => decodeTranscriptContextArguments(value) as unknown as CommandArguments,
+	"project.reveal": value => {
+		const x = strictArgs(value, ["projectId"]);
+		projectId(x.projectId, "args.projectId");
+		return x;
+	},
 	"session.create": value => {
 		const x = args(value);
 		if (x.cwd !== undefined) fail("UNSAFE_PATH", "cwd is not accepted; use projectId", "args.cwd");
@@ -1528,6 +1541,7 @@ export const COMMAND_RESULT_DECODERS: Readonly<Record<string, (value: unknown) =
 	"session.list": decodeSessions,
 	"transcript.search": value => decodeTranscriptSearchResult(value) as unknown as CommandResult,
 	"transcript.context": value => decodeTranscriptContextResult(value) as unknown as CommandResult,
+	"project.reveal": value => boolField(value, "revealed"),
 	"session.create": decodeCreate,
 	"session.attach": decodeAttach,
 	"session.prompt": value => boolField(value, "accepted"),

@@ -194,6 +194,8 @@ export interface AppserverOptions {
 	/** Maximum time allowed for one account-usage snapshot read. */
 	usageReadTimeoutMs?: number;
 	projectRootForProject?: (projectId: ProjectId) => Promise<string> | string;
+	/** Host-native reveal action. Local transports only; absolute paths never cross the wire. */
+	projectRevealer?: (root: string) => Promise<boolean> | boolean;
 	/** Categorizes external ownership without weakening the write lock gate. */
 	lockStatus?: SessionLockInspector;
 	/** Final write-lock gate, retained for every child/lifecycle mutation. */

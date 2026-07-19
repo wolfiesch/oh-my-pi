@@ -4,6 +4,8 @@
 
 ### Added
 
+- Add native Finder reveal support for local appserver projects without exposing their absolute paths.
+
 - Added profile-local cross-session transcript search with redacted snippets, bounded historical context, and filters for project, role, archive state, and time.
 - Added redacted OpenAI Codex transport state to RPC session diagnostics, including actual transport, fallback, context-shape, and request-size counters without credentials or provider payloads.
 - Added an owner-socket `appserver drain-if-idle` maintenance fence that atomically refuses new client work only after the exact appserver identity is confirmed idle.
