@@ -950,7 +950,7 @@ describe("child supervision", () => {
 	});
 });
 describe("appserver startup and cleanup", () => {
-	test("startup failure releases ownership and stop kills every child", async () => {
+	test("startup does not wait for discovery and stop releases ownership", async () => {
 		const root = await mkdtemp(join(tmpdir(), "omp-clean-"));
 		const path = join(root, "app.sock");
 		const factory = new IdleFactory();
@@ -965,15 +965,20 @@ describe("appserver startup and cleanup", () => {
 		expect(factory.children).toHaveLength(0);
 		await expect(stat(path)).rejects.toThrow();
 		await expect(stat(`${path}.owner`)).rejects.toThrow();
-		const failing = createAppserver({
+		let discoveryCalls = 0;
+		const deferred = createAppserver({
 			hostId: host,
 			socketPath: path,
 			discovery: {
 				list: async () => {
+					discoveryCalls += 1;
 					throw new Error("discovery failed");
 				},
 			},
 		});
-		await expect(failing.start()).rejects.toThrow("discovery failed");
+		await deferred.start();
+		expect(discoveryCalls).toBe(0);
+		await deferred.stop();
+		expect(await unixSocketActive(path)).toBe(false);
 	});
 });

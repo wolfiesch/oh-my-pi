@@ -23,6 +23,7 @@
 
 ### Fixed
 
+- Fixed large session histories blocking appserver socket startup and repeatedly parsing every transcript body. Startup now publishes the transport before discovery, sends a complete initial inventory after bounded previews finish, and loads a transcript body only when that session is opened. Oversized non-header records are skipped without hiding the whole session.
 - Fixed appserver Agent View cancellation aborting the parent RPC process instead of the selected live subagent. Cancellation now targets only validated worker subagents, survives the requesting client disconnecting after dispatch, publishes a non-resumable terminal `cancelled` lifecycle state before hard release, and cannot revive or park an agent after that release begins.
 - Fixed macOS appserver startup rejecting Node's `/var/folders` temporary paths because `/var` is a system symlink, while retaining rejection of nested user-controlled symlinks.
 - Fixed appserver durable tool results dropping structured content, renderer details, and error state. Bounded, redacted canonical fields now survive transcript projection without embedding image bytes, while legacy text output remains available.

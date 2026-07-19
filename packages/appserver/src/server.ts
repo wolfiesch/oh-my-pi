@@ -47,7 +47,6 @@ import { completeAttachOutput, prepareAttachOutput } from "./attach-output.ts";
 import { AttentionOutcomeStore } from "./attention-outcome-store.ts";
 import { AppserverCommandHandlers } from "./command-handler.ts";
 import {
-	compareSessionRecords,
 	fallbackSessionTitle,
 	projectMessageText,
 	projectNameFromCwd,
@@ -610,6 +609,9 @@ export class LocalAppserver implements AppserverHandle {
 	#observerRefreshes = new Map<SessionId, { promise: Promise<void>; rerun: boolean }>();
 	#promotionFailures = new Map<SessionId, string>();
 	#sessionRefresh?: Promise<void>;
+	#sessionLoads = new Map<SessionId, Promise<void>>();
+	#inventoryGeneration = 0;
+	#inventoryLoaded = false;
 	#discoveryMisses = new Map<SessionId, number>();
 	#agentTranscripts = new Map<SessionId, AgentTranscriptProjection>();
 	#startPromises = new Map<SessionId, Promise<RpcChildSupervisor>>();
@@ -755,6 +757,8 @@ export class LocalAppserver implements AppserverHandle {
 	}
 	async start(): Promise<void> {
 		if (this.#started) return;
+		this.#inventoryGeneration += 1;
+		this.#inventoryLoaded = false;
 		this.#stopping = false;
 		this.#draining = false;
 		this.#closedSessions.clear();
@@ -764,7 +768,6 @@ export class LocalAppserver implements AppserverHandle {
 			await this.#transcriptSearch?.initialize();
 			this.#records.clear();
 			this.#projections.clear();
-			await this.loadSessions();
 		} catch (error) {
 			await this.#transcriptSearch?.close();
 			throw error;
@@ -859,7 +862,6 @@ export class LocalAppserver implements AppserverHandle {
 			if (this.#stopping) throw new Error("appserver is stopping");
 			this.#runIdentity = { paths, record, marker: finalMarker };
 			this.#started = true;
-			this.scheduleTranscriptSearchReconcile();
 			if (this.#remotePolicy && this.#remoteEndpoint) {
 				const listener =
 					this.#remoteListener ??
@@ -896,6 +898,9 @@ export class LocalAppserver implements AppserverHandle {
 	async stop(): Promise<void> {
 		if (!this.#started && !this.#server && !this.#ownerLock && this.#startPromises.size === 0) return;
 		this.#stopping = true;
+		this.#inventoryGeneration += 1;
+		this.#sessionRefresh = undefined;
+		this.#sessionLoads.clear();
 		try {
 			await this.#remoteListener?.stop();
 			this.#remoteListener = undefined;
@@ -1170,6 +1175,10 @@ export class LocalAppserver implements AppserverHandle {
 			};
 		if (command.command === "host.list" || command.command === "session.list") await this.refreshSessions();
 		else if (command.command === "transcript.search") await this.refreshTranscriptSearch();
+		else if (command.sessionId) {
+			if (!this.#records.has(command.sessionId)) await this.refreshSessions();
+			await this.loadSession(command.sessionId);
+		}
 		const projection = command.sessionId ? this.#projections.get(command.sessionId) : undefined;
 		// Attach output is connection-scoped and rebuilt on every delivery. A
 		if (this.observerBarrierBlocks(command)) return this.observerBarrierOutcome(command);
@@ -3029,6 +3038,8 @@ export class LocalAppserver implements AppserverHandle {
 		};
 		await this.#sendFrame(ws, welcome as ServerFrame);
 		if (decision?.authentication === "pairing-required") return;
+		await this.refreshSessions();
+		if (this.#stopping || !this.#hello.has(ws)) return;
 		await this.#sendFrame(ws, this.sessionsFrame());
 	}
 	#createLocalTransport(ws: LocalWs): AppWs {
@@ -3129,21 +3140,9 @@ export class LocalAppserver implements AppserverHandle {
 		}
 		return transport.send(JSON.stringify(frame));
 	}
-	private async loadSessions(): Promise<void> {
-		const records = await this.#discovery.list();
-		records.sort(compareSessionRecords);
-		for (const record of records) {
-			if (this.#records.has(record.sessionId)) throw new Error(`duplicate session id: ${record.sessionId}`);
-			this.#records.set(record.sessionId, record);
-			const projection = new SessionProjection(this.hostId, record, this.epoch, this.#ringSize);
-			const outcome = this.#attentionOutcomes?.get(record.sessionId);
-			if (outcome) projection.setLatestOutcome(outcome);
-			this.#projections.set(record.sessionId, projection);
-		}
-	}
 	private refreshSessions(): Promise<void> {
 		if (this.#sessionRefresh) return this.#sessionRefresh;
-		const refresh = this.refreshSessionsOnce();
+		const refresh = this.refreshSessionsOnce(this.#inventoryGeneration);
 		this.#sessionRefresh = refresh;
 		const clear = () => {
 			if (this.#sessionRefresh === refresh) this.#sessionRefresh = undefined;
@@ -3151,15 +3150,25 @@ export class LocalAppserver implements AppserverHandle {
 		void refresh.then(clear, clear);
 		return refresh;
 	}
-	private async refreshSessionsOnce(): Promise<void> {
+	private async refreshSessionsOnce(generation: number): Promise<void> {
 		const discovered = await this.#discovery.list();
+		if (generation !== this.#inventoryGeneration || this.#stopping || !this.#started) return;
+		const publishChanges = this.#inventoryLoaded;
 		const discoveredIds = new Set(discovered.map(record => record.sessionId));
 		for (const discoveredRecord of discovered) {
 			const previous = this.#records.get(discoveredRecord.sessionId);
-			const record: SessionRecord =
+			let record: SessionRecord =
 				previous?.archivedAt && !discoveredRecord.archivedAt
 					? { ...discoveredRecord, archivedAt: previous.archivedAt }
 					: discoveredRecord;
+			if (
+				previous !== undefined &&
+				previous.entriesLoaded !== false &&
+				record.entriesLoaded === false &&
+				previous.path === record.path &&
+				previous.updatedAt === record.updatedAt
+			)
+				record = previous;
 			this.#records.set(record.sessionId, record);
 			this.#discoveryMisses.delete(record.sessionId);
 			this.#createdPending.delete(record.sessionId);
@@ -3169,12 +3178,12 @@ export class LocalAppserver implements AppserverHandle {
 				const outcome = this.#attentionOutcomes?.get(record.sessionId);
 				if (outcome) inserted.setLatestOutcome(outcome);
 				this.#projections.set(record.sessionId, inserted);
-				await this.broadcastIndex(inserted.indexUpsert());
+				if (publishChanges) await this.broadcastIndex(inserted.indexUpsert());
 			} else {
 				const output = projection.value.ref.liveState?.sessionControl
 					? projection.reconcileObserverRecord(record)
 					: projection.reconcileRecord(record);
-				if (output) await this.broadcastIndex(output);
+				if (output && publishChanges) await this.broadcastIndex(output);
 			}
 		}
 		for (const [sessionId, pending] of this.#createdPending) {
@@ -3229,7 +3238,38 @@ export class LocalAppserver implements AppserverHandle {
 				this.#lifecycleMutations.delete(sessionId);
 			}
 		}
+		this.#inventoryLoaded = true;
 		this.scheduleTranscriptSearchReconcile();
+	}
+	private loadSession(sessionId: SessionId): Promise<void> {
+		const pending = this.#sessionLoads.get(sessionId);
+		if (pending) return pending;
+		const record = this.#records.get(sessionId);
+		const loader = this.#discovery.load?.bind(this.#discovery);
+		if (record?.entriesLoaded !== false || !loader) return Promise.resolve();
+		const generation = this.#inventoryGeneration;
+		const load = this.loadSessionOnce(record, generation, loader);
+		this.#sessionLoads.set(sessionId, load);
+		const clear = () => {
+			if (this.#sessionLoads.get(sessionId) === load) this.#sessionLoads.delete(sessionId);
+		};
+		void load.then(clear, clear);
+		return load;
+	}
+	private async loadSessionOnce(
+		record: SessionRecord,
+		generation: number,
+		loader: (session: SessionRecord) => Promise<SessionRecord>,
+	): Promise<void> {
+		const loaded = await loader(record);
+		if (generation !== this.#inventoryGeneration || this.#stopping || !this.#started) return;
+		if (loaded.sessionId !== record.sessionId || loaded.path !== record.path)
+			throw new Error("session identity changed while loading transcript");
+		this.#records.set(loaded.sessionId, loaded);
+		const projection = new SessionProjection(this.hostId, loaded, this.epoch, this.#ringSize);
+		const outcome = this.#attentionOutcomes?.get(loaded.sessionId);
+		if (outcome) projection.setLatestOutcome(outcome);
+		this.#projections.set(loaded.sessionId, projection);
 	}
 	private async refreshTranscriptSearch(): Promise<void> {
 		if (!this.#transcriptSearch) return;

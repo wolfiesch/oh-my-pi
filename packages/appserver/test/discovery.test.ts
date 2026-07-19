@@ -960,7 +960,7 @@ describe("current OMP JSONL projection", () => {
 		expect(session?.entries.map(entry => entry.data.text)).toEqual(["complete entry"]);
 	});
 
-	test("still rejects malformed or missing headers and oversized entry lines", async () => {
+	test("rejects malformed headers while dropping an oversized non-header entry", async () => {
 		const validHeader = sessionTranscript("oversized-entry", "/tmp/project", "Oversized entry");
 		const files = {
 			"/root/malformed-header.jsonl": '{"type":"session"',
@@ -975,7 +975,9 @@ describe("current OMP JSONL projection", () => {
 		};
 		const discovery = new FileSessionDiscovery("/root", fakeFs(files, ["/root"]), host);
 
-		expect(await discovery.list()).toEqual([]);
+		const sessions = await discovery.list();
+		expect(sessions.map(session => session.sessionId)).toEqual([sessionId("oversized-entry")]);
+		expect(sessions[0]?.entries).toEqual([]);
 	});
 
 	test("limits snapshots to 1000 entries with an omission notice", async () => {
@@ -1188,6 +1190,26 @@ test("rebinds a canonical cached transcript when its live symlink alias changes"
 		const warmAlias = await discovery.list();
 		expect(warmAlias[0]?.path).toBe(secondAlias);
 		await expect(stat(warmAlias[0]!.path)).resolves.toBeDefined();
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("lazy discovery reads a bounded preview and hydrates only the selected transcript", async () => {
+	const root = await mkdtemp(join(tmpdir(), "omp-discovery-lazy-"));
+	const path = join(root, "lazy.jsonl");
+	const body = `${JSON.stringify({ type: "session", id: "lazy-session", cwd: "/tmp/lazy", timestamp: stamp })}\n${JSON.stringify({ type: "message", id: "user", parentId: null, timestamp: stamp, message: { role: "user", content: "Lazy title" } })}\n`;
+	try {
+		await writeFile(path, body);
+		const discovery = new FileSessionDiscovery(root, undefined, host, true);
+		const [preview] = await discovery.list();
+		expect(preview).toMatchObject({ title: "Lazy title", entriesLoaded: false, entries: [] });
+		if (!preview) throw new Error("missing lazy transcript preview");
+		const loaded = await discovery.load(preview);
+		expect(loaded.entriesLoaded).not.toBe(false);
+		expect(loaded.entries.map(entry => entry.kind)).toEqual(["message"]);
+		const [cached] = await discovery.list();
+		expect(cached?.entries.map(entry => entry.kind)).toEqual(["message"]);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
