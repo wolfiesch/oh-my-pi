@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added profile-local cross-session transcript search with redacted snippets, bounded historical context, and filters for project, role, archive state, and time.
 - Added redacted OpenAI Codex transport state to RPC session diagnostics, including actual transport, fallback, context-shape, and request-size counters without credentials or provider payloads.
 - Added an owner-socket `appserver drain-if-idle` maintenance fence that atomically refuses new client work only after the exact appserver identity is confirmed idle.
 - Added desktop appserver controls for session model, thinking level, and fast mode, with live settings, model-role, and task-agent catalog metadata.

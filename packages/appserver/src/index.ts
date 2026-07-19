@@ -29,4 +29,5 @@ export {
 } from "./security/index.ts";
 export * from "./server.ts";
 export * from "./transcript-image-reader.ts";
+export * from "./transcript-search-index.ts";
 export * from "./types.ts";

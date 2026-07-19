@@ -328,6 +328,7 @@ async function defaultCreateAppserver(
 		operationsAuthority: runtime.operationsAuthority,
 		projectRootForProject: runtime.projectRootForProject,
 		usageAuthority: runtime.usageAuthority,
+		transcriptSearchAuthority: runtime.transcriptSearchAuthority,
 		lockCheck: runtime.lockCheck,
 		lockStatus: runtime.lockStatus,
 		transcriptImageRoot: getBlobsDir(),

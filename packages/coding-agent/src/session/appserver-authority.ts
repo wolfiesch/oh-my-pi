@@ -2,7 +2,13 @@ import { statSync } from "node:fs";
 import * as path from "node:path";
 import type { UsageReadResult } from "@oh-my-pi/app-wire";
 import { hostId, type ProjectId, type SessionId, sessionId } from "@oh-my-pi/app-wire";
-import type { LockCheckHook, SessionAuthority, SessionAuthoritySession, SessionRecord } from "@oh-my-pi/appserver";
+import type {
+	AppserverTranscriptSearchAuthority,
+	LockCheckHook,
+	SessionAuthority,
+	SessionAuthoritySession,
+	SessionRecord,
+} from "@oh-my-pi/appserver";
 import {
 	type DesktopOperationsAuthority,
 	FileSessionDiscovery,
@@ -10,6 +16,7 @@ import {
 	projectNameFromCwd,
 	projectSessionEntries,
 	stableProjectId,
+	TranscriptSearchIndex,
 } from "@oh-my-pi/appserver";
 import { getAgentDir, getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
 import type { ModelRegistry } from "../config/model-registry";
@@ -43,6 +50,7 @@ export interface AppserverRuntimeAuthorities {
 	discovery: { list(): Promise<SessionRecord[]> };
 	operationsAuthority: DesktopOperationsAuthority;
 	usageAuthority?: { read(signal: AbortSignal): Promise<UsageReadResult> };
+	transcriptSearchAuthority: AppserverTranscriptSearchAuthority;
 	projectRootForProject(project: ProjectId): Promise<string>;
 	projectRootForSession(session: SessionId): Promise<string>;
 	lockCheck: LockCheckHook;
@@ -67,6 +75,8 @@ export interface AppserverAuthorityOptions {
 	agentAuthority?: { cancel(agentId: string, sessionId: string): Promise<boolean> };
 	authStorage?: AuthStorage;
 	usageAuthority?: { read(signal: AbortSignal): Promise<UsageReadResult> };
+	/** Override the private profile-local transcript search database path. */
+	transcriptSearchPath?: string;
 }
 
 function settingsPort(settings: Settings): DesktopSettingsPort {
@@ -86,6 +96,9 @@ function settingsPort(settings: Settings): DesktopSettingsPort {
 export function createAppserverRuntime(options: AppserverAuthorityOptions = {}): AppserverRuntimeAuthorities {
 	const records = new Map<SessionId, SessionRecord>();
 	const sessionsDir = path.resolve(options.sessionsDir ?? getSessionsDir());
+	const transcriptSearchAuthority = new TranscriptSearchIndex(
+		path.resolve(options.transcriptSearchPath ?? path.join(getAgentDir(), "appserver", "transcript-search.sqlite")),
+	);
 	const lifecycle = new AppserverSessionLifecycleStore(
 		options.lifecycleMetadataPath ?? path.join(getAgentDir(), "appserver", "session-lifecycle.json"),
 		sessionsDir,
@@ -344,6 +357,7 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 		discovery,
 		operationsAuthority: operations,
 		...(usageAuthority ? { usageAuthority } : {}),
+		transcriptSearchAuthority,
 		projectRootForProject,
 		projectRootForSession,
 		lockCheck: appserverLockCheck,

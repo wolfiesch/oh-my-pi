@@ -32,6 +32,8 @@ import {
 	type SessionImageReadArguments,
 	type SessionRef,
 	type SessionStateResult,
+	type TranscriptContextArguments,
+	type TranscriptSearchArguments,
 	type UsageReadResult,
 	utf8ByteLength,
 } from "@oh-my-pi/app-wire";
@@ -93,11 +95,13 @@ import {
 	TranscriptEventTranslator,
 } from "./transcript-events.ts";
 import { TranscriptImageError, TranscriptImageReader } from "./transcript-image-reader.ts";
+import { TranscriptSearchError } from "./transcript-search-index.ts";
 import type {
 	AppserverDrainBusy,
 	AppserverDrainResult,
 	AppserverHandle,
 	AppserverOptions,
+	AppserverTranscriptSearchAuthority,
 	AppserverUsageAuthority,
 	ChildHandle,
 	Clock,
@@ -124,6 +128,7 @@ const ARCHIVED_SESSION_COMMANDS = new Set([
 	"files.list",
 	"files.diff",
 	"review.read",
+	"transcript.context",
 ]);
 const SESSION_LIFECYCLE_COMMANDS = new Set(["session.close", "session.archive", "session.restore", "session.delete"]);
 const IMAGE_UPLOAD_COMMANDS = new Set(["session.image.begin", "session.image.chunk", "session.image.discard"]);
@@ -148,6 +153,7 @@ const OBSERVER_READ_COMMANDS = new Set([
 	"review.read",
 	"preview.state",
 	"preview.capture",
+	"transcript.context",
 ]);
 const SUBAGENT_TRANSCRIPT_RPC_BYTES = 384 * 1024;
 const REMOTE_OUTBOUND_TRANSFORM_TIMEOUT_MS = 10_000;
@@ -522,7 +528,10 @@ async function publishOwnerAtomic(
 	return final;
 }
 export function appserverSupportedFeatures(
-	options: Pick<AppserverOptions, "operationsAuthority" | "supportedFeatures" | "transcriptImageRoot"> & {
+	options: Pick<
+		AppserverOptions,
+		"operationsAuthority" | "supportedFeatures" | "transcriptImageRoot" | "transcriptSearchAuthority"
+	> & {
 		readonly remotePolicy?: AppserverOptions["remotePolicy"];
 	},
 	includeRemotePolicy = false,
@@ -535,6 +544,7 @@ export function appserverSupportedFeatures(
 	}
 	const authority = options.operationsAuthority;
 	if (options.transcriptImageRoot) implementedFeatures.add("transcript.images");
+	if (options.transcriptSearchAuthority) implementedFeatures.add("transcript.search");
 	if (authority?.catalogGet) implementedFeatures.add("catalog.metadata");
 	if (authority?.settingsRead) implementedFeatures.add("settings.metadata");
 	if (authority?.termOpen && authority.terminalInput && authority.terminalResize && authority.terminalClose)
@@ -570,6 +580,9 @@ export class LocalAppserver implements AppserverHandle {
 	#authority?: SessionAuthority;
 	#operations?: DesktopOperationDispatcher;
 	#usageAuthority?: AppserverUsageAuthority;
+	#transcriptSearch?: AppserverTranscriptSearchAuthority;
+	#transcriptSearchReconcile?: Promise<unknown>;
+	#transcriptSearchRerun = false;
 	#factory: RpcChildFactory;
 	#imageUploads: ImageUploadStore;
 	#transcriptImages?: TranscriptImageReader;
@@ -672,6 +685,7 @@ export class LocalAppserver implements AppserverHandle {
 				})
 			: undefined;
 		this.#usageAuthority = options.usageAuthority;
+		this.#transcriptSearch = options.transcriptSearchAuthority;
 		this.#projectRootForProject = options.projectRootForProject;
 		this.#discovery = options.discovery ?? options.sessionAuthority ?? { list: async () => [] };
 		this.#imageUploads = new ImageUploadStore({ root: `${this.socketPath}.images` });
@@ -727,6 +741,8 @@ export class LocalAppserver implements AppserverHandle {
 	}
 	hasDesktopCatalogCommandHandler(command: string): boolean {
 		if (command === "usage.read") return this.#usageAuthority !== undefined;
+		if (command === "transcript.search" || command === "transcript.context")
+			return this.#transcriptSearch !== undefined;
 		if (this.#operations?.hasCommand(command)) return true;
 		return (
 			this.#handlers.has(command) ||
@@ -742,9 +758,15 @@ export class LocalAppserver implements AppserverHandle {
 		this.#closedSessions.clear();
 		if (!this.#hostProvided) this.hostId = await loadPersistentHostId(this.#hostIdPath);
 		await this.#attentionOutcomes?.load();
-		this.#records.clear();
-		this.#projections.clear();
-		await this.loadSessions();
+		try {
+			await this.#transcriptSearch?.initialize();
+			this.#records.clear();
+			this.#projections.clear();
+			await this.loadSessions();
+		} catch (error) {
+			await this.#transcriptSearch?.close();
+			throw error;
+		}
 		await ensureSecureSocketDirectory(this.socketPath);
 		const ownerId = randomUUID();
 		const paths = ownerPaths(this.socketPath, ownerId);
@@ -835,6 +857,7 @@ export class LocalAppserver implements AppserverHandle {
 			if (this.#stopping) throw new Error("appserver is stopping");
 			this.#runIdentity = { paths, record, marker: finalMarker };
 			this.#started = true;
+			this.scheduleTranscriptSearchReconcile();
 			if (this.#remotePolicy && this.#remoteEndpoint) {
 				const listener =
 					this.#remoteListener ??
@@ -862,6 +885,7 @@ export class LocalAppserver implements AppserverHandle {
 			try {
 				await this.cleanupPartial();
 			} finally {
+				await this.#transcriptSearch?.close();
 				await this.#imageUploads.stop().catch(() => undefined);
 			}
 			throw error;
@@ -917,6 +941,9 @@ export class LocalAppserver implements AppserverHandle {
 			this.#agentTranscripts.clear();
 			await Promise.allSettled([...this.#startPromises.values()]);
 			this.#startPromises.clear();
+			await this.#transcriptSearchReconcile?.catch(() => undefined);
+			this.#transcriptSearchReconcile = undefined;
+			this.#transcriptSearchRerun = false;
 			await this.#attentionOutcomes?.flush().catch(() => undefined);
 			this.#started = false;
 			const identity = this.#runIdentity;
@@ -930,6 +957,7 @@ export class LocalAppserver implements AppserverHandle {
 			this.#ownerHandle = undefined;
 		} finally {
 			this.#transcriptImages?.clear();
+			await this.#transcriptSearch?.close();
 			await this.#imageUploads.stop();
 		}
 	}
@@ -1139,6 +1167,7 @@ export class LocalAppserver implements AppserverHandle {
 				}),
 			};
 		if (command.command === "host.list" || command.command === "session.list") await this.refreshSessions();
+		else if (command.command === "transcript.search") await this.refreshTranscriptSearch();
 		const projection = command.sessionId ? this.#projections.get(command.sessionId) : undefined;
 		// Attach output is connection-scoped and rebuilt on every delivery. A
 		if (this.observerBarrierBlocks(command)) return this.observerBarrierOutcome(command);
@@ -1152,7 +1181,10 @@ export class LocalAppserver implements AppserverHandle {
 			};
 		// Read chunks can be hundreds of KiB. They are safe to recompute, so never
 		// retain their response bodies in the completed-command cache.
-		const bypassOutcomeCache = command.command === "session.image.read";
+		const bypassOutcomeCache =
+			command.command === "session.image.read" ||
+			command.command === "transcript.search" ||
+			command.command === "transcript.context";
 		const acceptedLifecycle = this.#messageLifecyclesByCommandId.get(command.commandId);
 		if (acceptedLifecycle?.accepted)
 			return acceptedLifecycle.commandHash === payloadHash(command)
@@ -1295,7 +1327,39 @@ export class LocalAppserver implements AppserverHandle {
 			// leave a late upload behind for a dead connection.
 			const registered = this.#handlers.has(command.command) ? await this.#handlers.dispatch(command) : undefined;
 			if (registered) outcome = registered;
-			else if (command.command === "host.list" || command.command === "session.list")
+			else if (command.command === "transcript.search") {
+				if (!this.#transcriptSearch)
+					outcome = {
+						frame: response(this.hostId, command, false, undefined, {
+							code: "unsupported",
+							message: "transcript search is unavailable",
+						}),
+					};
+				else {
+					const args = decodeCommandArguments(
+						command.command,
+						command.args,
+					) as unknown as TranscriptSearchArguments;
+					const result = await this.#transcriptSearch.search(args, controller.signal);
+					outcome = { frame: response(this.hostId, command, true, result) };
+				}
+			} else if (command.command === "transcript.context") {
+				if (!this.#transcriptSearch)
+					outcome = {
+						frame: response(this.hostId, command, false, undefined, {
+							code: "unsupported",
+							message: "transcript context is unavailable",
+						}),
+					};
+				else {
+					const args = decodeCommandArguments(
+						command.command,
+						command.args,
+					) as unknown as TranscriptContextArguments;
+					const result = await this.#transcriptSearch.context(command.sessionId!, args, controller.signal);
+					outcome = { frame: response(this.hostId, command, true, result) };
+				}
+			} else if (command.command === "host.list" || command.command === "session.list")
 				outcome = {
 					frame: response(this.hostId, command, true, {
 						cursor: { epoch: this.epoch, seq: 0 },
@@ -1708,6 +1772,7 @@ export class LocalAppserver implements AppserverHandle {
 				this.#projectTerminalStatus(command.sessionId!);
 			const imageError =
 				error instanceof ImageUploadError || error instanceof TranscriptImageError ? error : undefined;
+			const transcriptSearchError = error instanceof TranscriptSearchError ? error : undefined;
 			const operation =
 				this.#operations &&
 				ws &&
@@ -1720,19 +1785,27 @@ export class LocalAppserver implements AppserverHandle {
 					"session.list",
 					"host.list",
 				].includes(command.command);
-			const code = imageError
-				? imageError.code
-				: command.command === "session.ui.respond"
-					? "ui_request_invalid"
-					: operation && error && typeof error === "object" && "code" in error && typeof error.code === "string"
-						? error.code
-						: "outcome_unknown";
+			const code = transcriptSearchError
+				? transcriptSearchError.code
+				: imageError
+					? imageError.code
+					: command.command === "session.ui.respond"
+						? "ui_request_invalid"
+						: operation && error && typeof error === "object" && "code" in error && typeof error.code === "string"
+							? error.code
+							: "outcome_unknown";
 			outcome = {
 				frame: response(this.hostId, command, false, undefined, {
 					code,
-					message: imageError?.message ?? (operation ? "operation failed" : "command failed"),
+					message: transcriptSearchError
+						? transcriptSearchError.code === "transcript_anchor_not_found"
+							? "transcript entry no longer exists"
+							: transcriptSearchError.code === "transcript_cursor_stale"
+								? "transcript search cursor is stale"
+								: "transcript search cursor is invalid"
+						: (imageError?.message ?? (operation ? "operation failed" : "command failed")),
 				}),
-				unknown: !operation && !imageError,
+				unknown: !operation && !imageError && !transcriptSearchError,
 			};
 		} finally {
 			if (ws) this.#abortControllers.get(ws)?.delete(controller);
@@ -2052,6 +2125,7 @@ export class LocalAppserver implements AppserverHandle {
 			await this.#imageUploads.cleanupSession(sessionId);
 			await this.#authority.archive(record, archivedAt);
 			record.archivedAt = archivedAt;
+			this.scheduleTranscriptSearchReconcile();
 			await this.broadcastAttachedOrdered(
 				sessionId,
 				projection.appendEvent({ type: "session_archived", archivedAt }),
@@ -2089,6 +2163,7 @@ export class LocalAppserver implements AppserverHandle {
 			await this.#imageUploads.cleanupSession(sessionId);
 			await this.#authority.restore(record);
 			delete record.archivedAt;
+			this.scheduleTranscriptSearchReconcile();
 			await this.broadcastAttachedOrdered(sessionId, projection.appendEvent({ type: "session_restored" }));
 			const delta = projection.updateArchivedAt();
 			if (delta) await this.broadcastIndex(delta);
@@ -2127,6 +2202,7 @@ export class LocalAppserver implements AppserverHandle {
 			if (finalGuard) return this.lifecycleFailureOutcome(command, finalGuard);
 			await this.#imageUploads.cleanupSession(sessionId);
 			await this.#authority!.delete(record);
+			await this.#transcriptSearch?.deleteSession(sessionId);
 			this.cleanupObserverState(sessionId);
 			await this.broadcastAttachedOrdered(sessionId, projection.appendEvent({ type: "session_deleted" }));
 			await this.broadcastIndex(projection.remove());
@@ -3138,6 +3214,7 @@ export class LocalAppserver implements AppserverHandle {
 				this.cleanupObserverState(sessionId);
 				await this.#imageUploads.cleanupSession(sessionId);
 				this.#records.delete(sessionId);
+				await this.#transcriptSearch?.deleteSession(sessionId);
 				this.#projections.delete(sessionId);
 				await this.#attentionOutcomes?.delete(sessionId);
 				this.#closedSessions.delete(sessionId);
@@ -3150,6 +3227,42 @@ export class LocalAppserver implements AppserverHandle {
 				this.#lifecycleMutations.delete(sessionId);
 			}
 		}
+		this.scheduleTranscriptSearchReconcile();
+	}
+	private async refreshTranscriptSearch(): Promise<void> {
+		if (!this.#transcriptSearch) return;
+		// Mark the current coverage as building immediately, then coalesce any
+		// discovery changes into one follow-up pass. Search waits for the complete
+		// chain, but ordinary startup and session-list refreshes remain background work.
+		this.scheduleTranscriptSearchReconcile();
+		await this.refreshSessions();
+		this.scheduleTranscriptSearchReconcile();
+		while (this.#transcriptSearchReconcile) {
+			const reconcile = this.#transcriptSearchReconcile;
+			await reconcile;
+			// The scheduler's completion handler starts a requested follow-up pass.
+			// Yield one microtask so the loop observes that replacement promise.
+			await Promise.resolve();
+		}
+	}
+	private scheduleTranscriptSearchReconcile(): void {
+		if (!this.#transcriptSearch || this.#stopping) return;
+		if (this.#transcriptSearchReconcile) {
+			this.#transcriptSearchRerun = true;
+			return;
+		}
+		const authority = this.#transcriptSearch;
+		const records = [...this.#records.values()];
+		const reconcile = authority.reconcile(records);
+		this.#transcriptSearchReconcile = reconcile;
+		void reconcile
+			.catch(() => undefined)
+			.finally(() => {
+				if (this.#transcriptSearchReconcile === reconcile) this.#transcriptSearchReconcile = undefined;
+				if (!this.#transcriptSearchRerun) return;
+				this.#transcriptSearchRerun = false;
+				this.scheduleTranscriptSearchReconcile();
+			});
 	}
 	private cleanupObserverState(sessionId: SessionId): void {
 		const timer = this.#observerTimers.get(sessionId);

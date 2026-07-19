@@ -4,6 +4,7 @@
 
 ### Added
 
+- Add the negotiated `transcript.search` feature with strict, bounded host search and session context commands.
 - Add the strict, bounded `SessionRef.attention` summary for cross-session pending questions, approvals, plan reviews, and latest root outcomes.
 
 ## [0.5.10] - 2026-07-18
