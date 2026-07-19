@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+	ADDITIVE_FEATURES,
 	AppWireError,
 	COMMAND_DESCRIPTORS,
 	decodeClientFrame,
@@ -37,6 +38,7 @@ async function decodeServerOrClient(name: string): Promise<void> {
 
 test("transcript search descriptors and negotiated feature match the frozen authority contract", () => {
 	expect(PROTOCOL_FEATURES).toContain("transcript.search");
+	expect(ADDITIVE_FEATURES).toContain("transcript.search");
 	expect(COMMAND_DESCRIPTORS["transcript.search"]).toEqual({
 		capability: "sessions.read",
 		scope: "host",
