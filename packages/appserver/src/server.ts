@@ -1167,6 +1167,7 @@ export class LocalAppserver implements AppserverHandle {
 				}),
 			};
 		if (command.command === "host.list" || command.command === "session.list") await this.refreshSessions();
+		else if (command.command === "transcript.search") await this.refreshTranscriptSearch();
 		const projection = command.sessionId ? this.#projections.get(command.sessionId) : undefined;
 		// Attach output is connection-scoped and rebuilt on every delivery. A
 		if (this.observerBarrierBlocks(command)) return this.observerBarrierOutcome(command);
@@ -3227,6 +3228,22 @@ export class LocalAppserver implements AppserverHandle {
 			}
 		}
 		this.scheduleTranscriptSearchReconcile();
+	}
+	private async refreshTranscriptSearch(): Promise<void> {
+		if (!this.#transcriptSearch) return;
+		// Mark the current coverage as building immediately, then coalesce any
+		// discovery changes into one follow-up pass. Search waits for the complete
+		// chain, but ordinary startup and session-list refreshes remain background work.
+		this.scheduleTranscriptSearchReconcile();
+		await this.refreshSessions();
+		this.scheduleTranscriptSearchReconcile();
+		while (this.#transcriptSearchReconcile) {
+			const reconcile = this.#transcriptSearchReconcile;
+			await reconcile;
+			// The scheduler's completion handler starts a requested follow-up pass.
+			// Yield one microtask so the loop observes that replacement promise.
+			await Promise.resolve();
+		}
 	}
 	private scheduleTranscriptSearchReconcile(): void {
 		if (!this.#transcriptSearch || this.#stopping) return;

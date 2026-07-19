@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -16,7 +16,7 @@ import {
 	type TranscriptSearchResult,
 } from "@oh-my-pi/app-wire";
 import { appserverSupportedFeatures, createAppserver, type LocalAppserver } from "../src/server.ts";
-import { TranscriptSearchError } from "../src/transcript-search-index.ts";
+import { TranscriptSearchError, TranscriptSearchIndex } from "../src/transcript-search-index.ts";
 import type {
 	AppserverTranscriptSearchAuthority,
 	SessionAuthority,
@@ -41,6 +41,15 @@ function record(id: string, archivedAt?: string): SessionRecord {
 		...(archivedAt ? { archivedAt } : {}),
 		entries: [],
 	};
+}
+
+function transcriptMessage(id: string, text: string): string {
+	return `${JSON.stringify({
+		type: "message",
+		id,
+		timestamp: stamp,
+		message: { role: "assistant", content: [{ type: "text", text }] },
+	})}\n`;
 }
 
 class StaticDiscovery implements SessionDiscovery {
@@ -236,7 +245,7 @@ async function responseFor(
 
 async function startServer(
 	records: SessionRecord[],
-	transcriptSearchAuthority: FakeTranscriptSearchAuthority,
+	transcriptSearchAuthority: AppserverTranscriptSearchAuthority,
 	sessionAuthority?: SessionAuthority,
 ): Promise<{ appserver: LocalAppserver; client: RawUdsWebSocket; root: string }> {
 	const root = await mkdtemp(join(tmpdir(), "omp-transcript-search-server-"));
@@ -318,6 +327,51 @@ describe("transcript search appserver boundary", () => {
 				{ sessionId: "archived", args: { anchorId: entryId("anchor-1"), before: 3, after: 4 } },
 				{ sessionId: "archived", args: { anchorId: entryId("anchor-1"), before: 3, after: 4 } },
 			]);
+		} finally {
+			await cleanup(appserver, client, root);
+		}
+	});
+
+	test("refreshes appended transcripts and newly discovered sessions before serving search", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-transcript-search-live-"));
+		const firstPath = join(root, "first.jsonl");
+		const secondPath = join(root, "second.jsonl");
+		await Bun.write(firstPath, transcriptMessage("old", "original koala decision"));
+		const records = [{ ...record("first"), path: firstPath }];
+		const search = new TranscriptSearchIndex(join(root, "search.sqlite"));
+		const socketPath = join(root, "run", "app.sock");
+		const appserver = createAppserver({
+			hostId: host,
+			epoch: "transcript-search-live-test",
+			socketPath,
+			discovery: new StaticDiscovery(records),
+			transcriptSearchAuthority: search,
+		});
+		await appserver.start();
+		const { client } = await readyClient(socketPath);
+		try {
+			await appendFile(firstPath, transcriptMessage("recent", "recent narwhal conclusion"));
+			client.sendJson(hostCommand("recent-search", "recent-search", "transcript.search", { query: "narwhal" }));
+			expect(await responseFor(client, "recent-search")).toMatchObject({
+				ok: true,
+				result: {
+					items: [{ sessionId: "first", anchorId: "recent" }],
+					incomplete: false,
+					index: { state: "ready", indexedSessions: 1, knownSessions: 1 },
+				},
+			});
+
+			await Bun.write(secondPath, transcriptMessage("new-session", "new platypus architecture"));
+			records.push({ ...record("second"), path: secondPath });
+			client.sendJson(hostCommand("new-search", "new-search", "transcript.search", { query: "platypus" }));
+			expect(await responseFor(client, "new-search")).toMatchObject({
+				ok: true,
+				result: {
+					items: [{ sessionId: "second", anchorId: "new-session" }],
+					incomplete: false,
+					index: { state: "ready", indexedSessions: 2, knownSessions: 2 },
+				},
+			});
 		} finally {
 			await cleanup(appserver, client, root);
 		}
