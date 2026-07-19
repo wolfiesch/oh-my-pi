@@ -35,6 +35,7 @@ export const PROTOCOL_FEATURES = [
 	"prompt.lease",
 	"prompt.images",
 	"transcript.images",
+	"transcript.search",
 	"agent.lifecycle",
 	"agent.progress",
 	"agent.event",

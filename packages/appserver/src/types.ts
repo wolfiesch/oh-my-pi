@@ -13,6 +13,11 @@ import type {
 	SessionEvent,
 	SessionId,
 	SessionRef,
+	TranscriptContextArguments,
+	TranscriptContextResult,
+	TranscriptSearchArguments,
+	TranscriptSearchIndexStatus,
+	TranscriptSearchResult,
 	UsageReadResult,
 } from "@oh-my-pi/app-wire";
 import type { DesktopOperationsAuthority } from "./operations/dispatcher.ts";
@@ -153,6 +158,21 @@ export interface AppserverAdminCallbacks {
 export interface AppserverUsageAuthority {
 	read(signal: AbortSignal): Promise<UsageReadResult>;
 }
+export interface AppserverTranscriptSearchAuthority {
+	initialize(): Promise<void>;
+	reconcile(records: readonly SessionRecord[]): Promise<TranscriptSearchIndexStatus>;
+	search(
+		args: TranscriptSearchArguments,
+		signal: AbortSignal,
+	): Promise<TranscriptSearchResult> | TranscriptSearchResult;
+	context(
+		sessionId: SessionId,
+		args: TranscriptContextArguments,
+		signal: AbortSignal,
+	): Promise<TranscriptContextResult> | TranscriptContextResult;
+	deleteSession(sessionId: SessionId): Promise<void> | void;
+	close(): Promise<void> | void;
+}
 export interface AppserverOptions {
 	hostId?: HostId;
 	/** Persistent host identity path. Omitted to preserve the default OMP identity location. */
@@ -165,6 +185,8 @@ export interface AppserverOptions {
 	sessionAuthority?: SessionAuthority;
 	operationsAuthority?: DesktopOperationsAuthority;
 	usageAuthority?: AppserverUsageAuthority;
+	/** Rebuildable, profile-local index for bounded transcript search and read-around. */
+	transcriptSearchAuthority?: AppserverTranscriptSearchAuthority;
 	/** Maximum time allowed for one account-usage snapshot read. */
 	usageReadTimeoutMs?: number;
 	projectRootForProject?: (projectId: ProjectId) => Promise<string> | string;

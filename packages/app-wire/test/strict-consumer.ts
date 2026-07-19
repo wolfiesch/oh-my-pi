@@ -9,6 +9,8 @@ import {
 	hostId,
 	type ResultFrame,
 	requestId,
+	type TranscriptContextResult,
+	type TranscriptSearchResult,
 } from "../src/index.js";
 
 const command: CommandFrame = {
@@ -34,3 +36,9 @@ void decoded;
 void APP_WIRE_VERSION;
 void COMMAND_DESCRIPTORS["session.create"];
 void COMMAND_DESCRIPTORS["usage.read"];
+void COMMAND_DESCRIPTORS["transcript.search"];
+void COMMAND_DESCRIPTORS["transcript.context"];
+declare const searchResult: TranscriptSearchResult;
+declare const contextResult: TranscriptContextResult;
+void searchResult.index.generation;
+void contextResult.rows[contextResult.anchorIndex];

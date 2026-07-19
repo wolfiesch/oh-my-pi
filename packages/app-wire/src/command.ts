@@ -52,6 +52,12 @@ import {
 } from "./limits.js";
 import { decodeSessionListResult, decodeSessionRef, type SessionListResult } from "./session-index.js";
 import { decodeSessionStateResult } from "./session-state.js";
+import {
+	decodeTranscriptContextArguments,
+	decodeTranscriptContextResult,
+	decodeTranscriptSearchArguments,
+	decodeTranscriptSearchResult,
+} from "./transcript-search.js";
 import { decodeUsageReadResult } from "./usage.js";
 export type RevisionOwner = "none" | "session" | "authority";
 export interface CommandDescriptor {
@@ -73,6 +79,20 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 	"session.list": {
 		capability: "sessions.read",
 		scope: "host",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "none",
+	},
+	"transcript.search": {
+		capability: "sessions.read",
+		scope: "host",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "none",
+	},
+	"transcript.context": {
+		capability: "sessions.read",
+		scope: "session",
 		revision: "none",
 		revisionOwner: "none",
 		confirmation: "none",
@@ -837,6 +857,8 @@ function decodePauseResult(value: unknown): CommandResult {
 export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown) => CommandArguments>> = {
 	"host.list": args,
 	"session.list": args,
+	"transcript.search": value => decodeTranscriptSearchArguments(value) as unknown as CommandArguments,
+	"transcript.context": value => decodeTranscriptContextArguments(value) as unknown as CommandArguments,
 	"session.create": value => {
 		const x = args(value);
 		if (x.cwd !== undefined) fail("UNSAFE_PATH", "cwd is not accepted; use projectId", "args.cwd");
@@ -1035,6 +1057,8 @@ export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown)
 export const COMMAND_RESULT_DECODERS: Readonly<Record<string, (value: unknown) => CommandResult>> = {
 	"host.list": decodeSessions,
 	"session.list": decodeSessions,
+	"transcript.search": value => decodeTranscriptSearchResult(value) as unknown as CommandResult,
+	"transcript.context": value => decodeTranscriptContextResult(value) as unknown as CommandResult,
 	"session.create": decodeCreate,
 	"session.attach": decodeAttach,
 	"session.prompt": value => boolField(value, "accepted"),

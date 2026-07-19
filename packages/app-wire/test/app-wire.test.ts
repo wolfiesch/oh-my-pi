@@ -60,6 +60,8 @@ describe("app-wire authority", () => {
 			"pair-start.json",
 			"host-list.json",
 			"ping.json",
+			"transcript-search-request.json",
+			"transcript-context-request.json",
 		]);
 		for (const name of files) {
 			const value = await fixture(name);
@@ -904,6 +906,8 @@ describe("app-wire authority", () => {
 			"settings.write": "authority",
 			"host.list": "none",
 			"session.list": "none",
+			"transcript.search": "none",
+			"transcript.context": "none",
 			"session.create": "none",
 			"session.attach": "none",
 			"audit.read": "none",
