@@ -168,6 +168,30 @@ describe("Settings.reloadForCwd", () => {
 		}
 	});
 
+	it("can skip project discovery during a host daemon's initial settings load", async () => {
+		const testDir = path.join(os.tmpdir(), "test-settings-without-project-discovery", Snowflake.next());
+		const projectDir = path.join(testDir, "project");
+		try {
+			resetSettingsForTest();
+			fs.mkdirSync(getProjectAgentDir(projectDir), { recursive: true });
+			fs.writeFileSync(
+				path.join(getProjectAgentDir(projectDir), "settings.json"),
+				JSON.stringify({ compaction: { enabled: false } }),
+			);
+
+			const settings = await Settings.init({
+				cwd: projectDir,
+				inMemory: true,
+				loadProjectSettings: false,
+			});
+
+			expect(settings.get("compaction.enabled")).toBe(true);
+		} finally {
+			resetSettingsForTest();
+			if (fs.existsSync(testDir)) removeSyncWithRetries(testDir);
+		}
+	});
+
 	it("rejects a missing --config overlay instead of silently ignoring it", async () => {
 		const testDir = path.join(os.tmpdir(), "test-config-overlay-missing", Snowflake.next());
 		try {

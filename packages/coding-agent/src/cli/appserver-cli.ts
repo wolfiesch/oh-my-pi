@@ -261,7 +261,7 @@ function persistedServeConfig(settings: Pick<SettingsType, "get">): AppserverSer
 // Deliberately lazy: status and admin actions must not load Settings or the runtime graph.
 async function defaultLoadAppserverSettings(): Promise<SettingsType> {
 	const { Settings } = await import("../config/settings");
-	return Settings.init({ cwd: process.cwd() });
+	return Settings.init({ cwd: process.cwd(), loadProjectSettings: false });
 }
 
 // This is intentionally a lazy boundary: `status`, `pair`, `devices`, and `revoke` must not load the native PTY graph.
@@ -290,7 +290,7 @@ async function defaultCreateAppserver(
 	let settings: SettingsType | undefined = settingsOverride;
 	if (!settings) {
 		try {
-			settings = await Settings.init({ cwd });
+			settings = await Settings.init({ cwd, loadProjectSettings: false });
 		} catch {}
 	}
 	const runtimeOptions: Parameters<typeof createAppserverRuntime>[0] = {};

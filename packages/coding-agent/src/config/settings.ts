@@ -76,6 +76,8 @@ export interface SettingsDesktopSnapshot {
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
 	cwd?: string;
+	/** Load project settings during initialization by default; set false for host daemons to skip discovery */
+	loadProjectSettings?: boolean;
 	/** Agent directory for config.yml/config.yaml storage */
 	agentDir?: string;
 	/** Don't persist to disk (for tests) */
@@ -379,6 +381,8 @@ export class Settings {
 
 	/** Whether to persist changes */
 	#persist: boolean;
+	/** Whether the initial load should discover project-scoped settings */
+	#loadProjectSettingsOnInit: boolean;
 
 	private constructor(options: SettingsOptions = {}) {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
@@ -389,6 +393,7 @@ export class Settings {
 		if (options.configFiles) configFiles.push(...options.configFiles);
 		this.#configFiles = configFiles.map(file => path.resolve(this.#cwd, expandTilde(file)));
 		this.#persist = !options.inMemory && options.readOnly !== true;
+		this.#loadProjectSettingsOnInit = options.loadProjectSettings !== false;
 
 		if (options.overrides) {
 			for (const [key, value] of Object.entries(options.overrides)) {
@@ -1081,7 +1086,7 @@ export class Settings {
 		// persist steps remain sequential: existing config discovery decides
 		// whether migration may write config.yml before the global config is read;
 		// migration's db fallback needs #storage opened.
-		const projectPromise = this.#loadProjectSettings();
+		const projectPromise = this.#loadProjectSettingsOnInit ? this.#loadProjectSettings() : Promise.resolve({});
 
 		if (this.#persist) {
 			this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
@@ -1109,7 +1114,7 @@ export class Settings {
 	}
 
 	async #loadReadOnly(): Promise<Settings> {
-		const projectPromise = this.#loadProjectSettings();
+		const projectPromise = this.#loadProjectSettingsOnInit ? this.#loadProjectSettings() : Promise.resolve({});
 
 		const existingConfig = await this.#loadExistingMainYaml();
 		if (existingConfig) {
