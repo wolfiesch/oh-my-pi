@@ -17,6 +17,7 @@ export type WatchId = string & { readonly __watchId: unique symbol };
 export type LeaseId = string & { readonly __leaseId: unique symbol };
 export type OperationId = string & { readonly __operationId: unique symbol };
 export type PreviewId = string & { readonly __previewId: unique symbol };
+export type PreviewCaptureId = string & { readonly __previewCaptureId: unique symbol };
 export type CatalogId = string & { readonly __catalogId: unique symbol };
 export type DeviceId = string & { readonly __deviceId: unique symbol };
 export type ImageId = string & { readonly __imageId: unique symbol };
@@ -38,6 +39,7 @@ export const watchId = (v: unknown, p = "watchId"): WatchId => id<WatchId>(v, p)
 export const leaseId = (v: unknown, p = "leaseId"): LeaseId => id<LeaseId>(v, p);
 export const operationId = (v: unknown, p = "operationId"): OperationId => id<OperationId>(v, p);
 export const previewId = (v: unknown, p = "previewId"): PreviewId => id<PreviewId>(v, p);
+export const previewCaptureId = (v: unknown, p = "captureId"): PreviewCaptureId => id<PreviewCaptureId>(v, p);
 export const catalogId = (v: unknown, p = "catalogId"): CatalogId => id<CatalogId>(v, p);
 export const deviceId = (v: unknown, p = "deviceId"): DeviceId => id<DeviceId>(v, p);
 export const imageId = (value: unknown, path = "imageId"): ImageId => {

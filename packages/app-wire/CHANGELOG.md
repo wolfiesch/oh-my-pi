@@ -4,6 +4,7 @@
 
 ### Added
 
+- Add a bounded, ordered browser preview contract with backend-neutral authority metadata, capture chunking, tab controls, input actions, policy checks, cooperative leases, and human handoff.
 - Add the negotiated `transcript.search` feature with strict, bounded host search and session context commands.
 - Add the strict, bounded `SessionRef.attention` summary for cross-session pending questions, approvals, plan reviews, and latest root outcomes.
 

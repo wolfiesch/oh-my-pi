@@ -25,6 +25,7 @@ import {
 	MAX_FILE_BYTES,
 	MAX_INPUT_BYTES,
 	MAX_MAP_KEYS,
+	PREVIEW_CAPTURE_CHUNK_BYTES,
 	PROMPT_IMAGE_MAX_COUNT,
 	PROTOCOL_FEATURES,
 	safeRelativePath,
@@ -37,6 +38,17 @@ import {
 const root = new URL("../fixtures/v1/", import.meta.url);
 async function fixture(name: string): Promise<unknown> {
 	return JSON.parse(await Bun.file(new URL(name, root)).text()) as unknown;
+}
+
+function previewSnapshot(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		previewId: "preview-1",
+		state: "ready",
+		url: "https://example.com/",
+		revision: "preview-revision-1",
+		cursor: { epoch: "preview-1", seq: 1 },
+		...overrides,
+	};
 }
 
 describe("app-wire authority", () => {
@@ -689,13 +701,21 @@ describe("app-wire authority", () => {
 		expect(() => decodeServerFrame({ ...pairing, expiresAt: 1 })).toThrow(AppWireError);
 		expect(() => decodeServerFrame({ ...pairing, expiresAt: "x".repeat(129) })).toThrow(AppWireError);
 	});
-	test("preview captures require the declared base64 encoding", async () => {
+	test("preview captures carry bounded metadata instead of inline browser bytes", async () => {
 		const capture = (await fixture("preview-capture.json")) as Record<string, unknown>;
-		expect(decodeServerFrame(capture)).toMatchObject({ type: "preview.capture", encoding: "base64" });
-		const missingEncoding = { ...capture };
-		delete missingEncoding.encoding;
-		expect(() => decodeServerFrame(missingEncoding)).toThrow(AppWireError);
-		expect(() => decodeServerFrame({ ...capture, encoding: "utf8" })).toThrow(AppWireError);
+		expect(decodeServerFrame(capture)).toMatchObject({
+			type: "preview.capture",
+			capture: { captureId: "capture-1", mimeType: "image/png", size: 1 },
+		});
+		const missingMetadata = { ...capture };
+		delete missingMetadata.capture;
+		expect(() => decodeServerFrame(missingMetadata)).toThrow(AppWireError);
+		expect(() =>
+			decodeServerFrame({
+				...capture,
+				capture: { ...(capture.capture as Record<string, unknown>), mimeType: "text/html" },
+			}),
+		).toThrow(AppWireError);
 	});
 	test("authenticated hello fixtures reject partial/bad auth without echoing token", async () => {
 		const partial = await fixture("hello-auth-partial.invalid.json");
@@ -796,10 +816,17 @@ describe("app-wire authority", () => {
 				type: "preview.capture",
 				hostId: "h",
 				sessionId: "s",
-				previewId: "p",
-				content: "YQ==",
-				encoding: "base64",
-				mimeType: "image/png",
+				...previewSnapshot({
+					capture: {
+						captureId: "capture-1",
+						mimeType: "image/png",
+						size: 1,
+						width: 1,
+						height: 1,
+						capturedAt: 1,
+						sha256: "a".repeat(64),
+					},
+				}),
 			},
 		] as const;
 		for (const value of frames) expect(decodeServerFrame(value).type).toBe(value.type);
@@ -858,6 +885,51 @@ describe("app-wire authority", () => {
 			expect(descriptor).toBeDefined();
 		}
 	});
+	test("browser preview commands expose bounded controls, capture reads, leases, policy, and handoff", () => {
+		const validArguments: Record<string, Record<string, unknown>> = {
+			"preview.launch": { url: "https://example.com/", authorityId: "isolated" },
+			"preview.state": {},
+			"preview.activate": { previewId: "preview-1" },
+			"preview.navigate": { previewId: "preview-1", url: "https://example.com/next" },
+			"preview.back": { previewId: "preview-1" },
+			"preview.forward": { previewId: "preview-1" },
+			"preview.reload": { previewId: "preview-1" },
+			"preview.close": { previewId: "preview-1" },
+			"preview.capture": { previewId: "preview-1" },
+			"preview.capture.read": { previewId: "preview-1", captureId: "capture-1", offset: 0 },
+			"preview.click": { previewId: "preview-1", selector: "button[data-save]" },
+			"preview.fill": { previewId: "preview-1", selector: "input", text: "value" },
+			"preview.scroll": { previewId: "preview-1", deltaX: 0, deltaY: 100 },
+			"preview.type": { previewId: "preview-1", text: "value" },
+			"preview.select": { previewId: "preview-1", selector: "select", value: "one" },
+			"preview.press": { previewId: "preview-1", key: "Enter" },
+			"preview.upload": { previewId: "preview-1", selector: "input[type=file]", path: "uploads/a.txt" },
+			"preview.policy.check": { action: "navigate", url: "https://example.com/" },
+			"preview.lease.acquire": { previewId: "preview-1", ttlMs: 1_000 },
+			"preview.lease.renew": { previewId: "preview-1", leaseId: "lease-1", ttlMs: 1_000 },
+			"preview.lease.release": { previewId: "preview-1", leaseId: "lease-1" },
+			"preview.handoff": { previewId: "preview-1", message: "Complete sign-in", mode: "manual" },
+		};
+		for (const [command, args] of Object.entries(validArguments))
+			expect(decodeCommandArguments(command, args)).toMatchObject(args);
+
+		expect(COMMAND_DESCRIPTORS["preview.click"]).toMatchObject({
+			capability: "preview.input",
+			scope: "session",
+		});
+		expect(COMMAND_DESCRIPTORS["preview.launch"]?.confirmation).toBe("challenge");
+		expect(COMMAND_DESCRIPTORS["preview.upload"]?.confirmation).toBe("challenge");
+		expect(() =>
+			decodeCommandArguments("preview.click", { previewId: "preview-1", selector: "button", x: 1, y: 1 }),
+		).toThrow(AppWireError);
+		expect(() =>
+			decodeCommandArguments("preview.handoff", {
+				previewId: "preview-1",
+				message: "Complete sign-in",
+				mode: "selector",
+			}),
+		).toThrow(AppWireError);
+	});
 	test("every descriptor declares an exhaustive revision owner", () => {
 		const expected: Record<string, string> = {
 			"session.prompt": "session",
@@ -893,8 +965,26 @@ describe("app-wire authority", () => {
 			"prompt.lease.release": "session",
 			"preview.launch": "session",
 			"preview.state": "session",
+			"preview.activate": "session",
 			"preview.navigate": "session",
+			"preview.back": "session",
+			"preview.forward": "session",
+			"preview.reload": "session",
+			"preview.close": "session",
 			"preview.capture": "session",
+			"preview.capture.read": "none",
+			"preview.click": "session",
+			"preview.fill": "session",
+			"preview.scroll": "session",
+			"preview.type": "session",
+			"preview.select": "session",
+			"preview.press": "session",
+			"preview.upload": "session",
+			"preview.policy.check": "none",
+			"preview.lease.acquire": "session",
+			"preview.lease.renew": "session",
+			"preview.lease.release": "session",
+			"preview.handoff": "session",
 			"files.read": "authority",
 			"files.write": "authority",
 			"files.patch": "authority",
@@ -1107,10 +1197,29 @@ describe("app-wire authority", () => {
 		expect(decodeCommandResult("session.prompt", { accepted: true }).accepted).toBe(true);
 		expect(decodeCommandResult("term.open", { terminalId: "t" }).terminalId).toBe("t");
 		expect(() => decodeCommandResult("term.open", { terminalId: 1 })).toThrow(AppWireError);
-		expect(() => decodeCommandResult("preview.capture", { content: "not-base64" })).toThrow(AppWireError);
-		const maximumCapture = "A".repeat((MAX_FILE_BYTES / 3) * 4);
-		expect(decodeCommandResult("preview.capture", { content: maximumCapture }).content).toBe(maximumCapture);
-		expect(() => decodeCommandResult("preview.capture", { content: `${maximumCapture}AAAA` })).toThrow(AppWireError);
+		expect(decodeCommandResult("preview.capture", { preview: previewSnapshot() })).toMatchObject({
+			preview: { previewId: "preview-1" },
+		});
+		expect(() => decodeCommandResult("preview.capture", { preview: {} })).toThrow(AppWireError);
+		const maximumCapture = Buffer.alloc(PREVIEW_CAPTURE_CHUNK_BYTES).toString("base64");
+		const captureRead = {
+			previewId: "preview-1",
+			captureId: "capture-1",
+			size: PREVIEW_CAPTURE_CHUNK_BYTES,
+			offset: 0,
+			nextOffset: PREVIEW_CAPTURE_CHUNK_BYTES,
+			complete: true,
+			content: maximumCapture,
+		};
+		expect(decodeCommandResult("preview.capture.read", captureRead).content).toBe(maximumCapture);
+		expect(() =>
+			decodeCommandResult("preview.capture.read", {
+				...captureRead,
+				size: PREVIEW_CAPTURE_CHUNK_BYTES + 1,
+				nextOffset: PREVIEW_CAPTURE_CHUNK_BYTES + 1,
+				content: `${maximumCapture}AAAA`,
+			}),
+		).toThrow(AppWireError);
 		expect(() => decodeCommandResult("files.list", { entries: [{ path: "src", kind: "future" }] })).toThrow(
 			AppWireError,
 		);
