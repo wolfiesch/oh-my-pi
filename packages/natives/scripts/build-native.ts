@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { $ } from "bun";
 import { detectHostAvx2Support } from "../../../scripts/host-detect";
 import { generateEnumExports } from "./gen-enums";
+import { shouldRetryNapiBuildWithoutSccache } from "./sccache-fallback";
 
 // pcre2-sys prefers a system libpcre2 when pkg-config finds one. Release addons
 // must not retain host Homebrew paths such as /opt/homebrew/opt/pcre2/*.dylib.
@@ -398,12 +399,15 @@ if (!napiBin) {
 
 async function runNapiBuildWithSccacheFallback() {
 	let buildResult = await $`${napiBin} ${napiArgs}`.nothrow();
+	let stdout = buildResult.stdout?.toString("utf-8") ?? "";
 	let stderr = buildResult.stderr?.toString("utf-8") ?? "";
 	if (
-		buildResult.exitCode !== 0 &&
-		process.env.RUSTC_WRAPPER === "sccache" &&
-		stderr.includes("sccache: error") &&
-		stderr.includes("cache storage failed")
+		shouldRetryNapiBuildWithoutSccache({
+			exitCode: buildResult.exitCode,
+			rustcWrapper: process.env.RUSTC_WRAPPER,
+			stdout,
+			stderr,
+		})
 	) {
 		const retryEnv = { ...process.env };
 		delete retryEnv.RUSTC_WRAPPER;
@@ -412,17 +416,19 @@ async function runNapiBuildWithSccacheFallback() {
 		delete retryEnv.SCCACHE_REGION;
 		delete retryEnv.AWS_ACCESS_KEY_ID;
 		delete retryEnv.AWS_SECRET_ACCESS_KEY;
-		console.log("sccache storage unavailable; retrying native build without RUSTC_WRAPPER");
+		console.log("sccache unavailable; retrying native build without RUSTC_WRAPPER");
 		buildResult = await $`${napiBin} ${napiArgs}`.env(retryEnv).nothrow();
+		stdout = buildResult.stdout?.toString("utf-8") ?? "";
 		stderr = buildResult.stderr?.toString("utf-8") ?? "";
 	}
-	return { buildResult, stderr };
+	return { buildResult, stdout, stderr };
 }
 
 try {
-	const { buildResult, stderr } = await runNapiBuildWithSccacheFallback();
+	const { buildResult, stdout, stderr } = await runNapiBuildWithSccacheFallback();
 	if (buildResult.exitCode !== 0) {
-		throw new Error(`napi build failed${stderr ? `:\n${stderr}` : ""}`);
+		const diagnostics = stdout && stderr ? `${stdout}\n${stderr}` : stdout || stderr;
+		throw new Error(`napi build failed${diagnostics ? `:\n${diagnostics}` : ""}`);
 	}
 
 	const builtAddonPath = await resolveBuiltAddonPath(buildOutputDir, canonicalAddonFilename);

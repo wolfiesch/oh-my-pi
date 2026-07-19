@@ -176,6 +176,7 @@ function makeFileTransport(dir?: string): winston.transport {
 		dirname: logsDir,
 		filename: `omp.%DATE%.${process.pid}.log`,
 		datePattern: "YYYY-MM-DD",
+		utc: true,
 		maxSize: "10m",
 		maxFiles: 5,
 		zippedArchive: false,
