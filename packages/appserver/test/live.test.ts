@@ -6141,7 +6141,24 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		});
 		try {
 			await appserver.start();
-			const client = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage"]);
+			const unnegotiated = await readyClient(appserver.socketPath, ["sessions.read", "sessions.manage"]);
+			unnegotiated.client.sendJson(
+				hostCommand("reveal-unnegotiated", "reveal-unnegotiated", "project.reveal", {
+					projectId: stableProjectId(projectAlias),
+				}),
+			);
+			const denied = await untilResponse(unnegotiated.client, "reveal-unnegotiated");
+			expect(denied.response).toMatchObject({
+				ok: false,
+				error: { code: "UNSUPPORTED_FEATURE", details: { feature: "project.reveal" } },
+			});
+			expect(revealed).toEqual([]);
+
+			const client = await readyClient(
+				appserver.socketPath,
+				["sessions.read", "sessions.manage"],
+				["resume", "project.reveal"],
+			);
 			client.client.sendJson(
 				hostCommand("reveal-project", "reveal-project", "project.reveal", {
 					projectId: stableProjectId(projectAlias),
@@ -6151,7 +6168,7 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 			expect(outcome.response).toMatchObject({ ok: true, result: { revealed: true } });
 			expect(outcome.response).not.toHaveProperty("result.path");
 			expect(revealed).toEqual([await realpath(projectRoot)]);
-			await closeClients([client.client]);
+			await closeClients([unnegotiated.client, client.client]);
 		} finally {
 			await appserver.stop();
 			await rm(root, { recursive: true, force: true });

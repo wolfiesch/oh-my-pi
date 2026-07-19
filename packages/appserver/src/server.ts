@@ -1888,8 +1888,8 @@ export class LocalAppserver implements AppserverHandle {
 		return { sessionId: record.sessionId };
 	}
 	private async resolveProjectRoot(value: unknown): Promise<string> {
-		if (!this.#projectRootForProject) throw new Error("session project resolver is unavailable");
-		if (typeof value !== "string") throw new Error("session projectId is invalid");
+		if (!this.#projectRootForProject) throw new Error("project resolver is unavailable");
+		if (typeof value !== "string") throw new Error("projectId is invalid");
 		const requestedProject = projectId(value);
 		const requestedCwd = await this.#projectRootForProject(requestedProject);
 		if (typeof requestedCwd !== "string" || !requestedCwd.startsWith("/"))
