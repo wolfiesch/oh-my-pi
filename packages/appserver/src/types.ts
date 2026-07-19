@@ -177,6 +177,40 @@ export interface AppserverTranscriptSearchAuthority {
 	deleteSession(sessionId: SessionId): Promise<void> | void;
 	close(): Promise<void> | void;
 }
+export interface AppserverTestSeedRequest {
+	readonly runId: string;
+	readonly projectRoot: string;
+	readonly sessionCount: number;
+	readonly historyEntries: number;
+}
+export interface AppserverTestControlStatus {
+	readonly v: 1;
+	readonly runId: string;
+	readonly profile: string;
+	readonly state: "seeded" | "clean";
+	readonly sessions: { readonly seeded: number; readonly indexed: number };
+	readonly locks: {
+		readonly live: number;
+		readonly suspect: number;
+		readonly stale: number;
+		readonly malformed: number;
+	};
+	readonly workers: {
+		readonly supervisors: number;
+		readonly starting: number;
+		readonly pendingRpc: number;
+	};
+	readonly remainingFiles: number;
+	readonly errors: readonly string[];
+}
+export interface AppserverTestControl {
+	readonly token: string;
+	sessionIds(runId: string): Promise<readonly SessionId[]>;
+	seed(request: AppserverTestSeedRequest): Promise<AppserverTestControlStatus>;
+	status(runId: string): Promise<AppserverTestControlStatus>;
+	cleanup(runId: string): Promise<AppserverTestControlStatus>;
+}
+
 export interface AppserverOptions {
 	hostId?: HostId;
 	/** Persistent host identity path. Omitted to preserve the default OMP identity location. */
@@ -219,6 +253,8 @@ export interface AppserverOptions {
 	remoteResolver?: { resolve(address: string): Promise<RemotePeerIdentity> };
 	remoteListener?: BunRemoteListener;
 	admin?: AppserverAdminCallbacks;
+	/** Local-UDS-only deterministic integration control. Omitted outside explicit test mode. */
+	testControl?: AppserverTestControl;
 }
 export interface AppserverDrainBusy {
 	readonly connections: number;

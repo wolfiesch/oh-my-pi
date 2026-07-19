@@ -1,7 +1,7 @@
 import * as http from "node:http";
 import { isIP } from "node:net";
 import { isAbsolute, join } from "node:path";
-import type { AppserverDrainBusy, AppserverDrainResult, AppserverHandle } from "@oh-my-pi/appserver";
+import type { AppserverDrainBusy, AppserverDrainResult, AppserverHandle, AppserverOptions } from "@oh-my-pi/appserver";
 import { createRemoteAppserver, profileSocketPath } from "@oh-my-pi/appserver";
 import { getActiveProfile, getAgentDir, getBlobsDir, getProfileRootDir, postmortem } from "@oh-my-pi/pi-utils";
 import type { Settings as SettingsType } from "../config/settings";
@@ -264,6 +264,16 @@ async function defaultLoadAppserverSettings(): Promise<SettingsType> {
 	return Settings.init({ cwd: process.cwd(), loadProjectSettings: false });
 }
 
+export function validateAppserverTestProfile(
+	expectedProfile: string | undefined,
+	activeProfile = getActiveProfile(),
+): string {
+	if (!expectedProfile || !activeProfile || expectedProfile !== activeProfile) {
+		throw new Error("OMP_APP_TEST_PROFILE must match an explicit active profile");
+	}
+	return activeProfile;
+}
+
 // This is intentionally a lazy boundary: `status`, `pair`, `devices`, and `revoke` must not load the native PTY graph.
 async function defaultCreateAppserver(
 	config?: AppserverServeConfig,
@@ -272,6 +282,7 @@ async function defaultCreateAppserver(
 	const [
 		{ createAppserver },
 		{ createAppserverRuntime },
+		{ createAppserverTestControl },
 		{ Settings },
 		sdk,
 		modelModule,
@@ -280,6 +291,7 @@ async function defaultCreateAppserver(
 	] = await Promise.all([
 		import("@oh-my-pi/appserver"),
 		import("../session/appserver-authority"),
+		import("../session/appserver-test-control"),
 		import("../config/settings"),
 		import("../sdk"),
 		import("../config/model-registry"),
@@ -319,8 +331,21 @@ async function defaultCreateAppserver(
 	try {
 		runtimeOptions.pluginManager = new pluginModule.PluginManager(cwd);
 	} catch {}
+	const testMode = process.env.OMP_APP_TEST_MODE === "1";
+	const testToken = process.env.OMP_APP_TEST_TOKEN;
+	const testProjectRoot = process.env.OMP_APP_TEST_PROJECT_ROOT;
+	const expectedTestProfile = process.env.OMP_APP_TEST_PROFILE;
+	let testProfile: string | undefined;
+	if (testMode) {
+		if (config?.remoteMode) throw new Error("appserver test control is local-only");
+		if (!testToken || byteLength(testToken) < 32 || byteLength(testToken) > 256)
+			throw new Error("OMP_APP_TEST_TOKEN must contain 32 to 256 bytes");
+		if (!testProjectRoot || !isAbsolute(testProjectRoot))
+			throw new Error("OMP_APP_TEST_PROJECT_ROOT must be an absolute path");
+		testProfile = validateAppserverTestProfile(expectedTestProfile);
+	}
 	const runtime = createAppserverRuntime(runtimeOptions);
-	const base = {
+	const base: AppserverOptions = {
 		...getCodingAgentAppserverIdentity(),
 		...activeAppserverLocalIdentity(),
 		sessionAuthority: runtime.sessionAuthority,
@@ -341,6 +366,14 @@ async function defaultCreateAppserver(
 		lockStatus: runtime.lockStatus,
 		transcriptImageRoot: getBlobsDir(),
 	};
+	if (testMode && testToken && testProjectRoot && testProfile) {
+		base.testControl = createAppserverTestControl({
+			token: testToken,
+			allowedProjectRoot: testProjectRoot,
+			profile: testProfile,
+			sessionAuthority: runtime.sessionAuthority,
+		});
+	}
 	if (!config?.remoteMode) return createAppserver(base);
 	if (!config.remoteAddress || !config.remoteStateDir)
 		throw new Error("remote mode requires address and state directory");

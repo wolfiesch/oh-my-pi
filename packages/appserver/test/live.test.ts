@@ -14,7 +14,7 @@ import {
 	symlink,
 	writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	decodeServerFrame,
@@ -26,7 +26,11 @@ import {
 	type UsageReadResult,
 } from "@oh-my-pi/app-wire";
 import { appserverLockCheck } from "../../coding-agent/src/session/appserver-authority";
-import { inspectSessionLock } from "../../coding-agent/src/session/session-lock";
+import {
+	inspectSessionLock,
+	SESSION_LOCK_PROTOCOL_VERSION,
+	SESSION_LOCK_STEAL_AFTER_MS,
+} from "../../coding-agent/src/session/session-lock";
 import { stableProjectId } from "../src/discovery.ts";
 import { unixSocketActive } from "../src/identity.ts";
 import type { DesktopOperationsAuthority } from "../src/operations/dispatcher.ts";
@@ -5330,6 +5334,35 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 
 		await closeClients([client.client]);
 		await appserver.stop();
+	});
+
+	test("appserver control reclaims a stealable stale session lock", async () => {
+		const root = await realpath(await mkdtemp(join(tmpdir(), "omp-appserver-stale-lock-")));
+		const sessionPath = join(root, "session.jsonl");
+		const lockPath = `${sessionPath}.lock`;
+		await writeFile(sessionPath, `${JSON.stringify({ type: "session", id: "s1", cwd: root })}\n`);
+		const staleAt = Date.now() - SESSION_LOCK_STEAL_AFTER_MS - 1_000;
+		await writeFile(
+			lockPath,
+			JSON.stringify({
+				protocolVersion: SESSION_LOCK_PROTOCOL_VERSION,
+				ownerId: "00000000-0000-4000-8000-000000000001",
+				pid: 2_147_483_647,
+				processStartMarker: "test:dead-owner",
+				hostname: hostname(),
+				createdAt: staleAt,
+				heartbeatAt: staleAt,
+				sessionFile: sessionPath,
+			}),
+		);
+
+		try {
+			expect(inspectSessionLock(sessionPath)).toMatchObject({ status: "stale", stealable: true });
+			expect(() => appserverLockCheck({ ...record("s1"), path: sessionPath })).not.toThrow();
+			expect(inspectSessionLock(sessionPath).status).toBe("missing");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 
 	test("a real RPC child releases its session lock when stdin reaches EOF", async () => {

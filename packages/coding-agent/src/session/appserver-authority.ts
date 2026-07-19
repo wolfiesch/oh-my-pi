@@ -43,7 +43,7 @@ import {
 	type DesktopReviewApplyRequest,
 	type DesktopReviewReadRequest,
 } from "./desktop-operations-authority";
-import { inspectSessionLock } from "./session-lock";
+import { acquireSessionLock, inspectSessionLock } from "./session-lock";
 import { SessionManager } from "./session-manager";
 
 export interface AppserverRuntimeAuthorities {
@@ -381,7 +381,12 @@ export function createAppserverAuthority(): SessionAuthority {
 
 export const appserverLockCheck: LockCheckHook = session => {
 	const inspection = inspectSessionLock(session.path);
-	if (inspection.status !== "missing") throw new Error(`session lock is ${inspection.status}`);
+	if (inspection.status === "missing") return;
+	if (inspection.status === "stale" && inspection.stealable) {
+		acquireSessionLock(session.path).release();
+		return;
+	}
+	throw new Error(`session lock is ${inspection.status}`);
 };
 
 export type AppserverSessionLockStatus = "missing" | "live" | "suspect" | "stale" | "malformed";

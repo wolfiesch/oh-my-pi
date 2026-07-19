@@ -19,6 +19,7 @@ import {
 	runAppserverServe,
 	runAppserverStatus,
 	validateAppserverServeConfig,
+	validateAppserverTestProfile,
 } from "@oh-my-pi/pi-coding-agent/cli/appserver-cli";
 import { commands, isSubcommand } from "@oh-my-pi/pi-coding-agent/cli-commands";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -170,6 +171,19 @@ describe("appserver CLI routing", () => {
 			state: "stopped",
 			reason: "unreachable",
 		});
+	});
+
+	test("test mode requires an explicit matching named profile", () => {
+		expect(() => validateAppserverTestProfile(undefined, undefined)).toThrow(
+			"OMP_APP_TEST_PROFILE must match an explicit active profile",
+		);
+		expect(() => validateAppserverTestProfile("continuity-a", undefined)).toThrow(
+			"OMP_APP_TEST_PROFILE must match an explicit active profile",
+		);
+		expect(() => validateAppserverTestProfile("continuity-a", "continuity-b")).toThrow(
+			"OMP_APP_TEST_PROFILE must match an explicit active profile",
+		);
+		expect(validateAppserverTestProfile("continuity-a", "continuity-a")).toBe("continuity-a");
 	});
 
 	test("serve starts once, stops once, and removes both signal listeners", async () => {

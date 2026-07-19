@@ -101,6 +101,9 @@ import type {
 	AppserverDrainResult,
 	AppserverHandle,
 	AppserverOptions,
+	AppserverTestControl,
+	AppserverTestControlStatus,
+	AppserverTestSeedRequest,
 	AppserverTranscriptSearchAuthority,
 	AppserverUsageAuthority,
 	ChildHandle,
@@ -669,6 +672,7 @@ export class LocalAppserver implements AppserverHandle {
 	#agentTranscripts = new Map<SessionId, AgentTranscriptProjection>();
 	#startPromises = new Map<SessionId, Promise<RpcChildSupervisor>>();
 	#lifecycleMutations = new Set<SessionId>();
+	#testControlMutations = new Set<Promise<Response>>();
 	#inflightSessionOperations = new Map<SessionId, number>();
 	#closedSessions = new Set<SessionId>();
 	#idempotency: IdempotencyStore;
@@ -692,6 +696,7 @@ export class LocalAppserver implements AppserverHandle {
 	#remoteListener?: BunRemoteListener;
 	#remotePolicy?: RemoteConnectionPolicy;
 	#admin?: AppserverOptions["admin"];
+	#testControl?: AppserverOptions["testControl"];
 	#remoteEndpoint?: RemoteListenerConfig;
 	#remoteResolver?: AppserverOptions["remoteResolver"];
 	#started = false;
@@ -716,6 +721,18 @@ export class LocalAppserver implements AppserverHandle {
 	#projectRootForProject?: AppserverOptions["projectRootForProject"];
 	#projectRevealer?: AppserverOptions["projectRevealer"];
 	constructor(options: AppserverOptions = {}) {
+		if (options.testControl && (options.remoteEndpoint || options.remoteListener)) {
+			throw new Error("appserver test control is local-only");
+		}
+		if (options.testControl) {
+			if (process.env.OMP_APP_TEST_MODE !== "1") {
+				throw new Error("appserver test control requires OMP_APP_TEST_MODE=1");
+			}
+			const tokenBytes = utf8ByteLength(options.testControl.token);
+			if (tokenBytes < 32 || tokenBytes > 256) {
+				throw new Error("appserver test control token must contain 32 to 256 bytes");
+			}
+		}
 		this.#hostProvided = Boolean(options.hostId);
 		this.hostId = options.hostId ?? createHostId();
 		this.#hostIdPath = options.hostIdPath;
@@ -731,6 +748,7 @@ export class LocalAppserver implements AppserverHandle {
 		this.#remoteEndpoint = options.remoteEndpoint;
 		this.#remoteResolver = options.remoteResolver;
 		this.#admin = options.admin;
+		this.#testControl = options.testControl;
 		this.#remoteListener = options.remoteListener;
 		this.#clock = options.clock ?? clock;
 		this.#idempotency = new IdempotencyStore({ now: () => this.#clock.now().getTime() });
@@ -957,7 +975,14 @@ export class LocalAppserver implements AppserverHandle {
 		}
 	}
 	async stop(): Promise<void> {
-		if (!this.#started && !this.#server && !this.#ownerLock && this.#startPromises.size === 0) return;
+		if (
+			!this.#started &&
+			!this.#server &&
+			!this.#ownerLock &&
+			this.#startPromises.size === 0 &&
+			this.#testControlMutations.size === 0
+		)
+			return;
 		this.#stopping = true;
 		this.#inventoryGeneration += 1;
 		this.#sessionRefresh = undefined;
@@ -985,6 +1010,8 @@ export class LocalAppserver implements AppserverHandle {
 					await rename(this.#runIdentity.paths.backingPath, displaced);
 				}
 			}
+			await Promise.allSettled([...this.#testControlMutations]);
+			this.#testControlMutations.clear();
 			server?.stop(true);
 			if (displaced) {
 				try {
@@ -3567,7 +3594,7 @@ export class LocalAppserver implements AppserverHandle {
 		} catch {
 			promotionLockStatus = "malformed";
 		}
-		if (promotionLockStatus !== "missing") return;
+		if (promotionLockStatus !== "missing" && promotionLockStatus !== "stale") return;
 		const attemptFingerprint = this.promotionFingerprint(record, projection, poll);
 		if (this.#promotionFailures.get(sessionId) === attemptFingerprint) return;
 		let supervisor: RpcChildSupervisor;
@@ -3759,6 +3786,9 @@ export class LocalAppserver implements AppserverHandle {
 		if (url.pathname === "/admin/pair-ticket") return this.adminPairTicket(request);
 		if (url.pathname === "/admin/devices") return this.adminDevices(request);
 		if (url.pathname === "/admin/revoke") return this.adminRevoke(request);
+		if (url.pathname === "/admin/test/seed") return this.#adminTestSeed(request);
+		if (url.pathname === "/admin/test/status") return this.#adminTestStatus(request);
+		if (url.pathname === "/admin/test/cleanup") return this.#adminTestCleanup(request);
 		if (
 			url.pathname !== "/ws" ||
 			request.method !== "GET" ||
@@ -3868,6 +3898,155 @@ export class LocalAppserver implements AppserverHandle {
 		} finally {
 			this.#inflightLifecycleMutations -= 1;
 		}
+	}
+	async #quiesceTestSessions(control: AppserverTestControl, runId: string): Promise<void> {
+		for (const id of await control.sessionIds(runId)) {
+			clearInterval(this.#observerTimers.get(id));
+			this.#observerTimers.delete(id);
+			await this.#observerRefreshes.get(id)?.promise.catch(() => undefined);
+			await this.#startPromises.get(id)?.catch(() => undefined);
+			const supervisor = this.#supervisors.get(id);
+			if (supervisor) await this.discardPromotionSupervisor(id, supervisor);
+			this.#observers.delete(id);
+			this.#promotionFailures.delete(id);
+		}
+	}
+	async #evictTestSession(sessionId: SessionId): Promise<void> {
+		const projection = this.#projections.get(sessionId);
+		if (projection) await this.broadcastIndex(projection.remove());
+		this.cleanupObserverState(sessionId);
+		await this.#imageUploads.cleanupSession(sessionId);
+		this.#records.delete(sessionId);
+		await this.#transcriptSearch?.deleteSession(sessionId);
+		this.#projections.delete(sessionId);
+		await this.#attentionOutcomes?.delete(sessionId);
+		this.#closedSessions.delete(sessionId);
+		this.#releaseAllMessageLifecycles(sessionId, "completed-without-entry");
+		this.#stateRefreshGenerations.delete(sessionId);
+		this.#transcripts.delete(sessionId);
+		this.#sessionLoads.delete(sessionId);
+		this.#createdPending.delete(sessionId);
+		this.#discoveryMisses.delete(sessionId);
+		this.disposeSubagentState(sessionId);
+		for (const sessions of this.#attached.values()) sessions.delete(sessionId);
+	}
+	async #runTestControlMutation(operation: () => Promise<Response>): Promise<Response> {
+		if (this.#draining || this.#stopping) return this.adminError(503);
+		this.#inflightLifecycleMutations += 1;
+		const pending = operation();
+		this.#testControlMutations.add(pending);
+		try {
+			return await pending;
+		} finally {
+			this.#testControlMutations.delete(pending);
+			this.#inflightLifecycleMutations -= 1;
+		}
+	}
+	#authorizedTestControl(request: Request): AppserverOptions["testControl"] | undefined {
+		const control = this.#testControl;
+		if (!control || request.headers.get("authorization") !== `Bearer ${control.token}`) return undefined;
+		return control;
+	}
+	async #testControlStatus(
+		control: AppserverTestControl,
+		runId: string,
+		status: AppserverTestControlStatus,
+	): Promise<AppserverTestControlStatus> {
+		const sessionIds = await control.sessionIds(runId);
+		let supervisors = 0;
+		let starting = 0;
+		let pendingRpc = 0;
+		for (const sessionId of sessionIds) {
+			const supervisor = this.#supervisors.get(sessionId);
+			if (supervisor) {
+				supervisors += 1;
+				if (supervisor.hasPendingCalls()) pendingRpc += 1;
+			}
+			if (this.#startPromises.has(sessionId)) starting += 1;
+		}
+		return {
+			...status,
+			workers: { supervisors, starting, pendingRpc },
+		};
+	}
+	async #adminTestSeed(request: Request): Promise<Response> {
+		const control = this.#authorizedTestControl(request);
+		if (!control) return this.adminError(404);
+		if (this.#draining || this.#stopping) return this.adminError(503);
+		const body = await this.adminJson(request, ["runId", "projectRoot", "sessionCount", "historyEntries"]);
+		if (body instanceof Response) return body;
+		if (
+			typeof body.runId !== "string" ||
+			body.runId.length === 0 ||
+			body.runId.length > 128 ||
+			typeof body.projectRoot !== "string" ||
+			body.projectRoot.length === 0 ||
+			body.projectRoot.length > 4096 ||
+			typeof body.sessionCount !== "number" ||
+			!Number.isSafeInteger(body.sessionCount) ||
+			body.sessionCount < 1 ||
+			body.sessionCount > 100 ||
+			typeof body.historyEntries !== "number" ||
+			!Number.isSafeInteger(body.historyEntries) ||
+			body.historyEntries < 0 ||
+			body.historyEntries > 10_000
+		)
+			return this.adminError();
+		const seedRequest: AppserverTestSeedRequest = {
+			runId: body.runId,
+			projectRoot: body.projectRoot,
+			sessionCount: body.sessionCount,
+			historyEntries: body.historyEntries,
+		};
+		return this.#runTestControlMutation(async () => {
+			try {
+				await control.seed(seedRequest);
+				await this.refreshSessions();
+				const status = await this.#testControlStatus(
+					control,
+					seedRequest.runId,
+					await control.status(seedRequest.runId),
+				);
+				return Response.json(status);
+			} catch {
+				return this.adminError(500);
+			}
+		});
+	}
+	async #adminTestStatus(request: Request): Promise<Response> {
+		const control = this.#authorizedTestControl(request);
+		if (!control) return this.adminError(404);
+		const body = await this.adminJson(request, ["runId"]);
+		if (body instanceof Response) return body;
+		if (typeof body.runId !== "string" || body.runId.length === 0 || body.runId.length > 128)
+			return this.adminError();
+		try {
+			return Response.json(await this.#testControlStatus(control, body.runId, await control.status(body.runId)));
+		} catch {
+			return this.adminError(500);
+		}
+	}
+	async #adminTestCleanup(request: Request): Promise<Response> {
+		const control = this.#authorizedTestControl(request);
+		if (!control) return this.adminError(404);
+		if (this.#draining || this.#stopping) return this.adminError(503);
+		const body = await this.adminJson(request, ["runId"]);
+		if (body instanceof Response) return body;
+		if (typeof body.runId !== "string" || body.runId.length === 0 || body.runId.length > 128)
+			return this.adminError();
+		const runId = body.runId;
+		return this.#runTestControlMutation(async () => {
+			try {
+				const sessionIds = await control.sessionIds(runId);
+				await this.#quiesceTestSessions(control, runId);
+				const result = await control.cleanup(runId);
+				for (const sessionId of sessionIds) await this.#evictTestSession(sessionId);
+				await this.refreshSessions();
+				return Response.json(await this.#testControlStatus(control, runId, result));
+			} catch {
+				return this.adminError(500);
+			}
+		});
 	}
 }
 interface ServerWebSocketData {
