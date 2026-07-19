@@ -43,9 +43,9 @@ import type {
 	Tool,
 	ToolCall,
 } from "../types";
+import { isDemotedThinking } from "../utils/block-symbols";
 import { deterministicUuid } from "../utils/deterministic-id";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { isDemotedThinking } from "../utils/block-symbols";
 import { toolWireSchema } from "../utils/schema/wire";
 import { transformMessages } from "./transform-messages";
 
