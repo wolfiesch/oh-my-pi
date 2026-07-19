@@ -698,11 +698,9 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
 			}
 	}
 	if (!lines.length) throw new Error("empty transcript");
-	for (const line of lines) {
+	const parseTranscriptObject = (line: string | Uint8Array): Record<string, unknown> => {
 		if ((typeof line === "string" ? encoder.encode(line).byteLength : line.byteLength) > MAX_LINE_BYTES)
 			throw new Error("transcript line exceeds limit");
-	}
-	const parseTranscriptObject = (line: string | Uint8Array): Record<string, unknown> => {
 		const value = parseBounded(line);
 		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid transcript entry");
 		return value as Record<string, unknown>;
@@ -1197,7 +1195,37 @@ export class FileSessionDiscovery implements SessionDiscovery {
 		private readonly root: string,
 		private readonly fs: DiscoveryFileSystem = realFs,
 		private readonly host: HostId = hostId("discovery"),
+		private readonly lazyEntries = false,
 	) {}
+	private async parse(path: string, size: number, metadataOnly: boolean): Promise<SessionRecord> {
+		if (size > MAX_TRANSCRIPT_BYTES) {
+			const readSlice = this.fs.readFileSlice;
+			if (!readSlice) throw new Error("oversized transcript has no bounded reader");
+			return parseSessionTranscriptMetadata(await readSlice(path, MAX_METADATA_BYTES), path);
+		}
+		if (!metadataOnly) return parseTranscript(await this.fs.readFile(path), path, this.host);
+		if (!this.fs.readFileSlice) throw new Error("lazy transcript discovery has no bounded reader");
+		const preview = parseTranscript(await this.fs.readFileSlice(path, MAX_METADATA_BYTES), path, this.host);
+		return { ...preview, entries: [], entriesLoaded: false };
+	}
+	async load(session: SessionRecord): Promise<SessionRecord> {
+		if (!this.lazyEntries || session.entriesLoaded !== false) return session;
+		const path = session.path;
+		const fileStat = await this.fs.stat(path);
+		const loaded = await this.parse(path, fileStat.size, false);
+		if (loaded.sessionId !== session.sessionId) throw new Error("session identity changed while loading transcript");
+		loaded.updatedAt = new Date(fileStat.mtimeMs).toISOString();
+		const identity = (() => {
+			try {
+				return realpathSync.native(path);
+			} catch {
+				return resolve(path);
+			}
+		})();
+		const signature = `${fileStat.size}:${fileStat.mtimeMs}:${fileStat.ctimeMs ?? ""}:${fileStat.dev ?? ""}:${fileStat.ino ?? ""}`;
+		this.index.set(identity, { signature, record: loaded, misses: 0 });
+		return loaded;
+	}
 	private async isSessionArtifactDirectory(path: string): Promise<boolean> {
 		try {
 			const sibling = await this.fs.stat(`${path}.jsonl`);
@@ -1270,12 +1298,9 @@ export class FileSessionDiscovery implements SessionDiscovery {
 				const cached = this.index.get(identity);
 				let record = cached?.signature === signature ? cached.record : undefined;
 				if (!record) {
-					if (fileStat.size > MAX_TRANSCRIPT_BYTES) {
-						if (!this.fs.readFileSlice) throw new Error("oversized transcript has no bounded reader");
-						record = parseSessionTranscriptMetadata(await this.fs.readFileSlice(path, MAX_METADATA_BYTES), path);
-					} else {
-						record = parseTranscript(await this.fs.readFile(path), path, this.host);
-					}
+					if ((fileStat.size > MAX_TRANSCRIPT_BYTES || this.lazyEntries) && !this.fs.readFileSlice)
+						throw new Error("bounded transcript discovery has no bounded reader");
+					record = await this.parse(path, fileStat.size, this.lazyEntries);
 					record.updatedAt = new Date(fileStat.mtimeMs).toISOString();
 				} else if (record.path !== path) {
 					record = { ...record, path };

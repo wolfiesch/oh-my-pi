@@ -556,6 +556,160 @@ async function usageLiveServer(
 }
 
 describe("live Unix websocket protocol", () => {
+	test("publishes the socket and welcome before session discovery finishes", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-appserver-deferred-discovery-"));
+		const path = join(root, "run", "app.sock");
+		const deferred = Promise.withResolvers<SessionRecord[]>();
+		let discoveryCalls = 0;
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: path,
+			discovery: {
+				list: () => {
+					discoveryCalls += 1;
+					return deferred.promise;
+				},
+			},
+			childFactory: new LiveFactory(),
+		});
+		let client: RawUdsWebSocket | undefined;
+		try {
+			await appserver.start();
+			expect(discoveryCalls).toBe(0);
+			client = await RawUdsWebSocket.connect(path);
+			client.sendJson(hello(["sessions.read"]));
+			expect((await client.nextServer()).type).toBe("welcome");
+			expect(discoveryCalls).toBe(1);
+			const sessions = client.nextServer();
+			const early = await Promise.race([sessions.then(() => "sessions"), Bun.sleep(20).then(() => "pending")]);
+			expect(early).toBe("pending");
+			deferred.resolve([record("s1")]);
+			const inventory = await sessions;
+			expect(inventory.type).toBe("sessions");
+			if (inventory.type === "sessions")
+				expect(inventory.sessions.map(value => value.sessionId)).toEqual([sid("s1")]);
+		} finally {
+			deferred.resolve([]);
+			client?.destroy();
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("reports duplicate discovery after welcome without calling it an invalid frame", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-appserver-duplicate-discovery-"));
+		const path = join(root, "run", "app.sock");
+		const duplicate = record("duplicate");
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: path,
+			discovery: new StaticDiscovery([duplicate, { ...duplicate, path: "/tmp/duplicate-copy.jsonl" }]),
+			childFactory: new LiveFactory(),
+		});
+		let client: RawUdsWebSocket | undefined;
+		try {
+			await appserver.start();
+			client = await RawUdsWebSocket.connect(path);
+			client.sendJson(hello(["sessions.read"]));
+			expect((await client.nextServer()).type).toBe("welcome");
+			expect(await client.nextServer()).toMatchObject({
+				type: "error",
+				code: "session_inventory_unavailable",
+			});
+			expect((await client.nextOrClose())?.opcode).toBe(0x8);
+		} finally {
+			client?.destroy();
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("loads a lazy transcript once when the session is first attached", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-appserver-lazy-attach-"));
+		const path = join(root, "run", "app.sock");
+		const preview = { ...record("lazy"), entriesLoaded: false, entries: [] };
+		const loaded: SessionRecord = {
+			...preview,
+			entriesLoaded: true,
+			entries: [
+				{
+					id: entryId("lazy-entry"),
+					parentId: null,
+					hostId: host,
+					sessionId: sid("lazy"),
+					kind: "message",
+					timestamp: stamp,
+					data: { role: "user", text: "loaded on attach" },
+				},
+			],
+		};
+		let loads = 0;
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: path,
+			discovery: {
+				list: async () => [preview],
+				load: async () => {
+					loads += 1;
+					return loaded;
+				},
+			},
+			childFactory: new LiveFactory(),
+		});
+		let client: RawUdsWebSocket | undefined;
+		try {
+			await appserver.start();
+			const connected = await readyClient(path, ["sessions.read"]);
+			client = connected.client;
+			expect(loads).toBe(0);
+			client.sendJson(command("lazy-attach", "lazy-attach", "session.attach", "lazy", {}));
+			const [, snapshot] = await responseAndSnapshot(client, "lazy-attach");
+			expect(snapshot.entries.map(entry => entry.id)).toContain(entryId("lazy-entry"));
+			expect(loads).toBe(1);
+		} finally {
+			client?.destroy();
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("returns a command error when one lazy transcript cannot be loaded", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-appserver-lazy-load-failure-"));
+		const path = join(root, "run", "app.sock");
+		const preview = { ...record("broken"), entriesLoaded: false, entries: [] };
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: path,
+			discovery: {
+				list: async () => [preview],
+				load: async () => {
+					throw new Error("transcript changed");
+				},
+			},
+			childFactory: new LiveFactory(),
+		});
+		let client: RawUdsWebSocket | undefined;
+		try {
+			await appserver.start();
+			client = (await readyClient(path, ["sessions.read"])).client;
+			client.sendJson(command("broken-attach", "broken-attach", "session.attach", "broken", {}));
+			expect((await untilResponse(client, "broken-attach")).response).toMatchObject({
+				ok: false,
+				error: { code: "session_load_failed" },
+			});
+			client.sendJson({ v: "omp-app/1", type: "ping", nonce: "after-load-failure", timestamp: stamp });
+			expect((await client.nextServer()).type).toBe("pong");
+		} finally {
+			client?.destroy();
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("serves a typed usage snapshot only to clients granted the dedicated capability", async () => {
 		let reads = 0;
 		const { appserver, path, root } = await usageLiveServer({
@@ -1150,8 +1304,8 @@ describe("live Unix websocket protocol", () => {
 		];
 		const factory = new LiveFactory();
 		const { appserver, path } = await liveServer(factory, [normal, fragile]);
-		fragileData.unsupported = 1n;
 		const client = await readyClient(path, ["sessions.read", "sessions.prompt"]);
+		fragileData.unsupported = 1n;
 
 		client.client.sendJson(command("attach-normal", "attach-normal", "session.attach", "normal", {}));
 		const normalFrames = [await client.client.nextServer(), await client.client.nextServer()];
@@ -3862,6 +4016,7 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		const records = Array.from({ length: 96 }, (_, index) => record(`pending-session-${index}`));
 		const factory = new LiveFactory();
 		const { appserver, path } = await liveServer(factory, records);
+		const bootstrap = await readyClient(path, ["sessions.read"]);
 		const escapedText = '\n"\\'.repeat(2_048);
 		const promptsPerSession = 16;
 		for (const session of records) {
@@ -3908,7 +4063,7 @@ describe("WS command boundary, authority, confirmation, and lock lifecycle", () 
 		expect(response.type).toBe("response");
 		expect(new TextEncoder().encode(JSON.stringify(response)).byteLength).toBeLessThanOrEqual(1_048_576);
 		expect(() => decodeServerFrame(JSON.stringify(response))).not.toThrow();
-		await closeClients([client.client]);
+		await closeClients([bootstrap.client, client.client]);
 		await appserver.stop();
 	});
 

@@ -7,6 +7,7 @@ import type {
 	LockCheckHook,
 	SessionAuthority,
 	SessionAuthoritySession,
+	SessionDiscovery,
 	SessionRecord,
 } from "@oh-my-pi/appserver";
 import {
@@ -47,7 +48,7 @@ import { SessionManager } from "./session-manager";
 
 export interface AppserverRuntimeAuthorities {
 	sessionAuthority: SessionAuthority;
-	discovery: { list(): Promise<SessionRecord[]> };
+	discovery: SessionDiscovery;
 	operationsAuthority: DesktopOperationsAuthority;
 	usageAuthority?: { read(signal: AbortSignal): Promise<UsageReadResult> };
 	transcriptSearchAuthority: AppserverTranscriptSearchAuthority;
@@ -109,7 +110,7 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 		return recovery;
 	};
 	const authorityHost = hostId("appserver-authority");
-	const baseDiscovery = new FileSessionDiscovery(sessionsDir, undefined, authorityHost);
+	const baseDiscovery = new FileSessionDiscovery(sessionsDir, undefined, authorityHost, true);
 	const projectCatalog =
 		options.projectCatalog === false ? undefined : (options.projectCatalog ?? defaultSameFamilyProjectCatalog());
 	const refresh = async (): Promise<SessionRecord[]> => {
@@ -194,7 +195,16 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 			records.delete(session.sessionId);
 		},
 	};
-	const discovery = { list: () => sessionAuthority.list() };
+	const discovery = {
+		list: () => sessionAuthority.list(),
+		load: async (session: SessionRecord): Promise<SessionRecord> => {
+			const loaded = await baseDiscovery.load(session);
+			const archivedAt = (await lifecycle.archivedSessions()).get(loaded.sessionId);
+			const record = archivedAt ? { ...loaded, archivedAt } : loaded;
+			records.set(record.sessionId, record);
+			return record;
+		},
+	};
 	const projectRootForSessionSync = (session: string): string => {
 		const record = records.get(session as SessionId);
 		if (!record) throw new Error("unknown session");
