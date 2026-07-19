@@ -497,6 +497,52 @@ async function statIdentity(path: string): Promise<{ device: number; inode: numb
 		throw error;
 	}
 }
+function sameOwnerRecord(a: OwnerRecord, b: OwnerRecord): boolean {
+	return (
+		a.version === b.version &&
+		a.ownerId === b.ownerId &&
+		a.pid === b.pid &&
+		a.backingName === b.backingName &&
+		a.device === b.device &&
+		a.inode === b.inode
+	);
+}
+async function completedOwnerEndpointInactive(
+	paths: OwnerPaths,
+	record: OwnerRecord,
+	markerStat: { dev: number; ino: number },
+): Promise<boolean> {
+	if (record.device === 0 || record.inode === 0) return false;
+	try {
+		const publicTarget = await readPublicTarget(paths.publicPath);
+		if (publicTarget.target !== paths.backingName) return false;
+		const backing = await statIdentity(paths.backingPath);
+		if (!backing || !sameIdentity(backing, record) || (await unixSocketActive(paths.backingPath))) return false;
+
+		await Bun.sleep(100);
+
+		const latestOwner = await readStrictOwner(paths.ownerPath);
+		if (
+			latestOwner.stat.dev !== markerStat.dev ||
+			latestOwner.stat.ino !== markerStat.ino ||
+			!sameOwnerRecord(latestOwner.record, record)
+		)
+			return false;
+		const latestPublicTarget = await readPublicTarget(paths.publicPath);
+		if (
+			latestPublicTarget.stat.device !== publicTarget.stat.device ||
+			latestPublicTarget.stat.inode !== publicTarget.stat.inode ||
+			latestPublicTarget.target !== paths.backingName
+		)
+			return false;
+		const latestBacking = await statIdentity(paths.backingPath);
+		return Boolean(
+			latestBacking && sameIdentity(latestBacking, record) && !(await unixSocketActive(paths.backingPath)),
+		);
+	} catch {
+		return false;
+	}
+}
 async function publishSymlink(paths: OwnerPaths): Promise<void> {
 	await symlink(paths.backingName, paths.publicPath);
 	const published = await readPublicTarget(paths.publicPath);
@@ -802,9 +848,13 @@ export class LocalAppserver implements AppserverHandle {
 		} catch (error) {
 			if (!isErrno(error, "EEXIST")) throw error;
 			const existing = await readStrictOwner(`${this.socketPath}.owner`);
-			if (await pidIsAlive(existing.record.pid))
+			const existingPaths = ownerPaths(this.socketPath, existing.record.ownerId);
+			if (
+				(await pidIsAlive(existing.record.pid)) &&
+				!(await completedOwnerEndpointInactive(existingPaths, existing.record, existing.stat))
+			)
 				throw new Error(`appserver socket has another owner: ${this.socketPath}`);
-			await this.recoverStale(ownerPaths(this.socketPath, existing.record.ownerId), existing.record, existing.stat);
+			await this.recoverStale(existingPaths, existing.record, existing.stat);
 			ownerHandle = await open(`${this.socketPath}.owner`, "wx", 0o600);
 			await ownerHandle.write(`${JSON.stringify(initial)}\n`);
 			await ownerHandle.sync();
@@ -992,7 +1042,7 @@ export class LocalAppserver implements AppserverHandle {
 			const target = await readlink(paths.publicPath);
 			if (target !== paths.backingName) throw new Error(`appserver socket has another owner: ${this.socketPath}`);
 			const backing = await statIdentity(paths.backingPath);
-			if (backing && !sameIdentity(backing, record))
+			if (backing && (!sameIdentity(backing, record) || (await unixSocketActive(paths.backingPath))))
 				throw new Error(`appserver socket has another owner: ${this.socketPath}`);
 			const latest = await lstat(paths.publicPath);
 			const latestTarget = await readlink(paths.publicPath);

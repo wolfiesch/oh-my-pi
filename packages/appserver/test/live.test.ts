@@ -1,6 +1,19 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import {
+	chmod,
+	lstat,
+	mkdir,
+	mkdtemp,
+	readdir,
+	readFile,
+	realpath,
+	rm,
+	stat,
+	symlink,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -15,6 +28,7 @@ import {
 import { appserverLockCheck } from "../../coding-agent/src/session/appserver-authority";
 import { inspectSessionLock } from "../../coding-agent/src/session/session-lock";
 import { stableProjectId } from "../src/discovery.ts";
+import { unixSocketActive } from "../src/identity.ts";
 import type { DesktopOperationsAuthority } from "../src/operations/dispatcher.ts";
 import type { PendingPromptProjection } from "../src/projection.ts";
 import { BunRpcChildFactory } from "../src/rpc-child.ts";
@@ -34,6 +48,7 @@ const host = hostId("live-test-host");
 const epoch = "live-test-epoch";
 const stamp = "2026-01-01T00:00:00.000Z";
 const RPC_LOCK_CHILD = join(import.meta.dir, "fixtures", "rpc-lock-child.ts");
+const STALE_SOCKET_CHILD = join(import.meta.dir, "fixtures", "stale-socket-child.ts");
 const sid = (value: string) => sessionId(value);
 const rid = (value: string) => value as never;
 const promptTransientId = (commandId: string) =>
@@ -3939,6 +3954,72 @@ describe("raw RFC6455 boundary and lifecycle", () => {
 		);
 		await cleanup.stop();
 		expect(await stat(`${path}.owner`)).toBeDefined();
+	});
+	test("a replacement appserver reclaims an inactive socket after the recorded pid is reused", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-killed-owner-live-"));
+		const path = join(root, "run", "app.sock");
+		await mkdir(join(root, "run"), { recursive: true });
+		const staleOwner = "44444444-4444-4444-8444-444444444444";
+		const backingName = `.appserver-${staleOwner}.sock`;
+		const backingPath = join(root, "run", backingName);
+		const child = Bun.spawn([process.execPath, STALE_SOCKET_CHILD, backingPath], {
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		let replacement: LocalAppserver | undefined;
+		try {
+			let backing: Stats | undefined;
+			for (let attempt = 0; attempt < 200; attempt += 1) {
+				backing = await lstat(backingPath).catch(() => undefined);
+				if (backing?.isSocket()) break;
+				await Bun.sleep(5);
+			}
+			if (!backing?.isSocket()) throw new Error("fixture socket did not start");
+			await writeFile(
+				`${path}.owner`,
+				JSON.stringify({
+					version: 2,
+					ownerId: staleOwner,
+					// A PID can remain observable as a zombie or be reused after the real
+					// socket owner exits. The inactive socket is the observable health check.
+					pid: process.pid,
+					backingName,
+					device: Number(backing.dev),
+					inode: Number(backing.ino),
+				}),
+				{ mode: 0o600 },
+			);
+			await symlink(backingName, path);
+			child.kill("SIGKILL");
+			await child.exited;
+
+			replacement = createAppserver({ hostId: host, socketPath: path, discovery: new StaticDiscovery([]) });
+			await replacement.start();
+			expect(await unixSocketActive(path)).toBe(true);
+			await replacement.stop();
+			replacement = undefined;
+			expect(await stat(path).catch(() => undefined)).toBeUndefined();
+		} finally {
+			await replacement?.stop();
+			child.kill("SIGKILL");
+			await child.exited;
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+	test("a replacement appserver preserves a responsive owner's socket", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-responsive-owner-live-"));
+		const path = join(root, "run", "app.sock");
+		const owner = createAppserver({ hostId: host, socketPath: path, discovery: new StaticDiscovery([]) });
+		const replacement = createAppserver({ hostId: host, socketPath: path, discovery: new StaticDiscovery([]) });
+		try {
+			await owner.start();
+			await expect(replacement.start()).rejects.toThrow("appserver socket has another owner");
+			expect(await unixSocketActive(path)).toBe(true);
+		} finally {
+			await replacement.stop();
+			await owner.stop();
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 });
 describe("WS command boundary, authority, confirmation, and lock lifecycle", () => {
