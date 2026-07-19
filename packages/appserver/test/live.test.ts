@@ -597,6 +597,35 @@ describe("live Unix websocket protocol", () => {
 		}
 	});
 
+	test("reports duplicate discovery after welcome without calling it an invalid frame", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-appserver-duplicate-discovery-"));
+		const path = join(root, "run", "app.sock");
+		const duplicate = record("duplicate");
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: path,
+			discovery: new StaticDiscovery([duplicate, { ...duplicate, path: "/tmp/duplicate-copy.jsonl" }]),
+			childFactory: new LiveFactory(),
+		});
+		let client: RawUdsWebSocket | undefined;
+		try {
+			await appserver.start();
+			client = await RawUdsWebSocket.connect(path);
+			client.sendJson(hello(["sessions.read"]));
+			expect((await client.nextServer()).type).toBe("welcome");
+			expect(await client.nextServer()).toMatchObject({
+				type: "error",
+				code: "session_inventory_unavailable",
+			});
+			expect((await client.nextOrClose())?.opcode).toBe(0x8);
+		} finally {
+			client?.destroy();
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("loads a lazy transcript once when the session is first attached", async () => {
 		const root = await mkdtemp(join(tmpdir(), "omp-appserver-lazy-attach-"));
 		const path = join(root, "run", "app.sock");
@@ -640,6 +669,40 @@ describe("live Unix websocket protocol", () => {
 			const [, snapshot] = await responseAndSnapshot(client, "lazy-attach");
 			expect(snapshot.entries.map(entry => entry.id)).toContain(entryId("lazy-entry"));
 			expect(loads).toBe(1);
+		} finally {
+			client?.destroy();
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("returns a command error when one lazy transcript cannot be loaded", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-appserver-lazy-load-failure-"));
+		const path = join(root, "run", "app.sock");
+		const preview = { ...record("broken"), entriesLoaded: false, entries: [] };
+		const appserver = createAppserver({
+			hostId: host,
+			epoch,
+			socketPath: path,
+			discovery: {
+				list: async () => [preview],
+				load: async () => {
+					throw new Error("transcript changed");
+				},
+			},
+			childFactory: new LiveFactory(),
+		});
+		let client: RawUdsWebSocket | undefined;
+		try {
+			await appserver.start();
+			client = (await readyClient(path, ["sessions.read"])).client;
+			client.sendJson(command("broken-attach", "broken-attach", "session.attach", "broken", {}));
+			expect((await untilResponse(client, "broken-attach")).response).toMatchObject({
+				ok: false,
+				error: { code: "session_load_failed" },
+			});
+			client.sendJson({ v: "omp-app/1", type: "ping", nonce: "after-load-failure", timestamp: stamp });
+			expect((await client.nextServer()).type).toBe("pong");
 		} finally {
 			client?.destroy();
 			await appserver.stop();

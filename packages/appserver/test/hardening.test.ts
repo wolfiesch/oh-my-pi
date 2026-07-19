@@ -980,5 +980,6 @@ describe("appserver startup and cleanup", () => {
 		expect(discoveryCalls).toBe(0);
 		await deferred.stop();
 		expect(await unixSocketActive(path)).toBe(false);
+		await expect(stat(`${path}.owner`)).rejects.toThrow();
 	});
 });

@@ -1173,11 +1173,41 @@ export class LocalAppserver implements AppserverHandle {
 					message: "client capability was not granted",
 				}),
 			};
-		if (command.command === "host.list" || command.command === "session.list") await this.refreshSessions();
-		else if (command.command === "transcript.search") await this.refreshTranscriptSearch();
+		if (command.command === "host.list" || command.command === "session.list") {
+			try {
+				await this.refreshSessions();
+			} catch {
+				return {
+					frame: response(this.hostId, command, false, undefined, {
+						code: "session_inventory_unavailable",
+						message: "session history is unavailable",
+					}),
+				};
+			}
+		} else if (command.command === "transcript.search") await this.refreshTranscriptSearch();
 		else if (command.sessionId) {
-			if (!this.#records.has(command.sessionId)) await this.refreshSessions();
-			await this.loadSession(command.sessionId);
+			if (!this.#records.has(command.sessionId)) {
+				try {
+					await this.refreshSessions();
+				} catch {
+					return {
+						frame: response(this.hostId, command, false, undefined, {
+							code: "session_inventory_unavailable",
+							message: "session history is unavailable",
+						}),
+					};
+				}
+			}
+			try {
+				await this.loadSession(command.sessionId);
+			} catch {
+				return {
+					frame: response(this.hostId, command, false, undefined, {
+						code: "session_load_failed",
+						message: "session transcript could not be loaded",
+					}),
+				};
+			}
 		}
 		const projection = command.sessionId ? this.#projections.get(command.sessionId) : undefined;
 		// Attach output is connection-scoped and rebuilt on every delivery. A
@@ -3038,7 +3068,18 @@ export class LocalAppserver implements AppserverHandle {
 		};
 		await this.#sendFrame(ws, welcome as ServerFrame);
 		if (decision?.authentication === "pairing-required") return;
-		await this.refreshSessions();
+		try {
+			await this.refreshSessions();
+		} catch {
+			await this.#sendFrame(ws, {
+				v: "omp-app/1",
+				type: "error",
+				code: "session_inventory_unavailable",
+				message: "session history is unavailable",
+			});
+			ws.close(1011, "session history unavailable");
+			return;
+		}
 		if (this.#stopping || !this.#hello.has(ws)) return;
 		await this.#sendFrame(ws, this.sessionsFrame());
 	}
@@ -3154,7 +3195,11 @@ export class LocalAppserver implements AppserverHandle {
 		const discovered = await this.#discovery.list();
 		if (generation !== this.#inventoryGeneration || this.#stopping || !this.#started) return;
 		const publishChanges = this.#inventoryLoaded;
-		const discoveredIds = new Set(discovered.map(record => record.sessionId));
+		const discoveredIds = new Set<SessionId>();
+		for (const record of discovered) {
+			if (discoveredIds.has(record.sessionId)) throw new Error(`duplicate session id: ${record.sessionId}`);
+			discoveredIds.add(record.sessionId);
+		}
 		for (const discoveredRecord of discovered) {
 			const previous = this.#records.get(discoveredRecord.sessionId);
 			let record: SessionRecord =
