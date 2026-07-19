@@ -77,6 +77,7 @@ describe("CommandController /usage", () => {
 		} as unknown as InteractiveModeContext;
 		const controller = new CommandController(ctx);
 		const now = Date.now();
+		const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
 		const reports: UsageReport[] = [
 			{
 				provider: "cursor",
@@ -102,7 +103,11 @@ describe("CommandController /usage", () => {
 			},
 		];
 
-		await controller.handleUsageCommand(reports);
+		try {
+			await controller.handleUsageCommand(reports);
+		} finally {
+			nowSpy.mockRestore();
+		}
 
 		expect(present).toHaveBeenCalledTimes(1);
 		const firstCall = present.mock.calls[0];
