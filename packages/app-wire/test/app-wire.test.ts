@@ -929,6 +929,22 @@ describe("app-wire authority", () => {
 				mode: "selector",
 			}),
 		).toThrow(AppWireError);
+		for (const [command, args] of [
+			["preview.click", { previewId: "preview-1", selector: "" }],
+			["preview.fill", { previewId: "preview-1", selector: "input\n", text: "value" }],
+			["preview.handoff", { previewId: "preview-1", message: "Complete sign-in", mode: "selector", selector: "" }],
+			["preview.handoff", { previewId: "preview-1", message: "Complete sign-in", mode: "url", urlSubstring: "\n" }],
+			["preview.handoff", { previewId: "preview-1", message: "Complete sign-in", mode: "text", text: "" }],
+		] as const)
+			expect(() => decodeCommandArguments(command, args)).toThrow(AppWireError);
+		expect(
+			decodeCommandArguments("preview.handoff", {
+				previewId: "preview-1",
+				message: "Complete sign-in",
+				mode: "text",
+				text: "Signed in",
+			}),
+		).toMatchObject({ mode: "text", text: "Signed in" });
 	});
 	test("every descriptor declares an exhaustive revision owner", () => {
 		const expected: Record<string, string> = {
@@ -1212,6 +1228,23 @@ describe("app-wire authority", () => {
 			content: maximumCapture,
 		};
 		expect(decodeCommandResult("preview.capture.read", captureRead).content).toBe(maximumCapture);
+		const partialCapture = {
+			previewId: "preview-1",
+			captureId: "capture-1",
+			size: 4,
+			offset: 1,
+			nextOffset: 3,
+			complete: false,
+			content: "AgM=",
+		};
+		expect(decodeCommandResult("preview.capture.read", partialCapture)).toMatchObject(partialCapture);
+		for (const invalid of [
+			{ ...partialCapture, nextOffset: 1, content: "" },
+			{ ...partialCapture, content: "Ag==" },
+			{ ...partialCapture, nextOffset: 2, content: "AR==" },
+			{ ...partialCapture, nextOffset: 3, content: "AQJ=" },
+		])
+			expect(() => decodeCommandResult("preview.capture.read", invalid)).toThrow(AppWireError);
 		expect(() =>
 			decodeCommandResult("preview.capture.read", {
 				...captureRead,

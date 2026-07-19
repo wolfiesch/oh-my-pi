@@ -905,7 +905,7 @@ function previewAuthorityId(value: unknown, path: string): string {
 	return controlFree(value, path, 128);
 }
 function previewSelector(value: unknown, path: string): string {
-	return boundedText(value, path, PREVIEW_SELECTOR_BYTES);
+	return controlFree(value, path, PREVIEW_SELECTOR_BYTES);
 }
 function previewTtl(value: unknown, path: string): number {
 	const ttl = safeSeq(value, path);
@@ -1043,8 +1043,8 @@ function decodePreviewHandoffArguments(value: unknown): CommandArguments {
 		fail("INVALID_FRAME", "preview handoff requires exactly one matching completion condition", "args");
 	}
 	if (x.selector !== undefined) previewSelector(x.selector, "args.selector");
-	if (x.urlSubstring !== undefined) boundedText(x.urlSubstring, "args.urlSubstring", 4096);
-	if (x.text !== undefined) boundedText(x.text, "args.text", PREVIEW_TEXT_INPUT_BYTES);
+	if (x.urlSubstring !== undefined) controlFree(x.urlSubstring, "args.urlSubstring", 4096);
+	if (x.text !== undefined) controlFree(x.text, "args.text", PREVIEW_TEXT_INPUT_BYTES);
 	if (x.timeoutMs !== undefined) {
 		const timeoutMs = safeSeq(x.timeoutMs, "args.timeoutMs");
 		if (timeoutMs === 0 || timeoutMs > PREVIEW_HANDOFF_TIMEOUT_MAX_MS)
@@ -1136,9 +1136,21 @@ function decodePreviewCaptureReadResult(value: unknown): CommandResult {
 		fail("INVALID_FRAME", "preview capture completion must be boolean", "result.complete");
 	if (x.complete !== (nextOffset === size))
 		fail("INVALID_FRAME", "preview capture completion disagrees with offsets", "result.complete");
+	if (!x.complete && nextOffset === offset)
+		fail("INVALID_FRAME", "preview capture read must advance while incomplete", "result.nextOffset");
 	previewId(x.previewId, "result.previewId");
 	previewCaptureId(x.captureId, "result.captureId");
-	boundedBase64(x.content, "result.content", PREVIEW_CAPTURE_CHUNK_BYTES);
+	const content = boundedBase64(x.content, "result.content", PREVIEW_CAPTURE_CHUNK_BYTES);
+	const padding = content.endsWith("==") ? 2 : content.endsWith("=") ? 1 : 0;
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	if (
+		(padding === 2 && (alphabet.indexOf(content[content.length - 3]!) & 0x0f) !== 0) ||
+		(padding === 1 && (alphabet.indexOf(content[content.length - 2]!) & 0x03) !== 0)
+	)
+		fail("INVALID_FRAME", "preview capture content has non-canonical padding bits", "result.content");
+	const decodedBytes = (content.length / 4) * 3 - padding;
+	if (decodedBytes !== nextOffset - offset)
+		fail("INVALID_FRAME", "preview capture content does not match its offsets", "result.content");
 	return x;
 }
 function decodePreviewPolicyCheckResult(value: unknown): CommandResult {
