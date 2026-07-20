@@ -1,29 +1,16 @@
 import * as http from "node:http";
-import { isIP } from "node:net";
-import { isAbsolute, join } from "node:path";
-import type { AppserverDrainBusy, AppserverDrainResult, AppserverHandle } from "@oh-my-pi/appserver";
-import { createRemoteAppserver, profileSocketPath } from "@oh-my-pi/appserver";
-import { getActiveProfile, getAgentDir, getBlobsDir, getProfileRootDir, postmortem } from "@oh-my-pi/pi-utils";
+import { join } from "node:path";
+import type { AppserverDrainBusy, AppserverDrainResult } from "@oh-my-pi/appserver";
+import { profileSocketPath } from "@oh-my-pi/appserver";
+import { getActiveProfile, getAgentDir } from "@oh-my-pi/pi-utils";
 import type { Settings as SettingsType } from "../config/settings";
-import { getCodingAgentAppserverIdentity } from "./appserver-identity";
 
-export type AppserverAction = "serve" | "status" | "drain-if-idle" | "pair" | "devices" | "revoke";
-export type RemoteMode = "direct" | "serve";
-
-export interface AppserverServeConfig {
-	remoteMode?: RemoteMode;
-	remoteAddress?: string;
-	remotePort?: number;
-	remoteOrigins?: readonly string[];
-	remoteStateDir?: string;
-	trustedServeProxy?: boolean;
-}
+export type AppserverAction = "status" | "drain-if-idle" | "pair" | "devices" | "revoke";
 
 export interface AppserverCommandArgs {
 	action: AppserverAction;
 	flags: {
 		json?: boolean;
-		serve?: AppserverServeConfig;
 		capabilities?: readonly string[];
 		ttlSeconds?: number;
 		expectedNodeId?: string;
@@ -58,10 +45,6 @@ export type AppserverStatus =
 	| { state: "running"; health: AppserverHealth }
 	| { state: "stopped"; reason: "unreachable" | "malformed" | "failed" };
 export interface AppserverRunnerDeps {
-	createAppserver?: (config?: AppserverServeConfig) => AppserverHandle | Promise<AppserverHandle>;
-	/** Optional serve-only settings source. Status/admin actions never consult it. */
-	settings?: Pick<SettingsType, "get">;
-	loadSettings?: () => Promise<Pick<SettingsType, "get">>;
 	readHealth?: (socketPath: string, timeoutMs: number) => Promise<unknown>;
 	socketPath?: () => string;
 	timeoutMs?: number;
@@ -71,9 +54,6 @@ export interface AppserverRunnerDeps {
 		method: "GET" | "POST",
 		body?: Record<string, unknown>,
 	) => Promise<unknown>;
-	onSignal?: (signal: NodeJS.Signals, handler: () => void) => void;
-	removeSignal?: (signal: NodeJS.Signals, handler: () => void) => void;
-	registerCleanup?: (id: string, callback: (reason: unknown) => void | Promise<void>) => () => void;
 }
 
 const MAX_HEALTH_BYTES = 16 * 1024;
@@ -199,93 +179,21 @@ async function readUnixAdmin(
 	return gate.promise;
 }
 
-const MAX_REMOTE_ORIGINS = 64;
-const MAX_REMOTE_ORIGIN_LENGTH = 1024;
-
-function hasRemoteFlags(config: AppserverServeConfig): boolean {
-	return (
-		config.remoteMode !== undefined ||
-		config.remoteAddress !== undefined ||
-		config.remotePort !== undefined ||
-		config.remoteOrigins !== undefined ||
-		config.remoteStateDir !== undefined ||
-		config.trustedServeProxy !== undefined
+/**
+ * Build OMP's private authority adapter. The T4-owned daemon consumes this
+ * through `omp bridge --stdio`.
+ */
+export async function createDefaultAppserverRuntime(settingsOverride?: SettingsType) {
+	const [{ createAppserverRuntime }, { Settings }, sdk, modelModule, registryModule, pluginModule] = await Promise.all(
+		[
+			import("../session/appserver-authority"),
+			import("../config/settings"),
+			import("../sdk"),
+			import("../config/model-registry"),
+			import("../registry/agent-registry"),
+			import("../extensibility/plugins/manager"),
+		],
 	);
-}
-
-function validateOrigins(origins: unknown, errorMessage: string, enforceCount = false): readonly string[] | undefined {
-	if (origins === undefined) return undefined;
-	if (!Array.isArray(origins) || (enforceCount && origins.length > MAX_REMOTE_ORIGINS)) throw new Error(errorMessage);
-	for (const origin of origins) {
-		if (typeof origin !== "string" || origin.length === 0 || origin.length > MAX_REMOTE_ORIGIN_LENGTH)
-			throw new Error(errorMessage);
-	}
-	return origins;
-}
-
-function isAllZeroIpv6(address: string): boolean {
-	if (isIP(address) !== 6) return false;
-	return address.split(":").every(group => group.length === 0 || /^0+$/u.test(group));
-}
-
-function validatePersistedAddress(address: unknown): string {
-	if (
-		typeof address !== "string" ||
-		address.length === 0 ||
-		isIP(address) === 0 ||
-		address === "0.0.0.0" ||
-		address === "::" ||
-		isAllZeroIpv6(address)
-	)
-		throw new Error("appserver.remoteAddress must be a concrete non-wildcard IP address");
-	return address;
-}
-
-function persistedServeConfig(settings: Pick<SettingsType, "get">): AppserverServeConfig {
-	const mode = settings.get("appserver.remoteMode");
-	if (mode === "local") return {};
-	if (mode !== "direct") throw new Error("appserver.remoteMode must be local or direct");
-	const address = validatePersistedAddress(settings.get("appserver.remoteAddress"));
-	const port = settings.get("appserver.remotePort");
-	if (!Number.isSafeInteger(port) || port < 1 || port > 65_535)
-		throw new Error("appserver.remotePort must be between 1 and 65535");
-	const origins =
-		validateOrigins(
-			settings.get("appserver.remoteOrigins"),
-			"appserver.remoteOrigins contains an invalid origin",
-			true,
-		) ?? [];
-	return { remoteMode: "direct", remoteAddress: address, remotePort: port, remoteOrigins: origins };
-}
-
-// Deliberately lazy: status and admin actions must not load Settings or the runtime graph.
-async function defaultLoadAppserverSettings(): Promise<SettingsType> {
-	const { Settings } = await import("../config/settings");
-	return Settings.init({ cwd: process.cwd(), loadProjectSettings: false });
-}
-
-// This is intentionally a lazy boundary: `status`, `pair`, `devices`, and `revoke` must not load the native PTY graph.
-async function defaultCreateAppserver(
-	config?: AppserverServeConfig,
-	settingsOverride?: SettingsType,
-): Promise<AppserverHandle> {
-	const [
-		{ createAppserver },
-		{ createAppserverRuntime },
-		{ Settings },
-		sdk,
-		modelModule,
-		registryModule,
-		pluginModule,
-	] = await Promise.all([
-		import("@oh-my-pi/appserver"),
-		import("../session/appserver-authority"),
-		import("../config/settings"),
-		import("../sdk"),
-		import("../config/model-registry"),
-		import("../registry/agent-registry"),
-		import("../extensibility/plugins/manager"),
-	]);
 	const cwd = process.cwd();
 	let settings: SettingsType | undefined = settingsOverride;
 	if (!settings) {
@@ -319,40 +227,9 @@ async function defaultCreateAppserver(
 	try {
 		runtimeOptions.pluginManager = new pluginModule.PluginManager(cwd);
 	} catch {}
-	const runtime = createAppserverRuntime(runtimeOptions);
-	const base = {
-		...getCodingAgentAppserverIdentity(),
-		...activeAppserverLocalIdentity(),
-		sessionAuthority: runtime.sessionAuthority,
-		discovery: runtime.discovery,
-		operationsAuthority: runtime.operationsAuthority,
-		projectRootForProject: runtime.projectRootForProject,
-		...(process.platform === "darwin"
-			? {
-					projectRevealer: async (root: string): Promise<boolean> => {
-						const child = Bun.spawn(["open", "-R", root], { stderr: "ignore", stdout: "ignore" });
-						return (await child.exited) === 0;
-					},
-				}
-			: {}),
-		usageAuthority: runtime.usageAuthority,
-		transcriptSearchAuthority: runtime.transcriptSearchAuthority,
-		lockCheck: runtime.lockCheck,
-		lockStatus: runtime.lockStatus,
-		transcriptImageRoot: getBlobsDir(),
-	};
-	if (!config?.remoteMode) return createAppserver(base);
-	if (!config.remoteAddress || !config.remoteStateDir)
-		throw new Error("remote mode requires address and state directory");
-	const endpoint = {
-		address: config.remoteAddress,
-		port: config.remotePort ?? 8787,
-		originAllowlist: config.remoteOrigins,
-		serveProxy: config.remoteMode === "serve",
-		trustedServeProxy: config.trustedServeProxy,
-	};
-	return createRemoteAppserver({ stateDir: config.remoteStateDir, remoteEndpoint: endpoint, appserver: base });
+	return createAppserverRuntime(runtimeOptions);
 }
+
 export function activeAppserverLocalIdentity(): ActiveAppserverLocalIdentity {
 	const profile = getActiveProfile();
 	return {
@@ -362,108 +239,6 @@ export function activeAppserverLocalIdentity(): ActiveAppserverLocalIdentity {
 }
 export function activeAppserverSocketPath(): string {
 	return activeAppserverLocalIdentity().socketPath;
-}
-function defaultRemoteStateDir(): string {
-	return join(getProfileRootDir(getActiveProfile()), "appserver");
-}
-export function validateAppserverServeConfig(config: AppserverServeConfig = {}): AppserverServeConfig {
-	const remoteFlags = hasRemoteFlags(config);
-	if (!config.remoteMode) {
-		if (remoteFlags) throw new Error("remote-only flags require --remote-mode");
-		return {};
-	}
-	if (config.remoteMode !== "direct" && config.remoteMode !== "serve") throw new Error("remote mode is invalid");
-	if (!config.remoteAddress || typeof config.remoteAddress !== "string")
-		throw new Error("remote mode requires --remote-address");
-	if (
-		!Number.isSafeInteger(config.remotePort ?? 8787) ||
-		(config.remotePort ?? 8787) < 1 ||
-		(config.remotePort ?? 8787) > 65_535
-	)
-		throw new Error("--remote-port is invalid");
-	if (!config.remoteStateDir) config.remoteStateDir = defaultRemoteStateDir();
-	if (!isAbsolute(config.remoteStateDir)) throw new Error("--remote-state-dir must be absolute");
-	validateOrigins(config.remoteOrigins, "--remote-origin is invalid");
-	if (config.remoteMode === "serve") {
-		if (config.remoteAddress !== "127.0.0.1" && config.remoteAddress !== "::1")
-			throw new Error("Serve remote address must be loopback");
-		if (config.trustedServeProxy !== true) throw new Error("Serve mode requires --trusted-serve-proxy");
-	} else if (config.trustedServeProxy === true) {
-		throw new Error("--trusted-serve-proxy is only valid with Serve mode");
-	}
-	return config;
-}
-
-export async function runAppserverServe(
-	deps: AppserverRunnerDeps = {},
-	rawConfig: AppserverServeConfig = {},
-): Promise<void> {
-	let loadedSettings: SettingsType | undefined;
-	let config: AppserverServeConfig;
-	if (hasRemoteFlags(rawConfig)) {
-		// Any explicit remote flag is authoritative, including intentionally
-		// invalid combinations that validation should report to the caller.
-		config = validateAppserverServeConfig({ ...rawConfig });
-	} else {
-		let settings = deps.settings;
-		if (!settings) {
-			if (deps.loadSettings) settings = await deps.loadSettings();
-			else {
-				loadedSettings = await defaultLoadAppserverSettings();
-				settings = loadedSettings;
-			}
-		}
-		config = validateAppserverServeConfig(persistedServeConfig(settings));
-	}
-	const create = deps.createAppserver ?? (value => defaultCreateAppserver(value, loadedSettings));
-	const registerCleanup =
-		deps.registerCleanup ??
-		((id: string, callback: (reason: unknown) => void | Promise<void>) => postmortem.register(id, callback));
-	const stopped = Promise.withResolvers<void>();
-	let appserver: AppserverHandle | undefined;
-	let stopRequested = false;
-	let stopStarted = false;
-	let cleanupRequested = false;
-	const stopOnce = (): void => {
-		if (stopStarted || !appserver) return;
-		stopStarted = true;
-		void appserver.stop().then(stopped.resolve, stopped.reject);
-	};
-	const shutdown = (): void => {
-		cleanupRequested = true;
-		stopRequested = true;
-		stopOnce();
-	};
-	const unregister = registerCleanup("omp-appserver", async reason => {
-		if (reason !== "sigint" && reason !== "sigterm") return;
-		shutdown();
-		if (appserver) await stopped.promise;
-	});
-	if (deps.onSignal) {
-		deps.onSignal("SIGINT", shutdown);
-		deps.onSignal("SIGTERM", shutdown);
-	}
-	try {
-		appserver = await create(config);
-		try {
-			await appserver.start();
-		} catch (error) {
-			if (cleanupRequested) {
-				stopOnce();
-				if (stopStarted) await stopped.promise;
-				return;
-			}
-			throw error;
-		}
-		if (stopRequested) stopOnce();
-		await stopped.promise;
-	} finally {
-		if (deps.removeSignal && deps.onSignal) {
-			deps.removeSignal("SIGINT", shutdown);
-			deps.removeSignal("SIGTERM", shutdown);
-		}
-		unregister();
-	}
 }
 export async function runAppserverStatus(deps: AppserverRunnerDeps = {}): Promise<AppserverStatus> {
 	const readHealth = deps.readHealth ?? readUnixHealth;
@@ -611,10 +386,6 @@ export async function runAppserverRevoke(
 	else process.stdout.write(`revoked ${deviceId}\n`);
 }
 export async function runAppserverCommand(cmd: AppserverCommandArgs, deps: AppserverRunnerDeps = {}): Promise<void> {
-	if (cmd.action === "serve") {
-		await runAppserverServe(deps, cmd.flags.serve);
-		return;
-	}
 	if (cmd.action === "pair") {
 		await runAppserverPair(deps, cmd.flags);
 		return;

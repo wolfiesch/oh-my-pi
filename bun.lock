@@ -5,7 +5,7 @@
     "": {
       "name": "omp",
       "dependencies": {
-        "@t4-code/host-service": "./vendor/t4-host/t4-code-host-service-0.1.30.tgz",
+        "@t4-code/host-service": "./vendor/t4-host/t4-code-host-service-0.1.30-2712b18.tgz",
         "@t4-code/host-wire": "./vendor/t4-host/t4-code-host-wire-0.1.30.tgz",
         "sherpa-onnx": "1.13.2",
         "sherpa-onnx-darwin-arm64": "1.13.3",
@@ -58,6 +58,9 @@
     "packages/app-wire": {
       "name": "@oh-my-pi/app-wire",
       "version": "0.6.2",
+      "dependencies": {
+        "@t4-code/host-wire": "0.1.30",
+      },
     },
     "packages/appserver": {
       "name": "@oh-my-pi/appserver",
@@ -86,7 +89,6 @@
       "version": "17.0.5",
       "bin": {
         "omp": "src/cli.ts",
-        "ompd": "src/cli/ompd.ts",
       },
       "dependencies": {
         "@agentclientprotocol/sdk": "catalog:",
@@ -417,7 +419,7 @@
   },
   "overrides": {
     "@ark/schema": "0.56.2",
-    "@t4-code/host-service": "./vendor/t4-host/t4-code-host-service-0.1.30.tgz",
+    "@t4-code/host-service": "./vendor/t4-host/t4-code-host-service-0.1.30-2712b18.tgz",
     "@t4-code/host-wire": "./vendor/t4-host/t4-code-host-wire-0.1.30.tgz",
   },
   "catalog": {
@@ -966,7 +968,7 @@
 
     "@so-ric/colorspace": ["@so-ric/colorspace@1.1.6", "", { "dependencies": { "color": "^5.0.2", "text-hex": "1.0.x" } }, "sha512-/KiKkpHNOBgkFJwu9sh48LkHSMYGyuTcSFK/qMBdnOAlrRJzRSXAOFB5qwzaVQuDl8wAvHVMkaASQDReTahxuw=="],
 
-    "@t4-code/host-service": ["@t4-code/host-service@./vendor/t4-host/t4-code-host-service-0.1.30.tgz", { "dependencies": { "@agentclientprotocol/sdk": "1.2.1", "@t4-code/host-wire": "0.1.30" } }, "sha512-GOs87X/CYNLeWRfTv7OXhsZ5d73Zz2j6tAvkd1bc38Lu2oFsFx14X0V5ec0D4O7zcIwxAsdcmtsElkfWSwFVRQ=="],
+    "@t4-code/host-service": ["@t4-code/host-service@./vendor/t4-host/t4-code-host-service-0.1.30-2712b18.tgz", { "dependencies": { "@agentclientprotocol/sdk": "1.2.1", "@t4-code/host-wire": "0.1.30" } }, "sha512-CHj3cnoBzN/5ks3DWkbew6Fu+YBqaCp2GSye7SdMAqCq9z0sZNMxV9Ig/RxOWLugmKj+stsBnXiPyLYwICW97A=="],
 
     "@t4-code/host-wire": ["@t4-code/host-wire@./vendor/t4-host/t4-code-host-wire-0.1.30.tgz", {}, "sha512-jE3gHnp96LbH+MDK5DxWD4EDMPXuHW91XJjuO2/sq1XWgNEXGHf6bM4JI7mOIbls8Xx4PZ3wT7MpXqGRgTd1dA=="],
 

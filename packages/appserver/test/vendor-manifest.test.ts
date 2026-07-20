@@ -20,11 +20,11 @@ describe("vendored T4 host artifacts", () => {
 		expect(manifest.schemaVersion).toBe(1);
 		expect(manifest.source).toEqual({
 			repository: "https://github.com/LycaonLLC/t4-code.git",
-			commit: "b04b3115022cc74157cabc1eaba7d042e1f6c8be",
-			tree: "d37afe01c11bad8e61e780824b14d3cf03b069b8",
+			commit: "2712b18c9ca843925733a5126143b2647d7b1108",
+			tree: "59ce8d481b53d253db189a0dd6fbc46bfda0fdc3",
 		});
 		for (const artifact of manifest.packages) {
-			expect(artifact.file).toMatch(/^t4-code-host-(?:service|wire)-0\.1\.30\.tgz$/u);
+			expect(artifact.file).toMatch(/^t4-code-host-(?:service|wire)-0\.1\.30(?:-[0-9a-f]{7})?\.tgz$/u);
 			const digest = new Bun.CryptoHasher("sha256")
 				.update(await Bun.file(resolve(vendor, artifact.file)).arrayBuffer())
 				.digest("hex");
