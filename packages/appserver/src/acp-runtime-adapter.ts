@@ -225,11 +225,28 @@ export class AcpRuntimeAdapter implements RuntimeAdapter {
 		const stderr = consumeStderr(process.stderr, this.#maxStderrBytes, request.callbacks);
 		let closed = false;
 		let disposed = false;
+		let disposeStarted = false;
+		let disposeInFlight: Promise<void> | undefined;
 		let sessionId: string | undefined;
 		let sessionStartIssued = false;
 		let connection: ClientConnection | undefined;
+		let termination: Promise<void> | undefined;
+		let promptInFlight = false;
 		const markClosed = () => {
 			closed = true;
+		};
+		const terminateOwnedProcess = () => {
+			if (!termination) {
+				termination = terminateProcess(process, this.#terminationGraceMs).catch(cause => {
+					termination = undefined;
+					throw cause;
+				});
+			}
+			return termination;
+		};
+		const reapAfterTransportClose = () => {
+			markClosed();
+			void terminateOwnedProcess().catch(() => undefined);
 		};
 		try {
 			const app = client({ name: "oh-my-pi-appserver" })
@@ -239,11 +256,11 @@ export class AcpRuntimeAdapter implements RuntimeAdapter {
 					}
 					await request.callbacks?.onSessionUpdate?.(params);
 				})
-				.onRequest(methods.client.session.requestPermission, async ({ params }) => {
+				.onRequest(methods.client.session.requestPermission, async ({ params, signal }) => {
 					if (params.sessionId !== sessionId) {
 						throw new AcpTransportError("ACP permission request addressed a session not owned by this process");
 					}
-					const response = await request.callbacks?.onPermissionRequest?.(params);
+					const response = await request.callbacks?.onPermissionRequest?.(params, signal);
 					if (
 						response?.outcome === "selected" &&
 						typeof response.optionId === "string" &&
@@ -253,16 +270,21 @@ export class AcpRuntimeAdapter implements RuntimeAdapter {
 					return { outcome: { outcome: "cancelled" } };
 				});
 			connection = app.connect(ndJsonStream(process.stdin, boundNdjsonFrames(process.stdout, this.#maxFrameBytes)));
-			connection.closed.then(markClosed, markClosed);
+			connection.closed.then(reapAfterTransportClose, reapAfterTransportClose);
 			process.exited.then(markClosed, markClosed);
 
-			await initializationStep(
+			const initialization = await initializationStep(
 				connection.agent.request(methods.agent.initialize, {
 					protocolVersion: PROTOCOL_VERSION,
 					clientInfo: { name: "oh-my-pi-appserver", version: "0.1.0" },
 				}),
 				this.#initializationTimeoutMs,
 			);
+			if (initialization.protocolVersion !== PROTOCOL_VERSION) {
+				throw new AcpTransportError(
+					`ACP runtime returned unsupported protocol version ${initialization.protocolVersion}`,
+				);
+			}
 			if (request.sessionId) {
 				sessionId = request.sessionId;
 				sessionStartIssued = true;
@@ -291,7 +313,7 @@ export class AcpRuntimeAdapter implements RuntimeAdapter {
 			const transportWasClosed = closed;
 			connection?.close(cause);
 			try {
-				await terminateProcess(process, this.#terminationGraceMs);
+				await terminateOwnedProcess();
 			} catch (terminationCause) {
 				throw new AcpTransportError("ACP initialization failed and child termination could not be confirmed", {
 					cause,
@@ -309,26 +331,29 @@ export class AcpRuntimeAdapter implements RuntimeAdapter {
 		if (!sessionId) throw new AcpTransportError("ACP runtime returned an empty session ID");
 		const ownedConnection = connection;
 		const ownedSessionId = sessionId;
-		const terminationGraceMs = this.#terminationGraceMs;
 		return {
 			adapterId: this.manifest.id,
 			sessionId: ownedSessionId,
 			workspace,
 			async prompt(text) {
-				if (disposed) throw new AcpTransportError("ACP session has been disposed");
+				if (disposeStarted) throw new AcpTransportError("ACP session has been disposed");
 				if (closed) throw new AcpUnknownOutcomeError(ownedSessionId);
+				if (promptInFlight) throw new AcpTransportError("ACP session already has a prompt in flight");
+				promptInFlight = true;
 				try {
 					return await ownedConnection.agent.request(methods.agent.session.prompt, {
 						sessionId: ownedSessionId,
 						prompt: [{ type: "text", text }],
 					});
 				} catch (cause) {
-					if (closed) throw new AcpUnknownOutcomeError(ownedSessionId, cause);
+					if (closed || disposed) throw new AcpUnknownOutcomeError(ownedSessionId, cause);
 					throw cause;
+				} finally {
+					promptInFlight = false;
 				}
 			},
 			async cancel() {
-				if (disposed) throw new AcpTransportError("ACP session has been disposed");
+				if (disposeStarted) throw new AcpTransportError("ACP session has been disposed");
 				if (closed) throw new AcpUnknownOutcomeError(ownedSessionId);
 				try {
 					await ownedConnection.agent.notify(methods.agent.session.cancel, { sessionId: ownedSessionId });
@@ -339,9 +364,18 @@ export class AcpRuntimeAdapter implements RuntimeAdapter {
 			},
 			async dispose() {
 				if (disposed) return;
-				disposed = true;
-				ownedConnection.close();
-				await terminateProcess(process, terminationGraceMs);
+				if (!disposeInFlight) {
+					disposeStarted = true;
+					ownedConnection.close();
+					disposeInFlight = terminateOwnedProcess()
+						.then(() => {
+							disposed = true;
+						})
+						.finally(() => {
+							if (!disposed) disposeInFlight = undefined;
+						});
+				}
+				await disposeInFlight;
 			},
 		};
 	}

@@ -38,7 +38,10 @@ export interface RuntimeAdapterCallbacks {
 	/** Raw ACP session/update notification. No provider-specific projection is applied. */
 	onSessionUpdate?(update: unknown): void | Promise<void>;
 	/** Raw ACP session/request_permission request. */
-	onPermissionRequest?(request: unknown): RuntimePermissionResponse | Promise<RuntimePermissionResponse>;
+	onPermissionRequest?(
+		request: unknown,
+		signal?: AbortSignal,
+	): RuntimePermissionResponse | Promise<RuntimePermissionResponse>;
 	onStderr?(chunk: string): void | Promise<void>;
 }
 

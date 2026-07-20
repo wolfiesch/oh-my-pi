@@ -40,6 +40,7 @@ class FakeAcpPeer implements AcpProcess {
 	#buffer = "";
 	#pendingPromptId?: string | number;
 	#closed = false;
+	#ignoredFirstSigkill = false;
 	terminated = 0;
 	signals: Array<"SIGTERM" | "SIGKILL"> = [];
 	cancelled = 0;
@@ -49,9 +50,12 @@ class FakeAcpPeer implements AcpProcess {
 			readonly malformedOnInitialize?: boolean;
 			readonly malformedOnInitializeAndStayAlive?: boolean;
 			readonly closeOnPrompt?: boolean;
+			readonly holdPrompt?: boolean;
 			readonly rejectSessionNew?: boolean;
 			readonly hangOnSessionNew?: boolean;
 			readonly ignoreSigterm?: boolean;
+			readonly ignoreFirstSigkill?: boolean;
+			readonly protocolVersion?: number;
 		} = {},
 	) {
 		this.stdout = new ReadableStream<Uint8Array>({
@@ -82,7 +86,16 @@ class FakeAcpPeer implements AcpProcess {
 		this.terminated += 1;
 		this.signals.push(signal);
 		if (signal === "SIGTERM" && this.options.ignoreSigterm) return;
+		if (signal === "SIGKILL" && this.options.ignoreFirstSigkill && !this.#ignoredFirstSigkill) {
+			this.#ignoredFirstSigkill = true;
+			return;
+		}
 		this.close(0);
+	}
+
+	disconnectTransport(): void {
+		this.#controller?.close();
+		this.#controller = undefined;
 	}
 
 	close(code = 1): void {
@@ -111,7 +124,7 @@ class FakeAcpPeer implements AcpProcess {
 				if (!this.options.malformedOnInitializeAndStayAlive) this.close();
 				return;
 			}
-			this.#send({ id: message.id, result: { protocolVersion: 1 } });
+			this.#send({ id: message.id, result: { protocolVersion: this.options.protocolVersion ?? 1 } });
 			return;
 		}
 		if (message.method === "session/new") {
@@ -134,6 +147,7 @@ class FakeAcpPeer implements AcpProcess {
 				return;
 			}
 			this.#pendingPromptId = message.id;
+			if (this.options.holdPrompt) return;
 			this.#send({
 				method: "session/update",
 				params: {
@@ -247,6 +261,15 @@ describe("ACP runtime adapter", () => {
 		await session.dispose();
 	});
 
+	test("rejects an incompatible ACP protocol before starting a session", async () => {
+		const peer = new FakeAcpPeer({ protocolVersion: 2 });
+		await expect(
+			new AcpRuntimeAdapter(manifest, { runner: new FakeRunner(peer) }).openSession({ workspace }),
+		).rejects.toThrow("unsupported protocol version 2");
+		expect(peer.requests.some(request => request.method === "session/new")).toBe(false);
+		expect(peer.signals).toEqual(["SIGTERM"]);
+	});
+
 	test("loads only the supplied session into its own workspace process", async () => {
 		const peer = new FakeAcpPeer();
 		const session = await new AcpRuntimeAdapter(manifest, { runner: new FakeRunner(peer) }).openSession({
@@ -269,6 +292,31 @@ describe("ACP runtime adapter", () => {
 		expect(runner.spawns).toHaveLength(0);
 	});
 
+	test("rejects overlapping prompts before sending a second ACP request", async () => {
+		const peer = new FakeAcpPeer({ holdPrompt: true });
+		const session = await new AcpRuntimeAdapter(manifest, { runner: new FakeRunner(peer) }).openSession({ workspace });
+		const firstPrompt = session.prompt("first").catch(cause => cause);
+		await Bun.sleep(0);
+
+		await expect(session.prompt("second")).rejects.toThrow("already has a prompt in flight");
+		expect(peer.requests.filter(request => request.method === "session/prompt")).toHaveLength(1);
+
+		await session.dispose();
+		expect(await firstPrompt).toBeInstanceOf(AcpUnknownOutcomeError);
+	});
+
+	test("reaps the owned child when the ACP transport closes", async () => {
+		const peer = new FakeAcpPeer();
+		const session = await new AcpRuntimeAdapter(manifest, { runner: new FakeRunner(peer) }).openSession({ workspace });
+
+		peer.disconnectTransport();
+		await peer.exited;
+
+		expect(peer.signals).toEqual(["SIGTERM"]);
+		await session.dispose();
+		expect(peer.terminated).toBe(1);
+	});
+
 	test("escalates only its owned child after bounded graceful termination", async () => {
 		const peer = new FakeAcpPeer({ ignoreSigterm: true });
 		const session = await new AcpRuntimeAdapter(manifest, {
@@ -278,6 +326,35 @@ describe("ACP runtime adapter", () => {
 		await session.dispose();
 		expect(peer.signals).toEqual(["SIGTERM", "SIGKILL"]);
 		expect(peer.terminated).toBe(2);
+	});
+
+	test("rejects prompt and cancellation as soon as disposal starts", async () => {
+		const peer = new FakeAcpPeer({ ignoreSigterm: true });
+		const session = await new AcpRuntimeAdapter(manifest, {
+			runner: new FakeRunner(peer),
+			terminationGraceMs: 10,
+		}).openSession({ workspace });
+
+		const disposal = session.dispose();
+		await expect(session.prompt("too late")).rejects.toThrow("disposed");
+		await expect(session.cancel()).rejects.toThrow("disposed");
+		expect(peer.requests.filter(request => request.method === "session/prompt")).toHaveLength(0);
+		expect(peer.cancelled).toBe(0);
+		await disposal;
+	});
+
+	test("retries disposal until owned child termination is confirmed", async () => {
+		const peer = new FakeAcpPeer({ ignoreSigterm: true, ignoreFirstSigkill: true });
+		const session = await new AcpRuntimeAdapter(manifest, {
+			runner: new FakeRunner(peer),
+			terminationGraceMs: 1,
+		}).openSession({ workspace });
+
+		await expect(session.dispose()).rejects.toThrow("did not exit after SIGKILL");
+		await expect(session.dispose()).resolves.toBeUndefined();
+		expect(peer.signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL"]);
+		await session.dispose();
+		expect(peer.signals).toHaveLength(4);
 	});
 
 	test("kills a child whose initialization fails while stderr and the process remain open", async () => {

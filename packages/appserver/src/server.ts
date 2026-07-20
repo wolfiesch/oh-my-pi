@@ -713,6 +713,8 @@ export class LocalAppserver implements AppserverHandle {
 	#projections = new Map<SessionId, SessionProjection>();
 	#supervisors = new Map<SessionId, RpcChildSupervisor>();
 	#externalRuntimes = new Map<SessionId, ExternalRuntimeOwner>();
+	#workspaceArchives = new Set<string>();
+	#workspaceSessionStarts = new Map<string, number>();
 	#externalPermissions = new Map<SessionId, Map<string, ExternalPermissionRequest>>();
 	#externalTurns = new Map<SessionId, ExternalTurnProjection>();
 	#promptLifecycles = new Map<SessionId, PromptLifecycle>();
@@ -2063,6 +2065,13 @@ export class LocalAppserver implements AppserverHandle {
 		if (workspace.lifecycle !== "active") throw new Error("workspace is not active");
 		if (workspace.repositoryId !== requestedProject)
 			throw new Error("workspace does not belong to the requested project");
+		if (this.#workspaceArchives.has(workspaceInstanceId)) {
+			throw new WorkspaceAuthorityError("mutation-in-progress", "Workspace archival is in progress");
+		}
+		this.#workspaceSessionStarts.set(
+			workspaceInstanceId,
+			(this.#workspaceSessionStarts.get(workspaceInstanceId) ?? 0) + 1,
+		);
 		const publicSessionId = sessionId(`session-${randomUUID()}`);
 		const runtimeWorkspace: RuntimeWorkspaceIdentity = {
 			instanceId: workspace.instanceId,
@@ -2076,7 +2085,8 @@ export class LocalAppserver implements AppserverHandle {
 				workspace: runtimeWorkspace,
 				callbacks: {
 					onSessionUpdate: update => this.projectExternalUpdate(publicSessionId, update),
-					onPermissionRequest: request => this.requestExternalPermission(publicSessionId, request),
+					onPermissionRequest: (request, signal) =>
+						this.requestExternalPermission(publicSessionId, request, signal),
 				},
 			});
 			const timestamp = this.#clock.now().toISOString();
@@ -2101,6 +2111,10 @@ export class LocalAppserver implements AppserverHandle {
 			this.#records.delete(publicSessionId);
 			this.#projections.delete(publicSessionId);
 			throw cause;
+		} finally {
+			const remaining = (this.#workspaceSessionStarts.get(workspaceInstanceId) ?? 1) - 1;
+			if (remaining === 0) this.#workspaceSessionStarts.delete(workspaceInstanceId);
+			else this.#workspaceSessionStarts.set(workspaceInstanceId, remaining);
 		}
 	}
 
@@ -2229,7 +2243,11 @@ export class LocalAppserver implements AppserverHandle {
 			?.appendEvent(asAppWireEvent({ type: "turn.end", at: this.#clock.now().toISOString() }));
 		if (frame) this.broadcast(sessionId, frame);
 	}
-	private requestExternalPermission(sessionId: SessionId, value: unknown): Promise<RuntimePermissionResponse> {
+	private requestExternalPermission(
+		sessionId: SessionId,
+		value: unknown,
+		signal?: AbortSignal,
+	): Promise<RuntimePermissionResponse> {
 		const request = objectRecord(value);
 		const toolCall = objectRecord(request?.toolCall);
 		const options = Array.isArray(request?.options) ? request.options.map(objectRecord).filter(Boolean) : [];
@@ -2241,7 +2259,7 @@ export class LocalAppserver implements AppserverHandle {
 			options.find(option => option?.kind === "reject_always");
 		const allowOptionId = typeof allow?.optionId === "string" ? allow.optionId : undefined;
 		const rejectOptionId = typeof reject?.optionId === "string" ? reject.optionId : undefined;
-		if (!allowOptionId && !rejectOptionId) return Promise.resolve({ outcome: "cancelled" });
+		if ((!allowOptionId && !rejectOptionId) || signal?.aborted) return Promise.resolve({ outcome: "cancelled" });
 		const requestId = `acp-permission-${randomUUID()}`;
 		const pending = Promise.withResolvers<RuntimePermissionResponse>();
 		let requests = this.#externalPermissions.get(sessionId);
@@ -2250,9 +2268,13 @@ export class LocalAppserver implements AppserverHandle {
 			this.#externalPermissions.set(sessionId, requests);
 		}
 		requests.set(requestId, { resolve: pending.resolve, allowOptionId, rejectOptionId });
-		const clean = (input: unknown, fallback: string) =>
-			(typeof input === "string" ? input : fallback).replace(/[\u0000-\u001f\u007f]/gu, " ").slice(0, 512);
-		const title = clean(toolCall?.title, "Runtime permission required");
+		const cancel = () => pending.resolve({ outcome: "cancelled" });
+		signal?.addEventListener("abort", cancel, { once: true });
+		const title =
+			projectMessageText(
+				typeof toolCall?.title === "string" ? toolCall.title : "Runtime permission required",
+				512,
+			) || "Runtime permission required";
 		const frame = this.#projections.get(sessionId)?.setPendingAttention({
 			kind: "approval",
 			id: requestId,
@@ -2262,6 +2284,7 @@ export class LocalAppserver implements AppserverHandle {
 		});
 		if (frame) this.broadcast(sessionId, frame);
 		return pending.promise.finally(() => {
+			signal?.removeEventListener("abort", cancel);
 			const current = this.#externalPermissions.get(sessionId);
 			current?.delete(requestId);
 			if (current?.size === 0) this.#externalPermissions.delete(sessionId);
@@ -2338,6 +2361,7 @@ export class LocalAppserver implements AppserverHandle {
 			failed = true;
 			throw cause;
 		} finally {
+			this.cancelExternalPermissions(sessionId);
 			this.finalizeExternalTurn(sessionId, turn);
 			const reason: PromptDiscardReason = failed
 				? "failed"
@@ -2464,11 +2488,20 @@ export class LocalAppserver implements AppserverHandle {
 		});
 	}
 	private handleWorkspaceArchive(command: CommandFrame): Promise<CommandOutcome> {
-		return this.workspaceCommand(command, async () => ({
-			workspace: this.workspaceProjection(
-				await this.#workspaceAuthority!.archive({ instanceId: command.args.instanceId as string }),
-			),
-		}));
+		return this.workspaceCommand(command, async () => {
+			const instanceId = command.args.instanceId as string;
+			const owned = [...this.#externalRuntimes.values()].some(owner => owner.workspaceInstanceId === instanceId);
+			if (this.#workspaceArchives.has(instanceId) || this.#workspaceSessionStarts.has(instanceId) || owned) {
+				throw new WorkspaceAuthorityError("mutation-in-progress", "Workspace is owned by an external runtime session");
+			}
+			this.#workspaceArchives.add(instanceId);
+			try {
+				const workspace = await this.#workspaceAuthority!.archive({ instanceId });
+				return { workspace: this.workspaceProjection(workspace) };
+			} finally {
+				this.#workspaceArchives.delete(instanceId);
+			}
+		});
 	}
 	private handleWorkspaceRecover(command: CommandFrame): Promise<CommandOutcome> {
 		return this.workspaceCommand(command, async () => ({

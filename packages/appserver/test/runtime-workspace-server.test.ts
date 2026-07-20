@@ -64,7 +64,7 @@ async function sessionEvent(client: RawUdsWebSocket, type: string): Promise<Reco
 async function approveChallenge(
 	client: RawUdsWebSocket,
 	requestId: string,
-	sessionId: string,
+	sessionId?: string,
 ): Promise<Extract<ServerFrame, { type: "response" }>> {
 	for (;;) {
 		const frame = await client.nextServer();
@@ -76,7 +76,7 @@ async function approveChallenge(
 			confirmationId: frame.confirmationId,
 			commandId: requestId,
 			hostId: host,
-			sessionId,
+			...(sessionId === undefined ? {} : { sessionId }),
 			decision: "approve",
 		});
 		return response(client, requestId);
@@ -242,7 +242,9 @@ test("routes an external runtime session through appserver-owned workspace ident
 	const promptEntered = Promise.withResolvers<void>();
 	const promptRelease = Promise.withResolvers<void>();
 	const permissionEntered = Promise.withResolvers<void>();
+	const leakedPermissionEntered = Promise.withResolvers<void>();
 	let permissionSelection: unknown;
+	let leakedPermissionSelection: unknown;
 	let promptCount = 0;
 	let callbacks: RuntimeAdapterCallbacks | undefined;
 	let openedCwd: string | undefined;
@@ -301,16 +303,28 @@ test("routes an external runtime session through appserver-owned workspace ident
 							},
 						});
 						await promptRelease.promise;
-					} else {
+					} else if (promptCount === 2) {
 						permissionEntered.resolve();
 						permissionSelection = await callbacks?.onPermissionRequest?.({
 							sessionId: "provider-private-session",
-							toolCall: { toolCallId: "provider-tool-id", title: "Run command" },
+							toolCall: { toolCallId: "provider-tool-id", title: `Read ${repository}/secrets.env` },
 							options: [
 								{ optionId: "allow-once", name: "Allow", kind: "allow_once" },
 								{ optionId: "reject-once", name: "Reject", kind: "reject_once" },
 							],
 						});
+					} else {
+						leakedPermissionEntered.resolve();
+						void Promise.resolve(
+							callbacks?.onPermissionRequest?.({
+								sessionId: "provider-private-session",
+								toolCall: { toolCallId: "provider-leaked-tool", title: "Run command" },
+								options: [{ optionId: "allow-once", name: "Allow", kind: "allow_once" }],
+							}),
+						).then(selection => {
+							leakedPermissionSelection = selection;
+						});
+						throw new Error("provider failed after requesting permission");
 					}
 					return { stopReason: "end_turn" };
 				},
@@ -362,6 +376,11 @@ test("routes an external runtime session through appserver-owned workspace ident
 		expect(JSON.stringify(created)).not.toContain("provider-private-session");
 		expect(openedCwd).toBe(repository);
 		const publicSessionId = (created.result as { session: { sessionId: string } }).session.sessionId;
+		client.sendJson(command("archive-owned", "workspace.archive", { instanceId: workspace.instanceId }));
+		expect(await approveChallenge(client, "archive-owned")).toMatchObject({
+			ok: false,
+			error: { code: "mutation-in-progress" },
+		});
 		const sessionCommand = (requestId: string, name: string, args: Record<string, unknown> = {}) => ({
 			...command(requestId, name, args),
 			sessionId: publicSessionId,
@@ -396,12 +415,25 @@ test("routes an external runtime session through appserver-owned workspace ident
 		const permissionId = pendingSnapshot?.ref.attention?.pending[0]?.id;
 		expect(permissionId?.startsWith("acp-permission-")).toBeTrue();
 		expect(JSON.stringify(pendingSnapshot?.ref.attention)).not.toContain("provider-tool-id");
+		expect(JSON.stringify(pendingSnapshot?.ref.attention)).not.toContain(repository);
+		const pendingPermission = pendingSnapshot?.ref.attention?.pending[0];
+		expect(pendingPermission?.kind).toBe("approval");
+		if (pendingPermission?.kind !== "approval") throw new Error("expected pending approval");
+		expect(pendingPermission.title).toContain("[path]");
 		client.sendJson(
 			sessionCommand("approve-permission", "session.ui.respond", { requestId: permissionId, confirmed: true }),
 		);
 		expect(await response(client, "approve-permission")).toMatchObject({ ok: true, result: { accepted: true } });
 		expect(await response(client, "prompt-permission")).toMatchObject({ ok: true, result: { accepted: true } });
 		expect(permissionSelection).toEqual({ outcome: "selected", optionId: "allow-once" });
+
+		client.sendJson(sessionCommand("prompt-permission-failure", "session.prompt", { message: "fail permission" }));
+		await leakedPermissionEntered.promise;
+		expect(appserver.snapshot(sessionId(publicSessionId))?.ref.attention?.pending).toHaveLength(1);
+		expect(await response(client, "prompt-permission-failure")).toMatchObject({ ok: false });
+		await Bun.sleep(0);
+		expect(appserver.snapshot(sessionId(publicSessionId))?.ref.attention?.pending ?? []).toHaveLength(0);
+		expect(leakedPermissionSelection).toEqual({ outcome: "cancelled" });
 
 		const snapshot = appserver.snapshot(sessionId(publicSessionId));
 		expect(JSON.stringify(snapshot)).not.toContain("provider-private-session");
