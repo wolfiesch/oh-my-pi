@@ -73,7 +73,7 @@ export function decodeArtifactDescriptor(input: unknown, path: string): Artifact
 	if (!(ARTIFACT_KINDS as readonly string[]).includes(kind))
 		fail("INVALID_FRAME", "unsupported artifact kind", `${path}.kind`);
 	const mediaType = controlFree(value.mediaType, `${path}.mediaType`, 128);
-	if (!/^[!#$&^_.+*/-]+\/[!#$&^_.+*/-]+$/u.test(mediaType))
+	if (!/^[A-Za-z0-9!#$&^_.+*-]+\/[A-Za-z0-9!#$&^_.+*-]+$/u.test(mediaType))
 		fail("INVALID_FRAME", "artifact mediaType must be a MIME type", `${path}.mediaType`);
 	if (
 		value.size !== undefined &&

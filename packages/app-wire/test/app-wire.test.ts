@@ -8,6 +8,7 @@ import {
 	COMMAND_RESULT_DECODERS,
 	DESKTOP_CATALOG_COMMANDS,
 	decodeAdditiveServerFrame,
+	decodeArtifactDescriptor,
 	decodeClientFrame,
 	decodeCommandArguments,
 	decodeCommandResult,
@@ -16,6 +17,7 @@ import {
 	decodeServerFrame,
 	decodeSessionListResult,
 	decodeSessionRef,
+	decodeTurnReviewSnapshot,
 	deviceToken,
 	IMAGE_UPLOAD_CHUNK_BYTES,
 	inputObject,
@@ -1573,6 +1575,39 @@ describe("app-wire authority", () => {
 				content: Buffer.alloc(TRANSCRIPT_IMAGE_CHUNK_BYTES + 1).toString("base64"),
 			}),
 		).toThrow(AppWireError);
+	});
+	test("artifacts and turn reviews accept standard MIME types and reject untrusted descriptor fields", () => {
+		const patch = {
+			artifactId: "2001",
+			kind: "patch",
+			mediaType: "text/x-diff",
+			size: 128,
+			sha256: "a".repeat(64),
+			name: "2001.turn-review.log",
+			disposition: "attachment",
+			retention: "session",
+		};
+		expect(decodeArtifactDescriptor(patch, "artifact")).toEqual(patch);
+		expect(
+			decodeTurnReviewSnapshot({
+				turnId: "turn-1",
+				baseTree: "base",
+				headTree: "head",
+				changes: [
+					{
+						path: "src/index.ts",
+						status: "modified",
+						kind: "text",
+						state: "pending",
+						additions: 2,
+						deletions: 1,
+					},
+				],
+				patch,
+			}),
+		).toMatchObject({ turnId: "turn-1", patch });
+		expect(() => decodeArtifactDescriptor({ ...patch, mediaType: "invalid" }, "artifact")).toThrow(AppWireError);
+		expect(() => decodeArtifactDescriptor({ ...patch, path: "/tmp/patch" }, "artifact")).toThrow(AppWireError);
 	});
 	test("session identity remains host scoped", () => {
 		expect(

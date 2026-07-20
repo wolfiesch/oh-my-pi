@@ -708,35 +708,70 @@ export class CodingAgentDesktopAuthority {
 			const path = appWireSafeRelativePath(request.path, "path");
 			const change = snapshot.changes.find(candidate => candidate.path === path);
 			if (!change) throw protocolError("NOT_FOUND");
+			const expectedState = request.action === "keep" ? "applied" : "discarded";
+			if (change.state !== "pending") {
+				if (change.state !== expectedState) throw protocolError("stale_turn");
+				const resultingRevision = await captureWorktreeTree(this.#getRoot(sessionId));
+				if (!resultingRevision) throw protocolError("OPERATION_FAILED");
+				return freeze({
+					turnId: snapshot.turnId,
+					path,
+					action: request.action,
+					state: expectedState,
+					resultingRevision,
+				});
+			}
+			const appendCustomEntry = this.#context.sessionManager.appendCustomEntry;
+			if (!appendCustomEntry) throw protocolError("UNSUPPORTED");
 			const root = this.#getRoot(sessionId);
 			const before = await captureWorktreeTree(root);
-			if (!before || before !== snapshot.headTree) throw protocolError("stale_turn");
+			if (!before) throw protocolError("OPERATION_FAILED");
+			const targets = [change.path, ...(change.previousPath === undefined ? [] : [change.previousPath])];
+			const targetCheck = await runArgv(
+				["git", "diff", "--quiet", snapshot.headTree, before, "--", ...targets],
+				root,
+				signal,
+			);
+			if (targetCheck.cancelled) throw protocolError("ABORTED");
+			if (targetCheck.exitCode !== 0 || targetCheck.timedOut || targetCheck.truncated)
+				throw protocolError("stale_turn");
 			if (signal?.aborted) throw protocolError("ABORTED");
 			if (request.action === "discard") {
-				const targets = [change.path, ...(change.previousPath === undefined ? [] : [change.previousPath])];
-				const restored = await runArgv(
-					["git", "restore", "--worktree", `--source=${snapshot.baseTree}`, "--", ...targets],
-					root,
-					signal,
-				);
-				if (restored.cancelled) throw protocolError("ABORTED");
-				if (restored.exitCode !== 0 || restored.timedOut || restored.truncated)
+				const restore =
+					change.status === "untracked"
+						? await runArgv(["git", "clean", "-f", "--", change.path], root, signal)
+						: await runArgv(
+								["git", "restore", "--staged", "--worktree", `--source=${snapshot.baseTree}`, "--", ...targets],
+								root,
+								signal,
+							);
+				if (restore.cancelled) throw protocolError("ABORTED");
+				if (restore.exitCode !== 0 || restore.timedOut || restore.truncated)
 					throw protocolError("OPERATION_FAILED");
 			}
 			const resultingRevision = await captureWorktreeTree(root);
 			if (!resultingRevision) throw protocolError("OPERATION_FAILED");
-			const appendCustomEntry = this.#context.sessionManager.appendCustomEntry;
-			if (!appendCustomEntry) throw protocolError("UNSUPPORTED");
-			appendCustomEntry.call(this.#context.sessionManager, "turn-review-action", {
-				turnId: snapshot.turnId,
-				path,
-				action: request.action,
-			});
+			try {
+				appendCustomEntry.call(this.#context.sessionManager, "turn-review-action", {
+					turnId: snapshot.turnId,
+					path,
+					action: request.action,
+				});
+			} catch {
+				if (request.action === "discard") {
+					await runArgv(
+						["git", "restore", "--staged", "--worktree", `--source=${snapshot.headTree}`, "--", ...targets],
+						root,
+						undefined,
+					);
+				}
+				throw protocolError("OPERATION_FAILED");
+			}
 			return freeze({
 				turnId: snapshot.turnId,
 				path,
 				action: request.action,
-				state: request.action === "keep" ? "applied" : "discarded",
+				state: expectedState,
 				resultingRevision,
 			});
 		}
