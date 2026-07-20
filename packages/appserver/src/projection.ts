@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import {
+	type ArtifactDescriptor,
 	ATTENTION_MAX_PENDING_ITEMS,
 	type AttentionOutcome,
 	type DurableEntry,
+	decodeArtifactDescriptorList,
 	decodeTranscriptImageMetadataList,
 	type EntryId,
 	type HostId,
@@ -120,6 +122,18 @@ export class SessionProjection {
 		} catch {
 			return undefined;
 		}
+	}
+	artifact(artifactId: string): ArtifactDescriptor | undefined {
+		for (const entry of this.#byId.values()) {
+			if (entry.data.artifacts === undefined) continue;
+			try {
+				const artifact = decodeArtifactDescriptorList(entry.data.artifacts, "entry.data.artifacts").find(
+					candidate => candidate.artifactId === artifactId,
+				);
+				if (artifact) return artifact;
+			} catch {}
+		}
+		return undefined;
 	}
 	updateStatus(status: SessionRef["status"]): ServerFrame | undefined {
 		const current = this.value.ref;

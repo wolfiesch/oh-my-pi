@@ -21,6 +21,8 @@ export type PreviewCaptureId = string & { readonly __previewCaptureId: unique sy
 export type CatalogId = string & { readonly __catalogId: unique symbol };
 export type DeviceId = string & { readonly __deviceId: unique symbol };
 export type ImageId = string & { readonly __imageId: unique symbol };
+export type ArtifactId = string & { readonly __artifactId: unique symbol };
+export type TurnId = string & { readonly __turnId: unique symbol };
 
 export function id<T extends string>(value: unknown, path: string): T {
 	return controlFree(value, path, MAX_ID_BYTES) as T;
@@ -48,6 +50,12 @@ export const imageId = (value: unknown, path = "imageId"): ImageId => {
 		fail("INVALID_FRAME", "expected an opaque image identifier", path);
 	return result as ImageId;
 };
+export const artifactId = (value: unknown, path = "artifactId"): ArtifactId => {
+	const result = controlFree(value, path, 64);
+	if (!/^[0-9]+$/u.test(result)) fail("INVALID_FRAME", "expected a numeric opaque artifact identifier", path);
+	return result as ArtifactId;
+};
+export const turnId = (v: unknown, p = "turnId"): TurnId => id<TurnId>(v, p);
 export const revision = (v: unknown, p = "revision"): Revision => id<Revision>(v, p);
 export interface SessionKey {
 	readonly hostId: HostId;

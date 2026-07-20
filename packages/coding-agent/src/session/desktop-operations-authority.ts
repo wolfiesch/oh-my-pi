@@ -2,7 +2,15 @@ import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
-import { safeRelativePath as appWireSafeRelativePath, decodeCatalog } from "@oh-my-pi/app-wire";
+import {
+	type ArtifactDescriptor,
+	safeRelativePath as appWireSafeRelativePath,
+	decodeCatalog,
+	decodeTurnReviewSnapshot,
+	type TurnFileChange,
+	type TurnId,
+	turnId,
+} from "@oh-my-pi/app-wire";
 import {
 	Process as NativeProcess,
 	PtySession,
@@ -18,8 +26,17 @@ import type { Settings } from "../config/settings";
 import { parseApplyPatch } from "../edit/apply-patch/parser";
 import { type ApplyPatchResult, applyPatch, type FileSystem, type PatchInput } from "../edit/modes/patch";
 import type { SessionManager } from "./session-manager";
+import { captureWorktreeTree } from "./turn-review";
 
 const MAX_FILE_BYTES = 1024 * 1024;
+type MutableTurnFileChange = Omit<TurnFileChange, "state"> & { state: TurnFileChange["state"] };
+interface TurnSnapshot {
+	readonly turnId: TurnId;
+	readonly baseTree: string;
+	readonly headTree: string;
+	readonly changes: MutableTurnFileChange[];
+	readonly patch?: ArtifactDescriptor;
+}
 const MAX_OUTPUT_BYTES = 256 * 1024;
 const MAX_LIST_ENTRIES = 1_000;
 const MAX_COMMAND_MS = 120_000;
@@ -55,17 +72,28 @@ export interface DesktopReviewReadRequest {
 	reviewId: string;
 	signal?: AbortSignal;
 }
-export interface DesktopReviewApplyRequest {
+export interface LegacyDesktopReviewApplyRequest {
 	reviewId: string;
 	expectedRevision?: string;
 	signal?: AbortSignal;
 }
+export interface TurnDesktopReviewApplyRequest {
+	turnId: string;
+	path: string;
+	action: "keep" | "discard";
+	expectedRevision?: string;
+	signal?: AbortSignal;
+}
+export type DesktopReviewApplyRequest = LegacyDesktopReviewApplyRequest | TurnDesktopReviewApplyRequest;
 export interface ReviewStore {
 	read(request: DesktopReviewReadRequest, context?: OperationContextLike): unknown | Promise<unknown>;
-	apply(request: DesktopReviewApplyRequest, context?: OperationContextLike): unknown | Promise<unknown>;
+	apply(request: LegacyDesktopReviewApplyRequest, context?: OperationContextLike): unknown | Promise<unknown>;
 }
+type DesktopSessionManager = Pick<SessionManager, "getCwd" | "getSessionId"> &
+	Partial<Pick<SessionManager, "appendCustomEntry" | "getBranch">>;
+
 export interface DesktopAuthorityContext {
-	sessionManager: Pick<SessionManager, "getCwd" | "getSessionId">;
+	sessionManager: DesktopSessionManager;
 	projectRootForSession: (sessionId: string) => string;
 	secureFs?: SecureFsAdapter;
 	reviewStore?: ReviewStore;
@@ -94,10 +122,15 @@ export interface DesktopPatchRequest extends DesktopFileRequest {
 	patch: string;
 	expectedRevision?: string;
 }
-export interface DesktopDiffRequest extends DesktopFileRequest {
+export interface DesktopFileDiffRequest extends DesktopFileRequest {
 	content?: string;
 	fromRevision?: string;
 }
+export interface DesktopTurnDiffRequest {
+	turnId: string;
+	signal?: AbortSignal;
+}
+export type DesktopDiffRequest = DesktopFileDiffRequest | DesktopTurnDiffRequest;
 export interface DesktopFileReadResult {
 	path: string;
 	content: string;
@@ -141,6 +174,7 @@ function protocolError(code: string): Error {
 		BOUNDS: "resource exceeds protocol bounds",
 		ABORTED: "operation was cancelled",
 		OPERATION_FAILED: "operation failed",
+		stale_turn: "turn targets are stale",
 	};
 	return Object.assign(new Error(messages[code] ?? "operation failed"), { code });
 }
@@ -431,6 +465,63 @@ export class CodingAgentDesktopAuthority {
 		if (required && revision === undefined) throw protocolError("STALE_REVISION");
 		return revision;
 	}
+	#turnSnapshot(rawTurnId: string): TurnSnapshot {
+		const requested = turnId(rawTurnId, "turnId");
+		let result: TurnSnapshot | undefined;
+		const getBranch = this.#context.sessionManager.getBranch;
+		if (!getBranch) throw protocolError("UNSUPPORTED");
+		const entries = getBranch.call(this.#context.sessionManager);
+		for (const entry of entries) {
+			const data = entry.type === "custom" && entry.customType === "turn-review" ? entry.data : undefined;
+			if (
+				!data ||
+				typeof data !== "object" ||
+				!("turnId" in data) ||
+				data.turnId !== requested ||
+				!("baseTree" in data) ||
+				!("headTree" in data) ||
+				!("changes" in data)
+			)
+				continue;
+			try {
+				const snapshot = decodeTurnReviewSnapshot(
+					{
+						turnId: data.turnId,
+						baseTree: data.baseTree,
+						headTree: data.headTree,
+						changes: data.changes,
+						...("patch" in data ? { patch: data.patch } : {}),
+					},
+					"turn-review",
+				);
+				result = {
+					...snapshot,
+					changes: snapshot.changes.map(change => ({ ...change })),
+					...(snapshot.patch === undefined ? {} : { patch: snapshot.patch }),
+				};
+			} catch {}
+		}
+		if (!result) throw protocolError("NOT_FOUND");
+		for (const entry of entries) {
+			const action = entry.type === "custom" && entry.customType === "turn-review-action" ? entry.data : undefined;
+			if (
+				!action ||
+				typeof action !== "object" ||
+				!("turnId" in action) ||
+				!("action" in action) ||
+				action.turnId !== requested ||
+				(action.action !== "keep" && action.action !== "discard") ||
+				!("path" in action)
+			)
+				continue;
+			try {
+				const path = appWireSafeRelativePath(action.path, "turn-review-action.path");
+				for (const change of result.changes)
+					if (change.path === path) change.state = action.action === "keep" ? "applied" : "discarded";
+			} catch {}
+		}
+		return result;
+	}
 	async filesRead(request: DesktopFileRequest, context?: OperationContextLike): Promise<DesktopFileReadResult> {
 		const signal = this.#signal(request, context),
 			path = safeRelativePath(request.path),
@@ -490,8 +581,21 @@ export class CodingAgentDesktopAuthority {
 		}
 	}
 	async filesDiff(request: DesktopDiffRequest, context?: OperationContextLike): Promise<Record<string, unknown>> {
-		const signal = this.#signal(request, context),
-			path = safeRelativePath(request.path),
+		const signal = this.#signal(request, context);
+		if ("turnId" in request) {
+			const sessionId = this.#session(context);
+			if (sessionId !== this.#context.sessionManager.getSessionId()) throw protocolError("FORBIDDEN");
+			if (signal?.aborted) throw protocolError("ABORTED");
+			const snapshot = this.#turnSnapshot(request.turnId);
+			return freeze({
+				turnId: snapshot.turnId,
+				baseTree: snapshot.baseTree,
+				headTree: snapshot.headTree,
+				changes: snapshot.changes,
+				...(snapshot.patch === undefined ? {} : { patch: snapshot.patch }),
+			});
+		}
+		const path = safeRelativePath(request.path),
 			basis = request.fromRevision ?? context?.expectedRevision;
 		if (
 			request.fromRevision !== undefined &&
@@ -596,8 +700,46 @@ export class CodingAgentDesktopAuthority {
 		request: DesktopReviewApplyRequest,
 		context?: OperationContextLike,
 	): Promise<Record<string, unknown>> {
-		this.#signal(request, context);
-		this.#session(context);
+		const signal = this.#signal(request, context);
+		const sessionId = this.#session(context);
+		if ("turnId" in request) {
+			if (sessionId !== this.#context.sessionManager.getSessionId()) throw protocolError("FORBIDDEN");
+			const snapshot = this.#turnSnapshot(request.turnId);
+			const path = appWireSafeRelativePath(request.path, "path");
+			const change = snapshot.changes.find(candidate => candidate.path === path);
+			if (!change) throw protocolError("NOT_FOUND");
+			const root = this.#getRoot(sessionId);
+			const before = await captureWorktreeTree(root);
+			if (!before || before !== snapshot.headTree) throw protocolError("stale_turn");
+			if (signal?.aborted) throw protocolError("ABORTED");
+			if (request.action === "discard") {
+				const targets = [change.path, ...(change.previousPath === undefined ? [] : [change.previousPath])];
+				const restored = await runArgv(
+					["git", "restore", "--worktree", `--source=${snapshot.baseTree}`, "--", ...targets],
+					root,
+					signal,
+				);
+				if (restored.cancelled) throw protocolError("ABORTED");
+				if (restored.exitCode !== 0 || restored.timedOut || restored.truncated)
+					throw protocolError("OPERATION_FAILED");
+			}
+			const resultingRevision = await captureWorktreeTree(root);
+			if (!resultingRevision) throw protocolError("OPERATION_FAILED");
+			const appendCustomEntry = this.#context.sessionManager.appendCustomEntry;
+			if (!appendCustomEntry) throw protocolError("UNSUPPORTED");
+			appendCustomEntry.call(this.#context.sessionManager, "turn-review-action", {
+				turnId: snapshot.turnId,
+				path,
+				action: request.action,
+			});
+			return freeze({
+				turnId: snapshot.turnId,
+				path,
+				action: request.action,
+				state: request.action === "keep" ? "applied" : "discarded",
+				resultingRevision,
+			});
+		}
 		const expectedRevision = this.#expected(request, context, true);
 		if (!this.#context.reviewStore) throw protocolError("UNSUPPORTED");
 		try {

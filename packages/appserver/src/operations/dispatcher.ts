@@ -146,6 +146,7 @@ export const COMMAND_FEATURE_BY_COMMAND: Readonly<Record<string, string>> = {
 	"session.image.chunk": "prompt.images",
 	"session.image.discard": "prompt.images",
 	"session.image.read": "transcript.images",
+	"artifact.read": "artifacts.read",
 	"transcript.search": "transcript.search",
 	"transcript.context": "transcript.search",
 	"project.reveal": "project.reveal",
@@ -222,6 +223,7 @@ function safeError(error: unknown): { code: string; message: string } {
 		unsupported_feature: ["UNSUPPORTED_FEATURE", "negotiated feature is unavailable"],
 		aborted: ["ABORTED", "operation was cancelled"],
 		conflict: ["CONFLICT", "operation conflicts with current state"],
+		stale_turn: ["stale_turn", "turn targets are stale"],
 	};
 	const match = known[raw];
 	return match ? { code: match[0], message: match[1] } : { code: "OPERATION_FAILED", message: "operation failed" };

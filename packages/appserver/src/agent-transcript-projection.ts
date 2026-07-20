@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type {
 	AgentTranscriptFrame,
+	ArtifactDescriptor,
 	DurableEntry,
 	EntryId,
 	HostId,
@@ -8,7 +9,11 @@ import type {
 	SessionId,
 	TranscriptImageMetadata,
 } from "@oh-my-pi/app-wire";
-import { decodeTranscriptImageMetadataList, agentId as wireAgentId } from "@oh-my-pi/app-wire";
+import {
+	decodeArtifactDescriptorList,
+	decodeTranscriptImageMetadataList,
+	agentId as wireAgentId,
+} from "@oh-my-pi/app-wire";
 import type { RpcSubagentMessagesResult } from "../../coding-agent/src/modes/rpc/rpc-types.ts";
 import { SessionEntryProjector } from "./discovery.ts";
 
@@ -28,6 +33,7 @@ export interface AgentTranscriptProjectionOptions {
 	readonly read: (agentId: string, fromByte: number) => Promise<RpcSubagentMessagesResult>;
 	readonly revision: () => Revision;
 	readonly emit: (frame: AgentTranscriptFrame) => void;
+	readonly artifactResolver?: (id: string) => ArtifactDescriptor | undefined;
 }
 
 interface AgentTranscriptState {
@@ -130,6 +136,19 @@ export class AgentTranscriptProjection {
 			if (state.queued && !this.#disposed) queueMicrotask(() => this.refresh(agentId));
 		});
 	}
+	artifact(artifactId: string): ArtifactDescriptor | undefined {
+		for (const state of this.#states.values())
+			for (const entry of state.retained) {
+				if (entry.data.artifacts === undefined) continue;
+				try {
+					const artifact = decodeArtifactDescriptorList(entry.data.artifacts, "entry.data.artifacts").find(
+						candidate => candidate.artifactId === artifactId,
+					);
+					if (artifact) return artifact;
+				} catch {}
+			}
+		return undefined;
+	}
 
 	frames(): AgentTranscriptFrame[] {
 		const revision = this.options.revision();
@@ -226,7 +245,13 @@ export class AgentTranscriptProjection {
 		}
 		const state: AgentTranscriptState = {
 			agentId,
-			projector: new SessionEntryProjector(this.options.hostId, this.options.sessionId, "live"),
+			projector: new SessionEntryProjector(
+				this.options.hostId,
+				this.options.sessionId,
+				"live",
+				[],
+				this.options.artifactResolver,
+			),
 			fromByte: 0,
 			generation: 0,
 			seq: 0,
@@ -241,7 +266,13 @@ export class AgentTranscriptProjection {
 	}
 
 	#reset(state: AgentTranscriptState): void {
-		state.projector = new SessionEntryProjector(this.options.hostId, this.options.sessionId, "live");
+		state.projector = new SessionEntryProjector(
+			this.options.hostId,
+			this.options.sessionId,
+			"live",
+			[],
+			this.options.artifactResolver,
+		);
 		state.fromByte = 0;
 		state.generation++;
 		state.seq = 0;

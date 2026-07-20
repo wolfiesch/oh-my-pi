@@ -59,12 +59,19 @@ test("packed package typechecks under NodeNext and executes through its public e
 			`import { decodeCommandResult } from "@oh-my-pi/app-wire/command.js";
 import {
 	APP_WIRE_VERSION,
+	ARTIFACT_MAX_BYTES,
+	MAX_TURN_FILE_CHANGES,
 	type AppFrame,
+	type ArtifactReadChunk,
 	type CommandFrame,
+	type TurnReviewSnapshot,
+	artifactId,
 	commandId,
 	decodeClientFrame,
+	decodeTurnReviewSnapshot,
 	hostId,
 	requestId,
+	turnId,
 } from "@oh-my-pi/app-wire";
 
 const command: CommandFrame = {
@@ -81,6 +88,24 @@ if (decoded.type !== "command" || decoded.command !== "session.create" || APP_WI
 	throw new Error("packed app-wire public export did not execute");
 if (decodeCommandResult("session.cancel", { cancelled: true }).cancelled !== true)
 	throw new Error("packed app-wire .js subpath export did not execute");
+const review: TurnReviewSnapshot = decodeTurnReviewSnapshot({
+	turnId: turnId("turn"),
+	baseTree: "base",
+	headTree: "head",
+	changes: [{ path: "file.ts", status: "modified", kind: "text", state: "pending", additions: 1, deletions: 0 }],
+});
+const chunk: ArtifactReadChunk = {
+	artifactId: artifactId("1"),
+	kind: "text",
+	mediaType: "text/plain",
+	size: 1,
+	offset: 0,
+	nextOffset: 1,
+	complete: true,
+	content: "YQ==",
+};
+if (review.changes.length !== 1 || chunk.size !== 1 || ARTIFACT_MAX_BYTES < MAX_TURN_FILE_CHANGES)
+	throw new Error("packed app-wire artifact and turn exports did not execute");
 `,
 		);
 

@@ -11,6 +11,7 @@ import { decodeBrokerStatusResult } from "./broker.js";
 import type { DeviceCapability } from "./capabilities.js";
 import { decodeCursor } from "./cursor.js";
 import { fail } from "./errors.js";
+import { decodeTurnReviewSnapshot } from "./files-review.js";
 import {
 	boundedArray,
 	boundedBase64,
@@ -26,6 +27,8 @@ import {
 	safeSeq,
 } from "./guards.js";
 import {
+	type ArtifactId,
+	artifactId,
 	type CommandId,
 	type ConfirmationId,
 	commandId,
@@ -49,9 +52,14 @@ import {
 	revision,
 	type SessionId,
 	sessionId,
+	type TurnId,
 	terminalId,
+	turnId,
 } from "./ids.js";
 import {
+	ARTIFACT_CHUNK_BASE64_BYTES,
+	ARTIFACT_CHUNK_BYTES,
+	ARTIFACT_MAX_BYTES,
 	IMAGE_UPLOAD_CHUNK_BASE64_BYTES,
 	IMAGE_UPLOAD_CHUNK_BYTES,
 	IMAGE_UPLOAD_MAX_BYTES,
@@ -171,6 +179,13 @@ export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = 
 		confirmation: "none",
 	},
 	"session.image.read": {
+		capability: "sessions.read",
+		scope: "session",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "none",
+	},
+	"artifact.read": {
 		capability: "sessions.read",
 		scope: "session",
 		revision: "none",
@@ -700,6 +715,30 @@ export interface SessionImageReadResult {
 	readonly nextOffset: number;
 	readonly complete: boolean;
 	readonly content: string;
+}
+export interface ArtifactReadArguments {
+	readonly artifactId: ArtifactId;
+	readonly offset: number;
+}
+export interface ArtifactReadChunk {
+	readonly artifactId: ArtifactId;
+	readonly kind: "image" | "text" | "patch" | "binary";
+	readonly mediaType: string;
+	readonly size: number;
+	readonly offset: number;
+	readonly nextOffset: number;
+	readonly complete: boolean;
+	readonly content: string;
+}
+export type ArtifactReadResult = ArtifactReadChunk;
+export interface TurnReviewApplyArguments {
+	readonly turnId: TurnId;
+	readonly path: string;
+	readonly action: "keep" | "discard";
+}
+export interface TurnReviewApplyResult extends TurnReviewApplyArguments {
+	readonly state: "applied" | "discarded";
+	readonly resultingRevision: string;
 }
 export interface PreviewLaunchArguments {
 	readonly url: string;
@@ -1259,6 +1298,68 @@ function decodeImageDiscard(value: unknown): SessionImageDiscardArguments {
 	const x = strictArgs(value, ["imageId"]);
 	return { imageId: imageId(x.imageId, "args.imageId") };
 }
+function decodeArtifactRead(value: unknown): ArtifactReadArguments {
+	const x = strictArgs(value, ["artifactId", "offset"]);
+	const offset = safeSeq(x.offset, "args.offset");
+	if (offset >= ARTIFACT_MAX_BYTES) fail("BOUNDS", "artifact offset exceeds the artifact limit", "args.offset");
+	return { artifactId: artifactId(x.artifactId, "args.artifactId"), offset };
+}
+export function decodeArtifactReadChunk(value: unknown): ArtifactReadChunk {
+	const x = result(value);
+	const expected = ["artifactId", "kind", "mediaType", "size", "offset", "nextOffset", "complete", "content"];
+	if (Object.keys(x).length !== expected.length || expected.some(key => !Object.hasOwn(x, key)))
+		fail("INVALID_FRAME", "invalid artifact read result", "result");
+	artifactId(x.artifactId, "result.artifactId");
+	const kind = controlFree(x.kind, "result.kind", 16);
+	if (!["image", "text", "patch", "binary"].includes(kind))
+		fail("INVALID_FRAME", "unsupported artifact kind", "result.kind");
+	const mediaType = controlFree(x.mediaType, "result.mediaType", 128);
+	if (!/^[!#$&^_.+*/-]+\/[!#$&^_.+*/-]+$/u.test(mediaType))
+		fail("INVALID_FRAME", "artifact mediaType must be a MIME type", "result.mediaType");
+	const size = safeSeq(x.size, "result.size");
+	if (size <= 0 || size > ARTIFACT_MAX_BYTES)
+		fail("BOUNDS", "artifact size exceeds the artifact limit", "result.size");
+	const offset = safeSeq(x.offset, "result.offset");
+	const nextOffset = safeSeq(x.nextOffset, "result.nextOffset");
+	if (offset >= size || nextOffset <= offset || nextOffset > size)
+		fail("INVALID_FRAME", "artifact result offsets are invalid", "result.nextOffset");
+	if (typeof x.complete !== "boolean" || x.complete !== (nextOffset === size))
+		fail("INVALID_FRAME", "artifact completion does not match its offsets", "result.complete");
+	const content = boundedText(x.content, "result.content", ARTIFACT_CHUNK_BASE64_BYTES);
+	if (content.length === 0 || content.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(content))
+		fail("INVALID_FRAME", "artifact content must be canonical base64", "result.content");
+	const padding = content.endsWith("==") ? 2 : content.endsWith("=") ? 1 : 0;
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	if (
+		(padding === 2 && (alphabet.indexOf(content[content.length - 3]!) & 0x0f) !== 0) ||
+		(padding === 1 && (alphabet.indexOf(content[content.length - 2]!) & 0x03) !== 0)
+	)
+		fail("INVALID_FRAME", "artifact content has non-canonical padding bits", "result.content");
+	const decodedBytes = (content.length / 4) * 3 - padding;
+	if (decodedBytes <= 0 || decodedBytes > ARTIFACT_CHUNK_BYTES || nextOffset - offset !== decodedBytes)
+		fail("INVALID_FRAME", "artifact content does not match its offsets", "result.content");
+	return x as unknown as ArtifactReadChunk;
+}
+export function decodeTurnReviewApplyResult(value: unknown): TurnReviewApplyResult {
+	const x = result(value);
+	const expected = ["turnId", "path", "action", "state", "resultingRevision"];
+	if (Object.keys(x).length !== expected.length || expected.some(key => !Object.hasOwn(x, key)))
+		fail("INVALID_FRAME", "invalid turn review action result", "result");
+	const decodedTurnId = turnId(x.turnId, "result.turnId");
+	const path = safeRelativePath(x.path, "result.path");
+	if (x.action !== "keep" && x.action !== "discard")
+		fail("INVALID_FRAME", "invalid turn review action", "result.action");
+	if (x.state !== "applied" && x.state !== "discarded")
+		fail("INVALID_FRAME", "invalid turn review action state", "result.state");
+	const resultingRevision = controlFree(x.resultingRevision, "result.resultingRevision", 128);
+	return {
+		turnId: decodedTurnId,
+		path,
+		action: x.action,
+		state: x.state,
+		resultingRevision,
+	};
+}
 function decodeImageRead(value: unknown): SessionImageReadArguments {
 	const x = strictArgs(value, ["entryId", "sha256", "offset"]);
 	const offset = safeSeq(x.offset, "args.offset");
@@ -1348,6 +1449,7 @@ export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown)
 	"session.image.chunk": value => decodeImageChunk(value) as unknown as CommandArguments,
 	"session.image.discard": value => decodeImageDiscard(value) as unknown as CommandArguments,
 	"session.image.read": value => decodeImageRead(value) as unknown as CommandArguments,
+	"artifact.read": value => decodeArtifactRead(value) as unknown as CommandArguments,
 	"session.state.get": noArgs,
 	"session.steer": decodeMessage,
 	"session.followUp": decodeMessage,
@@ -1417,17 +1519,31 @@ export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown)
 	},
 	"files.diff": value => {
 		const x = args(value);
+		if (x.turnId !== undefined) {
+			if (Object.keys(x).length !== 1) fail("INVALID_FRAME", "turn diff accepts only turnId", "args");
+			turnId(x.turnId, "args.turnId");
+			return x;
+		}
 		safeRelativePath(x.path);
 		return x;
 	},
 	"review.read": value => {
-		const x = args(value);
+		const x = strictArgs(value, ["reviewId"]);
 		controlFree(x.reviewId, "args.reviewId", 256);
 		return x;
 	},
 	"review.apply": value => {
 		const x = args(value);
-		controlFree(x.reviewId, "args.reviewId", 256);
+		if (x.turnId === undefined) {
+			if (Object.keys(x).length !== 1) fail("INVALID_FRAME", "legacy review apply accepts only reviewId", "args");
+			controlFree(x.reviewId, "args.reviewId", 256);
+			return x;
+		}
+		if (Object.keys(x).length !== 3) fail("INVALID_FRAME", "turn review action has invalid fields", "args");
+		turnId(x.turnId, "args.turnId");
+		safeRelativePath(x.path, "args.path");
+		if (x.action !== "keep" && x.action !== "discard")
+			fail("INVALID_FRAME", "turn review action must be keep or discard", "args.action");
 		return x;
 	},
 	"agent.cancel": value => {
@@ -1571,6 +1687,7 @@ export const COMMAND_RESULT_DECODERS: Readonly<Record<string, (value: unknown) =
 	},
 	"session.image.discard": value => decodeBooleanResult(value, "discarded"),
 	"session.image.read": decodeImageReadResult,
+	"artifact.read": value => decodeArtifactReadChunk(value) as unknown as CommandResult,
 	"session.state.get": decodeSessionState,
 	"session.steer": decodeAcceptedResult,
 	"session.followUp": decodeAcceptedResult,
@@ -1603,11 +1720,15 @@ export const COMMAND_RESULT_DECODERS: Readonly<Record<string, (value: unknown) =
 	"files.list": decodeEntries,
 	"files.diff": value => {
 		const x = result(value);
+		if (x.turnId !== undefined) return decodeTurnReviewSnapshot(x, "result") as unknown as CommandResult;
 		boundedText(x.diff, "result.diff", MAX_FILE_BYTES);
 		return x;
 	},
 	"review.read": result,
-	"review.apply": result,
+	"review.apply": value => {
+		const x = result(value);
+		return x.turnId === undefined ? x : (decodeTurnReviewApplyResult(x) as unknown as CommandResult);
+	},
 	"agent.cancel": value => boolField(value, "cancelled"),
 	"bash.run": result,
 	"term.open": decodeTerminalResult,

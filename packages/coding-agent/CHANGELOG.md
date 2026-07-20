@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ### Added
+- Added bounded, session-authorized artifact descriptors and chunked reads for text, image, patch, and binary tool outputs.
+- Added per-turn Git snapshots with typed file-change summaries and durable review metadata for desktop clients.
+
 
 - Add native Finder reveal support for local appserver projects without exposing their absolute paths.
 

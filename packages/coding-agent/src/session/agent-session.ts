@@ -18,7 +18,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { isPromise } from "node:util/types";
-
+import { turnId } from "@oh-my-pi/app-wire";
 import type { InMemorySnapshotStore } from "@oh-my-pi/hashline";
 import { Patch } from "@oh-my-pi/hashline";
 import {
@@ -398,6 +398,7 @@ import { cleanupEmptyMoveSession, type SessionManager } from "./session-manager"
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { planTurnPersistence, sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
+import { appendTurnReview, prepareTurnReview } from "./turn-review";
 import { classifyUnexpectedStop, isUnexpectedStopCandidate } from "./unexpected-stop-classifier";
 import { YieldQueue } from "./yield-queue";
 
@@ -8901,6 +8902,8 @@ export class AgentSession {
 			preludeMessages.push(eagerTaskPrelude);
 		}
 
+		const preparedTurnReview =
+			message.role === "user" && !options?.synthetic ? await prepareTurnReview(this.sessionManager) : undefined;
 		try {
 			await this.#promptWithMessage(message, expandedText, {
 				...options,
@@ -8911,6 +8914,20 @@ export class AgentSession {
 						: undefined,
 			});
 		} finally {
+			if (preparedTurnReview && message.role === "user") {
+				const userEntry = this.sessionManager
+					.getBranch()
+					.slice()
+					.reverse()
+					.find(
+						entry =>
+							entry.type === "message" &&
+							entry.message.role === "user" &&
+							entry.message.timestamp === message.timestamp,
+					);
+				if (userEntry?.type === "message")
+					await appendTurnReview(this.sessionManager, preparedTurnReview, turnId(userEntry.id));
+			}
 			// Clean up residual eager-todo directive if the prompt never consumed it
 			// (e.g., compaction aborted, validation failed).
 			this.#toolChoiceQueue.removeByLabel("eager-todo");

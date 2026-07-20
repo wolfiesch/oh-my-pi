@@ -22,6 +22,14 @@ export const TRANSCRIPT_IMAGE_CHUNK_BYTES = 256 * 1024;
 export const TRANSCRIPT_IMAGE_CHUNK_BASE64_BYTES = Math.ceil(TRANSCRIPT_IMAGE_CHUNK_BYTES / 3) * 4;
 export const TRANSCRIPT_IMAGE_MAX_BYTES = IMAGE_UPLOAD_MAX_BYTES;
 export const TRANSCRIPT_IMAGE_MAX_COUNT = 64;
+/** Maximum descriptors retained on one durable entry. */
+export const MAX_ARTIFACTS_PER_ENTRY = 64;
+/** Maximum file summaries retained for one turn review. */
+export const MAX_TURN_FILE_CHANGES = 4_096;
+/** Raw bytes returned by one generic artifact read command. */
+export const ARTIFACT_CHUNK_BYTES = 256 * 1024;
+export const ARTIFACT_CHUNK_BASE64_BYTES = Math.ceil(ARTIFACT_CHUNK_BYTES / 3) * 4;
+export const ARTIFACT_MAX_BYTES = 20 * 1024 * 1024;
 /** Raw bytes returned by one preview-capture read command. */
 export const PREVIEW_CAPTURE_CHUNK_BYTES = 256 * 1024;
 export const PREVIEW_CAPTURE_CHUNK_BASE64_BYTES = Math.ceil(PREVIEW_CAPTURE_CHUNK_BYTES / 3) * 4;

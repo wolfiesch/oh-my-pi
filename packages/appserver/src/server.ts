@@ -43,10 +43,12 @@ import type {
 	RpcSubagentMessagesResult,
 } from "../../coding-agent/src/modes/rpc/rpc-types.ts";
 import { AgentTranscriptProjection } from "./agent-transcript-projection.ts";
+import { ArtifactReadError, ArtifactReader } from "./artifact-reader.ts";
 import { completeAttachOutput, prepareAttachOutput } from "./attach-output.ts";
 import { AttentionOutcomeStore } from "./attention-outcome-store.ts";
 import { AppserverCommandHandlers } from "./command-handler.ts";
 import {
+	artifactDescriptorForRoot,
 	fallbackSessionTitle,
 	projectMessageText,
 	projectNameFromCwd,
@@ -123,7 +125,7 @@ const ARCHIVED_SESSION_COMMANDS = new Set([
 	"session.archive",
 	"session.restore",
 	"session.delete",
-	"session.image.read",
+	"artifact.read",
 	"files.read",
 	"files.list",
 	"files.diff",
@@ -146,7 +148,7 @@ const SESSION_CANCEL_COMMAND = "session.cancel";
 const AGENT_CANCEL_COMMAND = "agent.cancel";
 const OBSERVER_READ_COMMANDS = new Set([
 	"session.attach",
-	"session.image.read",
+	"artifact.read",
 	"files.read",
 	"files.list",
 	"files.diff",
@@ -590,7 +592,13 @@ export function appserverSupportedFeatures(
 	includeRemotePolicy = false,
 ): string[] {
 	const unsupportedAdditiveFeatures = new Set(["host.watch", "session.watch"]);
-	const implementedFeatures = new Set<string>(["resume", "prompt.images", "agent.transcript", "session.observer"]);
+	const implementedFeatures = new Set<string>([
+		"resume",
+		"prompt.images",
+		"agent.transcript",
+		"session.observer",
+		"artifacts.read",
+	]);
 	if (includeRemotePolicy) {
 		implementedFeatures.add("controller.lease");
 		implementedFeatures.add("prompt.lease");
@@ -640,6 +648,7 @@ export class LocalAppserver implements AppserverHandle {
 	#factory: RpcChildFactory;
 	#imageUploads: ImageUploadStore;
 	#transcriptImages?: TranscriptImageReader;
+	#artifacts = new ArtifactReader();
 	#lockCheck: LockCheckHook;
 	#ringSize: number;
 	#lifecycleQuiesceTimeoutMs: number;
@@ -1526,6 +1535,28 @@ export class LocalAppserver implements AppserverHandle {
 				const result = await this.#transcriptImages.read(
 					metadata.sha256,
 					metadata.mimeType,
+					args.offset,
+					controller.signal,
+				);
+				outcome = { frame: response(this.hostId, command, true, result) };
+			} else if (command.command === "artifact.read") {
+				if (!ws || !this.#attached.get(ws)?.has(command.sessionId!))
+					throw new ArtifactReadError("session_not_attached", "session must be attached before reading artifacts");
+				const args = decodeCommandArguments(command.command, command.args) as {
+					artifactId: string;
+					offset: number;
+				};
+				let descriptor = projection!.artifact(args.artifactId);
+				if (!descriptor && this.#clientFeatures.get(ws)?.has("agent.transcript"))
+					descriptor = this.#agentTranscripts.get(command.sessionId!)?.artifact(args.artifactId);
+				if (!descriptor)
+					throw new ArtifactReadError("artifact_not_found", "artifact is not projected for this session");
+				const record = this.#records.get(command.sessionId!);
+				if (!record?.path.endsWith(".jsonl"))
+					throw new ArtifactReadError("artifact_not_found", "artifact session is unavailable");
+				const result = await this.#artifacts.read(
+					record.path.slice(0, -".jsonl".length),
+					descriptor,
 					args.offset,
 					controller.signal,
 				);
@@ -2631,8 +2662,9 @@ export class LocalAppserver implements AppserverHandle {
 		transcript.observeKnownEntries(projection.value.entries);
 		this.#transcripts.set(sessionId, transcript);
 		const subagents = new SubagentProjection(this.hostId, sessionId);
-		this.#subagents.set(sessionId, subagents);
-		const projector = new SessionEntryProjector(this.hostId, sessionId, "live", projection.value.entries);
+		const projector = new SessionEntryProjector(this.hostId, sessionId, "live", projection.value.entries, id =>
+			artifactDescriptorForRoot(record.path.slice(0, -".jsonl".length), id),
+		);
 		let supervisor: RpcChildSupervisor;
 		const agentTranscripts = new AgentTranscriptProjection({
 			hostId: this.hostId,

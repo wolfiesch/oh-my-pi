@@ -1,9 +1,22 @@
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { chmod, mkdir, open, readdir, readFile, stat, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { DurableEntry, EntryId, HostId, ProjectId, SessionId, TranscriptImageMetadata } from "@oh-my-pi/app-wire";
+import type {
+	ArtifactDescriptor,
+	DurableEntry,
+	EntryId,
+	HostId,
+	ProjectId,
+	SessionId,
+	TranscriptImageMetadata,
+	TurnId,
+} from "@oh-my-pi/app-wire";
 import {
+	ARTIFACT_MAX_BYTES,
+	artifactId,
+	decodeArtifactDescriptorList,
+	decodeTurnReviewSnapshot,
 	entryId,
 	hostId,
 	parseBounded,
@@ -11,6 +24,7 @@ import {
 	sessionId,
 	TRANSCRIPT_IMAGE_MAX_COUNT,
 	TRANSCRIPT_IMAGE_MIME_TYPES,
+	turnId,
 } from "@oh-my-pi/app-wire";
 import { boundSnapshotEntries, uniqueEntryId } from "./snapshot-limits.ts";
 import type { FileSystem, SessionDiscovery, SessionRecord } from "./types.ts";
@@ -190,6 +204,63 @@ function toolResultContent(content: unknown): ProjectedToolResultText[] {
 	return blocks;
 }
 
+type ArtifactDescriptorResolver = (id: string) => ArtifactDescriptor | undefined;
+function toolResultArtifacts(
+	content: unknown,
+	resolveArtifact: ArtifactDescriptorResolver | undefined,
+): ArtifactDescriptor[] {
+	if (!resolveArtifact) return [];
+	const text =
+		typeof content === "string" ? content : Array.isArray(content) ? contentText(content, MAX_RESULT_BYTES) : "";
+	const artifacts: ArtifactDescriptor[] = [];
+	const seen = new Set<string>();
+	for (const match of text
+		.slice(0, MAX_RESULT_BYTES)
+		.matchAll(/(?:^|[^A-Za-z0-9_])artifact:\/\/([0-9]+)(?![A-Za-z0-9_])/gu)) {
+		const id = match[1]!;
+		if (seen.has(id)) continue;
+		seen.add(id);
+		const descriptor = resolveArtifact(id);
+		if (descriptor) artifacts.push(descriptor);
+		if (artifacts.length >= 64) break;
+	}
+	return artifacts;
+}
+export function artifactDescriptorForRoot(root: string, id: string): ArtifactDescriptor | undefined {
+	try {
+		const uid = process.getuid?.();
+		if (uid === undefined) return undefined;
+		const rootInfo = lstatSync(root);
+		if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory() || rootInfo.uid !== uid || (rootInfo.mode & 0o002) !== 0)
+			return undefined;
+		const file = readdirSync(root).find(
+			name => name.startsWith(`${id}.`) && /^[0-9]+\.[A-Za-z0-9_-]+\.log$/u.test(name),
+		);
+		if (!file) return undefined;
+		const info = lstatSync(join(root, file));
+		if (
+			info.isSymbolicLink() ||
+			!info.isFile() ||
+			info.uid !== uid ||
+			(info.mode & 0o002) !== 0 ||
+			info.size <= 0 ||
+			info.size > ARTIFACT_MAX_BYTES
+		)
+			return undefined;
+		return {
+			artifactId: artifactId(id),
+			kind: "text",
+			mediaType: "text/plain",
+			size: info.size,
+			name: file,
+			disposition: "attachment",
+			retention: "session",
+		};
+	} catch {
+		return undefined;
+	}
+}
+
 export function projectToolResultDetails(details: unknown): unknown {
 	if (details === undefined) return undefined;
 	const projected = safeValue(details, "", 0, true);
@@ -286,6 +357,7 @@ interface ProjectedToolResult {
 	images: TranscriptImageMetadata[];
 	timestamp: string;
 	xdev?: ProjectedXdevResult;
+	artifacts: ArtifactDescriptor[];
 }
 
 function mergeImages(
@@ -337,11 +409,22 @@ export class SessionEntryProjector {
 	#model?: string;
 	#thinking?: string;
 	#knownEntryIds = new Set<string>();
+	#artifactResolver?: ArtifactDescriptorResolver;
+	#turnByRawId = new Map<string, TurnId>();
+	#turnReviewEntries = new Map<TurnId, DurableEntry>();
+	#turnActions = new Map<string, "applied" | "discarded">();
 
-	constructor(host: HostId, session: SessionId, mode: ProjectionMode, knownEntries: readonly DurableEntry[] = []) {
+	constructor(
+		host: HostId,
+		session: SessionId,
+		mode: ProjectionMode,
+		knownEntries: readonly DurableEntry[] = [],
+		artifactResolver?: ArtifactDescriptorResolver,
+	) {
 		this.#host = host;
 		this.#session = session;
 		this.mode = mode;
+		this.#artifactResolver = artifactResolver;
 		for (const entry of knownEntries) this.#knownEntryIds.add(entry.id);
 	}
 
@@ -381,6 +464,26 @@ export class SessionEntryProjector {
 		}
 		return null;
 	}
+	#turnFor(raw: Record<string, unknown>): TurnId | undefined {
+		const rawId = String(raw.id);
+		const own = this.#turnByRawId.get(rawId);
+		if (own) return own;
+		const inherited = typeof raw.parentId === "string" ? this.#turnByRawId.get(raw.parentId) : undefined;
+		if (inherited) this.#turnByRawId.set(rawId, inherited);
+		return inherited;
+	}
+	#turnActionKey(id: TurnId, path: string): string {
+		return `${id}\u0000${path}`;
+	}
+	#applyTurnAction(entry: DurableEntry, path: string, state: "applied" | "discarded"): void {
+		const changes = entry.data.changes;
+		if (!Array.isArray(changes)) return;
+		for (const change of changes) {
+			if (!change || typeof change !== "object") continue;
+			const candidate = change as Record<string, unknown>;
+			if (candidate.path === path) candidate.state = state;
+		}
+	}
 
 	#add(
 		raw: Record<string, unknown>,
@@ -391,11 +494,13 @@ export class SessionEntryProjector {
 	): DurableEntry {
 		const id = uniqueEntryId(idBase, this.#usedIds);
 		this.#usedIds.add(id);
+		const inheritedTurn = this.#turnFor(raw);
 		const entry: DurableEntry = {
 			id,
 			parentId,
 			hostId: this.#host,
 			sessionId: this.#session,
+			...(inheritedTurn === undefined ? {} : { turnId: inheritedTurn }),
 			kind,
 			timestamp: String(raw.timestamp),
 			data,
@@ -438,6 +543,7 @@ export class SessionEntryProjector {
 					isError: !result.ok,
 				},
 				...(images.length > 0 ? { images } : {}),
+				...(result.artifacts.length > 0 ? { artifacts: result.artifacts } : {}),
 			},
 			call.parentId,
 			call.idBase,
@@ -462,6 +568,7 @@ export class SessionEntryProjector {
 					: raw.type === "message" && typeof raw.message === "string"
 						? "user"
 						: undefined;
+		if (role === "user") this.#turnByRawId.set(String(raw.id), turnId(String(raw.id)));
 
 		if (raw.type === "message" && (role === "user" || role === "assistant")) {
 			const content = message.content ?? message.text ?? (nested ? message.message : (raw.text ?? raw.message));
@@ -533,6 +640,7 @@ export class SessionEntryProjector {
 					content: toolResultContent(rawContent),
 					details: projectToolResultDetails(message.details),
 					images: toolResultImages(rawContent, message.details, this.mode === "live"),
+					artifacts: toolResultArtifacts(rawContent, this.#artifactResolver),
 					timestamp: String(raw.timestamp),
 					...(xdev
 						? {
@@ -554,6 +662,74 @@ export class SessionEntryProjector {
 				} else {
 					this.#pendingResults.set(callId, result);
 				}
+			}
+			this.#aliases.set(String(raw.id), parentId);
+		} else if (raw.type === "custom" && raw.customType === "turn-review") {
+			const data = asObject(raw.data);
+			try {
+				if (
+					!data ||
+					Object.keys(data).some(
+						key => !["turnId", "baseTree", "headTree", "changes", "patch", "artifacts"].includes(key),
+					)
+				)
+					throw new Error("invalid turn review");
+				const review = decodeTurnReviewSnapshot(
+					{
+						turnId: data.turnId,
+						baseTree: data.baseTree,
+						headTree: data.headTree,
+						changes: data.changes,
+						...(data.patch === undefined ? {} : { patch: data.patch }),
+					},
+					"turn-review",
+				);
+				const artifacts = decodeArtifactDescriptorList(data.artifacts, "turn-review.artifacts");
+				if (
+					(review.patch === undefined && artifacts.length !== 0) ||
+					(review.patch !== undefined &&
+						(artifacts.length !== 1 || artifacts[0]?.artifactId !== review.patch.artifactId))
+				)
+					throw new Error("invalid turn review artifacts");
+				this.#turnByRawId.set(String(raw.id), review.turnId);
+				const entry = this.#add(
+					raw,
+					"turn-review",
+					{
+						baseTree: review.baseTree,
+						headTree: review.headTree,
+						changes: review.changes.map(change => ({ ...change })),
+						...(review.patch === undefined ? {} : { patch: review.patch }),
+						artifacts,
+					},
+					parentId,
+				);
+				this.#turnReviewEntries.set(review.turnId, entry);
+				for (const change of review.changes) {
+					const state = this.#turnActions.get(this.#turnActionKey(review.turnId, change.path));
+					if (state) this.#applyTurnAction(entry, change.path, state);
+				}
+				this.#aliases.set(String(raw.id), entry.id);
+			} catch {
+				this.#aliases.set(String(raw.id), parentId);
+			}
+		} else if (raw.type === "custom" && raw.customType === "turn-review-action") {
+			const data = asObject(raw.data);
+			if (
+				data &&
+				(data.action === "keep" || data.action === "discard") &&
+				typeof data.path === "string" &&
+				data.path.length > 0 &&
+				!data.path.startsWith("/") &&
+				!data.path.split(/[\\/]/u).includes("..")
+			) {
+				try {
+					const id = turnId(data.turnId);
+					const state = data.action === "keep" ? "applied" : "discarded";
+					this.#turnActions.set(this.#turnActionKey(id, data.path), state);
+					const entry = this.#turnReviewEntries.get(id);
+					if (entry) this.#applyTurnAction(entry, data.path, state);
+				} catch {}
 			}
 			this.#aliases.set(String(raw.id), parentId);
 		} else if (raw.type === "custom_message" && raw.display === true) {
@@ -614,6 +790,7 @@ export class SessionEntryProjector {
 					ok: false,
 					content: [],
 					images: [],
+					artifacts: [],
 					timestamp: call.timestamp,
 				});
 				this.#settledCalls.add(call.callId);
@@ -630,6 +807,7 @@ export function projectSessionEntries(
 	host: HostId,
 	sid: SessionId,
 	headerTimestamp: string,
+	artifactResolver?: ArtifactDescriptorResolver,
 ): {
 	entries: DurableEntry[];
 	firstUserText?: string;
@@ -637,7 +815,7 @@ export function projectSessionEntries(
 	model?: string;
 	thinking?: string;
 } {
-	const projector = new SessionEntryProjector(host, sid, "batch");
+	const projector = new SessionEntryProjector(host, sid, "batch", [], artifactResolver);
 	for (const value of values) {
 		const raw = asObject(value);
 		if (!raw) continue;
@@ -740,7 +918,13 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
 			// only the bad entry so one partial write cannot hide the whole session.
 		}
 	}
-	const normalized = projectSessionEntries(values, host, sid, header.timestamp);
+	const normalized = projectSessionEntries(
+		values,
+		host,
+		sid,
+		header.timestamp,
+		path.endsWith(".jsonl") ? id => artifactDescriptorForRoot(path.slice(0, -".jsonl".length), id) : undefined,
+	);
 	const sessionTitle = typeof header.title === "string" ? cleanText(header.title, 512, true) : undefined;
 	const title =
 		fixedTitle ||
@@ -1122,7 +1306,9 @@ export class SessionTranscriptObserver {
 				const cwd = resolve(value.cwd);
 				this.#headerTitle =
 					typeof value.title === "string" ? cleanText(value.title, 512, true) || undefined : undefined;
-				this.#projector = new SessionEntryProjector(this.#host, sid, "live");
+				this.#projector = new SessionEntryProjector(this.#host, sid, "live", [], id =>
+					artifactDescriptorForRoot(this.#path.slice(0, -".jsonl".length), id),
+				);
 				this.#record = {
 					sessionId: sid,
 					path: this.#path,

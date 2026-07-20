@@ -9,6 +9,8 @@
 - Add a bounded, ordered browser preview contract with backend-neutral authority metadata, capture chunking, tab controls, input actions, policy checks, cooperative leases, and human handoff.
 - Add the negotiated `transcript.search` feature with strict, bounded host search and session context commands.
 - Add the strict, bounded `SessionRef.attention` summary for cross-session pending questions, approvals, plan reviews, and latest root outcomes.
+- Add the negotiated `artifacts.read` feature and `artifact.read` command with bounded canonical chunks, numeric opaque IDs, and strict artifact descriptors on durable entries.
+- Add durable `turnId` attribution, typed turn-review snapshots through `files.diff { turnId }`, and compatible typed turn actions through `review.apply`.
 
 ## [0.5.10] - 2026-07-18
 

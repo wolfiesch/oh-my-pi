@@ -1,3 +1,4 @@
+export * from "./artifact-reader.ts";
 export * from "./discovery.ts";
 export * from "./idempotency.ts";
 export * from "./identity.ts";

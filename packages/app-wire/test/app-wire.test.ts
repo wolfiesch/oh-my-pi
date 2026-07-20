@@ -1037,6 +1037,7 @@ describe("app-wire authority", () => {
 			"broker.status": "none",
 			"catalog.get": "none",
 			"usage.read": "none",
+			"artifact.read": "none",
 			"host.watch": "none",
 			"session.watch": "none",
 		};

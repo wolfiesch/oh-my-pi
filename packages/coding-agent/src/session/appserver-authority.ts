@@ -319,12 +319,12 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 				context.abortSignal.removeEventListener("abort", onAbort);
 			}
 		},
+		reviewApply: (args: Record<string, unknown>, context: OperationContext) =>
+			coding.reviewApply(args as unknown as Parameters<typeof coding.reviewApply>[0], context),
 		...(options.reviewStore
 			? {
 					reviewRead: (args: Record<string, unknown>, context: OperationContext) =>
 						coding.reviewRead(args as unknown as Parameters<typeof coding.reviewRead>[0], context),
-					reviewApply: (args: Record<string, unknown>, context: OperationContext) =>
-						coding.reviewApply(args as unknown as Parameters<typeof coding.reviewApply>[0], context),
 				}
 			: {}),
 		...(options.agentAuthority
