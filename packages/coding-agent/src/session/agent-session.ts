@@ -1108,6 +1108,8 @@ export interface PromptOptions {
 	userInitiated?: boolean;
 	/** Explicit billing/initiator attribution for the prompt. Defaults to user prompts as `user` and synthetic prompts as `agent`. */
 	attribution?: MessageAttribution;
+	/** Capture a worktree baseline and append a turn review snapshot. RPC/app sessions opt in; interactive prompts stay latency-free. */
+	captureTurnReview?: boolean;
 	/** Skip pre-send compaction checks for this prompt (internal use for maintenance flows). */
 	skipCompactionCheck?: boolean;
 }
@@ -8903,7 +8905,9 @@ export class AgentSession {
 		}
 
 		const preparedTurnReview =
-			message.role === "user" && !options?.synthetic ? await prepareTurnReview(this.sessionManager) : undefined;
+			options?.captureTurnReview && message.role === "user" && !options.synthetic
+				? await prepareTurnReview(this.sessionManager)
+				: undefined;
 		try {
 			await this.#promptWithMessage(message, expandedText, {
 				...options,

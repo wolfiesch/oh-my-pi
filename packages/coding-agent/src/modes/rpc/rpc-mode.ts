@@ -1608,7 +1608,11 @@ export async function runRpcMode(
 						watchAndReportLocalOnlyPromptResult({
 							id,
 							startPrompt: () =>
-								session.prompt(builtinResult.prompt, { images: promptImages, clientCorrelationId: id }),
+								session.prompt(builtinResult.prompt, {
+									images: promptImages,
+									clientCorrelationId: id,
+									captureTurnReview: true,
+								}),
 							output,
 							extensionUserMessageTracker,
 						});
@@ -1627,6 +1631,7 @@ export async function runRpcMode(
 							images: promptImages,
 							streamingBehavior: command.streamingBehavior,
 							clientCorrelationId: id,
+							captureTurnReview: true,
 						}),
 					output,
 					extensionUserMessageTracker,
