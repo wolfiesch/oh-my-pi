@@ -1,27 +1,5 @@
-export * from "./additive.js";
-export * from "./agents.js";
-export * from "./audit.js";
-export * from "./broker.js";
-export * from "./capabilities.js";
-export * from "./command.js";
-export * from "./cursor.js";
-export * from "./entry.js";
-export * from "./envelope.js";
-export * from "./errors.js";
-export * from "./event.js";
-export * from "./files-review.js";
-export * from "./gap.js";
-export * from "./guards.js";
-export * from "./heartbeat.js";
-export * from "./hello.js";
-export * from "./ids.js";
-export * from "./limits.js";
-export * from "./pairing-confirm.js";
-export * from "./result.js";
-export * from "./session-index.js";
-export * from "./session-state.js";
-export * from "./snapshot.js";
-export * from "./terminal.js";
-export * from "./transcript-search.js";
-export * from "./usage.js";
-export * from "./user-terminals.js";
+/**
+ * Compatibility export for OMP code that still imports @oh-my-pi/app-wire.
+ * The active protocol implementation is owned and released by T4.
+ */
+export * from "@t4-code/host-wire";

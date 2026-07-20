@@ -63,6 +63,8 @@ SOURCE_BUN_HOME="$WORK_DIR/bun-source"
 section "Tarball install smoke"
 TARBALL_DIR="$WORK_DIR/tarballs"
 mkdir -p "$TARBALL_DIR"
+cp "$ROOT_DIR/vendor/t4-host/t4-code-host-service-0.1.30.tgz" "$TARBALL_DIR/"
+cp "$ROOT_DIR/vendor/t4-host/t4-code-host-wire-0.1.30.tgz" "$TARBALL_DIR/"
 host_tag="$(bun -e "process.stdout.write(\`\${process.platform}-\${process.arch}\`)")"
 
 # Native addon split: the published core ships only the loader (no `.node`); the
@@ -120,6 +122,8 @@ utils_tgz="$(find_tarball "$TARBALL_DIR"/oh-my-pi-pi-utils-*.tgz)"
 wire_tgz="$(find_tarball "$TARBALL_DIR"/oh-my-pi-pi-wire-*.tgz)"
 app_wire_tgz="$(find_tarball "$TARBALL_DIR"/oh-my-pi-app-wire-*.tgz)"
 appserver_tgz="$(find_tarball "$TARBALL_DIR"/oh-my-pi-appserver-*.tgz)"
+t4_host_service_tgz="$(find_tarball "$TARBALL_DIR"/t4-code-host-service-*.tgz)"
+t4_host_wire_tgz="$(find_tarball "$TARBALL_DIR"/t4-code-host-wire-*.tgz)"
 mechanism_tgz="$(find_tarball "$TARBALL_DIR"/oh-my-pi-omp-mechanism-*.tgz)"
 natives_tgz="$(find_tarball "$TARBALL_DIR"/oh-my-pi-pi-natives-[0-9]*.tgz)"
 natives_leaf_tgz="$(find_tarball "$TARBALL_DIR"/oh-my-pi-pi-natives-"$host_tag"-*.tgz)"
@@ -149,6 +153,8 @@ mkdir -p "$TARBALL_APP_DIR"
 			'@oh-my-pi/pi-wire': '$wire_tgz',
 			'@oh-my-pi/app-wire': '$app_wire_tgz',
 			'@oh-my-pi/appserver': '$appserver_tgz',
+			'@t4-code/host-service': '$t4_host_service_tgz',
+			'@t4-code/host-wire': '$t4_host_wire_tgz',
 			'@oh-my-pi/omp-mechanism': '$mechanism_tgz',
 			'@oh-my-pi/pi-natives': '$natives_tgz',
 			'@oh-my-pi/pi-natives-$host_tag': '$natives_leaf_tgz',
@@ -166,7 +172,7 @@ mkdir -p "$TARBALL_APP_DIR"
 		require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
 	"
 
-   bun add "$utils_tgz" "$wire_tgz" "$app_wire_tgz" "$appserver_tgz" "$mechanism_tgz" "$natives_tgz" "$hashline_tgz" "$catalog_tgz" "$ai_tgz" "$mnemopi_tgz" "$snapcompact_tgz" "$agent_tgz" "$tui_tgz" "$stats_tgz" "$coding_agent_tgz" "$collab_web_tgz"
+   bun add "$utils_tgz" "$wire_tgz" "$app_wire_tgz" "$appserver_tgz" "$t4_host_service_tgz" "$t4_host_wire_tgz" "$mechanism_tgz" "$natives_tgz" "$hashline_tgz" "$catalog_tgz" "$ai_tgz" "$mnemopi_tgz" "$snapcompact_tgz" "$agent_tgz" "$tui_tgz" "$stats_tgz" "$coding_agent_tgz" "$collab_web_tgz"
    # The platform leaf must arrive through the core's optionalDependencies +
    # override, not as a direct dependency — assert it landed before smoking so a
    # resolution regression is distinguishable from a runtime loader bug.

@@ -77,6 +77,47 @@ describe("appserver session lifecycle authority", () => {
 		expect(decodeServerFrame(snapshot)).toMatchObject({ type: "snapshot", entries: [] });
 	});
 
+	test("pages the newest OMP transcript entries through the T4 host reader", async () => {
+		const { sessionsDir, metadataPath } = await fixture();
+		const transcript = await writeSession(sessionsDir, "session-paged-tail");
+		const entries = [
+			{ id: "message-1", parentId: null, role: "user", content: "first" },
+			{ id: "message-2", parentId: "message-1", role: "assistant", content: "second" },
+			{ id: "message-3", parentId: "message-2", role: "assistant", content: "third" },
+		];
+		await fs.appendFile(
+			transcript,
+			`${entries
+				.map((entry, index) =>
+					JSON.stringify({
+						type: "message",
+						id: entry.id,
+						parentId: entry.parentId,
+						timestamp: `2026-07-13T12:00:0${index + 1}.000Z`,
+						message: { role: entry.role, content: entry.content },
+					}),
+				)
+				.join("\n")}\n`,
+		);
+
+		const runtime = createAppserverRuntime({ sessionsDir, lifecycleMetadataPath: metadataPath });
+		const [record] = await runtime.discovery.list();
+		expect(record).toBeDefined();
+		expect(runtime.discovery.page).toBeFunction();
+		const newest = await runtime.discovery.page!(record!, { limit: 2, maxBytes: 4 * 1024 });
+		expect(newest.entries.map(entry => entry.data.text)).toEqual(["second", "third"]);
+		expect(newest.hasMore).toBe(true);
+		expect(newest.nextCursor).toBeString();
+
+		const earlier = await runtime.discovery.page!(record!, {
+			before: newest.nextCursor!,
+			limit: 2,
+			maxBytes: 4 * 1024,
+		});
+		expect(earlier.entries.map(entry => entry.data.text)).toEqual(["first"]);
+		expect(earlier.hasMore).toBe(false);
+	});
+
 	test("archive and restore survive runtime restart with private atomic metadata", async () => {
 		const { sessionsDir, metadataPath } = await fixture();
 		await writeSession(sessionsDir, "session-durable");

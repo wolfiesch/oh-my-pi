@@ -1,33 +1,8 @@
-export * from "./discovery.ts";
-export * from "./idempotency.ts";
-export * from "./identity.ts";
-export * from "./image-upload-store.ts";
-export * from "./operations/index.ts";
-export * from "./projection.ts";
-export * from "./remote/index.ts";
-export * from "./remote/listener.ts";
-export * from "./remote/policy.ts";
-export * from "./remote/resolver.ts";
-export * from "./remote/runtime.ts";
-export * from "./remote/types.ts";
-export * from "./rpc-child.ts";
-export type {
-	AuthenticatedPrincipal,
-	Capability,
-	DeviceMetadata,
-	DeviceRecord,
-	DeviceRegistry,
-	RemotePeerIdentity as SecurityRemotePeerIdentity,
-} from "./security/index.ts";
-export {
-	COMMAND_DESCRIPTORS,
-	DEVICE_CAPABILITIES,
-	LeaseRegistry,
-	LocalPairingTicketIssuer,
-	SqliteDeviceRegistry,
-	TokenBucketLimiter,
-} from "./security/index.ts";
-export * from "./server.ts";
-export * from "./transcript-image-reader.ts";
-export * from "./transcript-search-index.ts";
-export * from "./types.ts";
+/**
+ * OMP intentionally owns no generic desktop host implementation.
+ *
+ * This package remains as the stable import used by the OMP CLI and authority
+ * modules, but every generic server, wire, security, paging, and remote concern
+ * comes from the checksum-pinned T4 artifact under vendor/t4-host.
+ */
+export * from "@t4-code/host-service";

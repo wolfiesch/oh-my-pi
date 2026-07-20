@@ -16,6 +16,8 @@
 
 ### Changed
 
+- Replaced the fork's copied appserver and app-wire implementations with a thin OMP authority
+  launcher over checksum-pinned T4 host artifacts, including bounded transcript tail pagination.
 - Bounded incremental subagent transcript RPC reads to complete 384 KiB JSONL chunks, with byte cursors and an option to omit the redundant message view.
 - Appserver now admits one unresolved `session.prompt` per session and returns `session_busy` before a second prompt reaches the RPC child; active clients can use `session.steer` or `session.followUp` to add work to the running agent.
 - Bounded completed appserver command outcomes to a five-minute replay window and a 1,024-entry least-recently-used cache. Replays do not extend expiry, and pending commands are never evicted.

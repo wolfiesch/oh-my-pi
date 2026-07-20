@@ -3,16 +3,20 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Persistent local omp appserver over Unix WebSocket",
+  "description": "Thin OMP authority adapter for the T4-owned host service",
   "license": "MIT",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
-  "exports": { ".": { "types": "./src/index.ts", "import": "./src/index.ts" }, "./*": { "types": "./src/*.ts", "import": "./src/*.ts" } },
+  "files": ["src", "README.md"],
+  "exports": { ".": { "types": "./src/index.ts", "import": "./src/index.ts" } },
   "scripts": {
     "build": "bunx tsc -p tsconfig.json --noEmit",
     "check": "bun run build",
     "test": "bun test test/*.test.ts"
   },
-  "dependencies": { "@oh-my-pi/app-wire": "workspace:*" },
+  "dependencies": {
+    "@t4-code/host-service": "0.1.30",
+    "@t4-code/host-wire": "0.1.30"
+  },
   "engines": { "bun": ">=1.3.14" }
 }

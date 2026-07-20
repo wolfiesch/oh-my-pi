@@ -5,6 +5,8 @@
     "": {
       "name": "omp",
       "dependencies": {
+        "@t4-code/host-service": "./vendor/t4-host/t4-code-host-service-0.1.30.tgz",
+        "@t4-code/host-wire": "./vendor/t4-host/t4-code-host-wire-0.1.30.tgz",
         "sherpa-onnx": "1.13.2",
         "sherpa-onnx-darwin-arm64": "1.13.3",
         "sherpa-onnx-node": "1.13.2",
@@ -61,7 +63,8 @@
       "name": "@oh-my-pi/appserver",
       "version": "0.1.0",
       "dependencies": {
-        "@oh-my-pi/app-wire": "workspace:*",
+        "@t4-code/host-service": "0.1.30",
+        "@t4-code/host-wire": "0.1.30",
       },
     },
     "packages/catalog": {
@@ -414,6 +417,8 @@
   },
   "overrides": {
     "@ark/schema": "0.56.2",
+    "@t4-code/host-service": "./vendor/t4-host/t4-code-host-service-0.1.30.tgz",
+    "@t4-code/host-wire": "./vendor/t4-host/t4-code-host-wire-0.1.30.tgz",
   },
   "catalog": {
     "@agentclientprotocol/sdk": "1.2.1",
@@ -960,6 +965,10 @@
     "@sindresorhus/is": ["@sindresorhus/is@4.6.0", "", {}, "sha512-t09vSN3MdfsyCHoFcTRCH/iUtG7OJ0CsjzB8cjAmKc/va/kIgeDI/TxsigdncE/4be734m0cvIYwNaV4i2XqAw=="],
 
     "@so-ric/colorspace": ["@so-ric/colorspace@1.1.6", "", { "dependencies": { "color": "^5.0.2", "text-hex": "1.0.x" } }, "sha512-/KiKkpHNOBgkFJwu9sh48LkHSMYGyuTcSFK/qMBdnOAlrRJzRSXAOFB5qwzaVQuDl8wAvHVMkaASQDReTahxuw=="],
+
+    "@t4-code/host-service": ["@t4-code/host-service@./vendor/t4-host/t4-code-host-service-0.1.30.tgz", { "dependencies": { "@agentclientprotocol/sdk": "1.2.1", "@t4-code/host-wire": "0.1.30" } }, "sha512-GOs87X/CYNLeWRfTv7OXhsZ5d73Zz2j6tAvkd1bc38Lu2oFsFx14X0V5ec0D4O7zcIwxAsdcmtsElkfWSwFVRQ=="],
+
+    "@t4-code/host-wire": ["@t4-code/host-wire@./vendor/t4-host/t4-code-host-wire-0.1.30.tgz", {}, "sha512-jE3gHnp96LbH+MDK5DxWD4EDMPXuHW91XJjuO2/sq1XWgNEXGHf6bM4JI7mOIbls8Xx4PZ3wT7MpXqGRgTd1dA=="],
 
     "@tailwindcss/node": ["@tailwindcss/node@4.3.2", "", { "dependencies": { "@jridgewell/remapping": "^2.3.5", "enhanced-resolve": "5.21.6", "jiti": "^2.7.0", "lightningcss": "1.32.0", "magic-string": "^0.30.21", "source-map-js": "^1.2.1", "tailwindcss": "4.3.2" } }, "sha512-yWP/sqEcBLaD8JuA6zNwxoYKr75qxTioYwlRwekj5Jr/I5GXnoJfjetH/psLUIv74cYTH2lBUEzBkinthoYcBg=="],
 
