@@ -79,6 +79,10 @@ export interface ContextUsage {
 	used: number;
 	limit: number;
 }
+export interface SessionRuntime {
+	id: string;
+	workspaceInstanceId?: string;
+}
 export type SessionObserverLockStatus = "live" | "suspect" | "malformed";
 export type SessionObserverTranscript = "live" | "snapshot";
 export type ProviderTransportPolicy = "auto" | "on" | "off";
@@ -132,6 +136,7 @@ export interface SessionRef {
 	proposedPlan?: string;
 	contextUsage?: ContextUsage;
 	attention?: SessionAttentionState;
+	runtime?: SessionRuntime;
 }
 export interface SessionListResult {
 	cursor: Cursor;
@@ -321,6 +326,18 @@ export function decodeSessionAttentionState(value: unknown, path: string): Sessi
 			: { latestOutcome: decodeAttentionOutcome(attention.latestOutcome, `${path}.latestOutcome`) }),
 	};
 }
+function decodeSessionRuntime(value: unknown, path: string): SessionRuntime {
+	const runtime = boundedMap(value, path);
+	for (const key of Object.keys(runtime))
+		if (key !== "id" && key !== "workspaceInstanceId")
+			fail("INVALID_FRAME", "unknown session runtime field", `${path}.${key}`);
+	return {
+		id: controlFree(runtime.id, `${path}.id`, 64),
+		...(runtime.workspaceInstanceId === undefined
+			? {}
+			: { workspaceInstanceId: controlFree(runtime.workspaceInstanceId, `${path}.workspaceInstanceId`, 128) }),
+	};
+}
 
 export function decodeSessionRef(value: unknown, path: string): SessionRef {
 	const session = boundedMap(value, path);
@@ -368,6 +385,7 @@ export function decodeSessionRef(value: unknown, path: string): SessionRef {
 			fail("BOUNDS", "invalid context usage", `${path}.contextUsage`);
 	}
 	if (session.attention !== undefined) decodeSessionAttentionState(session.attention, `${path}.attention`);
+	if (session.runtime !== undefined) decodeSessionRuntime(session.runtime, `${path}.runtime`);
 	return session as unknown as SessionRef;
 }
 export function decodeSessionListResult(value: unknown): SessionListResult {

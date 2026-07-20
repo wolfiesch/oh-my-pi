@@ -6,6 +6,8 @@ import { dirname, isAbsolute, join } from "node:path";
 import {
 	type AttentionOutcome,
 	COMMAND_DESCRIPTORS,
+	type DurableEntry,
+	type EntryId,
 	type CommandFrame,
 	type ConfirmationChallenge,
 	type ConfirmFrame,
@@ -16,6 +18,7 @@ import {
 	decodeSessionPromptArguments,
 	decodeSessionStateResult,
 	decodeUsageReadResult,
+	entryId,
 	type HelloFrame,
 	type HostId,
 	IMAGE_UPLOAD_CHUNK_BYTES,
@@ -29,6 +32,7 @@ import {
 	requiredCapability,
 	type ServerFrame,
 	type SessionId,
+	sessionId,
 	type SessionImageReadArguments,
 	type SessionRef,
 	type SessionStateResult,
@@ -84,7 +88,12 @@ import {
 	unlinkIfExists,
 } from "./ownership.ts";
 import { SessionProjection } from "./projection.ts";
-import type { RuntimeAdapterRegistry } from "./runtime-adapter.ts";
+import type {
+	RuntimeAdapterRegistry,
+	RuntimePermissionResponse,
+	RuntimeSession,
+	RuntimeWorkspaceIdentity,
+} from "./runtime-adapter.ts";
 import { WorkspaceAuthorityError, type WorkspaceAuthority, type WorkspaceRecord } from "./workspace-authority.ts";
 import { BunRemoteListener, createListenerPlan, createServeProxyPlan } from "./remote/listener.ts";
 import type { RemoteConnection, RemoteListenerConfig } from "./remote/types.ts";
@@ -345,7 +354,8 @@ function argumentError(command: CommandFrame): string | undefined {
 		return "attach accepts only an optional cursor";
 	}
 	if (command.command === "session.create") {
-		if (keys.some(key => key !== "projectId" && key !== "title")) return "create accepts only projectId and title";
+		if (keys.some(key => !["projectId", "title", "runtimeId", "workspaceInstanceId"].includes(key)))
+			return "create arguments are invalid";
 		if (typeof args.projectId !== "string" || args.projectId.length === 0 || utf8ByteLength(args.projectId) > 256)
 			return "create projectId must be a bounded non-empty UTF-8 string";
 		if (
@@ -353,6 +363,17 @@ function argumentError(command: CommandFrame): string | undefined {
 			(typeof args.title !== "string" || args.title.length === 0 || utf8ByteLength(args.title) > 512)
 		)
 			return "create title must be a bounded non-empty UTF-8 string";
+		for (const [key, limit] of [
+			["runtimeId", 64],
+			["workspaceInstanceId", 128],
+		] as const)
+			if (
+				args[key] !== undefined &&
+				(typeof args[key] !== "string" || args[key].length === 0 || utf8ByteLength(args[key]) > limit)
+			)
+				return `create ${key} must be a bounded non-empty UTF-8 string`;
+		if ((args.runtimeId === undefined) !== (args.workspaceInstanceId === undefined))
+			return "create runtimeId and workspaceInstanceId must be provided together";
 		return undefined;
 	}
 	// Operation argument shapes are validated by decodeCommand and the typed
@@ -468,10 +489,45 @@ interface PromptLifecycle {
 	commandHash: string;
 	kind: "prompt" | "steer" | "followUp";
 	accepted?: true;
+	cancelRequested?: true;
 	internalId?: string;
 	transientEntryId?: string;
 }
 type PromptDiscardReason = "rejected" | "local-only" | "failed" | "cancelled" | "completed-without-entry";
+interface ExternalRuntimeOwner {
+	readonly runtimeId: string;
+	readonly workspaceInstanceId: string;
+	readonly session: RuntimeSession;
+}
+interface ExternalPermissionRequest {
+	readonly resolve: (response: RuntimePermissionResponse) => void;
+	readonly allowOptionId?: string;
+	readonly rejectOptionId?: string;
+}
+interface ExternalToolProjection {
+	readonly entryId: EntryId;
+	readonly callId: string;
+	tool: string;
+	title: string;
+	status?: string;
+	settled?: true;
+}
+interface ExternalTurnProjection {
+	readonly assistantEntryId: EntryId;
+	text: string;
+	reasoning: string;
+	readonly tools: Map<string, ExternalToolProjection>;
+}
+class ExternalRuntimeCommandError extends Error {
+	constructor(message = "command is unsupported by the selected runtime") {
+		super(message);
+		this.name = "ExternalRuntimeCommandError";
+	}
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
 
 function promptEntryCorrelationId(entry: RpcSessionEntryFrame["entry"]): string | undefined {
 	if (entry.type === "message" && entry.message.role === "user") return entry.message.clientCorrelationId;
@@ -656,6 +712,9 @@ export class LocalAppserver implements AppserverHandle {
 	#createdPending = new Map<SessionId, { record: SessionRecord; refreshesRemaining: number }>();
 	#projections = new Map<SessionId, SessionProjection>();
 	#supervisors = new Map<SessionId, RpcChildSupervisor>();
+	#externalRuntimes = new Map<SessionId, ExternalRuntimeOwner>();
+	#externalPermissions = new Map<SessionId, Map<string, ExternalPermissionRequest>>();
+	#externalTurns = new Map<SessionId, ExternalTurnProjection>();
 	#promptLifecycles = new Map<SessionId, PromptLifecycle>();
 	#messageLifecycles = new Map<SessionId, PromptLifecycle[]>();
 	#messageLifecyclesByCommandId = new Map<string, PromptLifecycle>();
@@ -1024,6 +1083,10 @@ export class LocalAppserver implements AppserverHandle {
 			this.#observerRefreshes.clear();
 			for (const supervisor of this.#supervisors.values()) supervisor.stop();
 			this.#supervisors.clear();
+			for (const sessionId of this.#externalPermissions.keys()) this.cancelExternalPermissions(sessionId);
+			await Promise.allSettled([...this.#externalRuntimes.values()].map(owner => owner.session.dispose()));
+			this.#externalRuntimes.clear();
+			this.#externalTurns.clear();
 			this.#promptLifecycles.clear();
 			this.#messageLifecycles.clear();
 			this.#messageLifecyclesByCommandId.clear();
@@ -1654,27 +1717,32 @@ export class LocalAppserver implements AppserverHandle {
 					this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId);
 				}
 			} else if (command.command === "session.ui.respond") {
-				const supervisor = await this.ensureSupervisor(command.sessionId!);
-				const requestId = command.args.requestId;
-				if (typeof requestId !== "string") throw new Error("UI request ID is invalid");
-				const transcript = this.#transcripts.get(command.sessionId!);
-				if (!transcript) throw new Error("session transcript translator is unavailable");
-				const pendingUi = transcript.pendingUiRequest(requestId);
-				if (!pendingUi) throw new Error("UI request is no longer pending");
-				let payload: { value?: string; confirmed?: boolean; cancelled?: true };
-				if (command.args.cancelled === true) payload = { cancelled: true };
-				else if (pendingUi.kind === "ask" && typeof command.args.value === "string")
-					payload = { value: command.args.value };
-				else if (pendingUi.kind === "approval" && typeof command.args.confirmed === "boolean")
-					payload = { confirmed: command.args.confirmed };
-				else throw new Error("UI response kind does not match the pending request");
-				await supervisor.respondUi(requestId, payload);
-				const resolved = transcript.resolveUiRequest(requestId);
-				if (resolved) {
-					this.broadcast(command.sessionId!, projection!.appendEvent(asAppWireEvent(resolved)));
-					this.#projectAttentionEvent(command.sessionId!, transcript, resolved);
+				const externalOutcome = this.respondExternalPermission(command);
+				if (externalOutcome) outcome = externalOutcome;
+				else {
+					if (this.#externalRuntimes.has(command.sessionId!)) throw new Error("UI request is no longer pending");
+					const supervisor = await this.ensureSupervisor(command.sessionId!);
+					const requestId = command.args.requestId;
+					if (typeof requestId !== "string") throw new Error("UI request ID is invalid");
+					const transcript = this.#transcripts.get(command.sessionId!);
+					if (!transcript) throw new Error("session transcript translator is unavailable");
+					const pendingUi = transcript.pendingUiRequest(requestId);
+					if (!pendingUi) throw new Error("UI request is no longer pending");
+					let payload: { value?: string; confirmed?: boolean; cancelled?: true };
+					if (command.args.cancelled === true) payload = { cancelled: true };
+					else if (pendingUi.kind === "ask" && typeof command.args.value === "string")
+						payload = { value: command.args.value };
+					else if (pendingUi.kind === "approval" && typeof command.args.confirmed === "boolean")
+						payload = { confirmed: command.args.confirmed };
+					else throw new Error("UI response kind does not match the pending request");
+					await supervisor.respondUi(requestId, payload);
+					const resolved = transcript.resolveUiRequest(requestId);
+					if (resolved) {
+						this.broadcast(command.sessionId!, projection!.appendEvent(asAppWireEvent(resolved)));
+						this.#projectAttentionEvent(command.sessionId!, transcript, resolved);
+					}
+					outcome = { frame: response(this.hostId, command, true, { accepted: true }) };
 				}
-				outcome = { frame: response(this.hostId, command, true, { accepted: true }) };
 			} else if (DIRECT_SESSION_RPC_COMMANDS.has(command.command)) {
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
 				const type =
@@ -1747,75 +1815,80 @@ export class LocalAppserver implements AppserverHandle {
 					this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId);
 			} else if (command.command === "session.prompt") {
 				if (this.#closedSessions.has(command.sessionId!)) throw new Error("session is closed");
-				const supervisor = await this.ensureSupervisor(command.sessionId!);
-				if (this.#promptLifecycles.has(command.sessionId!)) {
-					outcome = {
-						frame: response(this.hostId, command, false, undefined, {
-							code: "session_busy",
-							message: "another prompt is still running; use steer or follow-up",
-						}),
-					};
-				} else if (this.#pendingMessageCount(command.sessionId!) >= MAX_PENDING_PROMPTS) {
-					outcome = {
-						frame: response(this.hostId, command, false, undefined, {
-							code: "message_queue_full",
-							message: `at most ${MAX_PENDING_PROMPTS} accepted prompts may be pending`,
-						}),
-					};
-				} else {
-					const lifecycle: PromptLifecycle = {
-						requestId: command.requestId,
-						commandId: command.commandId,
-						commandHash: payloadHash(command),
-						kind: "prompt",
-					};
-					messageLifecycle = lifecycle;
-					if (!this.#registerMessageLifecycle(command.sessionId!, lifecycle))
-						throw new Error("pending prompt capacity changed");
-					this.#promptLifecycles.set(command.sessionId!, lifecycle);
-					this.updateStatus(command.sessionId!, "active");
-					const managedImages = promptArguments?.images
-						? await this.#imageUploads.consume(ws!.connectionId, command.sessionId!, promptArguments.images)
-						: undefined;
-					this.#emitPromptTransient(
-						command.sessionId!,
-						command,
-						lifecycle,
-						promptArguments!.message,
-						promptArguments?.images?.length ?? 0,
-					);
-					let result: RpcResponse;
-					try {
-						result = await supervisor.prompt(
-							command.requestId,
-							promptArguments!.message,
-							// Registration and transient publication make this accepted work.
-							// Client disconnect must not revoke it before the child acknowledges it.
-							undefined,
-							internalId => {
-								if (this.#hasMessageLifecycle(command.sessionId!, lifecycle)) lifecycle.internalId = internalId;
-							},
-							managedImages,
-						);
-					} finally {
-						if (managedImages) await this.#imageUploads.release(managedImages);
-					}
-					if (!result.success || childAgentInvoked(result) === false) {
-						const reason = result.success ? "local-only" : "rejected";
-						if (this.#releaseMessageLifecycle(command.sessionId!, lifecycle, reason))
-							this.#projectTerminalStatus(command.sessionId!, supervisor, `${command.requestId}:terminal`);
-					} else lifecycle.accepted = true;
-					outcome = {
-						frame: response(
-							this.hostId,
+				const externalOwner = this.#externalRuntimes.get(command.sessionId!);
+				if (externalOwner) outcome = await this.handleExternalPrompt(command, externalOwner, promptArguments!);
+				else {
+					const supervisor = await this.ensureSupervisor(command.sessionId!);
+					if (this.#promptLifecycles.has(command.sessionId!)) {
+						outcome = {
+							frame: response(this.hostId, command, false, undefined, {
+								code: "session_busy",
+								message: "another prompt is still running; use steer or follow-up",
+							}),
+						};
+					} else if (this.#pendingMessageCount(command.sessionId!) >= MAX_PENDING_PROMPTS) {
+						outcome = {
+							frame: response(this.hostId, command, false, undefined, {
+								code: "message_queue_full",
+								message: `at most ${MAX_PENDING_PROMPTS} accepted prompts may be pending`,
+							}),
+						};
+					} else {
+						const lifecycle: PromptLifecycle = {
+							requestId: command.requestId,
+							commandId: command.commandId,
+							commandHash: payloadHash(command),
+							kind: "prompt",
+						};
+						messageLifecycle = lifecycle;
+						if (!this.#registerMessageLifecycle(command.sessionId!, lifecycle))
+							throw new Error("pending prompt capacity changed");
+						this.#promptLifecycles.set(command.sessionId!, lifecycle);
+						this.updateStatus(command.sessionId!, "active");
+						const managedImages = promptArguments?.images
+							? await this.#imageUploads.consume(ws!.connectionId, command.sessionId!, promptArguments.images)
+							: undefined;
+						this.#emitPromptTransient(
+							command.sessionId!,
 							command,
-							result.success,
-							{ accepted: result.success },
-							result.success ? undefined : { code: "child_error", message: "session command failed" },
-						),
-					};
-					if (this.#hasMessageLifecycle(command.sessionId!, lifecycle))
-						this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId, true);
+							lifecycle,
+							promptArguments!.message,
+							promptArguments?.images?.length ?? 0,
+						);
+						let result: RpcResponse;
+						try {
+							result = await supervisor.prompt(
+								command.requestId,
+								promptArguments!.message,
+								// Registration and transient publication make this accepted work.
+								// Client disconnect must not revoke it before the child acknowledges it.
+								undefined,
+								internalId => {
+									if (this.#hasMessageLifecycle(command.sessionId!, lifecycle))
+										lifecycle.internalId = internalId;
+								},
+								managedImages,
+							);
+						} finally {
+							if (managedImages) await this.#imageUploads.release(managedImages);
+						}
+						if (!result.success || childAgentInvoked(result) === false) {
+							const reason = result.success ? "local-only" : "rejected";
+							if (this.#releaseMessageLifecycle(command.sessionId!, lifecycle, reason))
+								this.#projectTerminalStatus(command.sessionId!, supervisor, `${command.requestId}:terminal`);
+						} else lifecycle.accepted = true;
+						outcome = {
+							frame: response(
+								this.hostId,
+								command,
+								result.success,
+								{ accepted: result.success },
+								result.success ? undefined : { code: "child_error", message: "session command failed" },
+							),
+						};
+						if (this.#hasMessageLifecycle(command.sessionId!, lifecycle))
+							this.scheduleStateRefresh(command.sessionId!, supervisor, command.requestId, true);
+					}
 				}
 			} else if (command.command === AGENT_CANCEL_COMMAND) {
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
@@ -1847,28 +1920,32 @@ export class LocalAppserver implements AppserverHandle {
 					}
 				}
 			} else if (command.command === SESSION_CANCEL_COMMAND) {
-				// Capture the exact root before the first yield. A root which settles
-				// while the supervisor starts must not let this unscoped RPC abort a
-				// newer prompt that registered in the meantime.
-				const cancelledLifecycle = this.#promptLifecycles.get(command.sessionId!);
-				const supervisor = await this.ensureSupervisor(command.sessionId!);
-				if (this.#promptLifecycles.get(command.sessionId!) !== cancelledLifecycle) {
-					outcome = { frame: response(this.hostId, command, true, { cancelled: false }) };
-				} else {
-					const result = await supervisor.cancel(command.requestId);
-					if (result.success) {
-						this.#releaseMessageLifecycle(command.sessionId!, cancelledLifecycle, "cancelled");
-						this.#projectTerminalStatus(command.sessionId!, supervisor, `${command.requestId}:terminal`);
+				const externalOwner = this.#externalRuntimes.get(command.sessionId!);
+				if (externalOwner) outcome = await this.handleExternalCancel(command, externalOwner);
+				else {
+					// Capture the exact root before the first yield. A root which settles
+					// while the supervisor starts must not let this unscoped RPC abort a
+					// newer prompt that registered in the meantime.
+					const cancelledLifecycle = this.#promptLifecycles.get(command.sessionId!);
+					const supervisor = await this.ensureSupervisor(command.sessionId!);
+					if (this.#promptLifecycles.get(command.sessionId!) !== cancelledLifecycle) {
+						outcome = { frame: response(this.hostId, command, true, { cancelled: false }) };
+					} else {
+						const result = await supervisor.cancel(command.requestId);
+						if (result.success) {
+							this.#releaseMessageLifecycle(command.sessionId!, cancelledLifecycle, "cancelled");
+							this.#projectTerminalStatus(command.sessionId!, supervisor, `${command.requestId}:terminal`);
+						}
+						outcome = {
+							frame: response(
+								this.hostId,
+								command,
+								result.success,
+								{ cancelled: result.success },
+								result.success ? undefined : { code: "child_error", message: "session command failed" },
+							),
+						};
 					}
-					outcome = {
-						frame: response(
-							this.hostId,
-							command,
-							result.success,
-							{ cancelled: result.success },
-							result.success ? undefined : { code: "child_error", message: "session command failed" },
-						),
-					};
 				}
 			} else if (this.#operations && ws) {
 				const context: OperationContext = {
@@ -1899,6 +1976,7 @@ export class LocalAppserver implements AppserverHandle {
 				this.#projectTerminalStatus(command.sessionId!);
 			const imageError =
 				error instanceof ImageUploadError || error instanceof TranscriptImageError ? error : undefined;
+			const externalRuntimeError = error instanceof ExternalRuntimeCommandError ? error : undefined;
 			const transcriptSearchError = error instanceof TranscriptSearchError ? error : undefined;
 			const operation =
 				this.#operations &&
@@ -1914,13 +1992,19 @@ export class LocalAppserver implements AppserverHandle {
 				].includes(command.command);
 			const code = transcriptSearchError
 				? transcriptSearchError.code
-				: imageError
-					? imageError.code
-					: command.command === "session.ui.respond"
-						? "ui_request_invalid"
-						: operation && error && typeof error === "object" && "code" in error && typeof error.code === "string"
-							? error.code
-							: "outcome_unknown";
+				: externalRuntimeError
+					? "unsupported"
+					: imageError
+						? imageError.code
+						: command.command === "session.ui.respond"
+							? "ui_request_invalid"
+							: operation &&
+									error &&
+									typeof error === "object" &&
+									"code" in error &&
+									typeof error.code === "string"
+								? error.code
+								: "outcome_unknown";
 			outcome = {
 				frame: response(this.hostId, command, false, undefined, {
 					code,
@@ -1930,9 +2014,11 @@ export class LocalAppserver implements AppserverHandle {
 							: transcriptSearchError.code === "transcript_cursor_stale"
 								? "transcript search cursor is stale"
 								: "transcript search cursor is invalid"
-						: (imageError?.message ?? (operation ? "operation failed" : "command failed")),
+						: (externalRuntimeError?.message ??
+							imageError?.message ??
+							(operation ? "operation failed" : "command failed")),
 				}),
-				unknown: !operation && !imageError && !transcriptSearchError,
+				unknown: !operation && !imageError && !externalRuntimeError && !transcriptSearchError,
 			};
 		} finally {
 			if (ws) this.#abortControllers.get(ws)?.delete(controller);
@@ -1941,6 +2027,8 @@ export class LocalAppserver implements AppserverHandle {
 		return this.finish(command, outcome, idempotency);
 	}
 	private async createSession(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+		const runtimeId = typeof args.runtimeId === "string" ? args.runtimeId : undefined;
+		if (runtimeId) return this.createExternalSession(args, runtimeId, args.workspaceInstanceId as string);
 		if (!this.#authority) throw new Error("session creation is unavailable");
 		const canonical = await this.resolveProjectRoot(args.projectId);
 		const title = typeof args.title === "string" ? args.title : undefined;
@@ -1962,6 +2050,329 @@ export class LocalAppserver implements AppserverHandle {
 		this.#createdPending.set(record.sessionId, { record, refreshesRemaining: 1 });
 		return { sessionId: record.sessionId };
 	}
+	private async createExternalSession(
+		args: Record<string, unknown>,
+		runtimeId: string,
+		workspaceInstanceId: string,
+	): Promise<Record<string, unknown>> {
+		if (!this.#runtimeAdapters || !this.#workspaceAuthority)
+			throw new Error("external runtime session creation is unavailable");
+		const requestedProject = projectId(args.projectId as string);
+		const workspace = this.#workspaceAuthority.get(workspaceInstanceId);
+		if (!workspace) throw new Error("workspace is not indexed");
+		if (workspace.lifecycle !== "active") throw new Error("workspace is not active");
+		if (workspace.repositoryId !== requestedProject)
+			throw new Error("workspace does not belong to the requested project");
+		const publicSessionId = sessionId(`session-${randomUUID()}`);
+		const runtimeWorkspace: RuntimeWorkspaceIdentity = {
+			instanceId: workspace.instanceId,
+			cwd: workspace.canonicalPath,
+			ownership: workspace.ownership,
+			git: { commonDir: workspace.repositoryRoot, head: workspace.expectedHead },
+		};
+		let runtimeSession: RuntimeSession | undefined;
+		try {
+			runtimeSession = await this.#runtimeAdapters.openSession(runtimeId, {
+				workspace: runtimeWorkspace,
+				callbacks: {
+					onSessionUpdate: update => this.projectExternalUpdate(publicSessionId, update),
+					onPermissionRequest: request => this.requestExternalPermission(publicSessionId, request),
+				},
+			});
+			const timestamp = this.#clock.now().toISOString();
+			const record: SessionRecord = {
+				sessionId: publicSessionId,
+				path: workspace.canonicalPath,
+				cwd: workspace.canonicalPath,
+				projectId: requestedProject,
+				projectName: projectNameFromCwd(workspace.canonicalPath),
+				title: typeof args.title === "string" ? args.title : "Session",
+				updatedAt: timestamp,
+				status: "idle",
+				entries: [],
+				runtime: { id: runtimeId, workspaceInstanceId: workspace.instanceId },
+			};
+			this.#records.set(publicSessionId, record);
+			this.#projections.set(publicSessionId, new SessionProjection(this.hostId, record, this.epoch, this.#ringSize));
+			this.#externalRuntimes.set(publicSessionId, { runtimeId, workspaceInstanceId, session: runtimeSession });
+			return { sessionId: publicSessionId };
+		} catch (cause) {
+			if (runtimeSession) await runtimeSession.dispose().catch(() => undefined);
+			this.#records.delete(publicSessionId);
+			this.#projections.delete(publicSessionId);
+			throw cause;
+		}
+	}
+
+	private appendExternalEntry(
+		sessionId: SessionId,
+		kind: string,
+		data: Record<string, unknown>,
+		id = entryId(`acp-${randomUUID()}`),
+	): string | undefined {
+		const projection = this.#projections.get(sessionId);
+		if (!projection || this.#closedSessions.has(sessionId)) return undefined;
+		const entry: DurableEntry = {
+			id,
+			parentId: null,
+			hostId: this.hostId,
+			sessionId,
+			kind,
+			timestamp: this.#clock.now().toISOString(),
+			data,
+		};
+		const frame = projection.appendEntry(entry);
+		if (frame) this.broadcast(sessionId, frame);
+		return id;
+	}
+	private projectExternalUpdate(sessionId: SessionId, value: unknown): void {
+		const turn = this.#externalTurns.get(sessionId);
+		if (!turn) return;
+		const notification = objectRecord(value);
+		const update = objectRecord(notification?.update);
+		if (!update || typeof update.sessionUpdate !== "string") return;
+		const at = this.#clock.now().toISOString();
+		if (update.sessionUpdate === "agent_message_chunk" || update.sessionUpdate === "agent_thought_chunk") {
+			const content = objectRecord(update.content);
+			if (content?.type !== "text" || typeof content.text !== "string" || content.text.length === 0) return;
+			const reasoning = update.sessionUpdate === "agent_thought_chunk";
+			if (reasoning) turn.reasoning = projectMessageText(turn.reasoning + content.text);
+			else turn.text = projectMessageText(turn.text + content.text);
+			const messageFrame = this.#projections.get(sessionId)?.appendEvent(
+				asAppWireEvent({
+					type: "message.update",
+					entryId: turn.assistantEntryId,
+					role: "assistant",
+					text: turn.text,
+					reasoning: turn.reasoning,
+					at,
+				}),
+			);
+			if (messageFrame) this.broadcast(sessionId, messageFrame);
+			return;
+		}
+		if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+			if (typeof update.toolCallId !== "string") return;
+			const providerKey = createHash("sha256").update(update.toolCallId).digest("hex");
+			let toolState = turn.tools.get(providerKey);
+			if (!toolState) {
+				const tool = projectMessageText(typeof update.kind === "string" ? update.kind : "other", 64) || "other";
+				toolState = {
+					entryId: entryId(`acp-${randomUUID()}`),
+					callId: `tool-${randomUUID()}`,
+					tool,
+					title: projectMessageText(typeof update.title === "string" ? update.title : tool, 512) || tool,
+				};
+				turn.tools.set(providerKey, toolState);
+				const startFrame = this.#projections.get(sessionId)?.appendEvent(
+					asAppWireEvent({
+						type: "tool.start",
+						callId: toolState.callId,
+						tool: toolState.tool,
+						title: toolState.title,
+						args: {},
+						at,
+					}),
+				);
+				if (startFrame) this.broadcast(sessionId, startFrame);
+			}
+			if (toolState.settled) return;
+			if (typeof update.kind === "string") toolState.tool = projectMessageText(update.kind, 64) || toolState.tool;
+			if (typeof update.title === "string")
+				toolState.title = projectMessageText(update.title, 512) || toolState.title;
+			const status = projectMessageText(update.status, 64);
+			if (status) {
+				toolState.status = status;
+				const terminal = status === "completed" || status === "failed";
+				if (terminal) toolState.settled = true;
+				const toolFrame = this.#projections.get(sessionId)?.appendEvent(
+					asAppWireEvent(
+						terminal
+							? {
+									type: "tool.result",
+									callId: toolState.callId,
+									ok: status === "completed",
+									result: { status },
+									at,
+								}
+							: { type: "tool.progress", callId: toolState.callId, note: status, at },
+					),
+				);
+				if (toolFrame) this.broadcast(sessionId, toolFrame);
+			}
+		}
+	}
+	private finalizeExternalTurn(sessionId: SessionId, turn: ExternalTurnProjection): void {
+		if (this.#externalTurns.get(sessionId) !== turn) return;
+		this.#externalTurns.delete(sessionId);
+		if (turn.text || turn.reasoning)
+			this.appendExternalEntry(
+				sessionId,
+				"message",
+				{ role: "assistant", text: turn.text, ...(turn.reasoning ? { reasoning: turn.reasoning } : {}) },
+				turn.assistantEntryId,
+			);
+		for (const tool of turn.tools.values())
+			this.appendExternalEntry(
+				sessionId,
+				"tool-use",
+				{
+					toolCallId: tool.callId,
+					tool: tool.tool,
+					title: tool.title,
+					...(tool.status ? { status: tool.status } : {}),
+				},
+				tool.entryId,
+			);
+		const frame = this.#projections
+			.get(sessionId)
+			?.appendEvent(asAppWireEvent({ type: "turn.end", at: this.#clock.now().toISOString() }));
+		if (frame) this.broadcast(sessionId, frame);
+	}
+	private requestExternalPermission(sessionId: SessionId, value: unknown): Promise<RuntimePermissionResponse> {
+		const request = objectRecord(value);
+		const toolCall = objectRecord(request?.toolCall);
+		const options = Array.isArray(request?.options) ? request.options.map(objectRecord).filter(Boolean) : [];
+		const allow =
+			options.find(option => option?.kind === "allow_once") ??
+			options.find(option => option?.kind === "allow_always");
+		const reject =
+			options.find(option => option?.kind === "reject_once") ??
+			options.find(option => option?.kind === "reject_always");
+		const allowOptionId = typeof allow?.optionId === "string" ? allow.optionId : undefined;
+		const rejectOptionId = typeof reject?.optionId === "string" ? reject.optionId : undefined;
+		if (!allowOptionId && !rejectOptionId) return Promise.resolve({ outcome: "cancelled" });
+		const requestId = `acp-permission-${randomUUID()}`;
+		const pending = Promise.withResolvers<RuntimePermissionResponse>();
+		let requests = this.#externalPermissions.get(sessionId);
+		if (!requests) {
+			requests = new Map();
+			this.#externalPermissions.set(sessionId, requests);
+		}
+		requests.set(requestId, { resolve: pending.resolve, allowOptionId, rejectOptionId });
+		const clean = (input: unknown, fallback: string) =>
+			(typeof input === "string" ? input : fallback).replace(/[\u0000-\u001f\u007f]/gu, " ").slice(0, 512);
+		const title = clean(toolCall?.title, "Runtime permission required");
+		const frame = this.#projections.get(sessionId)?.setPendingAttention({
+			kind: "approval",
+			id: requestId,
+			title,
+			summary: title,
+			requestedAt: this.#clock.now().toISOString(),
+		});
+		if (frame) this.broadcast(sessionId, frame);
+		return pending.promise.finally(() => {
+			const current = this.#externalPermissions.get(sessionId);
+			current?.delete(requestId);
+			if (current?.size === 0) this.#externalPermissions.delete(sessionId);
+			const cleared = this.#projections.get(sessionId)?.removePendingAttention(requestId);
+			if (cleared) this.broadcast(sessionId, cleared);
+		});
+	}
+	private cancelExternalPermissions(sessionId: SessionId): void {
+		const pending = this.#externalPermissions.get(sessionId);
+		this.#externalPermissions.delete(sessionId);
+		for (const request of pending?.values() ?? []) request.resolve({ outcome: "cancelled" });
+		const cleared = this.#projections.get(sessionId)?.clearPendingAttention();
+		if (cleared) this.broadcast(sessionId, cleared);
+	}
+
+	private async handleExternalPrompt(
+		command: CommandFrame,
+		owner: ExternalRuntimeOwner,
+		args: { message: string; images?: readonly unknown[] },
+	): Promise<CommandOutcome> {
+		const sessionId = command.sessionId!;
+		if (args.images && args.images.length > 0)
+			return {
+				frame: response(this.hostId, command, false, undefined, {
+					code: "unsupported",
+					message: "the selected runtime does not support prompt images",
+				}),
+			};
+		if (this.#promptLifecycles.has(sessionId))
+			return {
+				frame: response(this.hostId, command, false, undefined, {
+					code: "session_busy",
+					message: "another prompt is still running",
+				}),
+			};
+		const lifecycle: PromptLifecycle = {
+			requestId: command.requestId,
+			commandId: command.commandId,
+			commandHash: payloadHash(command),
+			kind: "prompt",
+		};
+		if (!this.#registerMessageLifecycle(sessionId, lifecycle))
+			return {
+				frame: response(this.hostId, command, false, undefined, {
+					code: "message_queue_full",
+					message: `at most ${MAX_PENDING_PROMPTS} accepted prompts may be pending`,
+				}),
+			};
+		const turn: ExternalTurnProjection = {
+			assistantEntryId: entryId(`acp-${randomUUID()}`),
+			text: "",
+			reasoning: "",
+			tools: new Map(),
+		};
+		this.#promptLifecycles.set(sessionId, lifecycle);
+		this.#externalTurns.set(sessionId, turn);
+		this.updateStatus(sessionId, "active");
+		const turnStart = this.#projections
+			.get(sessionId)
+			?.appendEvent(asAppWireEvent({ type: "turn.start", at: this.#clock.now().toISOString() }));
+		if (turnStart) this.broadcast(sessionId, turnStart);
+		this.#emitPromptTransient(sessionId, command, lifecycle, args.message, 0);
+		const userEntryId = this.appendExternalEntry(sessionId, "message", {
+			role: "user",
+			text: projectMessageText(args.message),
+		});
+		if (userEntryId) this.#settlePromptTransient(sessionId, lifecycle, userEntryId);
+		let failed = false;
+		try {
+			await owner.session.prompt(args.message);
+			lifecycle.accepted = true;
+			return { frame: response(this.hostId, command, true, { accepted: true }) };
+		} catch (cause) {
+			failed = true;
+			throw cause;
+		} finally {
+			this.finalizeExternalTurn(sessionId, turn);
+			const reason: PromptDiscardReason = failed
+				? "failed"
+				: lifecycle.cancelRequested
+					? "cancelled"
+					: "completed-without-entry";
+			if (this.#releaseMessageLifecycle(sessionId, lifecycle, reason)) this.#projectTerminalStatus(sessionId);
+		}
+	}
+	private async handleExternalCancel(command: CommandFrame, owner: ExternalRuntimeOwner): Promise<CommandOutcome> {
+		const sessionId = command.sessionId!;
+		const lifecycle = this.#promptLifecycles.get(sessionId);
+		await owner.session.cancel();
+		if (this.#promptLifecycles.get(sessionId) === lifecycle && lifecycle) {
+			lifecycle.cancelRequested = true;
+			this.cancelExternalPermissions(sessionId);
+		}
+		return { frame: response(this.hostId, command, true, { cancelled: Boolean(lifecycle) }) };
+	}
+	private respondExternalPermission(command: CommandFrame): CommandOutcome | undefined {
+		const sessionId = command.sessionId!;
+		const requestId = command.args.requestId;
+		if (typeof requestId !== "string") throw new Error("UI request ID is invalid");
+		const request = this.#externalPermissions.get(sessionId)?.get(requestId);
+		if (!request) return undefined;
+		let selected: string | undefined;
+		if (command.args.cancelled !== true) {
+			if (typeof command.args.confirmed !== "boolean")
+				throw new Error("UI response kind does not match the pending request");
+			selected = command.args.confirmed ? request.allowOptionId : request.rejectOptionId;
+		}
+		request.resolve(selected ? { outcome: "selected", optionId: selected } : { outcome: "cancelled" });
+		return { frame: response(this.hostId, command, true, { accepted: true }) };
+	}
+
 	private async resolveProjectRoot(value: unknown): Promise<string> {
 		if (!this.#projectRootForProject) throw new Error("project resolver is unavailable");
 		if (typeof value !== "string") throw new Error("projectId is invalid");
@@ -2095,7 +2506,7 @@ export class LocalAppserver implements AppserverHandle {
 			const pending = this.#startPromises.get(sessionId);
 			if (pending) await pending.catch(() => undefined);
 			supervisor = this.#supervisors.get(sessionId);
-			if (!(await this.quiesceSupervisor(sessionId))) {
+			if (!(await this.quiesceSessionRuntime(sessionId))) {
 				if (!alreadyExplicitlyClosed) {
 					this.#closedSessions.delete(sessionId);
 					if (supervisor) this.markSupervisorCrashed(sessionId, supervisor);
@@ -2128,14 +2539,16 @@ export class LocalAppserver implements AppserverHandle {
 	): Promise<SessionLifecycleFailure | undefined> {
 		const sessionId = command.sessionId;
 		if (!sessionId) return { code: "unknown_session", message: "session is not indexed" };
-		if (!this.#authority) return { code: "unsupported", message: "session lifecycle management is unavailable" };
+		const external = this.#records.get(sessionId)?.runtime !== undefined;
+		if (!external && !this.#authority)
+			return { code: "unsupported", message: "session lifecycle management is unavailable" };
 		const revisionFailure = this.lifecycleRevisionFailure(command);
 		if (revisionFailure) return revisionFailure;
 		const record = this.#records.get(sessionId);
 		if (!record) return { code: "unknown_session", message: "session is not indexed" };
 		if (this.sessionLifecycleBusy(sessionId, ignoreLifecycleFence))
 			return { code: "session_busy", message: "session has active or pending work" };
-		if (!this.#supervisors.has(sessionId)) {
+		if (!external && !this.#supervisors.has(sessionId)) {
 			try {
 				await this.#lockCheck(record);
 			} catch {
@@ -2309,7 +2722,19 @@ export class LocalAppserver implements AppserverHandle {
 				if (timer) clearTimeout(timer);
 			}
 		}
-		return this.quiesceSupervisor(sessionId);
+		const owner = this.#externalRuntimes.get(sessionId);
+		if (!owner) return this.quiesceSupervisor(sessionId);
+		this.cancelExternalPermissions(sessionId);
+		try {
+			await owner.session.dispose();
+		} catch {
+			return false;
+		}
+		if (this.#externalRuntimes.get(sessionId) !== owner) return false;
+		this.#externalRuntimes.delete(sessionId);
+		this.#releaseAllMessageLifecycles(sessionId, "cancelled");
+		this.#stateRefreshGenerations.delete(sessionId);
+		return true;
 	}
 	private async handleArchive(command: CommandFrame): Promise<CommandOutcome> {
 		const sessionId = command.sessionId!;
@@ -2326,6 +2751,11 @@ export class LocalAppserver implements AppserverHandle {
 			if (revisionFailure) return this.lifecycleFailureOutcome(command, revisionFailure);
 			const projection = this.#projections.get(sessionId)!;
 			const record = this.#records.get(sessionId)!;
+			if (record.runtime)
+				return this.lifecycleFailureOutcome(command, {
+					code: "unsupported",
+					message: "external runtime sessions cannot be archived",
+				});
 			if (record.archivedAt) return { frame: response(this.hostId, command, true, { archived: true }) };
 			if (this.sessionLifecycleBusy(sessionId, true))
 				return this.lifecycleBusyOutcome(command, "sessions with active or pending work cannot be archived");
@@ -2379,6 +2809,11 @@ export class LocalAppserver implements AppserverHandle {
 			if (revisionFailure) return this.lifecycleFailureOutcome(command, revisionFailure);
 			const projection = this.#projections.get(sessionId)!;
 			const record = this.#records.get(sessionId)!;
+			if (record.runtime)
+				return this.lifecycleFailureOutcome(command, {
+					code: "unsupported",
+					message: "external runtime sessions cannot be restored",
+				});
 			if (!record.archivedAt) return { frame: response(this.hostId, command, true, { restored: true }) };
 			await this.#imageUploads.cleanupSession(sessionId);
 			await this.#authority.restore(record);
@@ -2421,7 +2856,7 @@ export class LocalAppserver implements AppserverHandle {
 			const finalGuard = await this.deletePreflight(command, true);
 			if (finalGuard) return this.lifecycleFailureOutcome(command, finalGuard);
 			await this.#imageUploads.cleanupSession(sessionId);
-			await this.#authority!.delete(record);
+			if (!record.runtime) await this.#authority!.delete(record);
 			await this.#transcriptSearch?.deleteSession(sessionId);
 			this.cleanupObserverState(sessionId);
 			await this.broadcastAttachedOrdered(sessionId, projection.appendEvent({ type: "session_deleted" }));
@@ -2706,6 +3141,7 @@ export class LocalAppserver implements AppserverHandle {
 		void this.refreshState(sessionId, supervisor, requestId, preserveProjectedStatus).catch(() => undefined);
 	}
 	private async ensureSupervisor(sessionId: SessionId): Promise<RpcChildSupervisor> {
+		if (this.#externalRuntimes.has(sessionId)) throw new ExternalRuntimeCommandError();
 		if (this.#draining) throw new Error("appserver is draining");
 		if (this.#stopping) throw new Error("appserver is stopping");
 		if (this.#closedSessions.has(sessionId)) throw new Error("session is closed");

@@ -105,6 +105,7 @@ export class SessionProjection {
 				...(record.archivedAt ? { archivedAt: record.archivedAt } : {}),
 				...(record.model ? { model: record.model } : {}),
 				...(record.thinking ? { thinking: record.thinking } : {}),
+				...(record.runtime ? { runtime: record.runtime } : {}),
 			},
 			indexCursor: { epoch, seq: 0 },
 			ring: [],

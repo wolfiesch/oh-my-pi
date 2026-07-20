@@ -4,7 +4,7 @@
 
 ### Added
 
-- Add appserver ACP runtime discovery and a profile-local workspace authority with durable repository identity, crash recovery, and managed worktree lifecycle controls.
+- Add appserver ACP runtime discovery and owned external sessions, plus a profile-local workspace authority with durable repository identity, crash recovery, and managed worktree lifecycle controls.
 
 - Add native Finder reveal support for local appserver projects without exposing their absolute paths.
 

@@ -1495,10 +1495,16 @@ export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown)
 		return x;
 	},
 	"session.create": value => {
-		const x = args(value);
-		if (x.cwd !== undefined) fail("UNSAFE_PATH", "cwd is not accepted; use projectId", "args.cwd");
+		const x = strictArgs(value, ["projectId", "title", "runtimeId", "workspaceInstanceId"]);
 		projectId(x.projectId, "args.projectId");
 		if (x.title !== undefined) boundedText(x.title, "args.title", 512);
+		const runtimeId = x.runtimeId === undefined ? undefined : controlFree(x.runtimeId, "args.runtimeId", 64);
+		const workspaceInstanceId =
+			x.workspaceInstanceId === undefined
+				? undefined
+				: controlFree(x.workspaceInstanceId, "args.workspaceInstanceId", 128);
+		if ((runtimeId === undefined) !== (workspaceInstanceId === undefined))
+			fail("INVALID_FRAME", "runtimeId and workspaceInstanceId must be provided together", "args");
 		return x;
 	},
 	"session.attach": value => {

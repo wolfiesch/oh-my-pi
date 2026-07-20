@@ -205,6 +205,35 @@ describe("app-wire authority", () => {
 			),
 		).toThrow(AppWireError);
 	});
+	test("session runtime projection is exact and bounded", () => {
+		const base = {
+			hostId: "h",
+			sessionId: "s",
+			project: { projectId: "p" },
+			revision: "r",
+			title: "Task",
+			status: "idle",
+			updatedAt: "2026-07-18T12:00:00.000Z",
+		};
+		expect(
+			decodeSessionRef(
+				{ ...base, runtime: { id: "external-runtime", workspaceInstanceId: "workspace-instance" } },
+				"session",
+			).runtime,
+		).toEqual({ id: "external-runtime", workspaceInstanceId: "workspace-instance" });
+		expect(decodeSessionRef({ ...base, runtime: { id: "native-runtime" } }, "session").runtime).toEqual({
+			id: "native-runtime",
+		});
+		for (const runtime of [
+			{},
+			{ workspaceInstanceId: "workspace-instance" },
+			{ id: "runtime", providerSessionId: "provider-session" },
+			{ id: "runtime", cwd: "src/project" },
+			{ id: "x".repeat(65) },
+			{ id: "runtime", workspaceInstanceId: "x".repeat(129) },
+		])
+			expect(() => decodeSessionRef({ ...base, runtime }, "session")).toThrow(AppWireError);
+	});
 	test("hello and durable lineage decode in string and parsed modes", () => {
 		expect(decodeClientFrame(hello).type).toBe("hello");
 		for (const protocol of [
@@ -429,14 +458,31 @@ describe("app-wire authority", () => {
 			decodeClientFrame({ ...base, command: "session.create", args: { projectId: "project-1" } }),
 		).not.toThrow();
 		expect(() =>
+			decodeClientFrame({
+				...base,
+				command: "session.create",
+				args: { projectId: "project-1", runtimeId: "external-runtime", workspaceInstanceId: "workspace-instance" },
+			}),
+		).not.toThrow();
+		for (const args of [
+			{ projectId: "project-1", runtimeId: "external-runtime" },
+			{ projectId: "project-1", workspaceInstanceId: "workspace-instance" },
+		])
+			expect(() => decodeClientFrame({ ...base, command: "session.create", args })).toThrow(AppWireError);
+		expect(() =>
 			decodeClientFrame({ ...base, command: "project.reveal", args: { projectId: "project-1" } }),
 		).not.toThrow();
 		expect(() => decodeClientFrame({ ...base, command: "project.reveal", args: { cwd: "/tmp/project" } })).toThrow(
 			AppWireError,
 		);
-		expect(() => decodeClientFrame({ ...base, command: "session.create", args: { cwd: "/tmp/project" } })).toThrow(
-			AppWireError,
-		);
+		for (const args of [
+			{ projectId: "project-1", cwd: "/tmp/project" },
+			{ projectId: "project-1", path: "src/project" },
+			{ projectId: "project-1", workspacePath: "src/project" },
+			{ projectId: "project-1", executable: "provider" },
+			{ projectId: "project-1", providerSessionId: "provider-session" },
+		])
+			expect(() => decodeClientFrame({ ...base, command: "session.create", args })).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("term.open", { cwd: "/tmp/project" })).toThrow(AppWireError);
 		expect(() => decodeCommandArguments("term.open", { cwd: "../project" })).toThrow(AppWireError);
 		expect(decodeCommandArguments("term.open", { cwd: "src/project" }).cwd).toBe("src/project");
