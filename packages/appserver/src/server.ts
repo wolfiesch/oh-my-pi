@@ -125,6 +125,7 @@ const ARCHIVED_SESSION_COMMANDS = new Set([
 	"session.archive",
 	"session.restore",
 	"session.delete",
+	"session.image.read",
 	"artifact.read",
 	"files.read",
 	"files.list",
@@ -148,6 +149,7 @@ const SESSION_CANCEL_COMMAND = "session.cancel";
 const AGENT_CANCEL_COMMAND = "agent.cancel";
 const OBSERVER_READ_COMMANDS = new Set([
 	"session.attach",
+	"session.image.read",
 	"artifact.read",
 	"files.read",
 	"files.list",
@@ -2662,6 +2664,7 @@ export class LocalAppserver implements AppserverHandle {
 		transcript.observeKnownEntries(projection.value.entries);
 		this.#transcripts.set(sessionId, transcript);
 		const subagents = new SubagentProjection(this.hostId, sessionId);
+		this.#subagents.set(sessionId, subagents);
 		const projector = new SessionEntryProjector(this.hostId, sessionId, "live", projection.value.entries, id =>
 			artifactDescriptorForRoot(record.path.slice(0, -".jsonl".length), id),
 		);

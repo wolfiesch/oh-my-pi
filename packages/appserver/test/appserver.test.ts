@@ -240,6 +240,7 @@ describe("appserver lifecycle", () => {
 			"prompt.images",
 			"agent.transcript",
 			"session.observer",
+			"artifacts.read",
 		]);
 	});
 	test("advertises transcript image reads only with an explicit blob root", () => {
