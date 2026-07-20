@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { decodeClientFrame, hostId, sessionId } from "@oh-my-pi/app-wire";
+import { decodeCommandArguments } from "@oh-my-pi/app-wire/command.js";
 
 describe("T4 host-wire compatibility export", () => {
 	test("decodes the negotiated transcript page command", () => {
@@ -15,5 +16,12 @@ describe("T4 host-wire compatibility export", () => {
 				args: { limit: 64, maxBytes: 256 * 1024 },
 			}),
 		).toMatchObject({ command: "transcript.page", args: { limit: 64, maxBytes: 256 * 1024 } });
+	});
+
+	test("preserves direct module import paths", () => {
+		expect(decodeCommandArguments("transcript.page", { limit: 64, maxBytes: 256 * 1024 })).toEqual({
+			limit: 64,
+			maxBytes: 256 * 1024,
+		});
 	});
 });
