@@ -1,6 +1,8 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { mkdtemp, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hostId } from "@oh-my-pi/app-wire";
+import { hostId, projectId } from "@oh-my-pi/app-wire";
 import {
 	type AppserverHandle,
 	BunRpcChildFactory,
@@ -12,6 +14,9 @@ import {
 	type AppserverServeConfig,
 	activeAppserverLocalIdentity,
 	activeAppserverSocketPath,
+	defaultAppserverRemotePort,
+	defaultWorkspaceTargetPath,
+	prepareDefaultWorkspaceTargetPath,
 	runAppserverDevices,
 	runAppserverDrainIfIdle,
 	runAppserverPair,
@@ -397,6 +402,13 @@ describe("appserver drain CLI", () => {
 });
 
 describe("appserver remote settings", () => {
+	test("derives stable non-colliding defaults for named local profiles", () => {
+		expect(defaultAppserverRemotePort("default")).toBe(8787);
+		expect(defaultAppserverRemotePort("alpha")).toBe(defaultAppserverRemotePort("alpha"));
+		expect(defaultAppserverRemotePort("alpha")).not.toBe(defaultAppserverRemotePort("beta"));
+		expect(defaultAppserverRemotePort("alpha")).toBeGreaterThanOrEqual(18_000);
+	});
+
 	test("defaults to local-only when persisted settings select local mode", async () => {
 		let observed: AppserverServeConfig | undefined;
 		await runServeWithSettings(Settings.isolated(), {}, config => {
@@ -517,6 +529,33 @@ describe("appserver remote settings", () => {
 		});
 		expect(result).toEqual({ state: "running", health });
 		expect(loaded).toBe(0);
+	});
+});
+
+describe("workspace target paths", () => {
+	test("derives stable sibling worktree paths without trusting names as path segments", () => {
+		const repository = "/repos/project";
+		const id = projectId("project-1");
+		const first = defaultWorkspaceTargetPath(repository, id, "../../Feature One");
+		const repeated = defaultWorkspaceTargetPath(repository, id, "../../Feature One");
+		const distinct = defaultWorkspaceTargetPath(repository, id, "Feature One");
+
+		expect(first).toBe(repeated);
+		expect(first.startsWith("/repos/project-worktrees/")).toBe(true);
+		expect(first.slice("/repos/project-worktrees/".length)).not.toContain("..");
+		expect(distinct).not.toBe(first);
+	});
+
+	test("creates the server-owned sibling worktree parent before Git mutation", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omp-workspace-target-"));
+		try {
+			const repository = join(root, "project");
+			const target = await prepareDefaultWorkspaceTargetPath(repository, projectId("project-1"), "Feature One");
+			expect((await stat(join(root, "project-worktrees"))).isDirectory()).toBe(true);
+			expect(target.startsWith(join(root, "project-worktrees"))).toBe(true);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 });
 

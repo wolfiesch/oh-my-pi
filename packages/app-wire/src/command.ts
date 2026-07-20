@@ -91,6 +91,48 @@ export interface CommandDescriptor {
 	desktopCatalog?: true;
 }
 export const COMMAND_DESCRIPTORS: Readonly<Record<string, CommandDescriptor>> = {
+	"runtime.list": {
+		capability: "sessions.read",
+		scope: "host",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "none",
+	},
+	"workspace.list": {
+		capability: "sessions.read",
+		scope: "host",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "none",
+	},
+	"workspace.create": {
+		capability: "sessions.manage",
+		scope: "host",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "none",
+	},
+	"workspace.import": {
+		capability: "sessions.manage",
+		scope: "host",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "none",
+	},
+	"workspace.archive": {
+		capability: "sessions.manage",
+		scope: "host",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "challenge",
+	},
+	"workspace.recover": {
+		capability: "sessions.manage",
+		scope: "host",
+		revision: "none",
+		revisionOwner: "none",
+		confirmation: "none",
+	},
 	"host.list": {
 		capability: "sessions.read",
 		scope: "host",
@@ -859,6 +901,105 @@ function strictArgs(value: unknown, allowed: readonly string[]): Record<string, 
 		if (!expected.has(key)) fail("INVALID_FRAME", "unknown command argument", `args.${key}`);
 	return out;
 }
+function strictMap(value: unknown, path: string, allowed: readonly string[]): Record<string, unknown> {
+	const out = boundedMap(value, path);
+	const expected = new Set(allowed);
+	for (const key of Object.keys(out))
+		if (!expected.has(key)) fail("INVALID_FRAME", "unknown object field", `${path}.${key}`);
+	return out;
+}
+function strictResult(value: unknown, allowed: readonly string[]): Record<string, unknown> {
+	return strictMap(value, "result", allowed);
+}
+const runtimeSupports = new Set(["native", "emulated", "unavailable"]);
+const workspaceOwnerships = new Set(["managed", "imported-user", "detected-external", "repository-root"]);
+const workspaceLifecycles = new Set(["creating", "active", "archiving", "archived", "recovery-required"]);
+function decodeRuntimeResultItem(value: unknown, path: string): Record<string, unknown> {
+	const item = strictMap(value, path, ["id", "displayName", "command", "capabilities", "availability"]);
+	const id = controlFree(item.id, `${path}.id`, 64);
+	if (!/^[a-z][a-z0-9-]{0,63}$/.test(id)) fail("INVALID_FRAME", "invalid runtime adapter id", `${path}.id`);
+	const displayName = controlFree(item.displayName, `${path}.displayName`, 128);
+	const command = strictMap(item.command, `${path}.command`, ["executable", "arguments", "cwdArgument"]);
+	const executable = controlFree(command.executable, `${path}.command.executable`, 512);
+	const arguments_ = boundedArray(command.arguments, `${path}.command.arguments`, 64).map((argument, index) =>
+		boundedText(argument, `${path}.command.arguments[${index}]`, 4096),
+	);
+	const cwdArgument =
+		command.cwdArgument === undefined
+			? undefined
+			: controlFree(command.cwdArgument, `${path}.command.cwdArgument`, 128);
+	const capabilities = boundedMap(item.capabilities, `${path}.capabilities`);
+	const decodedCapabilities: Record<string, string> = {};
+	for (const [capability, support] of Object.entries(capabilities)) {
+		controlFree(capability, `${path}.capabilities`, 128);
+		if (typeof support !== "string" || !runtimeSupports.has(support))
+			fail("INVALID_FRAME", "invalid runtime capability support", `${path}.capabilities.${capability}`);
+		decodedCapabilities[capability] = support;
+	}
+	const availability = boundedMap(item.availability, `${path}.availability`);
+	const state = availability.state;
+	let decodedAvailability: Record<string, unknown>;
+	if (state === "available") {
+		strictMap(availability, `${path}.availability`, ["state"]);
+		decodedAvailability = { state };
+	} else if (state === "unavailable") {
+		strictMap(availability, `${path}.availability`, ["state", "executable"]);
+		decodedAvailability = {
+			state,
+			executable: controlFree(availability.executable, `${path}.availability.executable`, 512),
+		};
+	} else if (state === "unknown") {
+		strictMap(availability, `${path}.availability`, ["state"]);
+		decodedAvailability = { state };
+	} else fail("INVALID_FRAME", "invalid runtime availability", `${path}.availability.state`);
+	return {
+		id,
+		displayName,
+		command: { executable, arguments: arguments_, ...(cwdArgument === undefined ? {} : { cwdArgument }) },
+		capabilities: decodedCapabilities,
+		availability: decodedAvailability!,
+	};
+}
+function decodeWorkspaceResultItem(value: unknown, path: string): Record<string, unknown> {
+	const item = strictMap(value, path, [
+		"repositoryId",
+		"instanceId",
+		"ownership",
+		"branch",
+		"sourceCommit",
+		"expectedHead",
+		"lifecycle",
+		"createdAt",
+		"updatedAt",
+		"archivedAt",
+	]);
+	const repositoryId = projectId(item.repositoryId, `${path}.repositoryId`);
+	const instanceId = controlFree(item.instanceId, `${path}.instanceId`, 128);
+	const ownership = item.ownership;
+	if (typeof ownership !== "string" || !workspaceOwnerships.has(ownership))
+		fail("INVALID_FRAME", "invalid workspace ownership", `${path}.ownership`);
+	const lifecycle = item.lifecycle;
+	if (typeof lifecycle !== "string" || !workspaceLifecycles.has(lifecycle))
+		fail("INVALID_FRAME", "invalid workspace lifecycle", `${path}.lifecycle`);
+	const createdAt = finiteNumber(item.createdAt, `${path}.createdAt`);
+	const updatedAt = finiteNumber(item.updatedAt, `${path}.updatedAt`);
+	if (createdAt < 0 || updatedAt < 0) fail("INVALID_FRAME", "workspace timestamps must be non-negative", path);
+	const archivedAt = item.archivedAt === undefined ? undefined : finiteNumber(item.archivedAt, `${path}.archivedAt`);
+	if (archivedAt !== undefined && archivedAt < 0)
+		fail("INVALID_FRAME", "workspace archivedAt must be non-negative", `${path}.archivedAt`);
+	return {
+		repositoryId,
+		instanceId,
+		ownership,
+		branch: controlFree(item.branch, `${path}.branch`, 256),
+		sourceCommit: controlFree(item.sourceCommit, `${path}.sourceCommit`, 256),
+		expectedHead: controlFree(item.expectedHead, `${path}.expectedHead`, 256),
+		lifecycle,
+		createdAt,
+		updatedAt,
+		...(archivedAt === undefined ? {} : { archivedAt }),
+	};
+}
 function leasedArgs(value: unknown, allowed: readonly string[]): Record<string, unknown> {
 	const x = strictArgs(value, [...allowed, "leaseId"]);
 	if (x.leaseId !== undefined) leaseId(x.leaseId, "args.leaseId");
@@ -1322,6 +1463,28 @@ function decodePauseResult(value: unknown): CommandResult {
 	return { paused: x.paused, changed: x.changed };
 }
 export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown) => CommandArguments>> = {
+	"runtime.list": noArgs,
+	"workspace.list": noArgs,
+	"workspace.create": value => {
+		const x = strictArgs(value, ["projectId", "name", "branch", "sourceCommit"]);
+		projectId(x.projectId, "args.projectId");
+		controlFree(x.name, "args.name", 128);
+		controlFree(x.branch, "args.branch", 256);
+		controlFree(x.sourceCommit, "args.sourceCommit", 256);
+		return x;
+	},
+	"workspace.import": value => {
+		const x = strictArgs(value, ["projectId", "name"]);
+		projectId(x.projectId, "args.projectId");
+		controlFree(x.name, "args.name", 128);
+		return x;
+	},
+	"workspace.archive": value => {
+		const x = strictArgs(value, ["instanceId"]);
+		controlFree(x.instanceId, "args.instanceId", 128);
+		return x;
+	},
+	"workspace.recover": noArgs,
 	"host.list": args,
 	"session.list": args,
 	"transcript.search": value => decodeTranscriptSearchArguments(value) as unknown as CommandArguments,
@@ -1537,6 +1700,42 @@ export const COMMAND_ARGUMENT_DECODERS: Readonly<Record<string, (value: unknown)
 	"preview.handoff": decodePreviewHandoffArguments,
 };
 export const COMMAND_RESULT_DECODERS: Readonly<Record<string, (value: unknown) => CommandResult>> = {
+	"runtime.list": value => {
+		const x = strictResult(value, ["runtimes"]);
+		return {
+			runtimes: boundedArray(x.runtimes, "result.runtimes", 64).map((runtime, index) =>
+				decodeRuntimeResultItem(runtime, `result.runtimes[${index}]`),
+			),
+		};
+	},
+	"workspace.list": value => {
+		const x = strictResult(value, ["workspaces"]);
+		return {
+			workspaces: boundedArray(x.workspaces, "result.workspaces", 256).map((workspace, index) =>
+				decodeWorkspaceResultItem(workspace, `result.workspaces[${index}]`),
+			),
+		};
+	},
+	"workspace.create": value => {
+		const x = strictResult(value, ["workspace"]);
+		return { workspace: decodeWorkspaceResultItem(x.workspace, "result.workspace") };
+	},
+	"workspace.import": value => {
+		const x = strictResult(value, ["workspace"]);
+		return { workspace: decodeWorkspaceResultItem(x.workspace, "result.workspace") };
+	},
+	"workspace.archive": value => {
+		const x = strictResult(value, ["workspace"]);
+		return { workspace: decodeWorkspaceResultItem(x.workspace, "result.workspace") };
+	},
+	"workspace.recover": value => {
+		const x = strictResult(value, ["workspaces"]);
+		return {
+			workspaces: boundedArray(x.workspaces, "result.workspaces", 256).map((workspace, index) =>
+				decodeWorkspaceResultItem(workspace, `result.workspaces[${index}]`),
+			),
+		};
+	},
 	"host.list": decodeSessions,
 	"session.list": decodeSessions,
 	"transcript.search": value => decodeTranscriptSearchResult(value) as unknown as CommandResult,

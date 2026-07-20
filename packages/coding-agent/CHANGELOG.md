@@ -4,6 +4,8 @@
 
 ### Added
 
+- Add appserver ACP runtime discovery and a profile-local workspace authority with durable repository identity, crash recovery, and managed worktree lifecycle controls.
+
 - Add native Finder reveal support for local appserver projects without exposing their absolute paths.
 
 - Added profile-local cross-session transcript search with redacted snippets, bounded historical context, and filters for project, role, archive state, and time.

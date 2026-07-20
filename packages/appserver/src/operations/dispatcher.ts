@@ -134,6 +134,12 @@ const OPERATION_METHOD_BY_COMMAND: Readonly<Record<string, keyof DesktopOperatio
  * corresponding negotiated feature is granted.
  */
 export const COMMAND_FEATURE_BY_COMMAND: Readonly<Record<string, string>> = {
+	"runtime.list": "runtime.adapters",
+	"workspace.list": "workspace.lifecycle",
+	"workspace.create": "workspace.lifecycle",
+	"workspace.import": "workspace.lifecycle",
+	"workspace.archive": "workspace.lifecycle",
+	"workspace.recover": "workspace.lifecycle",
 	"host.watch": "host.watch",
 	"session.watch": "session.watch",
 	"controller.lease.acquire": "controller.lease",

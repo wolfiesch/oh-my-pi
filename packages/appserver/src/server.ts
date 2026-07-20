@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
 import { chmod, stat as fsStat, lstat, open, readlink, realpath, rename, symlink, unlink } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import {
 	type AttentionOutcome,
 	COMMAND_DESCRIPTORS,
@@ -84,6 +84,8 @@ import {
 	unlinkIfExists,
 } from "./ownership.ts";
 import { SessionProjection } from "./projection.ts";
+import type { RuntimeAdapterRegistry } from "./runtime-adapter.ts";
+import { WorkspaceAuthorityError, type WorkspaceAuthority, type WorkspaceRecord } from "./workspace-authority.ts";
 import { BunRemoteListener, createListenerPlan, createServeProxyPlan } from "./remote/listener.ts";
 import type { RemoteConnection, RemoteListenerConfig } from "./remote/types.ts";
 import { BunRpcChildFactory, RpcChildSupervisor } from "./rpc-child.ts";
@@ -584,9 +586,10 @@ export function appserverSupportedFeatures(
 		| "supportedFeatures"
 		| "transcriptImageRoot"
 		| "transcriptSearchAuthority"
-	> & {
-		readonly remotePolicy?: AppserverOptions["remotePolicy"];
-	},
+		| "runtimeAdapters"
+		| "workspaceAuthority"
+		| "workspaceTargetPathForProject"
+	> & { readonly remotePolicy?: AppserverOptions["remotePolicy"] },
 	includeRemotePolicy = false,
 ): string[] {
 	const unsupportedAdditiveFeatures = new Set(["host.watch", "session.watch"]);
@@ -596,6 +599,9 @@ export function appserverSupportedFeatures(
 		implementedFeatures.add("prompt.lease");
 	}
 	const authority = options.operationsAuthority;
+	if (options.runtimeAdapters) implementedFeatures.add("runtime.adapters");
+	if (options.workspaceAuthority && options.projectRootForProject && options.workspaceTargetPathForProject)
+		implementedFeatures.add("workspace.lifecycle");
 	if (options.transcriptImageRoot) implementedFeatures.add("transcript.images");
 	if (options.transcriptSearchAuthority) implementedFeatures.add("transcript.search");
 	if (!includeRemotePolicy && options.projectRootForProject && options.projectRevealer)
@@ -715,6 +721,10 @@ export class LocalAppserver implements AppserverHandle {
 	#supportedCapabilities: Set<string>;
 	#projectRootForProject?: AppserverOptions["projectRootForProject"];
 	#projectRevealer?: AppserverOptions["projectRevealer"];
+	#runtimeAdapters?: RuntimeAdapterRegistry;
+	#workspaceAuthority?: WorkspaceAuthority;
+	#workspaceTargetPathForProject?: AppserverOptions["workspaceTargetPathForProject"];
+	#onOwnerAcquired?: AppserverOptions["onOwnerAcquired"];
 	constructor(options: AppserverOptions = {}) {
 		this.#hostProvided = Boolean(options.hostId);
 		this.hostId = options.hostId ?? createHostId();
@@ -746,6 +756,10 @@ export class LocalAppserver implements AppserverHandle {
 		this.#transcriptSearch = options.transcriptSearchAuthority;
 		this.#projectRootForProject = options.projectRootForProject;
 		this.#projectRevealer = options.projectRevealer;
+		this.#runtimeAdapters = options.runtimeAdapters;
+		this.#workspaceAuthority = options.workspaceAuthority;
+		this.#workspaceTargetPathForProject = options.workspaceTargetPathForProject;
+		this.#onOwnerAcquired = options.onOwnerAcquired;
 		this.#discovery = options.discovery ?? options.sessionAuthority ?? { list: async () => [] };
 		this.#imageUploads = new ImageUploadStore({ root: `${this.socketPath}.images` });
 		this.#transcriptImages = options.transcriptImageRoot
@@ -793,6 +807,16 @@ export class LocalAppserver implements AppserverHandle {
 			throw new Error("unsupported capability has no handler");
 		this.#supportedCapabilities = new Set(requested);
 		this.#handlers.register("session.create", command => this.handleCreate(command));
+		if (this.#runtimeAdapters) this.#handlers.register("runtime.list", command => this.handleRuntimeList(command));
+		if (this.#workspaceAuthority) {
+			this.#handlers.register("workspace.list", command => this.handleWorkspaceList(command));
+			this.#handlers.register("workspace.archive", command => this.handleWorkspaceArchive(command));
+			this.#handlers.register("workspace.recover", command => this.handleWorkspaceRecover(command));
+			if (this.#workspaceTargetPathForProject && this.#projectRootForProject) {
+				this.#handlers.register("workspace.create", command => this.handleWorkspaceCreate(command));
+				this.#handlers.register("workspace.import", command => this.handleWorkspaceImport(command));
+			}
+		}
 		if (this.#projectRootForProject && this.#projectRevealer)
 			this.#handlers.register("project.reveal", command => this.handleProjectReveal(command));
 		this.#handlers.register("session.close", command => this.handleClose(command));
@@ -864,6 +888,7 @@ export class LocalAppserver implements AppserverHandle {
 		this.#ownerId = ownerId;
 		this.#ownerPaths = paths;
 		try {
+			await this.#onOwnerAcquired?.();
 			await this.#imageUploads.start();
 			await this.preparePublic(paths);
 			this.#server = Bun.serve<ServerWebSocketData>({
@@ -1954,6 +1979,90 @@ export class LocalAppserver implements AppserverHandle {
 		if (stableProjectId(canonical) !== requestedProject)
 			throw new Error("project resolver returned a mismatched local root");
 		return canonical;
+	}
+	private workspaceProjection(record: WorkspaceRecord): Record<string, unknown> {
+		return {
+			repositoryId: record.repositoryId,
+			instanceId: record.instanceId,
+			ownership: record.ownership,
+			branch: record.branch,
+			sourceCommit: record.sourceCommit,
+			expectedHead: record.expectedHead,
+			lifecycle: record.lifecycle,
+			createdAt: record.createdAt,
+			updatedAt: record.updatedAt,
+			...(record.archivedAt === undefined ? {} : { archivedAt: record.archivedAt }),
+		};
+	}
+
+	private async handleRuntimeList(command: CommandFrame): Promise<CommandOutcome> {
+		const runtimes = await Promise.all(
+			this.#runtimeAdapters!.list().map(async manifest => {
+				try {
+					return { ...manifest, availability: await this.#runtimeAdapters!.availability(manifest.id) };
+				} catch {
+					return { ...manifest, availability: { state: "unknown" as const } };
+				}
+			}),
+		);
+		return { frame: response(this.hostId, command, true, { runtimes }) };
+	}
+	private async workspaceCommand(
+		command: CommandFrame,
+		action: () => Promise<Record<string, unknown>> | Record<string, unknown>,
+	): Promise<CommandOutcome> {
+		try {
+			return { frame: response(this.hostId, command, true, await action()) };
+		} catch (cause) {
+			const code = cause instanceof WorkspaceAuthorityError ? cause.code : "workspace-command-failed";
+			const message = cause instanceof WorkspaceAuthorityError ? cause.message : "workspace command failed";
+			return { frame: response(this.hostId, command, false, undefined, { code, message }) };
+		}
+	}
+	private handleWorkspaceList(command: CommandFrame): Promise<CommandOutcome> {
+		return this.workspaceCommand(command, () => ({
+			workspaces: this.#workspaceAuthority!.list().map(record => this.workspaceProjection(record)),
+		}));
+	}
+	private handleWorkspaceCreate(command: CommandFrame): Promise<CommandOutcome> {
+		return this.workspaceCommand(command, async () => {
+			const repositoryId = projectId(command.args.projectId as string);
+			const repositoryPath = await this.resolveProjectRoot(repositoryId);
+			const targetPath = await this.#workspaceTargetPathForProject!(repositoryId, command.args.name as string);
+			if (!isAbsolute(targetPath))
+				throw new WorkspaceAuthorityError("invalid-path", "Workspace target resolver returned a non-absolute path");
+			const workspace = await this.#workspaceAuthority!.create({
+				repositoryId,
+				repositoryPath,
+				targetPath,
+				branch: command.args.branch as string,
+				sourceCommit: command.args.sourceCommit as string,
+			});
+			return { workspace: this.workspaceProjection(workspace) };
+		});
+	}
+	private handleWorkspaceImport(command: CommandFrame): Promise<CommandOutcome> {
+		return this.workspaceCommand(command, async () => {
+			const repositoryId = projectId(command.args.projectId as string);
+			const repositoryPath = await this.resolveProjectRoot(repositoryId);
+			const workspacePath = await this.#workspaceTargetPathForProject!(repositoryId, command.args.name as string);
+			if (!isAbsolute(workspacePath))
+				throw new WorkspaceAuthorityError("invalid-path", "Workspace target resolver returned a non-absolute path");
+			const workspace = await this.#workspaceAuthority!.import({ repositoryId, repositoryPath, workspacePath });
+			return { workspace: this.workspaceProjection(workspace) };
+		});
+	}
+	private handleWorkspaceArchive(command: CommandFrame): Promise<CommandOutcome> {
+		return this.workspaceCommand(command, async () => ({
+			workspace: this.workspaceProjection(
+				await this.#workspaceAuthority!.archive({ instanceId: command.args.instanceId as string }),
+			),
+		}));
+	}
+	private handleWorkspaceRecover(command: CommandFrame): Promise<CommandOutcome> {
+		return this.workspaceCommand(command, async () => ({
+			workspaces: (await this.#workspaceAuthority!.recover()).map(record => this.workspaceProjection(record)),
+		}));
 	}
 	private async handleProjectReveal(command: CommandFrame): Promise<CommandOutcome> {
 		if (!this.#projectRevealer) throw new Error("project reveal is unavailable");

@@ -1,3 +1,4 @@
+export * from "./acp-runtime-adapter.ts";
 export * from "./discovery.ts";
 export * from "./idempotency.ts";
 export * from "./identity.ts";
@@ -11,6 +12,8 @@ export * from "./remote/resolver.ts";
 export * from "./remote/runtime.ts";
 export * from "./remote/types.ts";
 export * from "./rpc-child.ts";
+export * from "./runtime-adapter-presets.ts";
+export * from "./runtime-adapter.ts";
 export type {
 	AuthenticatedPrincipal,
 	Capability,
@@ -31,3 +34,4 @@ export * from "./server.ts";
 export * from "./transcript-image-reader.ts";
 export * from "./transcript-search-index.ts";
 export * from "./types.ts";
+export * from "./workspace-authority.ts";

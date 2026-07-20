@@ -13,6 +13,6 @@
     "check": "bun run build",
     "test": "bun test test/*.test.ts"
   },
-  "dependencies": { "@oh-my-pi/app-wire": "workspace:*" },
+  "dependencies": { "@agentclientprotocol/sdk": "1.2.1", "@oh-my-pi/app-wire": "workspace:*" },
   "engines": { "bun": ">=1.3.14" }
 }

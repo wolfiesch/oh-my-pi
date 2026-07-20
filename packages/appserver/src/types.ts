@@ -21,6 +21,8 @@ import type {
 	UsageReadResult,
 } from "@oh-my-pi/app-wire";
 import type { DesktopOperationsAuthority } from "./operations/dispatcher.ts";
+import type { RuntimeAdapterRegistry } from "./runtime-adapter.ts";
+import type { WorkspaceAuthority } from "./workspace-authority.ts";
 import type { BunRemoteListener } from "./remote/listener.ts";
 import type {
 	ListenerPeerContext,
@@ -198,8 +200,12 @@ export interface AppserverOptions {
 	projectRevealer?: (root: string) => Promise<boolean> | boolean;
 	/** Categorizes external ownership without weakening the write lock gate. */
 	lockStatus?: SessionLockInspector;
-	/** Final write-lock gate, retained for every child/lifecycle mutation. */
-	lockCheck?: LockCheckHook;
+	/** Final write-lock gate, retained for every child/lifecycle mutation. */ lockCheck?: LockCheckHook;
+	runtimeAdapters?: RuntimeAdapterRegistry;
+	workspaceAuthority?: WorkspaceAuthority;
+	workspaceTargetPathForProject?: (projectId: ProjectId, name: string) => Promise<string> | string;
+	/** Runs after exclusive appserver ownership is acquired and before transports start. */
+	onOwnerAcquired?: () => Promise<void> | void;
 	socketPath?: string;
 	ompVersion?: string;
 	ompBuild?: string;

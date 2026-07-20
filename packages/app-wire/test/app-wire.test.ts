@@ -471,6 +471,63 @@ describe("app-wire authority", () => {
 		expect(Object.values(COMMAND_DESCRIPTORS).every(descriptor => typeof descriptor.capability === "string")).toBe(
 			true,
 		);
+		expect(decodeCommandArguments("runtime.list", {})).toEqual({});
+		expect(
+			decodeCommandArguments("workspace.create", {
+				projectId: "project-1",
+				name: "review",
+				branch: "agent/review",
+				sourceCommit: "HEAD",
+			}),
+		).toMatchObject({ projectId: "project-1", name: "review", branch: "agent/review", sourceCommit: "HEAD" });
+		expect(() =>
+			decodeCommandArguments("workspace.create", {
+				projectId: "project-1",
+				name: "review",
+				branch: "agent/review",
+				sourceCommit: "HEAD",
+				targetPath: "/tmp/escape",
+			}),
+		).toThrow(AppWireError);
+		expect(COMMAND_DESCRIPTORS["workspace.archive"]?.confirmation).toBe("challenge");
+		const runtimeResult = {
+			id: "omp",
+			displayName: "Oh My Pi",
+			command: { executable: "omp", arguments: [], cwdArgument: "--cwd" },
+			capabilities: { prompt: "native" },
+			availability: { state: "available" },
+		};
+		expect(decodeCommandResult("runtime.list", { runtimes: [runtimeResult] }).runtimes).toHaveLength(1);
+		expect(
+			decodeCommandResult("runtime.list", {
+				runtimes: [{ ...runtimeResult, availability: { state: "unknown" } }],
+			}).runtimes,
+		).toHaveLength(1);
+		for (const invalid of [
+			{ runtimes: [{ ...runtimeResult, canonicalPath: "/private/path" }] },
+			{ runtimes: [{ ...runtimeResult, capabilities: { prompt: "maybe" } }] },
+			{ runtimes: [{ ...runtimeResult, availability: { state: "unknown", executable: "unexpected" } }] },
+			{ runtimes: [runtimeResult], extra: true },
+		])
+			expect(() => decodeCommandResult("runtime.list", invalid)).toThrow(AppWireError);
+		const workspaceResult = {
+			repositoryId: "project-1",
+			instanceId: "workspace-1",
+			ownership: "managed",
+			branch: "agent/review",
+			sourceCommit: "a".repeat(40),
+			expectedHead: "b".repeat(40),
+			lifecycle: "active",
+			createdAt: 1,
+			updatedAt: 2,
+		};
+		expect(decodeCommandResult("workspace.list", { workspaces: [workspaceResult] }).workspaces).toHaveLength(1);
+		for (const invalid of [
+			{ workspaces: [{ ...workspaceResult, canonicalPath: "/private/path" }] },
+			{ workspaces: [{ ...workspaceResult, ownership: "unknown" }] },
+			{ workspaces: [{ ...workspaceResult, lifecycle: "unknown" }] },
+		])
+			expect(() => decodeCommandResult("workspace.list", invalid)).toThrow(AppWireError);
 		expect(MAX_FILE_BYTES).toBeLessThan(MAX_INPUT_BYTES);
 	});
 	test("welcome identity requires every version and build field", async () => {
@@ -1024,6 +1081,12 @@ describe("app-wire authority", () => {
 			"review.apply": "authority",
 			"config.write": "authority",
 			"settings.write": "authority",
+			"runtime.list": "none",
+			"workspace.list": "none",
+			"workspace.create": "none",
+			"workspace.import": "none",
+			"workspace.archive": "none",
+			"workspace.recover": "none",
 			"host.list": "none",
 			"session.list": "none",
 			"transcript.search": "none",

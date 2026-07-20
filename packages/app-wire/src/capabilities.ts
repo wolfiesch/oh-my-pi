@@ -49,6 +49,8 @@ export const PROTOCOL_FEATURES = [
 	"catalog.metadata",
 	"settings.metadata",
 	"preview.control",
+	"runtime.adapters",
+	"workspace.lifecycle",
 ] as const;
 export type ProtocolFeature = (typeof PROTOCOL_FEATURES)[number];
 export const REMOTE_DEFAULT_CAPABILITIES = [

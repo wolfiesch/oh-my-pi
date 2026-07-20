@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import * as http from "node:http";
+import { mkdir } from "node:fs/promises";
 import { isIP } from "node:net";
-import { isAbsolute, join } from "node:path";
-import type { AppserverDrainBusy, AppserverDrainResult, AppserverHandle } from "@oh-my-pi/appserver";
+import { basename, dirname, isAbsolute, join } from "node:path";
+import type { AppserverDrainBusy, AppserverDrainResult, AppserverHandle, ProjectId } from "@oh-my-pi/appserver";
 import { createRemoteAppserver, profileSocketPath } from "@oh-my-pi/appserver";
 import { getActiveProfile, getAgentDir, getBlobsDir, getProfileRootDir, postmortem } from "@oh-my-pi/pi-utils";
 import type { Settings as SettingsType } from "../config/settings";
@@ -79,6 +81,19 @@ export interface AppserverRunnerDeps {
 const MAX_HEALTH_BYTES = 16 * 1024;
 const MAX_ID_BYTES = 1024;
 const STATUS_TIMEOUT_MS = 1_500;
+const DEFAULT_APPSERVER_REMOTE_PORT = 8787;
+const NAMED_PROFILE_PORT_BASE = 18_000;
+const NAMED_PROFILE_PORT_SPAN = 20_000;
+
+export function defaultAppserverRemotePort(profile = getActiveProfile()): number {
+	if (!profile || profile === "default") return DEFAULT_APPSERVER_REMOTE_PORT;
+	let hash = 2_166_136_261;
+	for (let index = 0; index < profile.length; index += 1) {
+		hash ^= profile.charCodeAt(index);
+		hash = Math.imul(hash, 16_777_619);
+	}
+	return NAMED_PROFILE_PORT_BASE + ((hash >>> 0) % NAMED_PROFILE_PORT_SPAN);
+}
 
 function byteLength(value: string): number {
 	return new TextEncoder().encode(value).byteLength;
@@ -246,9 +261,10 @@ function persistedServeConfig(settings: Pick<SettingsType, "get">): AppserverSer
 	if (mode === "local") return {};
 	if (mode !== "direct") throw new Error("appserver.remoteMode must be local or direct");
 	const address = validatePersistedAddress(settings.get("appserver.remoteAddress"));
-	const port = settings.get("appserver.remotePort");
-	if (!Number.isSafeInteger(port) || port < 1 || port > 65_535)
+	const configuredPort = settings.get("appserver.remotePort");
+	if (!Number.isSafeInteger(configuredPort) || configuredPort < 1 || configuredPort > 65_535)
 		throw new Error("appserver.remotePort must be between 1 and 65535");
+	const port = configuredPort === DEFAULT_APPSERVER_REMOTE_PORT ? defaultAppserverRemotePort() : configuredPort;
 	const origins =
 		validateOrigins(
 			settings.get("appserver.remoteOrigins"),
@@ -264,13 +280,33 @@ async function defaultLoadAppserverSettings(): Promise<SettingsType> {
 	return Settings.init({ cwd: process.cwd(), loadProjectSettings: false });
 }
 
+export function defaultWorkspaceTargetPath(repositoryRoot: string, repositoryId: ProjectId, name: string): string {
+	const slug = name
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 40);
+	const digest = createHash("sha256").update(`${repositoryId}\0${name}`).digest("hex").slice(0, 12);
+	return join(dirname(repositoryRoot), `${basename(repositoryRoot)}-worktrees`, `${slug || "workspace"}-${digest}`);
+}
+
+export async function prepareDefaultWorkspaceTargetPath(
+	repositoryRoot: string,
+	repositoryId: ProjectId,
+	name: string,
+): Promise<string> {
+	const targetPath = defaultWorkspaceTargetPath(repositoryRoot, repositoryId, name);
+	await mkdir(dirname(targetPath), { recursive: true, mode: 0o700 });
+	return targetPath;
+}
+
 // This is intentionally a lazy boundary: `status`, `pair`, `devices`, and `revoke` must not load the native PTY graph.
 async function defaultCreateAppserver(
 	config?: AppserverServeConfig,
 	settingsOverride?: SettingsType,
 ): Promise<AppserverHandle> {
 	const [
-		{ createAppserver },
+		{ createAppserver, createAcpRuntimePresetRegistry, WorkspaceAuthority },
 		{ createAppserverRuntime },
 		{ Settings },
 		sdk,
@@ -320,12 +356,21 @@ async function defaultCreateAppserver(
 		runtimeOptions.pluginManager = new pluginModule.PluginManager(cwd);
 	} catch {}
 	const runtime = createAppserverRuntime(runtimeOptions);
+	const runtimeAdapters = createAcpRuntimePresetRegistry();
+	const workspaceAuthority = new WorkspaceAuthority({
+		databasePath: join(getAgentDir(), "appserver", "workspaces.sqlite"),
+	});
 	const base = {
 		...getCodingAgentAppserverIdentity(),
 		...activeAppserverLocalIdentity(),
 		sessionAuthority: runtime.sessionAuthority,
 		discovery: runtime.discovery,
 		operationsAuthority: runtime.operationsAuthority,
+		runtimeAdapters,
+		workspaceAuthority,
+		onOwnerAcquired: () => workspaceAuthority.initialize(),
+		workspaceTargetPathForProject: async (projectId: ProjectId, name: string) =>
+			prepareDefaultWorkspaceTargetPath(await runtime.projectRootForProject(projectId), projectId, name),
 		projectRootForProject: runtime.projectRootForProject,
 		...(process.platform === "darwin"
 			? {
@@ -346,7 +391,7 @@ async function defaultCreateAppserver(
 		throw new Error("remote mode requires address and state directory");
 	const endpoint = {
 		address: config.remoteAddress,
-		port: config.remotePort ?? 8787,
+		port: config.remotePort ?? defaultAppserverRemotePort(),
 		originAllowlist: config.remoteOrigins,
 		serveProxy: config.remoteMode === "serve",
 		trustedServeProxy: config.trustedServeProxy,
@@ -376,9 +421,9 @@ export function validateAppserverServeConfig(config: AppserverServeConfig = {}):
 	if (!config.remoteAddress || typeof config.remoteAddress !== "string")
 		throw new Error("remote mode requires --remote-address");
 	if (
-		!Number.isSafeInteger(config.remotePort ?? 8787) ||
-		(config.remotePort ?? 8787) < 1 ||
-		(config.remotePort ?? 8787) > 65_535
+		!Number.isSafeInteger(config.remotePort ?? defaultAppserverRemotePort()) ||
+		(config.remotePort ?? defaultAppserverRemotePort()) < 1 ||
+		(config.remotePort ?? defaultAppserverRemotePort()) > 65_535
 	)
 		throw new Error("--remote-port is invalid");
 	if (!config.remoteStateDir) config.remoteStateDir = defaultRemoteStateDir();

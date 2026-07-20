@@ -4,6 +4,8 @@
 
 ### Added
 
+- Add negotiated runtime-adapter discovery and server-authorized workspace lifecycle commands with strict path-free result schemas.
+
 - Add the local-only `project.reveal` desktop command without exposing absolute folder paths to clients.
 
 - Add a bounded, ordered browser preview contract with backend-neutral authority metadata, capture chunking, tab controls, input actions, policy checks, cooperative leases, and human handoff.

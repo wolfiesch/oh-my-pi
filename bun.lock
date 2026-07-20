@@ -61,6 +61,7 @@
       "name": "@oh-my-pi/appserver",
       "version": "0.1.0",
       "dependencies": {
+        "@agentclientprotocol/sdk": "1.2.1",
         "@oh-my-pi/app-wire": "workspace:*",
       },
     },
