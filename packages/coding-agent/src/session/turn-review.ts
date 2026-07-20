@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ArtifactDescriptor, TurnFileChange, TurnId } from "@oh-my-pi/app-wire";
+import { type ArtifactDescriptor, MAX_TURN_FILE_CHANGES, type TurnFileChange, type TurnId } from "@oh-my-pi/app-wire";
 
 const MAX_TEXT_FILE_BYTES = 1024 * 1024;
 const MAX_PATCH_BYTES = 512 * 1024;
@@ -32,18 +32,27 @@ async function readBounded(
 	const reader = stream.getReader();
 	const chunks: Uint8Array[] = [];
 	let size = 0;
+	let overflowed = false;
 	try {
 		while (true) {
 			const next = await reader.read();
 			if (next.done) break;
+			if (overflowed) continue;
 			size += next.value.byteLength;
-			if (size > limit) return { text: "", overflowed: true };
+			if (size > limit) {
+				overflowed = true;
+				chunks.length = 0;
+				continue;
+			}
 			chunks.push(next.value);
 		}
 	} finally {
 		reader.releaseLock();
 	}
-	return { text: new TextDecoder().decode(Buffer.concat(chunks)), overflowed: false };
+	return {
+		text: overflowed ? "" : new TextDecoder().decode(Buffer.concat(chunks)),
+		overflowed,
+	};
 }
 
 async function git(
@@ -197,11 +206,12 @@ export async function appendTurnReview(
 			]),
 		]);
 		if (!status.ok || !changes.ok) return;
+		const raw = rawChanges(changes.stdout);
+		if (raw.length > MAX_TURN_FILE_CHANGES) return;
+		const untracked = untrackedPaths(status.stdout);
 		const summaries = (
 			await Promise.all(
-				rawChanges(changes.stdout).map(change =>
-					changeSummary(prepared.cwd, prepared.baseTree, headTree, change, untrackedPaths(status.stdout)),
-				),
+				raw.map(change => changeSummary(prepared.cwd, prepared.baseTree, headTree, change, untracked)),
 			)
 		).filter((change): change is TurnFileChange => change !== undefined);
 		if (summaries.length === 0) return;

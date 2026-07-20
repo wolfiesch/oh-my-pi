@@ -405,6 +405,45 @@ async function runArgv(
 	}
 }
 
+type TreeRestoreResult = "ok" | "aborted" | "failed";
+
+async function restoreTreePaths(
+	root: string,
+	tree: string,
+	targets: readonly string[],
+	signal: AbortSignal | undefined,
+): Promise<TreeRestoreResult> {
+	const treeCheck = await runArgv(["git", "cat-file", "-e", `${tree}^{tree}`], root, signal);
+	if (treeCheck.cancelled) return "aborted";
+	if (treeCheck.exitCode !== 0 || treeCheck.timedOut || treeCheck.truncated) return "failed";
+	const present: string[] = [];
+	const absent: string[] = [];
+	for (const target of targets) {
+		const check = await runArgv(["git", "cat-file", "-e", `${tree}:${target}`], root, signal);
+		if (check.cancelled) return "aborted";
+		if (check.timedOut || check.truncated || check.exitCode === undefined) return "failed";
+		(check.exitCode === 0 ? present : absent).push(target);
+	}
+	if (absent.length > 0) {
+		const remove = await runArgv(["git", "rm", "-f", "--ignore-unmatch", "--", ...absent], root, signal);
+		if (remove.cancelled) return "aborted";
+		if (remove.exitCode !== 0 || remove.timedOut || remove.truncated) return "failed";
+		const clean = await runArgv(["git", "clean", "-f", "--", ...absent], root, signal);
+		if (clean.cancelled) return "aborted";
+		if (clean.exitCode !== 0 || clean.timedOut || clean.truncated) return "failed";
+	}
+	if (present.length > 0) {
+		const restore = await runArgv(
+			["git", "restore", "--staged", "--worktree", `--source=${tree}`, "--", ...present],
+			root,
+			signal,
+		);
+		if (restore.cancelled) return "aborted";
+		if (restore.exitCode !== 0 || restore.timedOut || restore.truncated) return "failed";
+	}
+	return "ok";
+}
+
 function normalizedSecureFs(adapter: SecureFsAdapter): SecureFsAdapter {
 	return {
 		secureReadFile: async (root, path, max) => {
@@ -724,8 +763,10 @@ export class CodingAgentDesktopAuthority {
 			const appendCustomEntry = this.#context.sessionManager.appendCustomEntry;
 			if (!appendCustomEntry) throw protocolError("UNSUPPORTED");
 			const root = this.#getRoot(sessionId);
+			const expectedRevision = this.#expected(request, context, true);
 			const before = await captureWorktreeTree(root);
 			if (!before) throw protocolError("OPERATION_FAILED");
+			if (before !== expectedRevision) throw protocolError("STALE_REVISION");
 			const targets = [change.path, ...(change.previousPath === undefined ? [] : [change.previousPath])];
 			const targetCheck = await runArgv(
 				["git", "diff", "--quiet", snapshot.headTree, before, "--", ...targets],
@@ -737,17 +778,18 @@ export class CodingAgentDesktopAuthority {
 				throw protocolError("stale_turn");
 			if (signal?.aborted) throw protocolError("ABORTED");
 			if (request.action === "discard") {
-				const restore =
+				const restored =
 					change.status === "untracked"
-						? await runArgv(["git", "clean", "-f", "--", change.path], root, signal)
-						: await runArgv(
-								["git", "restore", "--staged", "--worktree", `--source=${snapshot.baseTree}`, "--", ...targets],
-								root,
-								signal,
-							);
-				if (restore.cancelled) throw protocolError("ABORTED");
-				if (restore.exitCode !== 0 || restore.timedOut || restore.truncated)
-					throw protocolError("OPERATION_FAILED");
+						? await runArgv(["git", "clean", "-f", "--", change.path], root, signal).then(result =>
+								result.cancelled
+									? "aborted"
+									: result.exitCode !== 0 || result.timedOut || result.truncated
+										? "failed"
+										: "ok",
+							)
+						: await restoreTreePaths(root, snapshot.baseTree, targets, signal);
+				if (restored === "aborted") throw protocolError("ABORTED");
+				if (restored === "failed") throw protocolError("OPERATION_FAILED");
 			}
 			const resultingRevision = await captureWorktreeTree(root);
 			if (!resultingRevision) throw protocolError("OPERATION_FAILED");
@@ -758,13 +800,7 @@ export class CodingAgentDesktopAuthority {
 					action: request.action,
 				});
 			} catch {
-				if (request.action === "discard") {
-					await runArgv(
-						["git", "restore", "--staged", "--worktree", `--source=${snapshot.headTree}`, "--", ...targets],
-						root,
-						undefined,
-					);
-				}
+				if (request.action === "discard") await restoreTreePaths(root, snapshot.headTree, targets, undefined);
 				throw protocolError("OPERATION_FAILED");
 			}
 			return freeze({
