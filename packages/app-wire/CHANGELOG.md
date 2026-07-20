@@ -10,6 +10,11 @@
 - Add the negotiated `transcript.search` feature with strict, bounded host search and session context commands.
 - Add the strict, bounded `SessionRef.attention` summary for cross-session pending questions, approvals, plan reviews, and latest root outcomes.
 
+### Changed
+
+- Replace the fork-owned wire implementation with a compatibility export of the checksum-pinned
+  T4 host-wire artifact. The active contract now includes bounded backward transcript paging.
+
 ## [0.5.10] - 2026-07-18
 
 ### Added

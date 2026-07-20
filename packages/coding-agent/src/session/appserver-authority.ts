@@ -195,7 +195,7 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 			records.delete(session.sessionId);
 		},
 	};
-	const discovery = {
+	const discovery: SessionDiscovery = {
 		list: () => sessionAuthority.list(),
 		load: async (session: SessionRecord): Promise<SessionRecord> => {
 			const loaded = await baseDiscovery.load(session);
@@ -203,6 +203,10 @@ export function createAppserverRuntime(options: AppserverAuthorityOptions = {}):
 			const record = archivedAt ? { ...loaded, archivedAt } : loaded;
 			records.set(record.sessionId, record);
 			return record;
+		},
+		page: (session, args) => {
+			if (!baseDiscovery.page) throw new Error("T4 transcript paging authority is unavailable");
+			return baseDiscovery.page(session, args);
 		},
 	};
 	const projectRootForSessionSync = (session: string): string => {

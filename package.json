@@ -101,7 +101,9 @@
     }
   },
   "overrides": {
-    "@ark/schema": "0.56.2"
+    "@ark/schema": "0.56.2",
+    "@t4-code/host-service": "./vendor/t4-host/t4-code-host-service-0.1.30.tgz",
+    "@t4-code/host-wire": "./vendor/t4-host/t4-code-host-wire-0.1.30.tgz"
   },
   "scripts": {
     "setup": "bun install && bun run build:native && bun --cwd=packages/coding-agent link && sh scripts/link-omp.sh",
@@ -210,6 +212,8 @@
     "*.{js,ts,jsx,tsx,json,jsonc,css}": "biome check --write --no-errors-on-unmatched"
   },
   "dependencies": {
+    "@t4-code/host-service": "./vendor/t4-host/t4-code-host-service-0.1.30.tgz",
+    "@t4-code/host-wire": "./vendor/t4-host/t4-code-host-wire-0.1.30.tgz",
     "sherpa-onnx": "1.13.2",
     "sherpa-onnx-darwin-arm64": "1.13.3",
     "sherpa-onnx-node": "1.13.2"

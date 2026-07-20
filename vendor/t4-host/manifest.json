@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "repository": "https://github.com/LycaonLLC/t4-code.git",
+    "commit": "b04b3115022cc74157cabc1eaba7d042e1f6c8be",
+    "tree": "d37afe01c11bad8e61e780824b14d3cf03b069b8"
+  },
+  "packages": [
+    {
+      "name": "@t4-code/host-service",
+      "version": "0.1.30",
+      "file": "t4-code-host-service-0.1.30.tgz",
+      "sha256": "b3a5491c4f7bfe5e320c3abcc52a06d740081f697bd46a920fad2ff0fa7c79e6"
+    },
+    {
+      "name": "@t4-code/host-wire",
+      "version": "0.1.30",
+      "file": "t4-code-host-wire-0.1.30.tgz",
+      "sha256": "de391332ab02aa90fd62c888fa81646d19bb4a9ff48f4b68e24e3335e6741cef"
+    }
+  ]
+}
