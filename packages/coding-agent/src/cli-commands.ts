@@ -16,6 +16,7 @@ export const commands: CommandEntry[] = [
 	{ name: "acp", load: () => import("./commands/acp").then(m => m.default) },
 	{ name: "auth-broker", load: () => import("./commands/auth-broker").then(m => m.default) },
 	{ name: "appserver", load: () => import("./commands/appserver").then(m => m.default) },
+	{ name: "bridge", load: () => import("./commands/bridge").then(m => m.default) },
 	{ name: "auth-gateway", load: () => import("./commands/auth-gateway").then(m => m.default) },
 	{ name: "agents", load: () => import("./commands/agents").then(m => m.default) },
 	{ name: "bench", load: () => import("./commands/bench").then(m => m.default) },
