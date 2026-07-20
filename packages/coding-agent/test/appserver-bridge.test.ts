@@ -3,6 +3,7 @@ import { hostId, projectId, sessionId } from "@oh-my-pi/app-wire";
 import {
 	decodeOmpAuthorityBridgeServerFrame,
 	encodeOmpAuthorityBridgeFrame,
+	OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES,
 	OMP_AUTHORITY_BRIDGE_PROTOCOL,
 } from "@oh-my-pi/appserver";
 import { runOmpAuthorityBridge } from "../src/cli/appserver-bridge-cli";
@@ -159,5 +160,17 @@ describe("thin OMP authority bridge", () => {
 		);
 		input.close();
 		await expect(running).rejects.toThrow("unknown or missing fields");
+	});
+
+	test("rejects an oversized unfinished input frame", async () => {
+		const input = new AsyncQueue();
+		const running = runOmpAuthorityBridge({
+			runtime: runtime(),
+			input,
+			write: () => {},
+			identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
+		});
+		input.push("x".repeat(OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES + 1));
+		await expect(running).rejects.toThrow("bridge input exceeds the line limit");
 	});
 });

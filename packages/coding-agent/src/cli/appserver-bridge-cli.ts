@@ -148,16 +148,21 @@ async function* lines(input: AsyncIterable<string | Uint8Array>): AsyncGenerator
 	let pending = "";
 	for await (const chunk of input) {
 		pending += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
-		if (Buffer.byteLength(pending, "utf8") > OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES)
-			throw new Error("bridge input exceeds the line limit");
 		let index = pending.indexOf("\n");
 		while (index >= 0) {
-			yield pending.slice(0, index).replace(/\r$/u, "");
+			const line = pending.slice(0, index).replace(/\r$/u, "");
+			if (Buffer.byteLength(line, "utf8") > OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES)
+				throw new Error("bridge input exceeds the line limit");
+			yield line;
 			pending = pending.slice(index + 1);
 			index = pending.indexOf("\n");
 		}
+		if (Buffer.byteLength(pending, "utf8") > OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES)
+			throw new Error("bridge input exceeds the line limit");
 	}
 	pending += decoder.decode();
+	if (Buffer.byteLength(pending, "utf8") > OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES)
+		throw new Error("bridge input exceeds the line limit");
 	if (pending) yield pending;
 }
 
