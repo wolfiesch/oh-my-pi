@@ -10405,15 +10405,16 @@ export class AgentSession {
 	}
 
 	/**
-	 * Set the thinking level. `auto` enables per-turn classification; the selector
-	 * itself is never written to the session log, but resolved concrete levels are
-	 * persisted when real user turns are classified so resumed sessions keep the
-	 * last resolved effort instead of reverting to pending auto.
+	 * Set the thinking level. `auto` enables per-turn classification. Entering
+	 * auto writes its provisional level plus `configured: "auto"` immediately,
+	 * giving external readers an authoritative selection receipt before the next
+	 * user turn. Later classifications persist only changed concrete resolutions.
 	 */
 	setThinkingLevel(level: ConfiguredThinkingLevel | undefined, persist: boolean = false): void {
 		if (level === AUTO_THINKING) {
 			const provisional = resolveProvisionalAutoLevel(this.model);
 			const wasAuto = this.#autoThinking;
+			const previousLevel = this.#thinkingLevel;
 			this.#autoThinking = true;
 			this.#autoResolvedLevel = undefined;
 			this.#thinkingLevel = provisional;
@@ -10424,7 +10425,9 @@ export class AgentSession {
 			if (persist) {
 				this.settings.set("defaultThinkingLevel", AUTO_THINKING);
 			}
-			if (!wasAuto || this.#thinkingLevel !== provisional) {
+			const isChanging = !wasAuto || previousLevel !== provisional;
+			if (isChanging) {
+				this.sessionManager.appendThinkingLevelChange(provisional, AUTO_THINKING);
 				this.#emit({ type: "thinking_level_changed", thinkingLevel: provisional, configured: AUTO_THINKING });
 			}
 			return;
@@ -10533,7 +10536,7 @@ export class AgentSession {
 
 		const effort = resolved ?? resolveProvisionalAutoLevel(model);
 		if (effort === undefined) return;
-		const shouldPersistResolution = this.#autoResolvedLevel !== effort;
+		const shouldPersistResolution = this.#thinkingLevel !== effort;
 		this.#autoResolvedLevel = effort;
 		this.#thinkingLevel = effort;
 		this.#applyThinkingLevelToAgent(effort);
