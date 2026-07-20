@@ -21,8 +21,6 @@ import type {
 	UsageReadResult,
 } from "@oh-my-pi/app-wire";
 import type { DesktopOperationsAuthority } from "./operations/dispatcher.ts";
-import type { RuntimeAdapterRegistry } from "./runtime-adapter.ts";
-import type { WorkspaceAuthority } from "./workspace-authority.ts";
 import type { BunRemoteListener } from "./remote/listener.ts";
 import type {
 	ListenerPeerContext,
@@ -30,6 +28,8 @@ import type {
 	RemoteListenerConfig,
 	RemotePeerIdentity,
 } from "./remote/types.ts";
+import type { RuntimeAdapterRegistry } from "./runtime-adapter.ts";
+import type { WorkspaceAuthority } from "./workspace-authority.ts";
 
 export interface ConnectionTransport {
 	readonly connectionId: string;

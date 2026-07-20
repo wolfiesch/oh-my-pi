@@ -12,8 +12,8 @@ export * from "./remote/resolver.ts";
 export * from "./remote/runtime.ts";
 export * from "./remote/types.ts";
 export * from "./rpc-child.ts";
-export * from "./runtime-adapter-presets.ts";
 export * from "./runtime-adapter.ts";
+export * from "./runtime-adapter-presets.ts";
 export type {
 	AuthenticatedPrincipal,
 	Capability,

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
-import { chmodSync, lstatSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { chmodSync, lstatSync, mkdirSync } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 
@@ -385,7 +385,7 @@ export class WorkspaceAuthority {
 			throw error("ownership-protected", "Imported and detected worktrees are never deleted by the authority");
 		return this.#withLease(current.repositoryId, async () => {
 			const record = this.get(request.instanceId);
-			if (!record || record.lifecycle !== "active")
+			if (record?.lifecycle !== "active")
 				throw error("recovery-required", "Workspace changed while waiting for mutation lease");
 			if (record.ownership !== "managed")
 				throw error("ownership-protected", "Workspace ownership changed while waiting for mutation lease");
@@ -429,7 +429,7 @@ export class WorkspaceAuthority {
 			throw error("recovery-required", "Workspace is not in a sealable lifecycle state");
 		return this.#withLease(current.repositoryId, async () => {
 			const record = this.get(request.instanceId);
-			if (!record || record.lifecycle !== "active")
+			if (record?.lifecycle !== "active")
 				throw error("recovery-required", "Workspace changed while waiting for mutation lease");
 			await this.#assertRepositoryId(record.repositoryId, record.repositoryRoot);
 			const metadata = await this.#worktree(record.repositoryRoot, record.canonicalPath);

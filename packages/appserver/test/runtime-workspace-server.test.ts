@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hostId, type ServerFrame, sessionId } from "@oh-my-pi/app-wire";
-import { RuntimeAdapterRegistry, type RuntimeAdapter, type RuntimeAdapterCallbacks } from "../src/runtime-adapter.ts";
+import { type RuntimeAdapter, type RuntimeAdapterCallbacks, RuntimeAdapterRegistry } from "../src/runtime-adapter.ts";
 import { appserverSupportedFeatures, createAppserver } from "../src/server.ts";
 import { WorkspaceAuthority } from "../src/workspace-authority.ts";
 import { RawUdsWebSocket } from "./raw-uds-client.ts";

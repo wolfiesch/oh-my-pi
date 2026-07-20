@@ -4,11 +4,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	type GitProcessResult,
 	WorkspaceAuthority,
 	WorkspaceAuthorityError,
-	type GitProcessResult,
-	type WorkspaceProcessRunner,
 	type WorkspaceAuthorityErrorCode,
+	type WorkspaceProcessRunner,
 } from "../src/workspace-authority.ts";
 
 async function git(cwd: string, arguments_: readonly string[]): Promise<GitProcessResult> {

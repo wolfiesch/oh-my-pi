@@ -6,11 +6,10 @@ import { dirname, isAbsolute, join } from "node:path";
 import {
 	type AttentionOutcome,
 	COMMAND_DESCRIPTORS,
-	type DurableEntry,
-	type EntryId,
 	type CommandFrame,
 	type ConfirmationChallenge,
 	type ConfirmFrame,
+	type DurableEntry,
 	decodeClientFrame,
 	decodeCommandArguments,
 	decodeCursor,
@@ -18,6 +17,7 @@ import {
 	decodeSessionPromptArguments,
 	decodeSessionStateResult,
 	decodeUsageReadResult,
+	type EntryId,
 	entryId,
 	type HelloFrame,
 	type HostId,
@@ -32,10 +32,10 @@ import {
 	requiredCapability,
 	type ServerFrame,
 	type SessionId,
-	sessionId,
 	type SessionImageReadArguments,
 	type SessionRef,
 	type SessionStateResult,
+	sessionId,
 	type TranscriptContextArguments,
 	type TranscriptSearchArguments,
 	type UsageReadResult,
@@ -88,16 +88,15 @@ import {
 	unlinkIfExists,
 } from "./ownership.ts";
 import { SessionProjection } from "./projection.ts";
+import { BunRemoteListener, createListenerPlan, createServeProxyPlan } from "./remote/listener.ts";
+import type { RemoteConnection, RemoteListenerConfig } from "./remote/types.ts";
+import { BunRpcChildFactory, RpcChildSupervisor } from "./rpc-child.ts";
 import type {
 	RuntimeAdapterRegistry,
 	RuntimePermissionResponse,
 	RuntimeSession,
 	RuntimeWorkspaceIdentity,
 } from "./runtime-adapter.ts";
-import { WorkspaceAuthorityError, type WorkspaceAuthority, type WorkspaceRecord } from "./workspace-authority.ts";
-import { BunRemoteListener, createListenerPlan, createServeProxyPlan } from "./remote/listener.ts";
-import type { RemoteConnection, RemoteListenerConfig } from "./remote/types.ts";
-import { BunRpcChildFactory, RpcChildSupervisor } from "./rpc-child.ts";
 import { SubagentProjection, subagentIdFromFrame } from "./subagent-projection.ts";
 import {
 	type AppserverEvent,
@@ -127,6 +126,7 @@ import type {
 	SessionLockStatus,
 	SessionRecord,
 } from "./types.ts";
+import { type WorkspaceAuthority, WorkspaceAuthorityError, type WorkspaceRecord } from "./workspace-authority.ts";
 
 const clock: Clock = { now: () => new Date() };
 const ARCHIVED_SESSION_COMMANDS = new Set([

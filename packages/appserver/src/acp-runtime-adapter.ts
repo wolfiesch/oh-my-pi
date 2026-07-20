@@ -2,10 +2,9 @@ import { spawn } from "node:child_process";
 import { isAbsolute } from "node:path";
 import { Readable, Writable } from "node:stream";
 
-import { PROTOCOL_VERSION, client, methods, ndJsonStream, type ClientConnection } from "@agentclientprotocol/sdk";
+import { type ClientConnection, client, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import {
 	immutableRuntimeAdapterManifest,
-	RuntimeUnavailableError,
 	type RuntimeAdapter,
 	type RuntimeAdapterCallbacks,
 	type RuntimeAdapterFactory,
@@ -13,6 +12,7 @@ import {
 	type RuntimeCommand,
 	type RuntimeSession,
 	type RuntimeSessionRequest,
+	RuntimeUnavailableError,
 } from "./runtime-adapter.ts";
 
 const DEFAULT_MAX_FRAME_BYTES = 1_048_576;
