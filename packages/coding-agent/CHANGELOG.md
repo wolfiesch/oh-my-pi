@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added plugin entries to the Extension Control Center dashboard so npm and marketplace installs appear alongside other extension capabilities ([#3924](https://github.com/can1357/oh-my-pi/pull/3924) by [@wolfiesch](https://github.com/wolfiesch)).
+
+### Fixed
+
+- Fixed partial MCP reconnects preserving tools from already-connected servers, and made dashboard live refresh report target-server connection failures instead of showing a false success message ([#3924](https://github.com/can1357/oh-my-pi/pull/3924) by [@wolfiesch](https://github.com/wolfiesch)).
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed

@@ -16,6 +16,7 @@ export type ExtensionKind =
 	| "instruction"
 	| "context-file"
 	| "hook"
+	| "plugin"
 	| "slash-command";
 
 /**

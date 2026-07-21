@@ -4,7 +4,7 @@
  */
 import * as path from "node:path";
 import { fuzzyMatch } from "@oh-my-pi/pi-tui";
-import { getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
+import { getMCPConfigPath, getProjectDir, logger } from "@oh-my-pi/pi-utils";
 import type { ContextFile } from "../../../capability/context-file";
 import type { ExtensionModule } from "../../../capability/extension-module";
 import type { Hook } from "../../../capability/hook";
@@ -22,6 +22,16 @@ import {
 	isProviderEnabled,
 	loadCapability,
 } from "../../../discovery";
+import { clearPluginRootsAndCaches, resolveOrDefaultProjectRegistryPath } from "../../../discovery/helpers";
+import { PluginManager } from "../../../extensibility/plugins/manager";
+import {
+	getInstalledPluginsRegistryPath,
+	getMarketplacesCacheDir,
+	getMarketplacesRegistryPath,
+	getPluginsCacheDir,
+	MarketplaceManager,
+} from "../../../extensibility/plugins/marketplace";
+import type { InstalledPluginEntry, InstalledPluginSummary } from "../../../extensibility/plugins/marketplace/types";
 import { readDisabledServers, readEnabledServers } from "../../../mcp/config-writer";
 import type {
 	DashboardState,
@@ -315,6 +325,74 @@ export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): P
 		logger.warn("Failed to load context-files capability", { error: String(error) });
 	}
 
+	// Load npm plugins (installed via npm in the plugins dir)
+	try {
+		const npmManager = new PluginManager(cwd ?? getProjectDir());
+		const npmPlugins = await npmManager.list();
+		for (const plugin of npmPlugins) {
+			const id = makeExtensionId("plugin", `npm/${plugin.name}`);
+			extensions.push({
+				id,
+				kind: "plugin",
+				name: plugin.name,
+				displayName: plugin.manifest?.name ?? plugin.name,
+				description: plugin.manifest?.description ?? `v${plugin.version}`,
+				trigger: plugin.manifest?.version ?? plugin.version,
+				path: plugin.path,
+				source: {
+					provider: "npm-plugin",
+					providerName: "npm Plugin",
+					level: "user",
+				},
+				state: plugin.enabled ? "active" : "disabled",
+				disabledReason: plugin.enabled ? undefined : "item-disabled",
+				raw: { type: "npm", name: plugin.name, plugin },
+			});
+		}
+	} catch (error) {
+		logger.warn("Failed to load npm plugins", { error: String(error) });
+	}
+
+	// Load marketplace plugins
+	try {
+		const projectPath = await resolveOrDefaultProjectRegistryPath(cwd ?? getProjectDir());
+		const marketplaceManager = new MarketplaceManager({
+			marketplacesRegistryPath: getMarketplacesRegistryPath(),
+			installedRegistryPath: getInstalledPluginsRegistryPath(),
+			projectInstalledRegistryPath: projectPath,
+			marketplacesCacheDir: getMarketplacesCacheDir(),
+			pluginsCacheDir: getPluginsCacheDir(),
+			clearPluginRootsCache: clearPluginRootsAndCaches,
+		});
+		const installed: InstalledPluginSummary[] = await marketplaceManager.listInstalledPlugins();
+		for (const summary of installed) {
+			const id = makeExtensionId("plugin", `mkt/${summary.id}@${summary.scope}`);
+			const entry: InstalledPluginEntry | undefined = summary.entries[0];
+			const isShadowed = Boolean(summary.shadowedBy);
+			const isDisabled = entry?.enabled === false;
+			extensions.push({
+				id,
+				kind: "plugin",
+				name: summary.id,
+				displayName: summary.id,
+				description: `v${entry?.version ?? "?"} [${summary.scope}]`,
+				trigger: summary.scope,
+				path: entry?.installPath ?? "",
+				source: {
+					provider: "marketplace-plugin",
+					providerName: "Marketplace Plugin",
+					level: summary.scope,
+				},
+				state: isDisabled ? "disabled" : isShadowed ? "shadowed" : "active",
+				disabledReason: isDisabled ? "item-disabled" : isShadowed ? "shadowed" : undefined,
+				shadowedBy: summary.shadowedBy,
+				raw: { type: "marketplace", summary },
+			});
+		}
+	} catch (error) {
+		logger.warn("Failed to load marketplace plugins", { error: String(error) });
+	}
+
 	return extensions;
 }
 
@@ -457,6 +535,8 @@ function getKindDisplayName(kind: ExtensionKind): string {
 			return "Hooks";
 		case "slash-command":
 			return "Slash Commands";
+		case "plugin":
+			return "Plugins";
 		default:
 			return kind;
 	}

@@ -8,6 +8,7 @@
 import { type Component, matchesKey, padding, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { isProviderEnabled } from "../../../discovery";
 import { theme } from "../../../modes/theme/theme";
+import { replaceTabs } from "../../../tools/render-utils";
 import { matchesSelectDown, matchesSelectUp } from "../../utils/keybinding-matchers";
 import { clampSelection, contentRowWidth, renderScrollableList, searchableChar } from "../selector-helpers";
 import { applyFilter } from "./state-manager";
@@ -208,7 +209,7 @@ export class ExtensionList implements Component {
 		const stateIcon = this.#getStateIcon(ext.state, masterDisabled);
 
 		// Name
-		let name = ext.displayName;
+		let name = replaceTabs(ext.displayName);
 		const nameWidth = Math.min(24, width - 16);
 
 		// Build the line with indentation (visually "inside" the master switch)
@@ -231,7 +232,7 @@ export class ExtensionList implements Component {
 			const triggerStyle = effectivelyDisabled ? "dim" : "muted";
 			const remainingWidth = width - visibleWidth(line) - 2;
 			if (remainingWidth > 5) {
-				line += `  ${truncateToWidth(theme.fg(triggerStyle as "dim" | "muted", ext.trigger), remainingWidth)}`;
+				line += `  ${truncateToWidth(theme.fg(triggerStyle as "dim" | "muted", replaceTabs(ext.trigger)), remainingWidth)}`;
 			}
 		}
 
@@ -255,6 +256,8 @@ export class ExtensionList implements Component {
 				return theme.icon.extensionSlashCommand;
 			case "mcp":
 				return theme.icon.extensionMcp;
+			case "plugin":
+				return theme.icon.extensionTool;
 			case "rule":
 				return theme.icon.extensionRule;
 			case "hook":
@@ -338,6 +341,7 @@ export class ExtensionList implements Component {
 			"tool",
 			"slash-command",
 			"rule",
+			"plugin",
 			"mcp",
 			"hook",
 			"prompt",
@@ -377,6 +381,8 @@ export class ExtensionList implements Component {
 				return "Rules";
 			case "mcp":
 				return "MCP Servers";
+			case "plugin":
+				return "Plugins";
 			case "hook":
 				return "Hooks";
 			case "prompt":

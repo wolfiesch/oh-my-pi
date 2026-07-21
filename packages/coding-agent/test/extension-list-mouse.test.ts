@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { buildTabBarTabs } from "@oh-my-pi/pi-coding-agent/modes/components/extensions/extension-dashboard";
 import { ExtensionList } from "@oh-my-pi/pi-coding-agent/modes/components/extensions/extension-list";
+import { InspectorPanel } from "@oh-my-pi/pi-coding-agent/modes/components/extensions/inspector-panel";
 import type { Extension } from "@oh-my-pi/pi-coding-agent/modes/components/extensions/types";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 
@@ -17,6 +18,19 @@ function skill(name: string, state: Extension["state"] = "active"): Extension {
 		path: `/tmp/skill-${name}`,
 		source: { provider: "native", providerName: "Native", level: "native" },
 		state,
+		raw: {},
+	};
+}
+
+function plugin(name: string): Extension {
+	return {
+		id: `plugin:${name}`,
+		kind: "plugin",
+		name,
+		displayName: name,
+		path: `/tmp/plugin-${name}`,
+		source: { provider: "marketplace-plugin", providerName: "Marketplace Plugin", level: "user" },
+		state: "active",
 		raw: {},
 	};
 }
@@ -97,6 +111,56 @@ describe("ExtensionList mouse routing", () => {
 		list.handleWheel(-1); // up -> alpha
 		expect(list.getSelectedExtension()?.id).toBe("skill:alpha");
 		expect(seen).toEqual(["skill:alpha", "skill:beta", "skill:alpha"]);
+	});
+
+	test("renders plugin rows in the default all-capabilities view", () => {
+		const list = new ExtensionList([skill("alpha"), plugin("hello-plugin")], {
+			masterSwitchProvider: null,
+			onSelectionChange: () => {},
+			onToggle: () => {},
+		});
+		list.setFocused(true);
+
+		const rendered = list.render(60).join("\n");
+
+		expect(rendered).toContain("Plugins");
+		expect(rendered).toContain("hello-plugin");
+	});
+
+	test("normalizes tabs in plugin metadata before rendering rows", () => {
+		const unsafePlugin = { ...plugin("hello-plugin"), trigger: "v1\tbeta" };
+		const list = new ExtensionList([unsafePlugin], {
+			masterSwitchProvider: null,
+			onSelectionChange: () => {},
+			onToggle: () => {},
+		});
+		list.setFocused(true);
+
+		const rendered = list.render(60).join("\n");
+
+		expect(rendered).not.toContain("\t");
+		expect(rendered).toContain("v1");
+		expect(rendered).toContain("beta");
+	});
+});
+
+describe("InspectorPanel rendering", () => {
+	test("normalizes tabs in shadowed plugin status metadata", () => {
+		const panel = new InspectorPanel();
+		panel.setExtension({
+			...plugin("shadowed-plugin"),
+			state: "shadowed",
+			shadowedBy: "project\tinstall-with-an-excessively-long-name",
+		});
+
+		const rendered = panel
+			.render(40)
+			.map(line => Bun.stripANSI(line))
+			.join("\n");
+
+		expect(rendered).not.toContain("\t");
+		expect(rendered).toContain("Shadowed by project");
+		expect(rendered).toContain("install-with-");
 	});
 });
 

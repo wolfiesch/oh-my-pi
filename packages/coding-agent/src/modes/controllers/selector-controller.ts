@@ -1,5 +1,5 @@
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import { PASTE_CODE_LOGIN_PROVIDERS } from "@oh-my-pi/pi-ai";
+import { PASTE_CODE_LOGIN_PROVIDERS, type TSchema } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
@@ -13,6 +13,7 @@ import {
 	saveWatchdogConfigFile,
 } from "../../advisor";
 import { reset as resetCapabilities } from "../../capability";
+import type { SourceMeta } from "../../capability/types";
 import {
 	formatModelSelectorValue,
 	resolveAdvisorRoleSelection,
@@ -22,6 +23,7 @@ import { getRoleInfo } from "../../config/model-roles";
 import { settings } from "../../config/settings";
 import { disableProvider, enableProvider } from "../../discovery";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
+import type { CustomTool } from "../../extensibility/custom-tools/types";
 import {
 	getInstalledPluginsRegistryPath,
 	getMarketplacesCacheDir,
@@ -29,6 +31,9 @@ import {
 	getPluginsCacheDir,
 	MarketplaceManager,
 } from "../../extensibility/plugins/marketplace";
+import type { MCPLoadResult } from "../../mcp/manager";
+import type { MCPToolDetails } from "../../mcp/tool-bridge";
+import type { MCPServerConfig } from "../../mcp/types";
 import {
 	getAvailableThemes,
 	getSymbolTheme,
@@ -93,6 +98,62 @@ import type { SessionObserverRegistry } from "../session-observer-registry";
 import { buildCopyTargets } from "../utils/copy-targets";
 
 const MANUAL_LOGIN_PROMPT = "Paste the authorization code (or full redirect URL), then press Enter:";
+
+export interface McpLiveRefreshManager {
+	getServerConfig(name: string): MCPServerConfig | undefined;
+	getSource(name: string): SourceMeta | undefined;
+	resolveServerConfig(name: string): Promise<{ config: MCPServerConfig; source: SourceMeta | undefined } | undefined>;
+	connectServers(
+		configs: Record<string, MCPServerConfig>,
+		sources: Record<string, SourceMeta>,
+	): Promise<MCPLoadResult>;
+	disconnectServer(name: string): Promise<void>;
+	getConnectionStatus(name: string): "connected" | "connecting" | "disconnected";
+	getTools(): CustomTool<TSchema, MCPToolDetails>[];
+}
+
+export interface McpLiveRefreshContext {
+	mcpManager?: McpLiveRefreshManager;
+	session: {
+		refreshMCPTools(mcpTools: CustomTool<TSchema, MCPToolDetails>[]): Promise<void>;
+	};
+}
+
+function throwIfTargetMcpRefreshFailed(result: MCPLoadResult, name: string): void {
+	const targetError = result.errors.get(name);
+	if (targetError) {
+		throw new Error(targetError);
+	}
+}
+
+export async function refreshMcpLiveTools(
+	ctx: McpLiveRefreshContext,
+	name: string,
+	enabled: boolean,
+): Promise<boolean> {
+	const manager = ctx.mcpManager;
+	if (!manager) return false;
+
+	if (enabled) {
+		const knownConfig = manager.getServerConfig(name);
+		const knownSource = manager.getSource(name);
+		const resolved = knownConfig
+			? { config: knownConfig, source: knownSource }
+			: await manager.resolveServerConfig(name);
+		if (!resolved) return false;
+		const result = await manager.connectServers(
+			{ [name]: resolved.config },
+			resolved.source ? { [name]: resolved.source } : {},
+		);
+		throwIfTargetMcpRefreshFailed(result, name);
+		await ctx.session.refreshMCPTools(manager.getTools());
+		return manager.getConnectionStatus(name) === "connected";
+	}
+
+	await manager.disconnectServer(name);
+	await ctx.session.refreshMCPTools(manager.getTools());
+	return true;
+}
 
 export class SelectorController {
 	constructor(private ctx: InteractiveModeContext) {}
@@ -344,7 +405,10 @@ export class SelectorController {
 	 * Replaces /status with a unified view of all providers and extensions.
 	 */
 	async showExtensionsDashboard(): Promise<void> {
-		const dashboard = await ExtensionDashboard.create(getProjectDir(), this.ctx.settings, this.ctx.ui.terminal.rows);
+		const dashboard = await ExtensionDashboard.create(getProjectDir(), this.ctx.settings, this.ctx.ui.terminal.rows, {
+			refreshMcpLive: (name, enabled) => refreshMcpLiveTools(this.ctx, name, enabled),
+			notify: message => this.ctx.showStatus(message),
+		});
 		// Fullscreen dashboard on the alternate screen (the /settings idiom): the
 		// overlay borrows the terminal's alt buffer and enables mouse tracking for
 		// its lifetime, leaving the transcript untouched underneath.

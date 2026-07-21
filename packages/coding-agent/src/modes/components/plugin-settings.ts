@@ -679,7 +679,7 @@ export class PluginSettingsComponent extends Container {
 
 		this.#viewComponent = new PluginDetailComponent(plugin, this.#manager, {
 			onEnabledChange: async enabled => {
-				await this.#manager.setEnabled(plugin.name, enabled);
+				await this.#manager.setEnabled(plugin.name, enabled, { clearProjectDisabled: true });
 				await this.callbacks.onPluginChanged();
 			},
 			onFeatureChange: async (feature, enabled) => {

@@ -7,8 +7,8 @@ import * as os from "node:os";
 import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { type Component, truncateToWidth, wrapTextWithAnsi } from "@oh-my-pi/pi-tui";
 import { theme } from "../../../modes/theme/theme";
-import { shortenPath } from "../../../tools/render-utils";
-import type { Extension, ExtensionState } from "./types";
+import { replaceTabs, shortenPath } from "../../../tools/render-utils";
+import type { Extension, ExtensionKind, ExtensionState } from "./types";
 
 export class InspectorPanel implements Component {
 	#extension: Extension | null = null;
@@ -28,7 +28,7 @@ export class InspectorPanel implements Component {
 		const lines: string[] = [];
 
 		// Name header
-		lines.push(theme.bold(theme.fg("accent", ext.displayName)));
+		lines.push(theme.bold(theme.fg("accent", truncateToWidth(replaceTabs(ext.displayName), width))));
 		lines.push("");
 
 		// Kind badge
@@ -39,33 +39,42 @@ export class InspectorPanel implements Component {
 		const desc = ext.description;
 		const isValidDescription = typeof desc === "string" && desc.length > 0;
 		if (isValidDescription && width > 2) {
-			const wrapped = wrapTextWithAnsi(desc, width - 2);
+			const wrapped = wrapTextWithAnsi(replaceTabs(desc), width - 2);
 			for (const line of wrapped) {
 				lines.push(truncateToWidth(line, width));
 			}
 			lines.push("");
 		} else if (isValidDescription) {
 			// Width too small for wrapping, show truncated single line
-			lines.push(truncateToWidth(desc, width));
+			lines.push(truncateToWidth(replaceTabs(desc), width));
 			lines.push("");
 		}
 
 		// Origin
 		lines.push(theme.fg("muted", "Origin:"));
 		const levelLabel = ext.source.level === "user" ? "User" : ext.source.level === "project" ? "Project" : "Native";
-		lines.push(`  ${theme.italic(`via ${ext.source.providerName} (${levelLabel})`)}`);
+		lines.push(
+			truncateToWidth(`  ${theme.italic(`via ${replaceTabs(ext.source.providerName)} (${levelLabel})`)}`, width),
+		);
 		const shortened = shortenPath(ext.path, os.homedir());
 		// If path is very long, show just the last parts
 		const displayPath =
 			shortened.length > 40 && shortened.split("/").length > 3
 				? `.../${shortened.split("/").slice(-3).join("/")}`
 				: shortened;
-		lines.push(`  ${theme.fg("dim", displayPath)}`);
+		lines.push(truncateToWidth(`  ${theme.fg("dim", replaceTabs(displayPath))}`, width));
 		lines.push("");
 
 		// Status badge
 		lines.push(theme.fg("muted", "Status:"));
-		lines.push(`  ${this.#getStatusBadge(ext.state, ext.disabledReason, ext.shadowedBy)}`);
+		lines.push(
+			truncateToWidth(`  ${this.#getStatusBadge(ext.state, ext.disabledReason, ext.shadowedBy, width - 2)}`, width),
+		);
+		lines.push("");
+
+		// Hot-refresh badge
+		lines.push(theme.fg("muted", "Applies:"));
+		lines.push(`  ${this.#getRefreshBadge(ext.kind)}`);
 		lines.push("");
 
 		// Preview section (routed based on kind)
@@ -91,6 +100,9 @@ export class InspectorPanel implements Component {
 				break;
 			case "mcp":
 				content = this.#renderMcpDetails(ext.raw, width);
+				break;
+			case "plugin":
+				content = this.#renderPluginPreview(ext.raw, width);
 				break;
 			default:
 				content = this.#renderDefaultPreview(ext, width);
@@ -269,6 +281,41 @@ export class InspectorPanel implements Component {
 		return lines;
 	}
 
+	#renderPluginPreview(raw: unknown, width: number): string[] {
+		const lines: string[] = [];
+		const data = raw as {
+			type?: string;
+			name?: string;
+			plugin?: { version?: string; manifest?: { description?: string } };
+			summary?: {
+				id: string;
+				scope: string;
+				shadowedBy?: string;
+				entries: Array<{ version?: string; enabled?: boolean }>;
+			};
+		};
+		if (data?.type === "npm" && data.plugin) {
+			lines.push(truncateToWidth(`${theme.fg("muted", "Source: ")}npm`, width));
+			lines.push(truncateToWidth(theme.fg("muted", "Version: ") + replaceTabs(data.plugin.version ?? "?"), width));
+			if (data.plugin.manifest?.description) {
+				lines.push("");
+				lines.push(theme.fg("muted", "Description:"));
+				for (const line of wrapTextWithAnsi(replaceTabs(data.plugin.manifest.description), width - 2)) {
+					lines.push(truncateToWidth(line, width));
+				}
+			}
+		} else if (data?.type === "marketplace" && data.summary) {
+			const entry = data.summary.entries[0];
+			lines.push(truncateToWidth(`${theme.fg("muted", "Source: ")}Marketplace`, width));
+			lines.push(truncateToWidth(theme.fg("muted", "Scope: ") + replaceTabs(data.summary.scope), width));
+			lines.push(truncateToWidth(theme.fg("muted", "Version: ") + replaceTabs(entry?.version ?? "?"), width));
+			if (data.summary.shadowedBy) {
+				lines.push(truncateToWidth(theme.fg("warning", replaceTabs("Shadowed by project install")), width));
+			}
+		}
+		return lines;
+	}
+
 	#renderDefaultPreview(ext: Extension, width: number): string[] {
 		const lines: string[] = [];
 
@@ -301,7 +348,14 @@ export class InspectorPanel implements Component {
 		return theme.fg(color as any, kind);
 	}
 
-	#getStatusBadge(state: ExtensionState, reason?: string, shadowedBy?: string): string {
+	#getRefreshBadge(kind: ExtensionKind): string {
+		if (kind === "mcp") {
+			return theme.fg("success", "● live (no restart needed)");
+		}
+		return theme.fg("warning", "↻ restart required");
+	}
+
+	#getStatusBadge(state: ExtensionState, reason?: string, shadowedBy?: string, width?: number): string {
 		switch (state) {
 			case "active":
 				return theme.fg("success", `${theme.status.enabled} Active`);
@@ -314,8 +368,10 @@ export class InspectorPanel implements Component {
 							: "unknown";
 				return theme.fg("dim", `${theme.status.disabled} Disabled (${reasonText})`);
 			}
-			case "shadowed":
-				return theme.fg("warning", `${theme.status.shadowed} Shadowed${shadowedBy ? ` by ${shadowedBy}` : ""}`);
+			case "shadowed": {
+				const label = `${theme.status.shadowed} Shadowed${shadowedBy ? ` by ${replaceTabs(shadowedBy)}` : ""}`;
+				return theme.fg("warning", width === undefined ? label : truncateToWidth(label, width));
+			}
 		}
 	}
 }

@@ -55,4 +55,60 @@ describe("plugin config", () => {
 
 		await expect(new PluginManager(tmpRoot).getPluginSettings(pluginName)).resolves.toEqual({});
 	});
+
+	test("re-enabling from a project UI clears the project-disabled override", async () => {
+		const pluginName = "@gaodes/pi-graphify";
+		const overridesPath = path.join(tmpRoot, "plugin-overrides.json");
+		await writeLegacyLockfile(pluginName);
+		await Bun.write(
+			overridesPath,
+			JSON.stringify({
+				disabled: [pluginName, "other-plugin"],
+				features: { [pluginName]: ["inspect"] },
+			}),
+		);
+
+		await new PluginManager(tmpRoot).setEnabled(pluginName, true, { clearProjectDisabled: true });
+
+		const overrides = await Bun.file(overridesPath).json();
+		expect(overrides).toEqual({
+			disabled: ["other-plugin"],
+			features: { [pluginName]: ["inspect"] },
+		});
+		const lock = await Bun.file(lockfile).json();
+		expect(lock.plugins[pluginName].enabled).toBe(true);
+	});
+
+	test("re-enabling clears the override from the discovered legacy config dir", async () => {
+		const pluginName = "@gaodes/pi-graphify";
+		const legacyOverridesPath = path.join(tmpRoot, ".claude", "plugin-overrides.json");
+		await writeLegacyLockfile(pluginName);
+		await fs.mkdir(path.dirname(legacyOverridesPath), { recursive: true });
+		await Bun.write(legacyOverridesPath, JSON.stringify({ disabled: [pluginName] }));
+
+		await new PluginManager(tmpRoot).setEnabled(pluginName, true, { clearProjectDisabled: true });
+
+		// The override is removed from the file the runtime loader reads...
+		await expect(Bun.file(legacyOverridesPath).json()).resolves.toEqual({});
+		// ...and no unrelated override file is created elsewhere.
+		expect(await Bun.file(path.join(tmpRoot, ".omp", "plugin-overrides.json")).exists()).toBe(false);
+		expect(await Bun.file(path.join(tmpRoot, "plugin-overrides.json")).exists()).toBe(false);
+	});
+
+	test("re-enabling honors loader precedence when multiple override files exist", async () => {
+		const pluginName = "@gaodes/pi-graphify";
+		const canonicalOverridesPath = path.join(tmpRoot, ".omp", "plugin-overrides.json");
+		const legacyOverridesPath = path.join(tmpRoot, ".claude", "plugin-overrides.json");
+		await writeLegacyLockfile(pluginName);
+		await fs.mkdir(path.dirname(canonicalOverridesPath), { recursive: true });
+		await fs.mkdir(path.dirname(legacyOverridesPath), { recursive: true });
+		await Bun.write(canonicalOverridesPath, JSON.stringify({ disabled: [pluginName] }));
+		await Bun.write(legacyOverridesPath, JSON.stringify({ disabled: [pluginName] }));
+
+		await new PluginManager(tmpRoot).setEnabled(pluginName, true, { clearProjectDisabled: true });
+
+		// Only the highest-precedence file — the one the loader reads — is mutated.
+		await expect(Bun.file(canonicalOverridesPath).json()).resolves.toEqual({});
+		await expect(Bun.file(legacyOverridesPath).json()).resolves.toEqual({ disabled: [pluginName] });
+	});
 });
