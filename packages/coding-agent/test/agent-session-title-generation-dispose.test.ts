@@ -65,12 +65,16 @@ describe("AgentSession title generation disposal", () => {
 			return response.promise;
 		});
 
+		const onDispose = vi.fn();
+		session.onDispose(onDispose);
 		const generation = session.generateTitle("Investigate shutdown");
 		await started.promise;
 		expect(getApiKey.mock.calls[0]?.[1]).toBe(providerSessionId);
 		expect(resolver.mock.calls[0]?.[1]).toBe(providerSessionId);
 		session.beginDispose();
+		session.beginDispose();
 
+		expect(onDispose).toHaveBeenCalledTimes(1);
 		expect(requestSignal?.aborted).toBe(true);
 		expect(await generation).toBeNull();
 	});

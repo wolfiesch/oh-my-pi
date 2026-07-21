@@ -137,17 +137,20 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 		try {
 			expect(session.getActiveToolNames()).toContain("read");
 
-			// Deferred discovery mounts MCP under xd:// and activates write as its transport.
+			// Deferred discovery registers the xd:// device before the active provider
+			// tools update completes. Poll both states from the real fixture subprocess.
 			const deadline = Date.now() + 12_000;
 			let deviceNames = session.getXdevToolEntries().map(entry => entry.name);
-			while (!deviceNames.includes(MCP_TOOL_NAME) && Date.now() < deadline) {
+			let activeNames = session.getActiveToolNames();
+			while ((!deviceNames.includes(MCP_TOOL_NAME) || !activeNames.includes("write")) && Date.now() < deadline) {
 				await Bun.sleep(50);
 				deviceNames = session.getXdevToolEntries().map(entry => entry.name);
+				activeNames = session.getActiveToolNames();
 			}
 
-			expect(session.getActiveToolNames()).toContain("read");
-			expect(session.getActiveToolNames()).toContain("write");
-			expect(session.getActiveToolNames()).not.toContain(MCP_TOOL_NAME);
+			expect(activeNames).toContain("read");
+			expect(activeNames).toContain("write");
+			expect(activeNames).not.toContain(MCP_TOOL_NAME);
 			expect(deviceNames).toContain(MCP_TOOL_NAME);
 			const write = session.getToolByName("write");
 			expect(write).toBeDefined();
@@ -178,13 +181,19 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 			toolNames: ["read", MCP_TOOL_NAME],
 		});
 		try {
+			// MCP discovery rebuilds the prompt before installing tools; poll the real
+			// subprocess-backed connection because the SDK intentionally exposes no completion signal.
 			const deadline = Date.now() + 12_000;
 			let prompt = session.systemPrompt.join("\n");
-			while (!prompt.includes(SERVER_INSTRUCTIONS) && Date.now() < deadline) {
+			let activeNames = session.getActiveToolNames();
+			while (
+				(!prompt.includes(SERVER_INSTRUCTIONS) || !activeNames.includes(MCP_TOOL_NAME)) &&
+				Date.now() < deadline
+			) {
 				await Bun.sleep(50);
 				prompt = session.systemPrompt.join("\n");
+				activeNames = session.getActiveToolNames();
 			}
-			const activeNames = session.getActiveToolNames();
 
 			expect(activeNames).toContain(MCP_TOOL_NAME);
 			expect(session.getXdevToolEntries().map(entry => entry.name)).not.toContain(MCP_TOOL_NAME);

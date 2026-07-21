@@ -56,6 +56,7 @@ import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { generateTaskLabel } from "./label";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
+import type { TaskTreeBudget } from "./tree-budget";
 import {
 	type AgentDefinition,
 	type AgentProgress,
@@ -73,6 +74,7 @@ import {
 } from "./types";
 import { arrayValuedLabels, assembleYieldResult } from "./yield-assembly";
 
+export { TaskTreeBudget } from "./tree-budget";
 export type { YieldItem } from "./types";
 
 const MCP_CALL_TIMEOUT_MS = 60_000;
@@ -340,6 +342,8 @@ export interface ExecutorOptions {
 	maxRuntimeMs?: number;
 	/** Include IRC only when the invocation policy permits collaboration. */
 	enableIrc?: boolean;
+	/** Session-wide budget shared by every descendant in this task tree. */
+	taskTreeBudget?: TaskTreeBudget;
 	enableLsp?: boolean;
 	/**
 	 * Enable MCP capabilities for this child. `false` suppresses both inherited
@@ -353,6 +357,8 @@ export interface ExecutorOptions {
 	 */
 	restrictToolNames?: boolean;
 	signal?: AbortSignal;
+	/** Mark a reserved spawn consumed after setup succeeds and before the first turn. */
+	beforeRun?: () => void;
 	onProgress?: (progress: AgentProgress) => void;
 	/**
 	 * Epochs (ms, `Date.now()`) bracketing the concurrency-semaphore wait:
@@ -727,6 +733,56 @@ function getUsageTokens(usage: unknown): number {
 	return firstNumberField(record, ["totalTokens", "total_tokens"]) ?? 0;
 }
 
+function attachFollowUpTreeBudgetAccounting(session: AgentSession, budget: TaskTreeBudget): void {
+	let yieldCallPending = false;
+	const hasYieldToolCall = (message: unknown): boolean => {
+		if (!isRecord(message) || !Array.isArray(message.content)) return false;
+		return message.content.some(block => isRecord(block) && block.type === "toolCall" && block.name === "yield");
+	};
+	const sessionRef = new WeakRef(session);
+	const abortSession = () => {
+		if (yieldCallPending) return;
+		const target = sessionRef.deref();
+		if (!target || target.isDisposed) return;
+		void target.abort().catch(error => {
+			logger.debug("Task-tree follow-up abort failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+	};
+	if (budget.signal.aborted) abortSession();
+	else budget.signal.addEventListener("abort", abortSession, { once: true });
+
+	const unsubscribeEvents = session.subscribe(event => {
+		if (event.type === "agent_start") {
+			if (budget.signal.aborted) abortSession();
+			return;
+		}
+		if (event.type === "tool_execution_start" && event.toolName === "yield") {
+			yieldCallPending = true;
+			return;
+		}
+		if (event.type === "tool_execution_end" && event.toolName === "yield") {
+			yieldCallPending = false;
+			if (budget.signal.aborted) abortSession();
+			return;
+		}
+		if (event.type !== "message_end" || !isRecord(event.message) || event.message.role !== "assistant") return;
+		if (hasYieldToolCall(event.message)) yieldCallPending = true;
+		const eventUsage = isRecord(event) && "usage" in event ? event.usage : undefined;
+		const messageUsage = "usage" in event.message ? event.message.usage : eventUsage;
+		const budgetError = budget.recordRequest(getUsageTokens(messageUsage));
+		if (budgetError) abortSession();
+	});
+	let unsubscribeDispose = () => {};
+	const cleanup = () => {
+		budget.signal.removeEventListener("abort", abortSession);
+		unsubscribeEvents();
+		unsubscribeDispose();
+	};
+	unsubscribeDispose = session.onDispose(cleanup);
+}
+
 /**
  * Create proxy tools that reuse the parent's MCP connections.
  */
@@ -826,7 +882,7 @@ export function createSubagentSettings(
 	});
 }
 
-export type AbortReason = "signal" | "terminate" | "timeout" | "budget";
+type AbortReason = "signal" | "terminate" | "timeout" | "budget" | "treeBudget";
 
 const MAX_YIELD_TOOL_ERRORS = 6;
 
@@ -853,6 +909,8 @@ interface RunMonitorArgs {
 	softRequestBudget: number;
 	/** Whether crossing the soft budget injects a wrap-up steering notice. */
 	softRequestBudgetNotice: boolean;
+	/** Session-wide budget shared by sibling and nested task agents. */
+	taskTreeBudget?: TaskTreeBudget;
 	/** Wall-clock cap in ms; 0 disables the timer. */
 	maxRuntimeMs: number;
 }
@@ -869,6 +927,7 @@ interface SubagentRunMonitor {
 	readonly accumulatedUsage: Usage;
 	hasUsage(): boolean;
 	yieldCalled(): boolean;
+	terminalYieldAccepted(): boolean;
 	runtimeLimitExceeded(): boolean;
 	/** True once the soft-budget stop fired: the free-running turn was aborted and the run is being driven to a forced final yield. */
 	budgetStopRequested(): boolean;
@@ -913,6 +972,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		onProgress,
 		softRequestBudget,
 		softRequestBudgetNotice,
+		taskTreeBudget,
 		maxRuntimeMs,
 	} = args;
 	const startTime = Date.now();
@@ -953,6 +1013,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let activeSession: AgentSession | null = null;
 	let yieldCalled = false;
 	let yieldCallPending = false;
+	let terminalYieldAccepted = false;
 
 	// Accumulate usage incrementally from message_end events (no memory for streaming events)
 	const accumulatedUsage: Usage = {
@@ -971,6 +1032,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let budgetStopAbortPromise: Promise<void> | undefined;
 	let terminalError: string | undefined;
 	let consecutiveYieldToolErrors = 0;
+	let treeBudgetLimitExceeded = false;
 	let lastAssistantSalvageText: string | undefined;
 	let activeSessionAbortPromise: Promise<void> | undefined;
 
@@ -995,6 +1057,9 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		}
 		if (reason === "budget") {
 			budgetLimitExceeded = true;
+		}
+		if (reason === "treeBudget") {
+			treeBudgetLimitExceeded = true;
 		}
 		if (abortSent) {
 			if (reason === "signal" && abortReason !== "signal" && abortReason !== "timeout") {
@@ -1042,6 +1107,19 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			{ once: true, signal: listenerSignal },
 		);
 	}
+	if (taskTreeBudget) {
+		const abortFromTreeBudget = () => {
+			if (!resolved && !yieldCallPending && !terminalYieldAccepted) requestAbort("treeBudget");
+		};
+		if (taskTreeBudget.signal.aborted) {
+			abortFromTreeBudget();
+		} else {
+			taskTreeBudget.signal.addEventListener("abort", abortFromTreeBudget, {
+				once: true,
+				signal: listenerSignal,
+			});
+		}
+	}
 
 	// Wall-clock hard limit. Defense-in-depth for the case where a provider stream
 	// hang escapes the inference-layer watchdog (see openai-completions
@@ -1081,6 +1159,9 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		}
 		if (budgetStopRequested) {
 			return `Soft request budget exceeded (${progress.requests} requests; budget ${softRequestBudget})`;
+		}
+		if (treeBudgetLimitExceeded) {
+			return taskTreeBudget?.snapshot().reason ?? "Task tree budget exceeded";
 		}
 		return resolveSignalAbortReason();
 	};
@@ -1321,16 +1402,19 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 						yieldCallPending = false;
 					}
 
-					// Check if handler wants to terminate the session
-					if (
+					// Check if handler wants to terminate the session.
+					const shouldTerminate =
 						handler.shouldTerminate?.({
 							toolName: event.toolName,
 							toolCallId: event.toolCallId,
 							args: eventArgs,
 							result: event.result,
 							isError: event.isError,
-						})
-					) {
+						}) ?? false;
+					if (event.toolName === "yield" && shouldTerminate) {
+						terminalYieldAccepted = true;
+					}
+					if (shouldTerminate) {
 						requestAbort("terminate");
 					}
 				}
@@ -1364,6 +1448,9 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 					} else if (!event.isError) {
 						consecutiveYieldToolErrors = 0;
 					}
+				}
+				if (taskTreeBudget?.signal.aborted && !yieldCallPending && !terminalYieldAccepted) {
+					requestAbort("treeBudget");
 				}
 				flushProgress = true;
 				break;
@@ -1494,6 +1581,9 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 						}
 					}
 				}
+				if (role === "assistant" && taskTreeBudget) {
+					taskTreeBudget.recordRequest(getUsageTokens(messageUsage));
+				}
 				break;
 			}
 
@@ -1599,17 +1689,26 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		accumulatedUsage,
 		hasUsage: () => hasUsage,
 		yieldCalled: () => yieldCalled,
+		terminalYieldAccepted: () => terminalYieldAccepted,
 		runtimeLimitExceeded: () => runtimeLimitExceeded,
 		terminalError: () => terminalError,
 		hasExplicitAbortReason: () =>
-			abortReason === "signal" || runtimeLimitExceeded || budgetLimitExceeded || budgetStopRequested,
+			abortReason === "signal" ||
+			runtimeLimitExceeded ||
+			budgetLimitExceeded ||
+			budgetStopRequested ||
+			treeBudgetLimitExceeded,
 		budgetStopRequested: () => budgetStopRequested,
 		waitForBudgetStop: () => budgetStopAbortPromise ?? Promise.resolve(),
 		// A soft stop that never escalated still identifies as a budget abort so
 		// the lifecycle can park the agent as resumable instead of killing it.
 		abortKind: () => abortReason ?? (budgetStopRequested ? "budget" : undefined),
 		isAbortedRun: () =>
-			abortReason === "signal" || runtimeLimitExceeded || budgetLimitExceeded || abortReason === undefined,
+			abortReason === "signal" ||
+			runtimeLimitExceeded ||
+			budgetLimitExceeded ||
+			treeBudgetLimitExceeded ||
+			abortReason === undefined,
 		requestAbort,
 		failWithError,
 		abortActiveSession,
@@ -1770,7 +1869,7 @@ async function driveSessionToYield(
 		const lastAssistant = session.getLastAssistantMessage();
 		if (lastAssistant) {
 			if (lastAssistant.stopReason === "aborted") {
-				if (!monitor.yieldCalled() || monitor.runtimeLimitExceeded()) {
+				if (!monitor.terminalYieldAccepted() || monitor.runtimeLimitExceeded()) {
 					aborted = monitor.isAbortedRun();
 					if (aborted) {
 						// A real caller signal or the wall-clock timer carries a precise
@@ -1798,7 +1897,7 @@ async function driveSessionToYield(
 			exitCode = 1;
 		}
 	} catch (err) {
-		if (abortSignal.aborted && monitor.yieldCalled() && !monitor.runtimeLimitExceeded()) {
+		if (abortSignal.aborted && monitor.terminalYieldAccepted() && !monitor.runtimeLimitExceeded()) {
 			exitCode = 0;
 		} else {
 			exitCode = 1;
@@ -1808,7 +1907,7 @@ async function driveSessionToYield(
 		}
 	} finally {
 		error ??= monitor.terminalError();
-		if (abortSignal.aborted && (!monitor.yieldCalled() || monitor.runtimeLimitExceeded())) {
+		if (abortSignal.aborted && (!monitor.terminalYieldAccepted() || monitor.runtimeLimitExceeded())) {
 			aborted = monitor.isAbortedRun();
 			if (aborted) {
 				abortReasonText ??= monitor.resolveAbortReasonText();
@@ -1892,7 +1991,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	}
 	const lastYield = yieldItems?.[yieldItems.length - 1];
 	const yieldAbortReason = lastYield?.status === "aborted" ? lastYield.error || "Subagent aborted task" : undefined;
-	const { abortedViaYield, hasYield } = finalized;
+	const { abortedViaYield } = finalized;
 	const { content: truncatedOutput, truncated } = truncateTail(rawOutput, {
 		maxBytes: MAX_OUTPUT_BYTES,
 		maxLines: MAX_OUTPUT_LINES,
@@ -1925,7 +2024,12 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		exitCode = 1;
 	}
 	const wasAborted =
-		runtimeLimitExceeded || abortedViaYield || (!hasYield && (done.aborted || signal?.aborted || false));
+		runtimeLimitExceeded ||
+		abortedViaYield ||
+		(!monitor.terminalYieldAccepted() && (done.aborted || signal?.aborted || false));
+	if (wasAborted && exitCode === 0) {
+		exitCode = 1;
+	}
 	const finalAbortReason = wasAborted
 		? runtimeLimitExceeded
 			? monitor.resolveAbortReasonText()
@@ -2298,6 +2402,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		sessionFile: subtaskSessionFile,
 		softRequestBudget,
 		softRequestBudgetNotice,
+		taskTreeBudget: options.taskTreeBudget,
 		maxRuntimeMs,
 	});
 	const progress = monitor.progress;
@@ -2599,6 +2704,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				localProtocolOptions: options.localProtocolOptions,
 				telemetry: subagentTelemetry,
 				parentEvalSessionId: options.parentEvalSessionId,
+				taskTreeBudget: options.taskTreeBudget,
 				onFirstChatDispatch: () => {
 					firstChatDispatchAt ??= performance.now();
 				},
@@ -2633,6 +2739,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					}
 					const { session: revived } = await createAgentSession(buildSubagentSessionOptions(reopened));
 					installRegistryStatusSync(revived);
+					if (options.taskTreeBudget) {
+						attachFollowUpTreeBudgetAccounting(revived, options.taskTreeBudget);
+					}
 					return revived;
 				};
 			}
@@ -2766,6 +2875,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 			}
 
+			// Model, session, tool, extension, and autoload setup has completed.
+			// Consume a reserved spawn only at the point where the child can start
+			// its first turn; setup failures must leave capacity available.
+			checkAbort();
+			options.beforeRun?.();
 			readyAt = performance.now();
 			const outcome = await driveSessionToYield(session, monitor, task);
 			exitCode = outcome.exitCode;
@@ -2802,6 +2916,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const session = monitor.takeActiveSession();
 			if (session) {
 				monitor.captureSalvage(session);
+				if (
+					options.keepAlive !== false &&
+					worktree === undefined &&
+					(!aborted || (monitor.abortKind() === "budget" && reviveSession !== null)) &&
+					options.taskTreeBudget
+				) {
+					attachFollowUpTreeBudgetAccounting(session, options.taskTreeBudget);
+				}
 				await finalizeSubagentLifecycle({
 					id,
 					session,

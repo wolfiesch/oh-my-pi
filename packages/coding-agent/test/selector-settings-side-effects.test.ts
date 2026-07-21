@@ -14,6 +14,7 @@ import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { ResolvedRoleModel } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { TaskTreeBudget } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
@@ -52,6 +53,20 @@ describe("selector setting side effects", () => {
 		// The setting-change side effect is a single render request — the lazy
 		// top-border provider rebuilds during paint (#4145).
 		expect(requestRender).toHaveBeenCalledTimes(1);
+	});
+
+	it("enforces lowered task-tree limits immediately", () => {
+		const taskTreeBudget = new TaskTreeBudget({ maxRequests: 10 });
+		taskTreeBudget.recordRequest(5);
+		taskTreeBudget.recordRequest(5);
+		const controller = new SelectorController({
+			session: { taskTreeBudget },
+		} as unknown as InteractiveModeContext);
+
+		controller.handleSettingChange("task.treeMaxRequests", 1);
+
+		expect(taskTreeBudget.signal.aborted).toBe(true);
+		expect(taskTreeBudget.snapshot()).toMatchObject({ maxRequests: 1, requests: 2, exhausted: true });
 	});
 
 	it("invalidates the UI and requests a repaint when tui.tight changes", () => {

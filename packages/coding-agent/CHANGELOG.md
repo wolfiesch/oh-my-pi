@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added optional session-wide spawn, request, and counted-token budgets for task trees, with atomic batch rejection, graceful descendant aborts, runtime limit updates, setup-failure reservation release, and budget usage telemetry ([#5177](https://github.com/can1357/oh-my-pi/pull/5177) by [@wolfiesch](https://github.com/wolfiesch)).
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed

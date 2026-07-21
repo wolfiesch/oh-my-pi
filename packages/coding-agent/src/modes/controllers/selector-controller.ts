@@ -425,6 +425,15 @@ export class SelectorController {
 			case "interruptMode":
 				this.ctx.session.setInterruptMode(value as "immediate" | "wait");
 				break;
+			case "task.treeMaxSpawns":
+				this.ctx.session.taskTreeBudget?.updateLimits({ maxSpawns: Number(value) });
+				break;
+			case "task.treeMaxRequests":
+				this.ctx.session.taskTreeBudget?.updateLimits({ maxRequests: Number(value) });
+				break;
+			case "task.treeMaxTokens":
+				this.ctx.session.taskTreeBudget?.updateLimits({ maxTokens: Number(value) });
+				break;
 			case "thinkingLevel":
 			case "defaultThinkingLevel":
 				this.ctx.session.setThinkingLevel(value as ConfiguredThinkingLevel, true);

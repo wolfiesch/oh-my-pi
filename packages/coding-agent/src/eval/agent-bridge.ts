@@ -130,6 +130,21 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 			`agent() blocked: turn token budget exhausted (${turnBudget.spent}/${turnBudget.total} output tokens). Raise or drop the +Nk! ceiling to continue.`,
 		);
 	}
+	const treeBudget = options.session.taskTreeBudget;
+	const settings = options.session.settings;
+	// Descendant tool sessions carry a settings snapshot. Only the root
+	// session is allowed to change limits on the shared tree budget.
+	if ((options.session.taskDepth ?? 0) === 0) {
+		treeBudget?.updateLimits({
+			...(settings.isConfigured("task.treeMaxSpawns") && { maxSpawns: settings.get("task.treeMaxSpawns") }),
+			...(settings.isConfigured("task.treeMaxRequests") && {
+				maxRequests: settings.get("task.treeMaxRequests"),
+			}),
+			...(settings.isConfigured("task.treeMaxTokens") && { maxTokens: settings.get("task.treeMaxTokens") }),
+		});
+	}
+	let spawnReserved = false;
+	let spawnConsumed = false;
 	const isolation =
 		Object.hasOwn(parsed, "isolated") || Object.hasOwn(parsed, "apply") || Object.hasOwn(parsed, "merge")
 			? {
@@ -157,6 +172,14 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 					keepAlive: false,
 					maxRuntimeMs: 0,
 					shareEvalSession: false,
+					reserveRun: () => {
+						const error = treeBudget?.reserveSpawns(1);
+						spawnReserved = error === undefined;
+						return error;
+					},
+					beforeRun: () => {
+						spawnConsumed = true;
+					},
 					...(options.signal !== undefined ? { signal: options.signal } : {}),
 					...(options.emitStatus
 						? { onProgress: (progress: AgentProgress) => emitProgressStatus(options.emitStatus, progress) }
@@ -220,5 +243,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 	} catch (error) {
 		if (error instanceof StructuredSubagentError) throw new ToolError(error.message);
 		throw error;
+	} finally {
+		if (spawnReserved && !spawnConsumed) treeBudget?.releaseSpawns(1);
 	}
 }

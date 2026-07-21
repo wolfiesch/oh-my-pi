@@ -8,7 +8,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { runSubprocess, TaskTreeBudget } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -31,6 +31,7 @@ interface MockSessionHandle {
 	prompts: Array<{ text: string; options?: PromptOptions }>;
 	abortCalls: () => number;
 	disposeCalls: () => number;
+	emit: (event: AgentSessionEvent) => void;
 }
 
 function assistantText(text: string, stopReason: "stop" | "aborted" = "stop") {
@@ -45,6 +46,7 @@ function createMockSession(
 	}) => void,
 ): MockSessionHandle {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
+	const disposeListeners = new Set<() => void>();
 	const messages: unknown[] = [];
 	const prompts: Array<{ text: string; options?: PromptOptions }> = [];
 	let abortCount = 0;
@@ -84,8 +86,14 @@ function createMockSession(
 		abort: async () => {
 			abortCount += 1;
 		},
+		onDispose: listener => {
+			disposeListeners.add(listener);
+			return () => disposeListeners.delete(listener);
+		},
 		dispose: async () => {
 			disposeCount += 1;
+			for (const listener of disposeListeners) listener();
+			disposeListeners.clear();
 		},
 	};
 
@@ -94,6 +102,7 @@ function createMockSession(
 		prompts,
 		abortCalls: () => abortCount,
 		disposeCalls: () => disposeCount,
+		emit,
 	};
 }
 
@@ -233,7 +242,8 @@ describe("runSubprocess soft request budget", () => {
 		mockCreateAgentSession(handle.session);
 		registerRunning(id, handle.session);
 
-		const result = await runSubprocess(baseOptions(id));
+		const treeBudget = new TaskTreeBudget({ maxRequests: 20 });
+		const result = await runSubprocess({ ...baseOptions(id), taskTreeBudget: treeBudget });
 
 		expect(result.aborted).toBe(true);
 		expect(result.abortReason).toMatch(/Soft request budget exceeded/);
@@ -241,6 +251,12 @@ describe("runSubprocess soft request budget", () => {
 		expect(AgentRegistry.global().get(id)?.status).toBe("idle");
 		expect(AgentLifecycleManager.global().has(id)).toBe(true);
 		expect(handle.disposeCalls()).toBe(0);
+		const requestsAfterInitialRun = treeBudget.snapshot().requests;
+		handle.emit({
+			type: "message_end",
+			message: assistantText("resumed"),
+		} as unknown as AgentSessionEvent);
+		expect(treeBudget.snapshot().requests).toBe(requestsAfterInitialRun + 1);
 
 		// The whole point: irc can reach the stopped agent to resume it.
 		const receipt = await new IrcBus().send({ from: "Main", to: id, body: "resume your inventory" });
@@ -270,5 +286,80 @@ describe("runSubprocess soft request budget", () => {
 		expect(receipt.outcome).toBe("failed");
 		expect(receipt.error).toMatch(/hard-aborted/);
 		expect(receipt.error).toMatch(new RegExp(`history://${id}`));
+	});
+
+	it("releases a reserved spawn when session setup fails before the first turn", async () => {
+		const treeBudget = new TaskTreeBudget({ maxSpawns: 1 });
+		expect(treeBudget.reserveSpawns(1)).toBeUndefined();
+		let reservationSettled = false;
+		let consumeCalls = 0;
+		const releaseReservation = () => {
+			if (reservationSettled) return;
+			reservationSettled = true;
+			treeBudget.releaseSpawns(1);
+		};
+		const createAgentSessionSpy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockRejectedValueOnce(new Error("session setup failed"));
+
+		const failed = await runSubprocess({
+			...baseOptions("setup-failed"),
+			taskTreeBudget: treeBudget,
+			beforeRun: () => {
+				consumeCalls += 1;
+				reservationSettled = true;
+			},
+		});
+
+		expect(failed.exitCode).toBe(1);
+		expect(consumeCalls).toBe(0);
+		releaseReservation();
+		expect(treeBudget.snapshot().spawns).toBe(0);
+
+		const handle = createMockSession(({ emit, pushMessage }) => {
+			const yieldMessage = {
+				role: "assistant" as const,
+				content: [
+					{
+						type: "toolCall" as const,
+						id: "tool-retry-yield",
+						name: "yield",
+						arguments: { result: { data: { ok: true } } },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			pushMessage(yieldMessage);
+			emit({ type: "message_end", message: yieldMessage } as unknown as AgentSessionEvent);
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-retry-yield",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			} as AgentSessionEvent);
+		});
+		createAgentSessionSpy.mockResolvedValueOnce({
+			session: handle.session,
+			extensionsResult: {} as unknown as LoadExtensionsResult,
+			setToolUIContext: () => {},
+			eventBus: new EventBus(),
+		} satisfies CreateAgentSessionResult);
+		expect(treeBudget.reserveSpawns(1)).toBeUndefined();
+		const retried = await runSubprocess({
+			...baseOptions("setup-retry"),
+			taskTreeBudget: treeBudget,
+			beforeRun: () => {
+				consumeCalls += 1;
+				reservationSettled = true;
+			},
+		});
+
+		expect(retried.exitCode).toBe(0);
+		expect(consumeCalls).toBe(1);
+		expect(treeBudget.snapshot().spawns).toBe(1);
 	});
 });

@@ -3,6 +3,7 @@ import { $env } from "@oh-my-pi/pi-utils";
 import { type BaseType, type } from "arktype";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { ConfiguredThinkingLevel } from "../thinking";
+import type { TaskTreeBudgetSnapshot } from "./tree-budget";
 import type { NestedRepoPatch } from "./worktree";
 
 /** Source of an agent definition */
@@ -528,6 +529,8 @@ export interface TaskToolDetails {
 	totalDurationMs: number;
 	/** Aggregated usage across all subagents. */
 	usage?: Usage;
+	/** Session-wide task-tree budget state after this update/result. */
+	treeBudget?: TaskTreeBudgetSnapshot;
 	outputPaths?: string[];
 	progress?: AgentProgress[];
 	async?: {
