@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added model- and reasoning-aware advisor auto-activation through `advisor.autoEnableFor`, plus `/advisor auto` to restore configured behavior after a session override ([#5824](https://github.com/can1357/oh-my-pi/pull/5824) by [@wolfiesch](https://github.com/wolfiesch)).
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed

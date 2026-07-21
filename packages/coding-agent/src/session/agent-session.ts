@@ -197,6 +197,7 @@ import { buildServiceTierByFamily, serviceTierForAllFamilies, serviceTierSetting
 import type { Settings, SkillsSettings } from "../config/settings";
 import {
 	getDefault,
+	onAdvisorActivationChanged,
 	onAppendOnlyModeChanged,
 	onModelRolesChanged,
 	validateProviderMaxInFlightRequests,
@@ -1171,6 +1172,8 @@ export interface SessionStats {
 export interface AdvisorStats {
 	configured: boolean;
 	active: boolean;
+	/** Model selector that activated the automatic policy, when applicable. */
+	automaticMatch?: string;
 	model?: Model;
 	contextWindow: number;
 	contextTokens: number;
@@ -1884,6 +1887,7 @@ export class AgentSession {
 	#unsubscribeAgent?: () => void;
 	#cancelExitRecorder?: () => void;
 	#exitRecorded = false;
+	#unsubscribeAdvisorActivation?: () => void;
 	#unsubscribeAppendOnly?: () => void;
 	#unsubscribeModelRoles?: () => void;
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
@@ -1908,6 +1912,8 @@ export class AgentSession {
 	#goalModeState: GoalModeState | undefined;
 	#goalRuntime: GoalRuntime;
 	#advisorEnabled = false;
+	#advisorEnabledOverride: boolean | undefined;
+	#advisorAutomaticMatch: string | undefined;
 	#advisorTools?: AgentTool[];
 	#advisorWatchdogPrompt?: string;
 	#advisorSharedInstructions?: string;
@@ -2913,8 +2919,7 @@ export class AgentSession {
 			this.#recordSessionExit(reason);
 		});
 
-		this.#advisorEnabled = this.settings.get("advisor.enabled") as boolean;
-		if (this.#advisorEnabled) this.#buildAdvisorRuntime();
+		this.#syncAdvisorActivation();
 
 		this.#rehydrateCheckpointRewindState();
 
@@ -2923,15 +2928,66 @@ export class AgentSession {
 		this.#unsubscribeAgent = this.agent.subscribe(this.#handleAgentEvent);
 		// Re-evaluate append-only context mode when the setting changes at runtime.
 		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
+		this.#unsubscribeAdvisorActivation = onAdvisorActivationChanged(() => {
+			if (this.#isDisposed) return;
+			this.#syncAdvisorActivation(true);
+		});
 		this.#unsubscribeModelRoles = onModelRolesChanged(() => {
-			if (!this.#advisorEnabled || this.#isDisposed) return;
-			if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) this.#stopAdvisorRuntime();
-			this.#buildAdvisorRuntime(true);
+			if (this.#isDisposed) return;
+			this.#syncAdvisorActivation(true);
 		});
 	}
 	// -------------------------------------------------------------------------
 	// Advisor runtime lifecycle
 	// -------------------------------------------------------------------------
+	#advisorAutomaticPatterns(): string[] {
+		return (this.settings.get("advisor.autoEnableFor") ?? "")
+			.split(",")
+			.map(pattern => pattern.trim())
+			.filter(Boolean);
+	}
+
+	#matchAdvisorAutomaticPattern(): string | undefined {
+		const patterns = this.#advisorAutomaticPatterns();
+		if (patterns.length === 0) return undefined;
+		const model = this.model;
+		if (!model) return undefined;
+		const availableModels = this.#modelRegistry.getAvailable();
+		const matchPreferences = getModelMatchPreferences(this.settings);
+		const configuredThinking = this.configuredThinkingLevel() ?? ThinkingLevel.Off;
+		for (const pattern of patterns) {
+			const resolved = resolveModelRoleValue(pattern, availableModels, {
+				settings: this.settings,
+				matchPreferences,
+				allowInvalidThinkingSelectorFallback: false,
+			});
+			if (!resolved.model || formatModelStringWithRouting(resolved.model) !== formatModelStringWithRouting(model)) {
+				continue;
+			}
+			const explicitThinking = resolved.explicitThinkingSelector;
+			if (explicitThinking !== undefined && explicitThinking !== configuredThinking) continue;
+			return pattern;
+		}
+		return undefined;
+	}
+
+	#syncAdvisorActivation(seedToCurrent = false): boolean {
+		const alwaysEnabled = this.settings.get("advisor.enabled");
+		const automaticMatch =
+			this.#advisorEnabledOverride === undefined && !alwaysEnabled
+				? this.#matchAdvisorAutomaticPattern()
+				: undefined;
+		const enabled = this.#advisorEnabledOverride ?? (alwaysEnabled || automaticMatch !== undefined);
+		this.#advisorAutomaticMatch = automaticMatch;
+		this.#advisorEnabled = enabled;
+		if (!enabled || (this.#agentKind !== "main" && !this.settings.get("advisor.subagents"))) {
+			this.#stopAdvisorRuntime();
+			return false;
+		}
+		if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) this.#stopAdvisorRuntime();
+		return this.#buildAdvisorRuntime(seedToCurrent);
+	}
+
 	#advisorImmuneTurnLimit(): number {
 		const immuneTurns = this.settings.get("advisor.immuneTurns") as number;
 		if (!Number.isFinite(immuneTurns) || immuneTurns <= 0) return 0;
@@ -3480,6 +3536,7 @@ export class AgentSession {
 		}
 		this.#advisorRecorderClosed = Promise.all(closes).then(() => {});
 		this.#advisors = [];
+		this.#advisorStatuses.clear();
 		this.#advisorYieldQueueUnsubscribe?.();
 		this.#advisorYieldQueueUnsubscribe = undefined;
 	}
@@ -6933,6 +6990,10 @@ export class AgentSession {
 		this.setHindsightSessionState(undefined);
 		hindsightState?.dispose();
 		this.#disconnectFromAgent();
+		if (this.#unsubscribeAdvisorActivation) {
+			this.#unsubscribeAdvisorActivation();
+			this.#unsubscribeAdvisorActivation = undefined;
+		}
 		if (this.#unsubscribeAppendOnly) {
 			this.#unsubscribeAppendOnly();
 			this.#unsubscribeAppendOnly = undefined;
@@ -10430,6 +10491,7 @@ export class AgentSession {
 				this.sessionManager.appendThinkingLevelChange(provisional, AUTO_THINKING);
 				this.#emit({ type: "thinking_level_changed", thinkingLevel: provisional, configured: AUTO_THINKING });
 			}
+			this.#syncAdvisorActivation(true);
 			return;
 		}
 
@@ -10453,6 +10515,7 @@ export class AgentSession {
 			}
 			this.#emit({ type: "thinking_level_changed", thinkingLevel: effectiveLevel });
 		}
+		this.#syncAdvisorActivation(true);
 	}
 
 	/**
@@ -15262,6 +15325,7 @@ export class AgentSession {
 		this.#setModelWithProviderSessionReset(baseModel);
 		this.sessionManager.appendModelChange(baseSelector, EPHEMERAL_MODEL_CHANGE_ROLE);
 		this.settings.getStorage()?.recordModelUsage(baseSelector);
+		this.#syncAdvisorActivation(true);
 		await this.#emitSessionEvent({
 			type: "retry_fallback_applied",
 			from: currentSelector,
@@ -16766,6 +16830,7 @@ export class AgentSession {
 				this.#thinkingLevel = resolveThinkingLevelForModel(this.model, restoredThinkingLevel);
 			}
 			this.#applyThinkingLevelToAgent(this.#thinkingLevel);
+			this.#syncAdvisorActivation(true);
 			this.#serviceTierByFamily = hasServiceTierEntry
 				? (sessionContext.serviceTier ?? {})
 				: configuredServiceTierByFamily;
@@ -16813,6 +16878,7 @@ export class AgentSession {
 			this.#serviceTierByFamily = previousServiceTierByFamily;
 			this.#syncTodoPhasesFromBranch();
 			this.#resetAllAdvisorRuntimes();
+			this.#syncAdvisorActivation(true);
 			this.#reconnectToAgent();
 			this.#finishBashSessionTransition(bashTransition, false);
 			throw error;
@@ -17845,19 +17911,28 @@ export class AgentSession {
 	}
 
 	/**
-	 * Enable or disable the advisor for this session. The setting is overridden for the session,
-	 * and the runtime is started or stopped to match.
+	 * Force the advisor on or off for this session, overriding configured automatic activation.
 	 *
-	 * @returns true when the advisor is actively running after the call.
+	 * @returns true when an advisor runtime is actively running after the call.
 	 */
 	setAdvisorEnabled(enabled: boolean): boolean {
-		this.#advisorEnabled = enabled;
-		if (enabled) {
-			if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) this.#stopAdvisorRuntime();
-			return this.#buildAdvisorRuntime(true);
-		}
-		this.#stopAdvisorRuntime();
-		return false;
+		this.#advisorEnabledOverride = enabled;
+		return this.#syncAdvisorActivation(true);
+	}
+
+	/**
+	 * Clear the session override and return to configured always/automatic activation.
+	 *
+	 * @returns true when an advisor runtime is actively running after the call.
+	 */
+	resetAdvisorEnabledOverride(): boolean {
+		this.#advisorEnabledOverride = undefined;
+		return this.#syncAdvisorActivation(true);
+	}
+
+	/** Re-evaluate configured activation while preserving any session override. */
+	refreshAdvisorActivation(): boolean {
+		return this.#syncAdvisorActivation(true);
 	}
 
 	/**
@@ -17978,6 +18053,7 @@ export class AgentSession {
 			return {
 				configured,
 				active,
+				automaticMatch: this.#advisorAutomaticMatch,
 				contextWindow: 0,
 				contextTokens: 0,
 				tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
@@ -18008,6 +18084,7 @@ export class AgentSession {
 		return {
 			configured,
 			active,
+			automaticMatch: this.#advisorAutomaticMatch,
 			model: liveAdvisors[0].model,
 			contextWindow: liveAdvisors[0].contextWindow,
 			contextTokens,
@@ -18068,10 +18145,18 @@ export class AgentSession {
 	 */
 	formatAdvisorStatus(): string {
 		const stats = this.getAdvisorStats();
+		if (!stats.configured && !stats.active) {
+			if (this.#advisorEnabledOverride === false) return "Advisor is disabled for this session.";
+			if (this.#advisorAutomaticPatterns().length > 0) {
+				const model = this.model;
+				const modelLabel = model ? formatModelString(model) : "no model";
+				const thinking = this.configuredThinkingLevel() ?? ThinkingLevel.Off;
+				return `Advisor is automatic; no rule matches ${modelLabel}:${thinking}.`;
+			}
+			return "Advisor is disabled.";
+		}
 		if (!stats.active && stats.advisors.length === 0) {
-			return stats.configured
-				? "Advisor setting is enabled, but no model is assigned to the 'advisor' role."
-				: "Advisor is disabled.";
+			return "Advisor setting is enabled, but no model is assigned to the 'advisor' role.";
 		}
 		if (stats.advisors.length <= 1) {
 			const s = stats.advisors[0];
@@ -18089,9 +18174,11 @@ export class AgentSession {
 			if (s.tokens.cacheWrite > 0) spendParts.push(`${s.tokens.cacheWrite.toLocaleString()} cache write`);
 			const spendLine = `Spend: ${spendParts.join(", ")}, $${s.cost.toFixed(4)}`;
 			if (!s.model || s.status !== "running") return `Advisor "${s.name}" is ${s.status.replace("_", " ")}.`;
-			return `Advisor is enabled (${s.model.provider}/${s.model.id}). ${contextLine}. ${spendLine}.`;
+			const activation = this.#advisorAutomaticMatch ? ` Automatic match: ${this.#advisorAutomaticMatch}.` : "";
+			return `Advisor is enabled (${s.model.provider}/${s.model.id}).${activation} ${contextLine}. ${spendLine}.`;
 		}
-		const lines = [`Advisors enabled (${stats.advisors.length}):`];
+		const activation = this.#advisorAutomaticMatch ? ` via ${this.#advisorAutomaticMatch}` : "";
+		const lines = [`Advisors enabled (${stats.advisors.length})${activation}:`];
 		for (const s of stats.advisors) {
 			const ctx =
 				s.contextWindow > 0

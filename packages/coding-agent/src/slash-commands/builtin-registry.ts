@@ -491,10 +491,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		name: "advisor",
 		description: "Toggle the advisor (a second model that reviews each turn and injects notes)",
 		acpDescription: "Toggle advisor",
-		acpInputHint: "[on|off|status|dump [raw]|configure]",
+		acpInputHint: "[on|off|auto|status|dump [raw]|configure]",
 		subcommands: [
-			{ name: "on", description: "Enable the advisor" },
-			{ name: "off", description: "Disable the advisor" },
+			{ name: "on", description: "Enable the advisor for this session" },
+			{ name: "off", description: "Disable the advisor for this session" },
+			{ name: "auto", description: "Return to configured automatic activation" },
 			{ name: "status", description: "Show advisor status" },
 			{ name: "dump", description: "Copy the advisor's transcript to clipboard", usage: "[raw]" },
 			{ name: "configure", description: "Open the advisor configuration editor (TUI)" },
@@ -533,6 +534,13 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				await runtime.output("Advisor disabled.");
 				return commandConsumed();
 			}
+			if (verb === "auto") {
+				const active = runtime.session.resetAdvisorEnabledOverride();
+				await runtime.output(
+					`Advisor session override cleared; configured activation is ${active ? "active" : "inactive"}.`,
+				);
+				return commandConsumed();
+			}
 			if (verb === "status") {
 				await runtime.output(runtime.session.formatAdvisorStatus());
 				return commandConsumed();
@@ -549,7 +557,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				);
 				return commandConsumed();
 			}
-			return usage("Usage: /advisor [on|off|status|dump [raw]|configure]", runtime);
+			return usage("Usage: /advisor [on|off|auto|status|dump [raw]|configure]", runtime);
 		},
 		handleTui: async (command, runtime) => {
 			const { verb, rest } = parseSubcommand(command.args);
@@ -583,6 +591,15 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.editor.setText("");
 				return;
 			}
+			if (verb === "auto") {
+				const active = runtime.ctx.session.resetAdvisorEnabledOverride();
+				runtime.ctx.showStatus(
+					`Advisor session override cleared; configured activation is ${active ? "active" : "inactive"}.`,
+				);
+				refreshStatusLine(runtime.ctx);
+				runtime.ctx.editor.setText("");
+				return;
+			}
 			if (verb === "status") {
 				await runtime.ctx.handleAdvisorStatusCommand();
 				runtime.ctx.editor.setText("");
@@ -599,7 +616,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.editor.setText("");
 				return;
 			}
-			runtime.ctx.showStatus("Usage: /advisor [on|off|status|dump [raw]|configure]");
+			runtime.ctx.showStatus("Usage: /advisor [on|off|auto|status|dump [raw]|configure]");
 			runtime.ctx.editor.setText("");
 		},
 	},

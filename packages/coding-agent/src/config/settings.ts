@@ -314,6 +314,8 @@ export class Settings {
 	#configFiles: string[] = [];
 	/** Global settings from config.yml/config.yaml */
 	#global: RawSettings = {};
+	/** Host defaults: override global preferences but yield to project/config/runtime layers. */
+	#hostDefaults: RawSettings = {};
 	/** Project settings from .claude/settings.yml etc */
 	#project: RawSettings = {};
 	/** Extra config.yml-style overlays passed by CLI */
@@ -502,6 +504,14 @@ export class Settings {
 		this.#fireEffectiveSettingChanged(path, this.get(path), prev);
 	}
 
+	/** Apply a process-host default below project, config-overlay, and runtime layers. */
+	setHostDefault<P extends SettingPath>(path: P, value: SettingValue<P>): void {
+		const prev = this.get(path);
+		setByPath(this.#hostDefaults, path.split("."), value);
+		this.#rebuildMerged();
+		this.#fireEffectiveSettingChanged(path, this.get(path), prev);
+	}
+
 	/**
 	 * Clear a runtime override.
 	 */
@@ -529,6 +539,9 @@ export class Settings {
 		}
 		if (path === "modelRoles") {
 			modelRolesSignal.fire();
+		}
+		if (path === "advisor.enabled" || path === "advisor.autoEnableFor" || path === "advisor.subagents") {
+			advisorActivationSignal.fire();
 		}
 	}
 
@@ -568,6 +581,7 @@ export class Settings {
 		cloned.#storage = this.#storage;
 		cloned.#configPath = this.#configPath;
 		cloned.#global = structuredClone(this.#global);
+		cloned.#hostDefaults = structuredClone(this.#hostDefaults);
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
 		cloned.#configFiles = [...this.#configFiles];
 		cloned.#configOverlay = structuredClone(this.#configOverlay);
@@ -595,12 +609,22 @@ export class Settings {
 		await this.flush();
 		this.#restoreRuntimeModelRoleOverrides();
 		const prevModelRoles = this.get("modelRoles");
+		const prevAdvisorEnabled = this.get("advisor.enabled");
+		const prevAdvisorAutoEnableFor = this.get("advisor.autoEnableFor");
+		const prevAdvisorSubagents = this.get("advisor.subagents");
 		this.#cwd = normalized;
 		if (this.#persist) {
 			this.#project = await this.#loadProjectSettings();
 		}
 		this.#rebuildMerged();
 		this.#fireEffectiveSettingChanged("modelRoles", this.get("modelRoles"), prevModelRoles);
+		this.#fireEffectiveSettingChanged("advisor.enabled", this.get("advisor.enabled"), prevAdvisorEnabled);
+		this.#fireEffectiveSettingChanged(
+			"advisor.autoEnableFor",
+			this.get("advisor.autoEnableFor"),
+			prevAdvisorAutoEnableFor,
+		);
+		this.#fireEffectiveSettingChanged("advisor.subagents", this.get("advisor.subagents"), prevAdvisorSubagents);
 		this.#fireAllHooks();
 	}
 
@@ -1736,7 +1760,8 @@ export class Settings {
 	}
 
 	#rebuildMerged(): void {
-		this.#merged = this.#deepMerge(this.#deepMerge({}, this.#global), this.#projectSettingsForMerge());
+		this.#merged = this.#deepMerge(this.#deepMerge({}, this.#global), this.#hostDefaults);
+		this.#merged = this.#deepMerge(this.#merged, this.#projectSettingsForMerge());
 		this.#merged = this.#deepMerge(this.#merged, this.#configOverlay);
 		this.#merged = this.#deepMerge(this.#merged, this.#overrides);
 		this.#resolvedCache.clear();
@@ -1880,6 +1905,13 @@ const appendOnlyModeSignal = new SettingSignal<[value: string]>("provider.append
  * can register independently without overwriting each other.
  */
 export const onAppendOnlyModeChanged = (cb: (value: string) => void) => appendOnlyModeSignal.on(cb);
+
+/** Fires when configured advisor activation changes at runtime or after a project reload. */
+const advisorActivationSignal = new SettingSignal("advisor activation");
+
+/** Subscribe to advisor activation setting changes. Returns an unsubscribe function. */
+export const onAdvisorActivationChanged: (cb: () => void) => () => void =
+	advisorActivationSignal.on.bind(advisorActivationSignal);
 
 /** Fires when any model role changes at runtime. */
 const modelRolesSignal = new SettingSignal("modelRoles");

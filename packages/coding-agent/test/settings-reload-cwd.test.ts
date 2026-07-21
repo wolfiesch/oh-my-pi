@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { onAdvisorActivationChanged, resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { getProjectAgentDir, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
@@ -230,6 +230,47 @@ describe("Settings.reloadForCwd", () => {
 			resetSettingsForTest();
 			if (fs.existsSync(testDir)) {
 				removeSyncWithRetries(testDir);
+			}
+		});
+
+		it("lets destination project advisor settings override host defaults and emits the effective change", async () => {
+			fs.writeFileSync(
+				path.join(getProjectAgentDir(scopedProject), "settings.json"),
+				JSON.stringify({ advisor: { autoEnableFor: "openai/gpt-5:high" } }),
+			);
+			const settings = await Settings.init({ cwd: startDir, agentDir });
+			settings.setHostDefault("advisor.autoEnableFor", "");
+			let changes = 0;
+			const unsubscribe = onAdvisorActivationChanged(() => {
+				changes += 1;
+			});
+
+			try {
+				await settings.reloadForCwd(scopedProject);
+				expect(settings.get("advisor.autoEnableFor")).toBe("openai/gpt-5:high");
+				expect(changes).toBe(1);
+			} finally {
+				unsubscribe();
+			}
+		});
+
+		it("emits advisor activation when project subagent enablement changes", async () => {
+			fs.writeFileSync(
+				path.join(getProjectAgentDir(scopedProject), "settings.json"),
+				JSON.stringify({ advisor: { subagents: true } }),
+			);
+			const settings = await Settings.init({ cwd: startDir, agentDir });
+			let changes = 0;
+			const unsubscribe = onAdvisorActivationChanged(() => {
+				changes += 1;
+			});
+
+			try {
+				await settings.reloadForCwd(scopedProject);
+				expect(settings.get("advisor.subagents")).toBe(true);
+				expect(changes).toBe(1);
+			} finally {
+				unsubscribe();
 			}
 		});
 

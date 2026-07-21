@@ -87,7 +87,10 @@ const CONDITIONS: Record<string, () => boolean> = {
 	hasImageProtocol: () => !!TERMINAL.imageProtocol,
 	advisorEnabled: () => {
 		try {
-			return Settings.instance.get("advisor.enabled") === true;
+			return (
+				Settings.instance.get("advisor.enabled") === true ||
+				!!Settings.instance.get("advisor.autoEnableFor")?.trim()
+			);
 		} catch {
 			return false;
 		}

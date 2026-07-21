@@ -1,12 +1,13 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { parseModelPattern } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -27,6 +28,7 @@ describe("AgentSession advisor toggle", () => {
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		authStorage.setRuntimeApiKey("openai", "test-key");
 		authStorage.setRuntimeApiKey("openrouter", "test-key");
+		authStorage.setRuntimeApiKey("nanogpt", "test-key");
 		modelRegistry = new ModelRegistry(authStorage);
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const replacement = getBundledModel("openai", "gpt-4o-mini");
@@ -76,9 +78,210 @@ describe("AgentSession advisor toggle", () => {
 	});
 
 	it("starts with advisor disabled", () => {
+		expect(session.settings.get("advisor.autoEnableFor")).toBe("");
 		expect(session.isAdvisorActive()).toBe(false);
 		expect(session.isAdvisorEnabled()).toBe(false);
 		expect(session.formatAdvisorStatus()).toBe("Advisor is disabled.");
+	});
+
+	it("automatically follows configured model and thinking selectors", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.settings.set(
+			"advisor.autoEnableFor",
+			`${model.provider}/${model.id}:low, ${replacementModel.provider}/${replacementModel.id}`,
+		);
+
+		session.setThinkingLevel(ThinkingLevel.Low);
+		expect(session.isAdvisorActive()).toBe(true);
+		expect(session.formatAdvisorStatus()).toContain(`Automatic match: ${model.provider}/${model.id}:low.`);
+
+		session.setThinkingLevel(ThinkingLevel.High);
+		expect(session.isAdvisorActive()).toBe(false);
+		expect(session.getAdvisorStats().advisors).toEqual([]);
+		expect(session.formatAdvisorStatus()).toContain("Advisor is automatic; no rule matches");
+
+		await session.setModelTemporary(replacementModel);
+		expect(session.isAdvisorActive()).toBe(true);
+		expect(session.formatAdvisorStatus()).toContain(
+			`Automatic match: ${replacementModel.provider}/${replacementModel.id}.`,
+		);
+	});
+
+	it("re-evaluates automatic activation when its settings change", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.setThinkingLevel(ThinkingLevel.Low);
+		expect(session.isAdvisorActive()).toBe(false);
+
+		session.settings.set("advisor.autoEnableFor", `${model.provider}/${model.id}:low`);
+		expect(session.isAdvisorActive()).toBe(true);
+
+		session.settings.set("advisor.autoEnableFor", `${replacementModel.provider}/${replacementModel.id}`);
+		expect(session.isAdvisorActive()).toBe(false);
+	});
+
+	it("keeps routed automatic selectors scoped to the selected upstream", async () => {
+		const available = modelRegistry.getAvailable();
+		const cerebras = parseModelPattern("openrouter/z-ai/glm-4.7@cerebras", available).model;
+		const fireworks = parseModelPattern("openrouter/z-ai/glm-4.7@fireworks", available).model;
+		if (!cerebras || !fireworks) throw new Error("Expected routed OpenRouter models to resolve");
+
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.settings.set("advisor.autoEnableFor", "openrouter/z-ai/glm-4.7@cerebras");
+
+		await session.setModelTemporary(fireworks);
+		expect(session.isAdvisorActive()).toBe(false);
+
+		await session.setModelTemporary(cerebras);
+		expect(session.isAdvisorActive()).toBe(true);
+		expect(session.getAdvisorStats().automaticMatch).toBe("openrouter/z-ai/glm-4.7@cerebras");
+
+		session.settings.set("advisor.autoEnableFor", "openrouter/z-ai/glm-4.7");
+		expect(session.refreshAdvisorActivation()).toBe(false);
+	});
+
+	it("treats thinking-like suffixes in literal model IDs as part of the ID", async () => {
+		const literalModel = getBundledModel("nanogpt", "nanogpt/coding-router:low");
+		if (!literalModel) throw new Error("Expected literal thinking-suffix model to exist");
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.settings.set("advisor.autoEnableFor", `${literalModel.provider}/${literalModel.id}`);
+		session.setThinkingLevel(ThinkingLevel.High);
+
+		await session.setModelTemporary(literalModel);
+		expect(session.isAdvisorActive()).toBe(true);
+	});
+
+	it("does not match a thinking suffix clamped by the selected model", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.settings.set("advisor.autoEnableFor", `${model.provider}/${model.id}:max`);
+
+		session.setThinkingLevel(ThinkingLevel.High);
+		expect(session.isAdvisorActive()).toBe(false);
+	});
+
+	it("honors thinking suffixes on short bare model selectors", async () => {
+		const shortModel = getBundledModel("openai", "o3");
+		if (!shortModel) throw new Error("Expected short-name OpenAI model to exist");
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.settings.set("advisor.autoEnableFor", "o3:low");
+		await session.setModelTemporary(shortModel);
+
+		session.setThinkingLevel(ThinkingLevel.High);
+		expect(session.isAdvisorActive()).toBe(false);
+
+		session.setThinkingLevel(ThinkingLevel.Low);
+		expect(session.isAdvisorActive()).toBe(true);
+	});
+
+	it("rejects invalid thinking suffixes instead of widening the rule", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.settings.set("advisor.autoEnableFor", `${model.provider}/${model.id}:hihg`);
+
+		expect(session.refreshAdvisorActivation()).toBe(false);
+	});
+
+	it("uses the matched role fallback's thinking suffix", () => {
+		session.settings.setModelRole("smol", `missing/no-such-model:low, ${model.provider}/${model.id}:high`);
+		session.settings.set("advisor.autoEnableFor", "@smol");
+
+		session.setThinkingLevel(ThinkingLevel.High);
+		expect(session.refreshAdvisorActivation()).toBe(true);
+
+		session.setThinkingLevel(ThinkingLevel.Low);
+		expect(session.refreshAdvisorActivation()).toBe(false);
+	});
+
+	it("re-evaluates automatic activation after switching sessions", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.settings.set("advisor.autoEnableFor", `${replacementModel.provider}/${replacementModel.id}`);
+
+		const writeSession = async (name: string, primaryModel: Model): Promise<string> => {
+			const sessionFile = path.join(tempDir.path(), name);
+			const timestamp = "2026-07-17T00:00:00.000Z";
+			await Bun.write(
+				sessionFile,
+				`${[
+					{ type: "session", version: 3, id: name, timestamp, cwd: tempDir.path() },
+					{
+						type: "model_change",
+						id: `${name}-model`,
+						parentId: null,
+						timestamp,
+						model: `${primaryModel.provider}/${primaryModel.id}`,
+						role: "default",
+					},
+				]
+					.map(entry => JSON.stringify(entry))
+					.join("\n")}\n`,
+			);
+			return sessionFile;
+		};
+
+		const enabledSession = await writeSession("enabled.jsonl", replacementModel);
+		const disabledSession = await writeSession("disabled.jsonl", model);
+
+		expect(await session.switchSession(enabledSession)).toBe(true);
+		expect(session.isAdvisorActive()).toBe(true);
+		expect(await session.switchSession(disabledSession)).toBe(true);
+		expect(session.isAdvisorActive()).toBe(false);
+	});
+
+	it("keeps manual overrides until auto mode is restored", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.settings.set("advisor.autoEnableFor", `${model.provider}/${model.id}`);
+		expect(session.resetAdvisorEnabledOverride()).toBe(true);
+
+		expect(session.setAdvisorEnabled(false)).toBe(false);
+		session.setThinkingLevel(ThinkingLevel.Low);
+		expect(session.isAdvisorActive()).toBe(false);
+		expect(session.formatAdvisorStatus()).toBe("Advisor is disabled for this session.");
+
+		session.settings.set("advisor.autoEnableFor", `${replacementModel.provider}/${replacementModel.id}`);
+		expect(session.refreshAdvisorActivation()).toBe(false);
+		expect(session.formatAdvisorStatus()).toBe("Advisor is disabled for this session.");
+
+		session.settings.set("advisor.autoEnableFor", `${model.provider}/${model.id}`);
+		expect(session.resetAdvisorEnabledOverride()).toBe(true);
+		expect(session.isAdvisorActive()).toBe(true);
+
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		session.settings.set("advisor.enabled", false);
+		expect(session.refreshAdvisorActivation()).toBe(true);
+	});
+
+	it("evaluates automatic activation against a subagent's own model", async () => {
+		const subDir = TempDir.createSync("@pi-advisor-toggle-sub-");
+		const subSettings = Settings.isolated({
+			"advisor.autoEnableFor": `${model.provider}/${model.id}`,
+			"advisor.subagents": false,
+			"compaction.enabled": false,
+		});
+		subSettings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const subSession = new AgentSession({
+			agent: new Agent({
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			}),
+			sessionManager: SessionManager.create(subDir.path(), subDir.path()),
+			settings: subSettings,
+			modelRegistry,
+			advisorTools: [],
+			agentKind: "sub",
+		});
+		try {
+			expect(subSession.isAdvisorActive()).toBe(false);
+
+			subSettings.override("advisor.subagents", true);
+
+			expect(subSession.isAdvisorEnabled()).toBe(true);
+			expect(subSession.isAdvisorActive()).toBe(true);
+
+			subSettings.override("advisor.subagents", false);
+
+			expect(subSession.isAdvisorEnabled()).toBe(true);
+			expect(subSession.isAdvisorActive()).toBe(false);
+		} finally {
+			await subSession.dispose();
+			await subDir.remove();
+		}
 	});
 
 	it("toggle enables the advisor and runtime", () => {

@@ -151,6 +151,7 @@ const HOST_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	// instead of inheriting a user's globally-enabled local preference, and when
 	// they do opt in they get the default tuning rather than the user's local tuning.
 	"advisor.enabled",
+	"advisor.autoEnableFor",
 	"advisor.subagents",
 	"advisor.syncBacklog",
 	"advisor.immuneTurns",
@@ -174,7 +175,7 @@ const RPC_BACKGROUND_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 function applyDefaultSettingOverrides(settingPaths: SettingPath[], targetSettings: Settings): void {
 	for (const settingPath of settingPaths) {
 		if (targetSettings.isConfigured(settingPath)) continue;
-		targetSettings.override(settingPath, getDefault(settingPath));
+		targetSettings.setHostDefault(settingPath, getDefault(settingPath));
 	}
 }
 

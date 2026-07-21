@@ -369,7 +369,7 @@ export class CommandController {
 	async handleAdvisorStatusCommand(): Promise<void> {
 		const stats = this.ctx.session.getAdvisorStats();
 		if (!stats.configured) {
-			this.ctx.present([new Spacer(1), new Text("Advisor is disabled.", 1, 0)]);
+			this.ctx.present([new Spacer(1), new Text(this.ctx.session.formatAdvisorStatus(), 1, 0)]);
 			return;
 		}
 		// Fetch live quota data (cached 5 min by the auth-gateway) so we can show
@@ -396,6 +396,7 @@ export class CommandController {
 		// message that hid the per-advisor state the user needs to act on.
 		if (stats.advisors.length > 1 || (stats.configured && !stats.active)) {
 			let info = `${theme.bold("Advisor Status")} (${stats.advisors.length} advisors)\n`;
+			if (stats.automaticMatch) info += `\nAutomatic match: ${stats.automaticMatch}\n`;
 			for (const a of stats.advisors) {
 				const glyph = CommandController.#advisorStatusGlyph[a.status] ?? "?";
 				const label = CommandController.#advisorStatusLabel[a.status] ?? a.status;
@@ -441,6 +442,7 @@ export class CommandController {
 		// Single active advisor — detailed view.
 		const model = stats.model;
 		let info = `${theme.bold("Advisor Status")}\n\n`;
+		if (stats.automaticMatch) info += `Automatic match: ${stats.automaticMatch}\n\n`;
 		if (stats.advisors.length === 1) {
 			const a = stats.advisors[0];
 			const glyph = CommandController.#advisorStatusGlyph[a.status] ?? "?";
