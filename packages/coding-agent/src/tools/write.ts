@@ -69,6 +69,7 @@ import {
 } from "./render-utils";
 import { dispatchReportIssueDevice, REPORT_ISSUE_DEVICE_NAME, renderReportIssueDeviceCall } from "./report-tool-issue";
 import { dispatchResolutionDevice, isResolutionDeviceName, renderResolutionDeviceCall } from "./resolve";
+import { clearSearchResultCache } from "./search-result-cache";
 import {
 	deleteRowByKey,
 	deleteRowByRowId,
@@ -469,6 +470,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					transformDiagnostics: dedup
 						? (path, result) => getDiagnosticsLedger(session).reduce(path, result)
 						: undefined,
+					owner: session,
 				})
 			: writethroughNoop;
 		this.description = prompt.render(writeDescription);
@@ -556,7 +558,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			throw new ToolError(error instanceof Error ? error.message : String(error));
 		}
 
-		invalidateFsScanAfterWrite(resolvedArchivePath.absolutePath);
+		invalidateFsScanAfterWrite(resolvedArchivePath.absolutePath, this.session);
 		const outputPath = `${formatPathRelativeToCwd(resolvedArchivePath.absolutePath, this.session.cwd)}:${
 			resolvedArchivePath.archiveSubPath
 		}`;
@@ -677,7 +679,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				}
 			}
 
-			invalidateFsScanAfterWrite(resolvedSqlitePath.absolutePath);
+			invalidateFsScanAfterWrite(resolvedSqlitePath.absolutePath, this.session);
 			return toolResult<WriteToolDetails>({ resolvedPath: resolvedSqlitePath.absolutePath })
 				.text(resultText)
 				.sourcePath(resolvedSqlitePath.absolutePath)
@@ -724,7 +726,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const newContent = splice.text;
 
 		await writethroughNoop(absolutePath, newContent, signal);
-		invalidateFsScanAfterWrite(absolutePath);
+		invalidateFsScanAfterWrite(absolutePath, this.session);
 		this.session.bumpFileMutationVersion?.(absolutePath);
 		this.session.fileSnapshotStore?.invalidate(absolutePath);
 		const history = this.session.conflictHistory;
@@ -903,7 +905,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			}
 
 			await writethroughNoop(absolutePath, text, signal);
-			invalidateFsScanAfterWrite(absolutePath);
+			invalidateFsScanAfterWrite(absolutePath, this.session);
 			this.session.bumpFileMutationVersion?.(absolutePath);
 			this.session.fileSnapshotStore?.invalidate(absolutePath);
 			for (const entry of resolvedEntries) history.invalidate(entry.id);
@@ -1051,6 +1053,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 							},
 						},
 					});
+					clearSearchResultCache(this.session);
 					if (xdResult) return xdResult;
 					let resultText = `Successfully wrote ${cleanContent.length} bytes to ${path}`;
 					if (stripped) {
@@ -1167,7 +1170,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				batchRequest,
 				dst => this.#deferredDiagnostics?.begin(dst),
 			);
-			invalidateFsScanAfterWrite(absolutePath);
+			invalidateFsScanAfterWrite(absolutePath, this.session);
 			if (!this.#deferredDiagnostics || batchRequest?.flush === false) {
 				this.session.bumpFileMutationVersion?.(absolutePath);
 			}

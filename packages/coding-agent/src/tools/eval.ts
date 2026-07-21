@@ -18,6 +18,7 @@ import { truncateForPrompt } from "./approval";
 import { type EvalBackendsAllowance, resolveEvalBackends } from "./eval-backends";
 import { upsertStatusEvent } from "./eval-render";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "./output-meta";
+import { clearSearchResultCache } from "./search-result-cache";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
@@ -401,7 +402,13 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		_ctx?: AgentToolContext,
 	): Promise<AgentToolResult<EvalToolDetails | undefined>> {
 		if (this.#proxyExecutor) {
-			return this.#proxyExecutor(params, signal);
+			try {
+				return await this.#proxyExecutor(params, signal);
+			} finally {
+				// The proxied cell runs elsewhere but mutates the same filesystem;
+				// this session's cached search pages cannot be trusted afterwards.
+				if (this.session) clearSearchResultCache(this.session);
+			}
 		}
 
 		if (!this.session) {
@@ -732,6 +739,10 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					.truncationFromSummary(summaryForMeta, { direction: "tail" })
 					.done();
 			} finally {
+				// Eval cells have unrestricted filesystem access (documented `write`
+				// helper, Bun.write, arbitrary Node APIs) and no mutation tracking,
+				// so conservatively drop cached search pages once the cell settles.
+				clearSearchResultCache(session);
 				if (!outputDumped) {
 					try {
 						await finalizeOutput();

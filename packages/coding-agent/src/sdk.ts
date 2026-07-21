@@ -190,11 +190,13 @@ import {
 } from "./tools";
 import { isMCPToolName, normalizeToolNames } from "./tools/builtin-names";
 import { ToolContextStore } from "./tools/context";
+import { invalidateFsScanAfterWrite } from "./tools/fs-cache-invalidation";
 import { isIrcEnabled } from "./tools/hub";
 import { getImageGenTools } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
 import { isAutoQaEnabled } from "./tools/report-tool-issue";
 import { queueResolveHandler } from "./tools/resolve";
+import type { SearchResultCacheOwner } from "./tools/search-result-cache";
 import { ttsTool } from "./tools/tts";
 import { resolveActiveRepoContext } from "./utils/active-repo-context";
 import { EventBus } from "./utils/event-bus";
@@ -853,7 +855,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 
 // Internal Helpers
 
-function createCustomToolContext(ctx: ExtensionContext): CustomToolContext {
+function createCustomToolContext(ctx: ExtensionContext, cacheOwner?: SearchResultCacheOwner): CustomToolContext {
 	return {
 		sessionManager: ctx.sessionManager,
 		modelRegistry: ctx.modelRegistry,
@@ -862,6 +864,10 @@ function createCustomToolContext(ctx: ExtensionContext): CustomToolContext {
 		hasQueuedMessages: ctx.hasPendingMessages,
 		abort: ctx.abort,
 		localProtocolOptions: ctx.localProtocolOptions,
+		// Narrow mutation seam for write-capable custom tools (e.g. tts): clear
+		// the owning session's cached search pages for a written file without
+		// touching read-only custom tool behavior.
+		invalidateFileCaches: cacheOwner ? path => invalidateFsScanAfterWrite(path, cacheOwner) : undefined,
 	};
 }
 
@@ -907,7 +913,7 @@ function registerEvalCleanup(): void {
 	postmortem.register("julia-cleanup", disposeAllJuliaKernelSessions);
 }
 
-function customToolToDefinition(tool: CustomTool): ToolDefinition {
+function customToolToDefinition(tool: CustomTool, cacheOwner?: SearchResultCacheOwner): ToolDefinition {
 	const definition: ToolDefinition & { [TOOL_DEFINITION_MARKER]: true } = {
 		name: tool.name,
 		label: tool.label,
@@ -920,8 +926,10 @@ function customToolToDefinition(tool: CustomTool): ToolDefinition {
 		mcpServerName: tool.mcpServerName,
 		mcpToolName: tool.mcpToolName,
 		execute: (toolCallId, params, signal, onUpdate, ctx) =>
-			tool.execute(toolCallId, params, onUpdate, createCustomToolContext(ctx), signal),
-		onSession: tool.onSession ? (event, ctx) => tool.onSession?.(event, createCustomToolContext(ctx)) : undefined,
+			tool.execute(toolCallId, params, onUpdate, createCustomToolContext(ctx, cacheOwner), signal),
+		onSession: tool.onSession
+			? (event, ctx) => tool.onSession?.(event, createCustomToolContext(ctx, cacheOwner))
+			: undefined,
 		renderCall: tool.renderCall,
 		renderResult: tool.renderResult
 			? (result, options, theme): Component => {
@@ -939,17 +947,17 @@ function customToolToDefinition(tool: CustomTool): ToolDefinition {
 	return definition;
 }
 
-function createCustomToolsExtension(tools: CustomTool[]): ExtensionFactory {
+function createCustomToolsExtension(tools: CustomTool[], cacheOwner?: SearchResultCacheOwner): ExtensionFactory {
 	return api => {
 		for (const tool of tools) {
-			api.registerTool(customToolToDefinition(tool));
+			api.registerTool(customToolToDefinition(tool, cacheOwner));
 		}
 
 		const runOnSession = async (event: CustomToolSessionEvent, ctx: ExtensionContext) => {
 			for (const tool of tools) {
 				if (!tool.onSession) continue;
 				try {
-					await tool.onSession(event, createCustomToolContext(ctx));
+					await tool.onSession(event, createCustomToolContext(ctx, cacheOwner));
 				} catch (err) {
 					logger.warn("Custom tool onSession error", { tool: tool.name, error: String(err) });
 				}
@@ -1931,7 +1939,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			inlineExtensions.push(...(options.extensions ?? []));
 			inlineExtensions.push(createAutoresearchExtension);
 			if (customTools.length > 0) {
-				inlineExtensions.push(createCustomToolsExtension(customTools));
+				inlineExtensions.push(createCustomToolsExtension(customTools, toolSession));
 			}
 		}
 		// Forward the path list (NOT the loaded tools) to subagents so they
@@ -2342,6 +2350,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			settings,
 			localProtocolOptions,
 			autoApprove: options.autoApprove ?? false,
+			// Same owning session as the built-in tools: write-capable custom
+			// tools resolved through the context store must be able to drop the
+			// session's cached search pages after mutating the workspace.
+			invalidateFileCaches: (writtenPath: string) => invalidateFsScanAfterWrite(writtenPath, toolSession),
 		});
 		const toolContextStore = new ToolContextStore(getSessionContext);
 
@@ -2352,7 +2364,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const allCustomTools = [
 			...registeredTools,
 			...sdkCustomTools.map(tool => {
-				const definition = isCustomTool(tool) ? customToolToDefinition(tool) : tool;
+				const definition = isCustomTool(tool) ? customToolToDefinition(tool, toolSession) : tool;
 				return { definition, extensionPath: "<sdk>" };
 			}),
 		];

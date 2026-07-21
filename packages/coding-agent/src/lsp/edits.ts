@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { formatPathRelativeToCwd } from "../tools/path-utils";
+import { clearSearchResultCache, type SearchResultCacheOwner } from "../tools/search-result-cache";
 import { ToolError } from "../tools/tool-errors";
 import type {
 	CreateFile,
@@ -238,50 +239,63 @@ function planDocumentChanges(documentChanges: NonNullable<WorkspaceEdit["documen
  * Apply a workspace edit (collection of file changes).
  * All text-edit batches are overlap-validated before anything is written so a
  * conflict throws without leaving the workspace half-applied.
+ * When `cacheOwner` is given, its cached grouped search pages are invalidated
+ * whenever any operation mutated the workspace — including a partial apply
+ * where a later operation throws.
  * Returns array of applied change descriptions.
  */
-export async function applyWorkspaceEdit(edit: WorkspaceEdit, cwd: string): Promise<string[]> {
+export async function applyWorkspaceEdit(
+	edit: WorkspaceEdit,
+	cwd: string,
+	cacheOwner?: SearchResultCacheOwner,
+): Promise<string[]> {
 	const applied: string[] = [];
 
-	if (edit.documentChanges) {
-		const ops = planDocumentChanges(edit.documentChanges);
-		for (const op of ops) {
-			if (op.kind === "text") sortAndValidateTextEdits(op.edits);
-		}
-		for (const op of ops) {
-			if (op.kind === "text") {
-				const filePath = uriToFile(op.uri);
-				await applyTextEdits(filePath, op.edits);
-				applied.push(`Applied ${op.edits.length} edit(s) to ${formatPathRelativeToCwd(filePath, cwd)}`);
-			} else if (op.kind === "create") {
-				const filePath = uriToFile(op.uri);
-				await Bun.write(filePath, "");
-				applied.push(`Created ${formatPathRelativeToCwd(filePath, cwd)}`);
-			} else if (op.kind === "rename") {
-				const oldPath = uriToFile(op.oldUri);
-				const newPath = uriToFile(op.newUri);
-				await fs.mkdir(path.dirname(newPath), { recursive: true });
-				await fs.rename(oldPath, newPath);
-				applied.push(`Renamed ${formatPathRelativeToCwd(oldPath, cwd)} → ${formatPathRelativeToCwd(newPath, cwd)}`);
-			} else {
-				const filePath = uriToFile(op.uri);
-				await fs.rm(filePath, { recursive: true });
-				applied.push(`Deleted ${formatPathRelativeToCwd(filePath, cwd)}`);
+	try {
+		if (edit.documentChanges) {
+			const ops = planDocumentChanges(edit.documentChanges);
+			for (const op of ops) {
+				if (op.kind === "text") sortAndValidateTextEdits(op.edits);
+			}
+			for (const op of ops) {
+				if (op.kind === "text") {
+					const filePath = uriToFile(op.uri);
+					await applyTextEdits(filePath, op.edits);
+					applied.push(`Applied ${op.edits.length} edit(s) to ${formatPathRelativeToCwd(filePath, cwd)}`);
+				} else if (op.kind === "create") {
+					const filePath = uriToFile(op.uri);
+					await Bun.write(filePath, "");
+					applied.push(`Created ${formatPathRelativeToCwd(filePath, cwd)}`);
+				} else if (op.kind === "rename") {
+					const oldPath = uriToFile(op.oldUri);
+					const newPath = uriToFile(op.newUri);
+					await fs.mkdir(path.dirname(newPath), { recursive: true });
+					await fs.rename(oldPath, newPath);
+					applied.push(
+						`Renamed ${formatPathRelativeToCwd(oldPath, cwd)} → ${formatPathRelativeToCwd(newPath, cwd)}`,
+					);
+				} else {
+					const filePath = uriToFile(op.uri);
+					await fs.rm(filePath, { recursive: true });
+					applied.push(`Deleted ${formatPathRelativeToCwd(filePath, cwd)}`);
+				}
+			}
+		} else if (edit.changes) {
+			// Legacy changes-map path: validate every file's edits before writing any.
+			const changes = edit.changes;
+			for (const uri in changes) {
+				sortAndValidateTextEdits(changes[uri]);
+			}
+			for (const uri in changes) {
+				const textEdits = changes[uri];
+				if (textEdits.length === 0) continue;
+				const filePath = uriToFile(uri);
+				await applyTextEdits(filePath, textEdits);
+				applied.push(`Applied ${textEdits.length} edit(s) to ${formatPathRelativeToCwd(filePath, cwd)}`);
 			}
 		}
-	} else if (edit.changes) {
-		// Legacy changes-map path: validate every file's edits before writing any.
-		const changes = edit.changes;
-		for (const uri in changes) {
-			sortAndValidateTextEdits(changes[uri]);
-		}
-		for (const uri in changes) {
-			const textEdits = changes[uri];
-			if (textEdits.length === 0) continue;
-			const filePath = uriToFile(uri);
-			await applyTextEdits(filePath, textEdits);
-			applied.push(`Applied ${textEdits.length} edit(s) to ${formatPathRelativeToCwd(filePath, cwd)}`);
-		}
+	} finally {
+		if (applied.length > 0 && cacheOwner) clearSearchResultCache(cacheOwner);
 	}
 
 	return applied;

@@ -7,6 +7,9 @@
 ### Fixed
 
 - Fixed Portkey/gateway custom models whose ids start with `@` (e.g. `@modal/GLM-5-2-FP8`) being rewritten to unrelated bundled wire ids (e.g. `glm-5-2`), which caused `400` responses requiring `x-portkey-config` or `x-portkey-provider`.
+### Fixed
+
+- Fixed paginated plain-filesystem `search` calls with `skip` rerunning the same native grep work for each page; later pages now reuse a short-lived per-session grouped result cache until the query changes, expires, or the session mutates files ([#3263](https://github.com/can1357/oh-my-pi/pull/3263) by [@wolfiesch](https://github.com/wolfiesch)).
 
 ## [17.0.6] - 2026-07-20
 
@@ -1696,7 +1699,6 @@
 - Fixed configured model discovery caches to refresh when `models.yml`/`models.json` is newer than the cached row, so updated local model metadata is not shadowed by fresh `models.db` entries. ([#3242](https://github.com/can1357/oh-my-pi/issues/3242))
 - Fixed hide-secrets handling so advisor session updates are redacted before the advisor model sees them and opaque assistant thinking blocks are no longer deobfuscated.
 - Filtered alias definitions brush's whitespace-only expander cannot execute (`(`, `)`, `|`, `&`, `;`, `<`, `>`, `` ` ``) from the bash-tool shell snapshot, so user rc-files containing compound aliases like Fedora's default `which='(alias; declare -f) | /usr/bin/which …'` no longer poison the brush session with `error: command not found: (alias;` ([#3234](https://github.com/can1357/oh-my-pi/issues/3234)).
-
 ## [16.1.14] - 2026-06-22
 
 ### Added

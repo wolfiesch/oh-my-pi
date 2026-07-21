@@ -56,6 +56,7 @@ import { MemoryRetainTool } from "./memory-retain";
 import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
 import type { PlanProposalHandler } from "./resolve";
+import type { SearchResultCache } from "./search-result-cache";
 import { type TodoPhase, TodoTool } from "./todo";
 import { WriteTool } from "./write";
 import { isMountableUnderXdev, XdevRegistry } from "./xdev";
@@ -334,6 +335,9 @@ export interface ToolSession {
 	 *  reconstruct the version the model authored anchors against when the
 	 *  file changed out-of-band. Lazily initialized by `getFileSnapshotStore`. */
 	fileSnapshotStore?: InMemorySnapshotStore;
+
+	/** Per-session grouped search result cache used by search skip pagination. */
+	searchResultCache?: SearchResultCache;
 
 	/** Per-session log of unresolved git merge conflict regions surfaced by
 	 *  `read`. Each entry gets a stable id N referenced by `write conflict://N`

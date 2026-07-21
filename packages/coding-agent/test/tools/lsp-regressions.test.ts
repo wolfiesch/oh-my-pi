@@ -5,7 +5,7 @@ import * as path from "node:path";
 import type { AgentToolResult, RenderResultOptions } from "@oh-my-pi/pi-agent-core";
 import { arkToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { preloadPluginRoots } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
-import { LspTool } from "@oh-my-pi/pi-coding-agent/lsp";
+import { createLspWritethrough, flushLspWritethroughBatch, LspTool } from "@oh-my-pi/pi-coding-agent/lsp";
 import * as lspClient from "@oh-my-pi/pi-coding-agent/lsp/client";
 import * as lspConfig from "@oh-my-pi/pi-coding-agent/lsp/config";
 import { getServersForFile, type LspConfig, loadConfig } from "@oh-my-pi/pi-coding-agent/lsp/config";
@@ -43,6 +43,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/lsp/utils";
 import { getThemeByName } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { getSearchResultCache, type SearchResultCacheOwner } from "@oh-my-pi/pi-coding-agent/tools/search-result-cache";
 import { clampTimeout } from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { sanitizeText, TempDir } from "@oh-my-pi/pi-utils";
@@ -303,6 +304,155 @@ describe("lsp regressions", () => {
 			expect(shutdownIndex).toBeGreaterThanOrEqual(0);
 			expect(exitIndex).toBeGreaterThan(shutdownIndex);
 			expect(server.killed).toBe(false);
+		} finally {
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
+	it("registers write-notified sessions so server workspace edits clear their search caches", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-watched-owner-");
+		try {
+			const server = installFakeLsp((message, srv) => {
+				if (message.method === "initialize") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+				} else if (message.method === "shutdown") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: null });
+				} else if (message.method === "exit") {
+					srv.exit(0);
+				}
+			});
+			const config: ServerConfig = {
+				command: "fake-lsp",
+				fileTypes: ["ts"],
+				rootMarkers: [],
+			};
+			const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+
+			const targetPath = path.join(tempDir.path(), "watched.ts");
+			fs.writeFileSync(targetPath, "old\n");
+
+			// A session whose ONLY LSP contact is the write-notification path.
+			const sessionOwner: SearchResultCacheOwner = {};
+			const cache = getSearchResultCache(sessionOwner);
+			cache.set("stale", {
+				fileOrder: [],
+				matchesByPath: new Map(),
+				perFileLimitReached: false,
+				resultLimitReached: false,
+				skippedOversizedCount: 0,
+			});
+
+			const notifyChange = () =>
+				lspClient.notifyWorkspaceWatchedFiles(
+					tempDir.path(),
+					[{ filePath: targetPath, type: lspClient.FileChangeType.Changed }],
+					undefined,
+					sessionOwner,
+				);
+			await notifyChange();
+			const refs = Array.from(client.searchCacheOwners ?? []);
+			expect(refs.some(ref => ref.deref() === sessionOwner)).toBe(true);
+			// Re-notification must not accumulate duplicate refs.
+			await notifyChange();
+			expect(client.searchCacheOwners?.size).toBe(1);
+
+			// A later server-initiated workspace/applyEdit must clear the
+			// registered session's cached search pages.
+			server.send({
+				jsonrpc: "2.0",
+				id: 4242,
+				method: "workspace/applyEdit",
+				params: {
+					edit: {
+						changes: {
+							[fileToUri(targetPath)]: [
+								{
+									range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } },
+									newText: "new",
+								},
+							],
+						},
+					},
+				},
+			});
+			const response = await server.waitFor(message => message.id === 4242 && message.method === undefined);
+			expect(response.result).toMatchObject({ applied: true });
+			expect(cache.get("stale")).toBeUndefined();
+		} finally {
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
+	it("holds batch writethrough owners weakly and registers only live sessions at flush", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-batch-owner-");
+		try {
+			installFakeLsp((message, srv) => {
+				if (message.method === "initialize") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+				} else if (message.method === "shutdown") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: null });
+				} else if (message.method === "exit") {
+					srv.exit(0);
+				}
+			});
+			const config: ServerConfig = {
+				command: "fake-lsp",
+				fileTypes: ["ts"],
+				rootMarkers: [],
+			};
+			const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+
+			// Live owner: a flush:false batch defers all LSP work; the explicit
+			// flush must register the still-live session on the client.
+			const liveOwner: SearchResultCacheOwner = {};
+			const liveWritethrough = createLspWritethrough(tempDir.path(), { owner: liveOwner });
+			const livePath = path.join(tempDir.path(), "live.ts");
+			await liveWritethrough(livePath, "export const live = 1;\n", undefined, undefined, {
+				id: "batch-owner-live",
+				flush: false,
+			});
+			expect(Array.from(client.searchCacheOwners ?? []).some(ref => ref.deref() === liveOwner)).toBe(false);
+			await flushLspWritethroughBatch("batch-owner-live", tempDir.path());
+			expect(Array.from(client.searchCacheOwners ?? []).some(ref => ref.deref() === liveOwner)).toBe(true);
+
+			// Dead owner (deterministic stub, no GC): prototype-chained onto
+			// WeakRef so createLspWritethrough shares it instead of re-wrapping,
+			// with deref() overridden to simulate a collected session. The batch
+			// map must hold it weakly and flushing must skip registration while
+			// still writing.
+			const deadRef: WeakRef<SearchResultCacheOwner> = Object.assign(Object.create(WeakRef.prototype), {
+				deref: () => undefined,
+			});
+			const deadWritethrough = createLspWritethrough(tempDir.path(), { owner: deadRef });
+			const deadPath = path.join(tempDir.path(), "dead.ts");
+			await deadWritethrough(deadPath, "export const dead = 1;\n", undefined, undefined, {
+				id: "batch-owner-dead",
+				flush: false,
+			});
+			const sizeBefore = client.searchCacheOwners?.size ?? 0;
+			await flushLspWritethroughBatch("batch-owner-dead", tempDir.path());
+			expect(await Bun.file(deadPath).text()).toBe("export const dead = 1;\n");
+			expect(client.searchCacheOwners?.size ?? 0).toBe(sizeBefore);
+
+			// Merge audit: a dead ref left on a pending batch must not shadow a
+			// live session continuing the same batch.
+			const revivedOwner: SearchResultCacheOwner = {};
+			const deadFirst = createLspWritethrough(tempDir.path(), { owner: deadRef });
+			const mergedPathA = path.join(tempDir.path(), "merged-a.ts");
+			await deadFirst(mergedPathA, "export const a = 1;\n", undefined, undefined, {
+				id: "batch-owner-merge",
+				flush: false,
+			});
+			const liveSecond = createLspWritethrough(tempDir.path(), { owner: revivedOwner });
+			const mergedPathB = path.join(tempDir.path(), "merged-b.ts");
+			await liveSecond(mergedPathB, "export const b = 1;\n", undefined, undefined, {
+				id: "batch-owner-merge",
+				flush: false,
+			});
+			await flushLspWritethroughBatch("batch-owner-merge", tempDir.path());
+			expect(Array.from(client.searchCacheOwners ?? []).some(ref => ref.deref() === revivedOwner)).toBe(true);
 		} finally {
 			await lspClient.shutdownAll();
 			tempDir.removeSync();

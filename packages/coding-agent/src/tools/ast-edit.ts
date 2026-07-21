@@ -33,6 +33,7 @@ import {
 	PREVIEW_LIMITS,
 } from "./render-utils";
 import { queueResolveHandler } from "./resolve";
+import { clearSearchResultCache } from "./search-result-cache";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
@@ -437,12 +438,21 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					label: `AST Edit: ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}`,
 					sourceToolName: this.name,
 					apply: async (_reason: string) => {
-						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
-							rewrites: normalizedRewrites,
-							dryRun: false,
-							maxFiles,
-							failOnParseError: false,
-						});
+						let applyResult: AstEditAggregatedResult;
+						try {
+							applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
+								rewrites: normalizedRewrites,
+								dryRun: false,
+								maxFiles,
+								failOnParseError: false,
+							});
+						} finally {
+							// The rewrite may have touched files even when a later target
+							// throws (targets apply sequentially) or when the preview went
+							// stale, so cached search pages are conservatively dropped on
+							// every apply attempt — full, partial, or failed.
+							clearSearchResultCache(this.session);
+						}
 						const { errors: cappedApplyParseErrors, total: applyParseErrorsTotal } = capParseErrors(
 							applyResult.parseErrors,
 						);

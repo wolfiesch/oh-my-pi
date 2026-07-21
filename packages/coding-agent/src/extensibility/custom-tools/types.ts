@@ -102,6 +102,14 @@ export interface CustomToolContext {
 	localProtocolOptions?: LocalProtocolOptions;
 	/** Whether to auto-approve all destructive tool operations (--auto-approve CLI flag) */
 	autoApprove?: boolean;
+	/**
+	 * Invalidate filesystem-derived caches (native scan cache + the owning
+	 * session's cached grouped search pages) for a file this tool wrote.
+	 * Write-capable custom tools MUST call this for every workspace file they
+	 * create or overwrite; read-only tools never call it, so their execution
+	 * cannot evict cached search pagination.
+	 */
+	invalidateFileCaches?: (path: string) => void;
 }
 
 /** Session event passed to onSession callback */
