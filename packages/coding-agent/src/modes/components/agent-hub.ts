@@ -15,8 +15,9 @@
  */
 import { type AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { Container, Ellipsis, matchesKey, type OverlayHandle, padding, type TUI, visibleWidth } from "@oh-my-pi/pi-tui";
-import { formatAge, getProjectDir, logger } from "@oh-my-pi/pi-utils";
+import { formatAge, formatDuration, formatNumber, getProjectDir, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { KeyId } from "../../config/keybindings";
+import { formatModelStringWithRouting } from "../../config/model-resolver";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
 import { IrcBus } from "../../irc/bus";
 import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
@@ -30,6 +31,7 @@ import { theme } from "../theme/theme";
 import { matchesSelectDown, matchesSelectUp } from "../utils/keybinding-matchers";
 import { AgentTranscriptViewer } from "./agent-transcript-viewer";
 import { DynamicBorder } from "./dynamic-border";
+import { formatContextUsage } from "./status-line/context-thresholds";
 
 /** Refresh cadence for the relative-time column */
 const AGE_TICK_MS = 5_000;
@@ -44,7 +46,7 @@ function contentWidth(): number {
 
 /** Sanitize a line for TUI display: replace tabs, then truncate to viewport width. */
 function sanitizeLine(text: string, maxWidth?: number): string {
-	const singleLine = replaceTabs(text).replace(/[\r\n]+/g, " ");
+	const singleLine = replaceTabs(sanitizeText(text)).replace(/[\r\n]+/g, " ");
 	return truncateToWidth(singleLine, maxWidth ?? contentWidth());
 }
 
@@ -53,6 +55,20 @@ function clampHubLine(line: string, width: number): string {
 }
 
 const STATUS_ORDER: Record<AgentStatus, number> = { running: 0, idle: 1, parked: 2, aborted: 3 };
+type HubTab = "active" | "archive";
+
+interface AgentRuntimeView {
+	model?: string;
+	thinkingLevel?: string;
+	lspEnabled?: boolean;
+	advisorActive?: boolean;
+	turns?: number;
+	tokens?: number;
+	contextTokens?: number;
+	contextWindow?: number;
+	toolCount?: number;
+	cost?: number;
+}
 
 /** Status glyph, colored per theme status conventions. The title-line counts spell out the words. */
 function statusGlyph(status: AgentStatus): string {
@@ -164,13 +180,26 @@ export class AgentHubOverlayComponent extends Container {
 	/** Resolves after persisted historical subagents have been registered and rows refreshed. */
 	readonly persistedSubagentsReady: Promise<void>;
 
-	// Table state
+	// Dashboard state
+	#allRows: AgentRef[] = [];
 	#rows: AgentRef[] = [];
 	#selectedRow = 0;
+	#selectedByTab: Partial<Record<HubTab, string>> = {};
+	#tab: HubTab = "active";
+	#showIdle = false;
 	#notice: string | undefined;
-	/** Captured row order from the first refresh; keeps the hub stable while open. */
+	/** Captured row order from the first refresh; keeps each status group stable while open. */
 	#rowOrder: Map<string, number> | undefined;
-	/** Double-tap window state for the table's left-left "close hub" gesture. */
+	#liveMetricsCache:
+		| {
+				id: string;
+				revision: number;
+				metrics: Pick<
+					AgentRuntimeView,
+					"turns" | "tokens" | "contextTokens" | "contextWindow" | "toolCount" | "cost"
+				>;
+		  }
+		| undefined;
 	#lastLeftTap = 0;
 
 	// Transcript-viewer launch deps (passed through to AgentTranscriptViewer).
@@ -237,7 +266,7 @@ export class AgentHubOverlayComponent extends Container {
 	 * those included must wait for {@link persistedSubagentsReady} first.
 	 */
 	get isEmpty(): boolean {
-		return this.#rows.length === 0;
+		return this.#allRows.length === 0;
 	}
 
 	/** Tear down every subscription and timer. Called by the overlay owner on close. */
@@ -349,35 +378,52 @@ export class AgentHubOverlayComponent extends Container {
 	}
 
 	#refreshRows(): void {
-		const selectedId = this.#rows[this.#selectedRow]?.id;
+		const selectedId = this.#selectedByTab[this.#tab] ?? this.#rows[this.#selectedRow]?.id;
 		const refs = this.#registry.list().filter(ref => ref.id !== MAIN_AGENT_ID);
 
 		if (!this.#rowOrder) {
-			// First refresh (usually the constructor): order by status, then recency.
-			this.#rows = refs.sort(
+			const initiallySorted = [...refs].sort(
 				(a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || b.lastActivity - a.lastActivity,
 			);
-			this.#rowOrder = new Map(this.#rows.map((ref, i) => [ref.id, i]));
-		} else {
-			// After the hub is open, freeze the relative order so keyboard selection
-			// does not jump around as agents heartbeat or update activity. New agents
-			// are appended at the end and then stay put.
-			this.#rows = refs.sort((a, b) => {
-				const statusDiff = STATUS_ORDER[a.status] - STATUS_ORDER[b.status];
-				if (statusDiff !== 0) return statusDiff;
-				const aOrder = this.#rowOrder!.get(a.id) ?? Number.MAX_SAFE_INTEGER;
-				const bOrder = this.#rowOrder!.get(b.id) ?? Number.MAX_SAFE_INTEGER;
-				return aOrder - bOrder;
-			});
-			for (const ref of this.#rows) {
-				if (!this.#rowOrder.has(ref.id)) {
-					this.#rowOrder.set(ref.id, this.#rowOrder.size);
-				}
-			}
+			this.#rowOrder = new Map(initiallySorted.map((ref, i) => [ref.id, i]));
 		}
+		for (const ref of refs) {
+			if (!this.#rowOrder.has(ref.id)) this.#rowOrder.set(ref.id, this.#rowOrder.size);
+		}
+		this.#allRows = refs;
+		this.#rows = this.#rowsForTab(this.#tab);
 
 		const keptIndex = selectedId ? this.#rows.findIndex(ref => ref.id === selectedId) : -1;
 		this.#selectedRow = keptIndex >= 0 ? keptIndex : Math.min(this.#selectedRow, Math.max(0, this.#rows.length - 1));
+		const current = this.#rows[this.#selectedRow];
+		if (current) this.#selectedByTab[this.#tab] = current.id;
+	}
+
+	#rowsForTab(tab: HubTab): AgentRef[] {
+		const refs =
+			tab === "active"
+				? this.#allRows.filter(
+						ref =>
+							ref.kind !== "advisor" && (ref.status === "running" || (this.#showIdle && ref.status === "idle")),
+					)
+				: this.#allRows.filter(
+						ref => ref.kind === "advisor" || ref.status === "parked" || ref.status === "aborted",
+					);
+		return refs.sort((a, b) => {
+			const groupA = this.#rowGroup(a, tab);
+			const groupB = this.#rowGroup(b, tab);
+			if (groupA !== groupB) return groupA - groupB;
+			return (
+				(this.#rowOrder?.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
+				(this.#rowOrder?.get(b.id) ?? Number.MAX_SAFE_INTEGER)
+			);
+		});
+	}
+
+	#rowGroup(ref: AgentRef, tab: HubTab): number {
+		if (tab === "active") return ref.status === "running" ? 0 : 1;
+		if (ref.kind === "advisor") return 2;
+		return ref.status === "parked" ? 0 : 1;
 	}
 
 	#observableFor(id: string): ObservableSession | undefined {
@@ -390,67 +436,228 @@ export class AgentHubOverlayComponent extends Container {
 
 	#renderTable(width: number): string[] {
 		const lines: string[] = [];
+		const counts = this.#counts();
 		lines.push(...new DynamicBorder().render(width));
-		const counts = this.#statusSummary();
-		lines.push(` ${theme.fg("accent", "Agent Hub")}${counts ? theme.fg("dim", `${theme.sep.dot}${counts}`) : ""}`);
+		lines.push(
+			` ${theme.fg("accent", `Agent Hub · ${counts.running} running · ${counts.idle} idle · ${counts.archived} archived`)}`,
+		);
+		lines.push(
+			` ${this.#tab === "active" ? theme.bold("Active") : "Active"} (${counts.running + counts.idle})  ${this.#tab === "archive" ? theme.bold("Archive") : "Archive"} (${counts.archived})`,
+		);
 		lines.push(...new DynamicBorder().render(width));
 
-		if (this.#rows.length === 0) {
-			lines.push(` ${theme.fg("dim", "no subagents yet — task spawns appear here")}`);
+		const listLines = this.#renderList(width >= 96 ? Math.floor((width - 3) * 0.44) : width);
+		const inspectorLines = this.#renderInspector(this.#rows[this.#selectedRow], width >= 96 ? width : width - 2);
+		if (width >= 96) {
+			const leftWidth = Math.floor((width - 3) * 0.44);
+			const rightWidth = width - leftWidth - 3;
+			const bodyHeight = Math.max(listLines.length, inspectorLines.length);
+			const separator = theme.fg("dim", ` ${theme.boxRound.vertical} `);
+			for (let i = 0; i < bodyHeight; i++) {
+				const left = truncateToWidth(listLines[i] ?? "", leftWidth);
+				const leftPadded = left + padding(Math.max(0, leftWidth - visibleWidth(left)));
+				lines.push(leftPadded + separator + truncateToWidth(inspectorLines[i] ?? "", rightWidth));
+			}
 		} else {
-			const termHeight = process.stdout.rows || 40;
-			// Chrome: 2 borders + title + notice? + blank + hints + border
-			const budget = Math.max(4, termHeight - 7 - (this.#notice ? 1 : 0));
-			const entries = this.#rows.map((ref, i) => this.#renderEntry(ref, i === this.#selectedRow, width));
-			// Entries are 1-2 lines tall; grow a window around the selection until
-			// the line budget is spent, so the selected entry stays centered.
-			let start = this.#selectedRow;
-			let end = this.#selectedRow + 1;
-			let used = entries[start]?.length ?? 0;
-			for (let grew = true; grew; ) {
-				grew = false;
-				if (end < entries.length && used + entries[end].length <= budget) {
-					used += entries[end].length;
-					end++;
-					grew = true;
-				}
-				if (start > 0 && used + entries[start - 1].length <= budget) {
-					start--;
-					used += entries[start].length;
-					grew = true;
-				}
-			}
-			if (start > 0) {
-				lines.push(` ${theme.fg("dim", `… ${start} more`)}`);
-			}
-			for (let i = start; i < end; i++) {
-				lines.push(...entries[i]);
-			}
-			if (end < this.#rows.length) {
-				lines.push(` ${theme.fg("dim", `… ${this.#rows.length - end} more`)}`);
-			}
+			lines.push(...listLines);
+			const availableInspectorLines = Math.max(
+				0,
+				Math.min(9, (process.stdout.rows || 40) - lines.length - (this.#notice ? 4 : 3)),
+			);
+			if (availableInspectorLines > 0) lines.push(...inspectorLines.slice(0, availableInspectorLines));
 		}
 
 		if (this.#notice) {
 			lines.push(` ${theme.fg("error", sanitizeLine(this.#notice, Math.max(10, width - 2)))}`);
 		}
 		lines.push("");
-		lines.push(` ${theme.fg("dim", "j/k:select  Enter:open  r:revive  x:kill  Esc/←←:close")}`);
+		const footer =
+			this.#tab === "active"
+				? "j/k:select  Enter:focus  t:transcript  i:idle  Tab:switch  Esc/←←:close"
+				: "j/k:select  Enter:transcript  t:transcript  r:revive  x:kill  Tab:switch  Esc/←←:close";
+		lines.push(` ${theme.fg("dim", footer)}`);
 		lines.push(...new DynamicBorder().render(width));
 		return lines;
 	}
 
-	#statusSummary(): string {
-		const counts: Record<AgentStatus, number> = { running: 0, idle: 0, parked: 0, aborted: 0 };
-		for (const ref of this.#rows) {
-			counts[ref.status]++;
+	#counts(): { running: number; idle: number; archived: number } {
+		let running = 0;
+		let idle = 0;
+		let archived = 0;
+		for (const ref of this.#allRows) {
+			if (ref.kind === "advisor" || ref.status === "parked" || ref.status === "aborted") archived++;
+			else if (ref.status === "running") running++;
+			else if (ref.status === "idle") idle++;
 		}
-		const parts: string[] = [];
-		for (const status of ["running", "idle", "parked", "aborted"] as const) {
-			const count = counts[status];
-			if (count > 0) parts.push(`${count} ${status}`);
+		return { running, idle, archived };
+	}
+
+	#renderList(width: number): string[] {
+		const lines: string[] = [];
+		const runningCount = this.#allRows.filter(ref => ref.status === "running" && ref.kind !== "advisor").length;
+		const idleCount = this.#allRows.filter(ref => ref.status === "idle" && ref.kind !== "advisor").length;
+		if (this.#tab === "active" && runningCount === 0) lines.push(` ${theme.fg("dim", "No agents running.")}`);
+
+		const termHeight = process.stdout.rows || 40;
+		const maxVisibleLines = Math.max(3, termHeight - 10 - (this.#notice ? 1 : 0));
+		const renderedRows = this.#rows.map((ref, index) => this.#renderEntry(ref, index === this.#selectedRow, width));
+		let start = 0;
+		let end = 0;
+		let visibleLines = 0;
+		while (end < renderedRows.length && visibleLines + renderedRows[end]!.length <= maxVisibleLines) {
+			visibleLines += renderedRows[end]!.length;
+			end++;
 		}
-		return parts.join(theme.sep.dot);
+		if (renderedRows.length > 0 && this.#selectedRow >= end) {
+			start = this.#selectedRow;
+			end = this.#selectedRow + 1;
+			visibleLines = renderedRows[this.#selectedRow]?.length ?? 0;
+			while (start > 0 && visibleLines + renderedRows[start - 1]!.length <= maxVisibleLines) {
+				start--;
+				visibleLines += renderedRows[start]!.length;
+			}
+			while (end < renderedRows.length && visibleLines + renderedRows[end]!.length <= maxVisibleLines) {
+				visibleLines += renderedRows[end]!.length;
+				end++;
+			}
+		}
+		for (let i = start; i < end; i++) lines.push(...renderedRows[i]!);
+		if (end < this.#rows.length) lines.push(` ${theme.fg("dim", `… ${this.#rows.length - end} more`)}`);
+		if (this.#tab === "active" && idleCount > 0) {
+			lines.push(` ${theme.fg("dim", `${this.#showIdle ? "▾" : "▸"} ${idleCount} idle agents`)}`);
+		}
+		if (this.#tab === "archive" && this.#rows.length === 0) lines.push(` ${theme.fg("dim", "No archived agents.")}`);
+		return lines;
+	}
+
+	#runtimeView(ref: AgentRef): AgentRuntimeView {
+		const progress = this.#observableFor(ref.id)?.progress;
+		const view: AgentRuntimeView = {
+			model: progress?.resolvedModel,
+			thinkingLevel: progress?.thinkingLevel,
+			lspEnabled: progress?.lspEnabled,
+			advisorActive: progress?.advisorActive,
+			turns: progress?.requests,
+			tokens: progress?.tokens,
+			contextTokens: progress?.contextTokens,
+			contextWindow: progress?.contextWindow,
+			toolCount: progress?.toolCount,
+			cost: progress?.cost,
+		};
+		const session = ref.session;
+		if (!session) return view;
+		try {
+			if (session.model) view.model = formatModelStringWithRouting(session.model);
+		} catch {}
+		try {
+			const thinkingLevel = session.thinkingLevel;
+			if (thinkingLevel !== undefined) view.thinkingLevel = thinkingLevel;
+		} catch {}
+		try {
+			const toolNames = session.getActiveToolNames?.();
+			if (toolNames !== undefined) {
+				view.lspEnabled = toolNames.includes("lsp");
+			}
+		} catch {}
+		try {
+			const advisorActive = session.isAdvisorActive?.();
+			if (advisorActive !== undefined) {
+				view.advisorActive = advisorActive;
+			}
+		} catch {}
+
+		let revision = -1;
+		try {
+			revision = session.contextUsageRevision;
+		} catch {}
+		if (this.#liveMetricsCache?.id === ref.id && this.#liveMetricsCache.revision === revision) {
+			Object.assign(view, this.#liveMetricsCache.metrics);
+			return view;
+		}
+		const metrics: AgentRuntimeView = {};
+		try {
+			const stats = session.getSessionStats?.();
+			if (stats) {
+				metrics.turns = stats.assistantMessages;
+				metrics.tokens = stats.tokens.input + stats.tokens.output + stats.tokens.cacheWrite;
+				metrics.toolCount = stats.toolCalls;
+				metrics.cost = stats.cost;
+			}
+		} catch {}
+		try {
+			const context = session.getContextUsage?.();
+			if (context) {
+				metrics.contextTokens = context.tokens;
+				metrics.contextWindow = context.contextWindow;
+			}
+		} catch {}
+		this.#liveMetricsCache = { id: ref.id, revision, metrics };
+		Object.assign(view, metrics);
+		return view;
+	}
+
+	#renderInspector(ref: AgentRef | undefined, width: number): string[] {
+		if (!ref) return [` ${theme.fg("dim", "No agent selected.")}`];
+		const observed = this.#observableFor(ref.id);
+		const progress = observed?.progress;
+		const runtime = this.#runtimeView(ref);
+		const unknown = "unknown";
+		const capability = (value: boolean | undefined): string => (value === undefined ? unknown : value ? "on" : "off");
+		const age = formatAge(Math.max(1, Math.round((Date.now() - ref.lastActivity) / 1000)));
+		const parent = ref.parentId ? `${ref.kind}/of ${sanitizeLine(ref.parentId)}` : ref.kind;
+		const lines = [
+			` ${theme.bold(sanitizeLine(ref.id))} · ${ref.status} · ${parent} · unread ${this.#irc.unreadCount(ref.id)} · ${age}`,
+		];
+		const task = observed?.description ?? progress?.assignment ?? progress?.task;
+		lines.push(` Task: ${task ? sanitizeLine(task, TRUNCATE_LENGTHS.TITLE) : unknown}`);
+		lines.push(` Model ${sanitizeLine(runtime.model ?? unknown)} · Reasoning ${runtime.thinkingLevel ?? unknown}`);
+		lines.push(` Advisor ${capability(runtime.advisorActive)} · LSP ${capability(runtime.lspEnabled)}`);
+		const context =
+			runtime.contextTokens === undefined
+				? unknown
+				: formatContextUsage(
+						runtime.contextWindow && runtime.contextWindow > 0
+							? (runtime.contextTokens / runtime.contextWindow) * 100
+							: undefined,
+						runtime.contextWindow ?? 0,
+						runtime.contextTokens,
+					);
+		lines.push(
+			` Turns ${runtime.turns === undefined ? unknown : formatNumber(runtime.turns)} · Tokens ${runtime.tokens === undefined ? unknown : formatNumber(runtime.tokens)} · Context ${context}`,
+		);
+		lines.push(
+			` Tools ${runtime.toolCount === undefined ? unknown : formatNumber(runtime.toolCount)} · Duration ${progress ? formatDuration(progress.durationMs) : unknown} · Cost ${runtime.cost === undefined ? unknown : `$${runtime.cost.toFixed(2)}`}`,
+		);
+		if (!progress) {
+			lines.push(` ${theme.fg("dim", "No structured progress yet.")}`);
+			if (this.#tab === "archive") lines.push(` ${theme.fg("dim", "Open transcript for persisted details.")}`);
+			return lines.map(line => truncateToWidth(line, Math.max(1, width)));
+		}
+
+		let activity = progress.lastIntent;
+		if (progress.currentTool) {
+			const elapsed = progress.currentToolStartMs
+				? ` · ${formatDuration(Math.max(0, Date.now() - progress.currentToolStartMs))}`
+				: "";
+			activity = `${progress.currentTool}${progress.currentToolArgs ? ` ${progress.currentToolArgs}` : ""}${elapsed}`;
+		}
+		if (progress.retryState) {
+			activity = `retry ${progress.retryState.attempt}/${progress.retryState.maxAttempts} in ${formatDuration(progress.retryState.delayMs)}: ${progress.retryState.errorMessage}`;
+		} else if (progress.retryFailure) {
+			activity = `retry failed at ${progress.retryFailure.attempt}: ${progress.retryFailure.errorMessage}`;
+		}
+		lines.push(` Activity: ${sanitizeLine(activity ?? unknown, TRUNCATE_LENGTHS.TITLE)}`);
+		const recent = progress.recentTools.slice(-3).reverse();
+		if (recent.length === 0) {
+			lines.push(" Recent tools: none");
+		} else {
+			lines.push(" Recent tools:");
+			for (const tool of recent) {
+				const detail = `${tool.tool}${tool.args ? ` ${tool.args}` : ""} · ${formatAge(Math.max(1, Math.round((Date.now() - tool.endMs) / 1000)))}`;
+				lines.push(`  ${sanitizeLine(detail, TRUNCATE_LENGTHS.TITLE)}`);
+			}
+		}
+		return lines.map(line => truncateToWidth(line, Math.max(1, width)));
 	}
 
 	/**
@@ -515,33 +722,48 @@ export class AgentHubOverlayComponent extends Container {
 			}
 			return;
 		}
+		if (matchesKey(keyData, "tab") || matchesKey(keyData, "shift+tab") || keyData === "\t") {
+			this.#selectedByTab[this.#tab] = this.#rows[this.#selectedRow]?.id;
+			this.#tab = this.#tab === "active" ? "archive" : "active";
+			this.#selectedRow = 0;
+			this.#refreshRows();
+			this.#notice = undefined;
+			this.#requestRender();
+			return;
+		}
+		if (this.#tab === "active" && keyData === "i") {
+			this.#selectedByTab.active = this.#rows[this.#selectedRow]?.id;
+			this.#showIdle = !this.#showIdle;
+			this.#refreshRows();
+			this.#requestRender();
+			return;
+		}
 		if (matchesKey(keyData, "j") || matchesSelectDown(keyData)) {
-			if (this.#rows.length > 0) {
-				this.#selectedRow = Math.min(this.#selectedRow + 1, this.#rows.length - 1);
-			}
+			if (this.#rows.length > 0) this.#selectedRow = Math.min(this.#selectedRow + 1, this.#rows.length - 1);
+			this.#selectedByTab[this.#tab] = this.#rows[this.#selectedRow]?.id;
 			this.#requestRender();
 			return;
 		}
 		if (matchesKey(keyData, "k") || matchesSelectUp(keyData)) {
-			if (this.#rows.length > 0) {
-				this.#selectedRow = Math.max(this.#selectedRow - 1, 0);
-			}
+			if (this.#rows.length > 0) this.#selectedRow = Math.max(this.#selectedRow - 1, 0);
+			this.#selectedByTab[this.#tab] = this.#rows[this.#selectedRow]?.id;
 			this.#requestRender();
 			return;
 		}
+		const selected = this.#rows[this.#selectedRow];
 		if (matchesKey(keyData, "enter") || keyData === "\r" || keyData === "\n") {
-			const selected = this.#rows[this.#selectedRow];
 			if (selected) this.#activateAgent(selected);
 			return;
 		}
-		if (keyData === "r") {
+		if (keyData === "t") {
+			if (selected) this.openChat(selected.id);
+			return;
+		}
+		if (this.#tab === "archive" && keyData === "r") {
 			this.#reviveSelected();
 			return;
 		}
-		if (keyData === "x") {
-			this.#killSelected();
-			return;
-		}
+		if (this.#tab === "archive" && keyData === "x") this.#killSelected();
 	}
 
 	/**
@@ -552,16 +774,13 @@ export class AgentHubOverlayComponent extends Container {
 	 */
 	#activateAgent(ref: AgentRef): void {
 		this.#notice = undefined;
-		const focusAgent = this.#focusAgent;
-		// Advisor refs are read-only transcripts with no live/ revivable session;
-		// open the in-hub chat view (file-backed) instead of trying to focus one.
-		if (ref.kind === "advisor" || this.#remote || !focusAgent) {
+		if (this.#tab === "archive" || this.#remote || !this.#focusAgent) {
 			this.openChat(ref.id);
 			return;
 		}
 		void (async () => {
 			try {
-				await focusAgent(ref.id); // ensureLive inside revives parked agents; no parking, no session files
+				await this.#focusAgent!(ref.id);
 				this.#onDone();
 			} catch (error) {
 				this.#notice = error instanceof Error ? error.message : String(error);

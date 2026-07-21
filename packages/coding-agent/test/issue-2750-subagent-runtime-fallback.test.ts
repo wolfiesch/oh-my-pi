@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import type { Api, Model } from "@oh-my-pi/pi-ai";
+import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
@@ -22,15 +22,19 @@ function model(provider: string, id: string): Model<Api> {
 	});
 }
 
-function createYieldingSession(): AgentSession {
+function createYieldingSession(
+	options: { advisorActive?: boolean; initialThinkingLevel?: Effort; thinkingLevel?: Effort } = {},
+): AgentSession {
 	const listeners: Array<(event: { type: string; [key: string]: unknown }) => void> = [];
 	const session = {
 		agent: { state: { systemPrompt: ["test"] } },
 		state: { messages: [] },
+		thinkingLevel: options.initialThinkingLevel,
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
 		getActiveToolNames: () => ["yield"],
 		getEnabledToolNames: () => ["yield"],
+		isAdvisorActive: () => options.advisorActive ?? false,
 		setActiveToolsByName: async () => {},
 		subscribe: (listener: (event: { type: string; [key: string]: unknown }) => void) => {
 			listeners.push(listener);
@@ -38,6 +42,12 @@ function createYieldingSession(): AgentSession {
 		},
 		prompt: async () => {
 			for (const listener of listeners) {
+				if (options.thinkingLevel) {
+					listener({
+						type: "thinking_level_changed",
+						thinkingLevel: options.thinkingLevel,
+					});
+				}
 				listener({
 					type: "retry_fallback_applied",
 					from: "primary/bad-runtime-model",
@@ -374,5 +384,61 @@ describe("subagent runtime model resolution", () => {
 		expect(childModelPatternAuthFallback).toBe("openai-codex/gpt-5.5");
 		expect(childModelPatternFallbackRole).toBe("subagent:issue-4421");
 		expect(childModelPatternDefaultFallbackChain).toEqual(["openai-codex/gpt-5.6-sol"]);
+	});
+
+	it("publishes runtime capabilities and reasoning changes in progress snapshots", async () => {
+		const primary = model("primary", "runtime-model");
+		const snapshots: Array<{
+			thinkingLevel?: string;
+			lspEnabled?: boolean;
+			advisorActive?: boolean;
+		}> = [];
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(
+			async () =>
+				({
+					session: createYieldingSession({
+						advisorActive: true,
+						initialThinkingLevel: Effort.High,
+						thinkingLevel: Effort.Medium,
+					}),
+					extensionsResult: {},
+					setToolUIContext: () => {},
+				}) as never,
+		);
+
+		await runSubprocess({
+			cwd: "/tmp",
+			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+			task: "work",
+			index: 0,
+			id: "runtime-capabilities",
+			modelOverride: "primary/runtime-model",
+			thinkingLevel: Effort.High,
+			settings: Settings.isolated(),
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [primary],
+				getApiKey: async () => "test-key",
+			} as never,
+			enableLsp: false,
+			onProgress: progress => {
+				snapshots.push({
+					thinkingLevel: progress.thinkingLevel,
+					lspEnabled: progress.lspEnabled,
+					advisorActive: progress.advisorActive,
+				});
+			},
+		});
+
+		expect(snapshots).toContainEqual({
+			thinkingLevel: "high",
+			lspEnabled: false,
+			advisorActive: true,
+		});
+		expect(snapshots).toContainEqual({
+			thinkingLevel: "medium",
+			lspEnabled: false,
+			advisorActive: true,
+		});
 	});
 });

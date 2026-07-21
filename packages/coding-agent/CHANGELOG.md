@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Changed Agent Hub to default to running-agent visibility, archive parked and aborted agents, and expose live runtime metadata with structured activity ([#5251](https://github.com/can1357/oh-my-pi/pull/5251) by [@wolfiesch](https://github.com/wolfiesch)).
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed

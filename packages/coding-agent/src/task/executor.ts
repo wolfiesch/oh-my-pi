@@ -1561,6 +1561,11 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 					popLoopPhase();
 				}
 			}
+			if (event.type === "thinking_level_changed") {
+				progress.thinkingLevel = event.thinkingLevel;
+				scheduleProgress(true);
+				return;
+			}
 			if (event.type === "retry_fallback_applied") {
 				progress.resolvedModel = event.to;
 				scheduleProgress(true);
@@ -2443,6 +2448,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const effectiveThinkingLevel = explicitThinkingLevel
 				? resolvedThinkingLevel
 				: (thinkingLevel ?? resolvedThinkingLevel);
+			progress.lspEnabled = lspEnabled;
+			progress.thinkingLevel = effectiveThinkingLevel === "auto" ? undefined : effectiveThinkingLevel;
 			resolvedAt = performance.now();
 			// Per-agent prewalk: the agent definition's `prewalk` frontmatter or the
 			// `task.agentPrewalk` settings override hands the subagent off to a
@@ -2619,6 +2626,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			monitor.setActiveSession(session);
 			installRegistryStatusSync(session);
+			progress.thinkingLevel = session.thinkingLevel;
+			progress.advisorActive = session.isAdvisorActive?.();
+			monitor.scheduleProgress(true);
 			if (sessionFile !== null && worktree === undefined) {
 				// Lifecycle reviver: park closed the JSONL writer, so reopening takes
 				// the single-writer lock cleanly and restores the full message history
