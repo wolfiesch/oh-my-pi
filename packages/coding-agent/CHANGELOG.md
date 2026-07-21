@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an opt-in evidence-aware packer for large generic tool results that keeps exact source ranges and preserves the full raw output as a recoverable artifact.
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed

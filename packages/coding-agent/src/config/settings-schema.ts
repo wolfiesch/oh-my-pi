@@ -700,6 +700,17 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
+	"tools.evidenceAwarePacking": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			group: "Output Limits",
+			label: "Evidence-aware Output Packing",
+			description:
+				"Experimental: select task-relevant source ranges for large generic tool results while preserving the full output as an artifact",
+		},
+	},
 	"tools.artifactTailBytes": {
 		type: "number",
 		default: 20,

@@ -1,0 +1,12 @@
+{
+	"dedupeExactLines": true,
+	"errorWeight": 1200,
+	"headWeight": 0,
+	"neighborRadius": 0,
+	"neighborWeight": 80,
+	"pathWeight": 180,
+	"queryWeight": 140,
+	"structureWeight": 40,
+	"summaryWeight": 320,
+	"tailWeight": 0
+}

@@ -17,6 +17,7 @@ import { getDefault, type Settings } from "../config/settings";
 import { formatGroupedDiagnosticMessages } from "../lsp/utils";
 import type { Theme } from "../modes/theme/theme";
 import { type OutputSummary, type TruncationResult, truncateMiddle, truncateTail } from "../session/streaming-output";
+import { formatToolArgumentsForPacking, packToolOutput } from "./context-packing";
 import { formatBytes, wrapBrackets } from "./render-utils";
 import { renderError } from "./tool-errors";
 
@@ -24,8 +25,8 @@ import { renderError } from "./tool-errors";
  * Truncation metadata for the output notice.
  */
 export interface TruncationMeta {
-	direction: "head" | "tail" | "middle";
-	truncatedBy: "lines" | "bytes" | "middle";
+	direction: "head" | "tail" | "middle" | "selection";
+	truncatedBy: "lines" | "bytes" | "middle" | "selection";
 	totalLines: number;
 	totalBytes: number;
 	outputLines: number;
@@ -36,6 +37,8 @@ export interface TruncationMeta {
 	/** Head/tail line ranges shown when direction === "middle". */
 	headRange?: { start: number; end: number };
 	tailRange?: { start: number; end: number };
+	/** Exact source ranges retained by evidence-aware selection. */
+	selectedRanges?: { start: number; end: number }[];
 	/** Bytes elided from the middle. */
 	elidedBytes?: number;
 	/** Lines elided from the middle. */
@@ -445,6 +448,14 @@ export function stripGeneratedOutputNotice(text: string): string {
 export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 	let notice: string;
 
+	if (truncation.direction === "selection") {
+		const ranges = truncation.selectedRanges?.length ?? 0;
+		const elidedLines = truncation.elidedLines ?? Math.max(0, truncation.totalLines - truncation.outputLines);
+		notice = `Showing ${ranges} evidence-selected source range${ranges === 1 ? "" : "s"} from ${truncation.totalLines} lines; ${elidedLines.toLocaleString()} source line${elidedLines === 1 ? "" : "s"} elided`;
+		if (truncation.artifactId != null) notice += `. ${formatFullOutputReference(truncation.artifactId)}`;
+		return notice;
+	}
+
 	if (truncation.direction === "middle") {
 		const head = truncation.headRange;
 		const tail = truncation.tailRange;
@@ -612,14 +623,43 @@ function getSpillConfig(s: Settings | undefined) {
 		| "tools.artifactSpillThreshold"
 		| "tools.artifactTailBytes"
 		| "tools.artifactTailLines"
-		| "tools.artifactHeadBytes";
+		| "tools.artifactHeadBytes"
+		| "tools.evidenceAwarePacking";
 	const get = <P extends Path>(path: P) => s?.get(path) ?? getDefault(path);
 	return {
 		threshold: get("tools.artifactSpillThreshold") * 1024,
 		tailBytes: get("tools.artifactTailBytes") * 1024,
 		tailLines: get("tools.artifactTailLines"),
 		headBytes: get("tools.artifactHeadBytes") * 1024,
+		evidenceAwarePacking: get("tools.evidenceAwarePacking"),
 	};
+}
+
+const CONTINUATION_MESSAGE_RE =
+	/^(?:carry on|continue|do it|go ahead|go on|keep going|ok|okay|proceed|sounds good|sure|yeah|yep|yes)[.!?]*$/i;
+
+function isContinuationMessage(text: string): boolean {
+	return CONTINUATION_MESSAGE_RE.test(text.trim());
+}
+
+function latestUserTaskGoal(context: AgentToolContext | undefined): string | undefined {
+	const branch = context?.sessionManager.getBranch();
+	if (!branch) return undefined;
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type !== "message" || entry.message.role !== "user") continue;
+		const { content } = entry.message;
+		const text =
+			typeof content === "string"
+				? content
+				: content
+						.filter((block): block is TextContent => block.type === "text")
+						.map(block => block.text)
+						.join("\n");
+		const trimmed = text.trim();
+		if (trimmed && !isContinuationMessage(trimmed)) return trimmed;
+	}
+	return undefined;
 }
 
 /**
@@ -650,12 +690,13 @@ export function resolveOutputMaxColumns(s: Settings | undefined): number {
 async function spillLargeResultToArtifact(
 	result: AgentToolResult,
 	toolName: string,
+	params: unknown,
 	context: AgentToolContext | undefined,
 ): Promise<AgentToolResult> {
 	const sessionManager = context?.sessionManager;
 	if (!sessionManager) return result;
 	if (toolName === "read") return result;
-	const { threshold, tailBytes, tailLines, headBytes } = getSpillConfig(context?.settings);
+	const { threshold, tailBytes, tailLines, headBytes, evidenceAwarePacking } = getSpillConfig(context?.settings);
 
 	// Skip if tool already saved an artifact
 	const existingMeta: OutputMeta | undefined = result.details?.meta;
@@ -689,6 +730,37 @@ async function spillLargeResultToArtifact(
 			tool: toolName,
 			error: error instanceof Error ? error.message : String(error),
 		});
+	}
+
+	if (evidenceAwarePacking) {
+		const maxBytes = headBytes + tailBytes;
+		const packed = packToolOutput({
+			content: fullText,
+			isError: result.isError === true,
+			maxBytes,
+			taskGoal: latestUserTaskGoal(context) ?? toolName,
+			toolArguments: formatToolArgumentsForPacking(params),
+			toolName,
+		});
+		const newContent: (TextContent | ImageContent)[] = result.content.filter(
+			(block): block is ImageContent => block.type !== "text",
+		);
+		newContent.push({ type: "text", text: packed.content });
+		const truncationMeta: TruncationMeta = {
+			artifactId,
+			direction: "selection",
+			elidedBytes: Math.max(0, packed.totalBytes - packed.selectedSourceBytes),
+			elidedLines: packed.omittedLines,
+			maxBytes,
+			outputBytes: packed.outputBytes,
+			outputLines: packed.content.length === 0 ? 0 : packed.content.split("\n").length,
+			selectedRanges: packed.spans.map(span => ({ start: span.startLine, end: span.endLine })),
+			totalBytes: packed.totalBytes,
+			totalLines: packed.totalLines,
+			truncatedBy: "selection",
+		};
+		const newMeta: OutputMeta = { ...(existingMeta ?? {}), truncation: truncationMeta };
+		return { ...result, content: newContent, details: { ...(result.details ?? {}), meta: newMeta } };
 	}
 
 	// Truncate: middle elision when a head budget is configured, otherwise tail-only.
@@ -780,7 +852,7 @@ async function wrappedExecute(
 		let result = await originalExecute.call(this, toolCallId, params, signal, onUpdate, context);
 
 		// Spill large results to artifact, truncate to tail
-		result = await spillLargeResultToArtifact(result, this.name, context);
+		result = await spillLargeResultToArtifact(result, this.name, params, context);
 
 		// Append notices from meta
 		const meta: OutputMeta | undefined = result.details?.meta;
