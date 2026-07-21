@@ -96,7 +96,12 @@ function createContext(overrides?: {
 	let capturedOptions: AsyncJobRegisterOptions | undefined;
 	const sequence: string[] = [];
 	const register = vi.fn(
-		(_type: "bash" | "task", _label: string, run: CapturedJobRun, options?: AsyncJobRegisterOptions): string => {
+		(
+			_type: "bash" | "task" | "wakeup",
+			_label: string,
+			run: CapturedJobRun,
+			options?: AsyncJobRegisterOptions,
+		): string => {
 			sequence.push("register");
 			capturedRun = run;
 			capturedOptions = options;

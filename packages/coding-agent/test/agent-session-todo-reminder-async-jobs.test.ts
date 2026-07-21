@@ -184,6 +184,19 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
 
+	it("does not defer stop-time work for a passive owned wakeup", async () => {
+		setIncompleteTodos();
+		vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const gate = Promise.withResolvers<string>();
+		gates.push(gate);
+		manager.register("wakeup", "future wakeup", async () => await gate.promise, { ownerId: "Main", passive: true });
+
+		emitTextOnlyStop();
+		await withTimeout(firstReminderPromise, 1000, "todo_reminder never fired with passive wakeup");
+
+		expect(reminderAttempts).toEqual([1]);
+	});
+
 	it("does not defer for a running job owned by a different agent", async () => {
 		setIncompleteTodos();
 		vi.spyOn(session.agent, "continue").mockResolvedValue();

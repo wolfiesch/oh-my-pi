@@ -29,7 +29,7 @@ interface PollEscalationState {
 
 export interface AsyncJob {
 	id: string;
-	type: "bash" | "task";
+	type: "bash" | "task" | "wakeup";
 	status: "running" | "completed" | "failed" | "cancelled";
 	startTime: number;
 	label: string;
@@ -58,10 +58,14 @@ export interface AsyncJob {
 	 * until the caller invokes `markRunning()` from the run context.
 	 */
 	queued?: boolean;
+	/** Wait-only job that remains visible and cancellable without consuming execution capacity or delaying stop-time hooks. */
+	passive?: boolean;
 }
 
+export type AsyncJobCompletionHandler = (jobId: string, text: string, job?: AsyncJob) => void | Promise<void>;
+
 export interface AsyncJobManagerOptions {
-	onJobComplete: (jobId: string, text: string, job?: AsyncJob) => void | Promise<void>;
+	onJobComplete: AsyncJobCompletionHandler;
 	maxRunningJobs?: number;
 	retentionMs?: number;
 }
@@ -74,6 +78,7 @@ interface AsyncJobDelivery {
 	lastError?: string;
 	ownerId?: string;
 	promise?: Promise<void>;
+	onComplete?: AsyncJobCompletionHandler;
 }
 
 export interface AsyncJobDeliveryState {
@@ -90,8 +95,12 @@ export interface AsyncJobRegisterOptions {
 	/** Registry id of the subagent this job runs; see {@link AsyncJob.agentId}. */
 	agentId?: string;
 	onProgress?: (text: string, details?: Record<string, unknown>) => void | Promise<void>;
+	/** Per-job completion sink. Used when delivery must remain bound to the registering session. */
+	onComplete?: AsyncJobCompletionHandler;
 	/** Register the job in queued state; see {@link AsyncJob.queued}. */
 	queued?: boolean;
+	/** Keep the job visible and cancellable without consuming execution capacity or delaying stop-time hooks. */
+	passive?: boolean;
 }
 
 /**
@@ -128,6 +137,7 @@ export class AsyncJobManager {
 	readonly #watchedJobs = new Set<string>();
 	readonly #evictionTimers = new Map<string, NodeJS.Timeout>();
 	readonly #pollEscalation = new Map<string | undefined, PollEscalationState>();
+	readonly #completionHandlers = new Map<string, AsyncJobCompletionHandler>();
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
 	readonly #maxRunningJobs: number;
 	readonly #retentionMs: number;
@@ -153,16 +163,16 @@ export class AsyncJobManager {
 	/** True when the running-job count has reached the configured cap. */
 	get atCapacity(): boolean {
 		if (this.#disposed) return true;
-		// Mirror register(): queued jobs hold no execution slot.
+		// Mirror register(): queued and passive jobs hold no execution slot.
 		let activeCount = 0;
 		for (const job of this.#jobs.values()) {
-			if (job.status === "running" && !job.queued) activeCount++;
+			if (job.status === "running" && !job.queued && !job.passive) activeCount++;
 		}
 		return activeCount >= this.#maxRunningJobs;
 	}
 
 	register(
-		type: "bash" | "task",
+		type: "bash" | "task" | "wakeup",
 		label: string,
 		run: (ctx: {
 			jobId: string;
@@ -176,13 +186,13 @@ export class AsyncJobManager {
 		if (this.#disposed) {
 			throw new Error("Async job manager is disposed");
 		}
-		// Queued jobs hold no execution slot yet — only count jobs that are
-		// actually running so a large parked batch cannot starve registration.
+		// Queued and passive jobs hold no execution slot — only count jobs that
+		// actually execute so parked batches and wait-only timers cannot starve registration.
 		let activeCount = 0;
 		for (const existing of this.#jobs.values()) {
-			if (existing.status === "running" && !existing.queued) activeCount++;
+			if (existing.status === "running" && !existing.queued && !existing.passive) activeCount++;
 		}
-		if (activeCount >= this.#maxRunningJobs) {
+		if (!options?.passive && activeCount >= this.#maxRunningJobs) {
 			throw new Error(
 				`Background job limit reached (${this.#maxRunningJobs}). Wait for running jobs to finish or cancel one.`,
 			);
@@ -192,6 +202,9 @@ export class AsyncJobManager {
 		this.#suppressedDeliveries.delete(id);
 		const abortController = new AbortController();
 		const startTime = Date.now();
+		if (options?.onComplete) {
+			this.#completionHandlers.set(id, options.onComplete);
+		}
 
 		const job: AsyncJob = {
 			id,
@@ -204,6 +217,7 @@ export class AsyncJobManager {
 			ownerId: options?.ownerId,
 			agentId: options?.agentId,
 			queued: options?.queued === true,
+			passive: options?.passive === true,
 		};
 
 		const reportProgress = async (text: string, details?: Record<string, unknown>): Promise<void> => {
@@ -487,6 +501,7 @@ export class AsyncJobManager {
 		this.#deliveries.length = 0;
 		this.#inFlightDeliveries.length = 0;
 		this.#suppressedDeliveries.clear();
+		this.#completionHandlers.clear();
 		this.#watchedJobs.clear();
 		this.#pollEscalation.clear();
 		return jobsSettled && drained;
@@ -522,6 +537,7 @@ export class AsyncJobManager {
 		if (this.#retentionMs <= 0) {
 			this.#jobs.delete(jobId);
 			this.#suppressedDeliveries.delete(jobId);
+			this.#completionHandlers.delete(jobId);
 			this.#watchedJobs.delete(jobId);
 			return;
 		}
@@ -533,6 +549,7 @@ export class AsyncJobManager {
 			this.#evictionTimers.delete(jobId);
 			this.#jobs.delete(jobId);
 			this.#suppressedDeliveries.delete(jobId);
+			this.#completionHandlers.delete(jobId);
 			this.#watchedJobs.delete(jobId);
 		}, this.#retentionMs);
 		timer.unref();
@@ -610,6 +627,7 @@ export class AsyncJobManager {
 			attempt: 0,
 			nextAttemptAt: Date.now(),
 			ownerId: this.#jobs.get(jobId)?.ownerId,
+			onComplete: this.#completionHandlers.get(jobId),
 		});
 		this.#ensureDeliveryLoop();
 	}
@@ -659,7 +677,11 @@ export class AsyncJobManager {
 		const promise = (async () => {
 			this.#inFlightDeliveries.push(delivery);
 			try {
-				await this.#onJobComplete(delivery.jobId, delivery.text, this.#jobs.get(delivery.jobId));
+				await (delivery.onComplete ?? this.#onJobComplete)(
+					delivery.jobId,
+					delivery.text,
+					this.#jobs.get(delivery.jobId),
+				);
 			} catch (error) {
 				delivery.attempt += 1;
 				delivery.lastError = error instanceof Error ? error.message : String(error);

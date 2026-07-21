@@ -4043,9 +4043,15 @@ export class AgentSession {
 	}
 
 	/**
-	 * Cancel async jobs registered by *this* agent only. Used by lifecycle
-	 * transitions (newSession, switchSession, handoff, dispose) so a subagent
-	 * cleans up its own background work without touching its parent's jobs.
+	 * Cancel bash/task async jobs registered by *this* agent only. Used by
+	 * lifecycle transitions (newSession, handoff, branch, branchFromBtw,
+	 * dispose) so a subagent cleans up its own background work without touching
+	 * its parent's jobs. Wakeup timers are deliberately NOT cancelled here:
+	 * replacement transitions suppress their deliveries up front
+	 * (#suppressOwnWakeups) and cancel them only once the replacement commits
+	 * (#cancelOwnWakeups), so a pre-commit failure that leaves the old session
+	 * live can restore them; dispose cancels them via #cancelOwnWakeups before
+	 * reaching this call.
 	 *
 	 * Cancellation runs against this session's scoped manager. Subagents have
 	 * unique agent ids and inherit the parent's manager to clean up their own
@@ -4059,25 +4065,91 @@ export class AgentSession {
 	#cancelOwnAsyncJobs(): void {
 		if (!this.#agentId) return;
 		const manager = this.#asyncJobManager;
-		manager?.cancelAll({ ownerId: this.#agentId });
+		if (!manager) return;
+		const ownerFilter = { ownerId: this.#agentId };
+		for (const job of manager.getRunningJobs(ownerFilter)) {
+			if (job.type === "wakeup") continue;
+			manager.cancel(job.id, ownerFilter);
+		}
+	}
+
+	/** Suppress and cancel session-owned timers synchronously before dispose can await extension hooks. */
+	#cancelOwnWakeups(): void {
+		if (!this.#agentId) return;
+		const manager = this.#asyncJobManager;
+		if (!manager) return;
+		const ownerFilter = { ownerId: this.#agentId };
+		const wakeups = manager.getAllJobs(ownerFilter).filter(job => job.type === "wakeup");
+		manager.acknowledgeDeliveries(wakeups.map(job => job.id));
+		for (const job of wakeups) {
+			if (job.status === "running") manager.cancel(job.id, ownerFilter);
+		}
 	}
 
 	/**
-	 * True when a background async job owned by this agent is still running with
-	 * an unsuppressed delivery, or a finished job's delivery is still queued or
+	 * Suppress delivery of this session's pending wakeups without cancelling
+	 * their timers. Called the moment a replacement transition begins — before
+	 * the transition awaits pre-switch hooks or teardown work (abort, flush,
+	 * handoff generation) — so a wakeup expiring inside that window cannot
+	 * enqueue a follow-up turn into the session being replaced.
+	 *
+	 * Snapshots only wakeups whose suppression this transition newly owns and
+	 * that can still deliver: a wakeup already suppressed (acknowledged, or
+	 * watched by an in-flight `hub` wait) belongs to that suppressor, and a
+	 * finished wakeup whose delivery already drained must not be re-enqueued —
+	 * including either in the returned ids would let #restoreOwnWakeups lift
+	 * foreign suppression or duplicate a delivery. Returns the suppressed job
+	 * ids so a vetoed or failed transition can hand them to #restoreOwnWakeups;
+	 * a committed transition finalizes via #cancelOwnWakeups instead.
+	 */
+	#suppressOwnWakeups(): string[] {
+		if (!this.#agentId) return [];
+		const manager = this.#asyncJobManager;
+		if (!manager) return [];
+		const ownerFilter = { ownerId: this.#agentId };
+		const pendingDeliveryIds = new Set(manager.getDeliveryState(ownerFilter).pendingJobIds);
+		const wakeupIds = manager
+			.getAllJobs(ownerFilter)
+			.filter(
+				job =>
+					job.type === "wakeup" &&
+					!manager.isDeliverySuppressed(job.id) &&
+					(job.status === "running" || pendingDeliveryIds.has(job.id)),
+			)
+			.map(job => job.id);
+		if (wakeupIds.length > 0) manager.acknowledgeDeliveries(wakeupIds);
+		return wakeupIds;
+	}
+
+	/**
+	 * Undo #suppressOwnWakeups when a replacement transition is vetoed by a
+	 * pre-switch hook or fails before its cancellation point: lifts the
+	 * suppression and re-enqueues any wakeup that completed while suppressed,
+	 * so the surviving session still receives it exactly once. Harmless after
+	 * cancellation — cancelled jobs never enqueue a delivery.
+	 */
+	#restoreOwnWakeups(jobIds: string[]): void {
+		if (jobIds.length === 0) return;
+		this.#asyncJobManager?.resumeDeliveries(jobIds);
+	}
+
+	/**
+	 * True when a non-passive background async job owned by this agent is still
+	 * running with an unsuppressed delivery, or a finished job's delivery is still queued or
 	 * in flight. Either way the async-result follow-up will re-wake the loop, so
 	 * a settle observed now is a scheduling pause rather than a terminal stop:
 	 * stop-time passes (todo reminder, session_stop hooks) defer to the settle
 	 * reached once the session is fully idle. Suppressed deliveries
 	 * (acknowledged, or watched by an in-flight `hub` wait) never wake the loop,
-	 * so they don't count.
+	 * so they don't count. Passive wait-only jobs also do not count until they
+	 * finish and enqueue a delivery.
 	 */
 	#hasPendingAsyncWake(): boolean {
 		const manager = this.#asyncJobManager;
 		if (!manager) return false;
 		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
 		return (
-			manager.getRunningJobs(ownerFilter).some(job => !manager.isDeliverySuppressed(job.id)) ||
+			manager.getRunningJobs(ownerFilter).some(job => !job.passive && !manager.isDeliverySuppressed(job.id)) ||
 			manager.hasPendingDeliveries(ownerFilter)
 		);
 	}
@@ -6773,6 +6845,7 @@ export class AgentSession {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		this.#cancelOwnWakeups();
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
 		this.#flushPendingIrcAsides();
@@ -9943,52 +10016,67 @@ export class AgentSession {
 	async newSession(options?: NewSessionOptions): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
 
-		// Emit session_before_switch event with reason "new" (can be cancelled)
-		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
-			const result = (await this.#extensionRunner.emit({
-				type: "session_before_switch",
-				reason: "new",
-			})) as SessionBeforeSwitchResult | undefined;
-
-			if (result?.cancel) {
-				return false;
-			}
-		}
-
-		this.#disconnectFromAgent();
-		await this.abort();
-		this.#cancelOwnAsyncJobs();
-		this.#closeAllProviderSessions("new session");
-		await this.#flushPendingBashMessages();
-		const bashTransition = this.#beginBashSessionTransition({ persistDetached: options?.drop !== true });
+		// Suppress this session's wakeup deliveries before any await below: a
+		// wakeup expiring during the hook or the pre-commit awaits must not
+		// start a turn in the session being replaced. Restored on hook veto or
+		// any pre-commit failure; cancelled for good only once the session
+		// manager has actually switched to the new session.
+		const suppressedWakeupIds = this.#suppressOwnWakeups();
 		let sessionTransitioned = false;
 		try {
-			this.agent.reset();
-			if (options?.drop && previousSessionFile) {
-				// Detach the advisor recorder feed and drain its writer BEFORE deleting the
-				// old artifacts dir: `await this.abort()` only stops the primary, so a still-
-				// running advisor turn could otherwise finish, emit `message_end`, and recreate
-				// `<old>/__advisor.jsonl`. #resetAdvisorSessionState (after newSession) re-primes
-				// the advisor and re-attaches the feed at the new session's path.
-				for (const a of this.#advisors) {
-					a.agentUnsubscribe?.();
-					a.agentUnsubscribe = undefined;
-					await a.recorder.close();
+			// Emit session_before_switch event with reason "new" (can be cancelled)
+			if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
+				const result = (await this.#extensionRunner.emit({
+					type: "session_before_switch",
+					reason: "new",
+				})) as SessionBeforeSwitchResult | undefined;
+
+				if (result?.cancel) {
+					return false;
 				}
-				try {
-					await this.sessionManager.dropSession(previousSessionFile);
-				} catch (err) {
-					logger.error("Failed to delete session during /drop", { err });
-				}
-			} else {
-				await this.sessionManager.flush();
 			}
-			await this.sessionManager.newSession(options);
-			this.#markBashSessionTransition(bashTransition);
-			sessionTransitioned = true;
+
+			this.#disconnectFromAgent();
+			await this.abort();
+			this.#cancelOwnAsyncJobs();
+			this.#closeAllProviderSessions("new session");
+			await this.#flushPendingBashMessages();
+			const bashTransition = this.#beginBashSessionTransition({ persistDetached: options?.drop !== true });
+			try {
+				this.agent.reset();
+				if (options?.drop && previousSessionFile) {
+					// Detach the advisor recorder feed and drain its writer BEFORE deleting the
+					// old artifacts dir: `await this.abort()` only stops the primary, so a still-
+					// running advisor turn could otherwise finish, emit `message_end`, and recreate
+					// `<old>/__advisor.jsonl`. #resetAdvisorSessionState (after newSession) re-primes
+					// the advisor and re-attaches the feed at the new session's path.
+					for (const a of this.#advisors) {
+						a.agentUnsubscribe?.();
+						a.agentUnsubscribe = undefined;
+						await a.recorder.close();
+					}
+					try {
+						await this.sessionManager.dropSession(previousSessionFile);
+					} catch (err) {
+						logger.error("Failed to delete session during /drop", { err });
+					}
+				} else {
+					await this.sessionManager.flush();
+				}
+				await this.sessionManager.newSession(options);
+				this.#markBashSessionTransition(bashTransition);
+				sessionTransitioned = true;
+			} finally {
+				this.#finishBashSessionTransition(bashTransition, sessionTransitioned);
+			}
 		} finally {
-			this.#finishBashSessionTransition(bashTransition, sessionTransitioned);
+			// A veto or any pre-commit failure leaves the old session live, so
+			// its suppressed wakeups must deliver again.
+			if (!sessionTransitioned) this.#restoreOwnWakeups(suppressedWakeupIds);
 		}
+		// Committed: the old conversation is gone, so its pending wakeup timers
+		// are cancelled for good.
+		this.#cancelOwnWakeups();
 
 		this.#clearCheckpointRuntimeState();
 		this.setTodoPhases([]);
@@ -11363,6 +11451,14 @@ export class AgentSession {
 			}
 		}
 
+		// Suppress this session's wakeup deliveries before the first await: a
+		// wakeup expiring during handoff generation, the pre-switch hook, or the
+		// flushes must not start a turn in the session about to be reset. Every
+		// non-transition exit (empty handoff, hook veto, abort, failure) restores
+		// them in the finally below; a committed handoff cancels them instead.
+		const suppressedWakeupIds = this.#suppressOwnWakeups();
+		let handoffSessionTransitioned = false;
+
 		try {
 			if (handoffSignal.aborted) {
 				throw new Error("Handoff cancelled");
@@ -11472,6 +11568,10 @@ export class AgentSession {
 			} finally {
 				this.#finishBashSessionTransition(bashTransition, sessionTransitioned);
 			}
+			// Committed: the old conversation is gone, so its pending wakeup
+			// timers are cancelled for good.
+			handoffSessionTransitioned = true;
+			this.#cancelOwnWakeups();
 
 			this.#clearCheckpointRuntimeState();
 			// agent.reset() clears the core steering/follow-up queues. Preserve any queued
@@ -11540,6 +11640,9 @@ export class AgentSession {
 			}
 			throw error;
 		} finally {
+			// A veto, empty handoff, abort, or pre-commit failure leaves the old
+			// session live, so its suppressed wakeups must deliver again.
+			if (!handoffSessionTransitioned) this.#restoreOwnWakeups(suppressedWakeupIds);
 			sourceSignal?.removeEventListener("abort", onSourceAbort);
 			this.#handoffAbortController = undefined;
 		}
@@ -16583,25 +16686,37 @@ export class AgentSession {
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
 			: true;
+		// Suppress this session's wakeup deliveries before the hook/abort/flush
+		// awaits below: a wakeup expiring inside that window must not start a
+		// turn in the conversation being replaced. Same-session reloads are not a
+		// replacement, so their wakeups keep delivering. Restored on hook veto or
+		// rollback; cancelled once the switch succeeds.
+		const suppressedWakeupIds = switchingToDifferentSession ? this.#suppressOwnWakeups() : [];
 		// Emit session_before_switch event (can be cancelled)
-		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
-			const result = (await this.#extensionRunner.emit({
-				type: "session_before_switch",
-				reason: "resume",
-				targetSessionFile: sessionPath,
-			})) as SessionBeforeSwitchResult | undefined;
+		try {
+			if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
+				const result = (await this.#extensionRunner.emit({
+					type: "session_before_switch",
+					reason: "resume",
+					targetSessionFile: sessionPath,
+				})) as SessionBeforeSwitchResult | undefined;
 
-			if (result?.cancel) {
-				return false;
+				if (result?.cancel) {
+					this.#restoreOwnWakeups(suppressedWakeupIds);
+					return false;
+				}
 			}
+
+			this.#disconnectFromAgent();
+			await this.abort({ goalReason: "internal" });
+
+			await this.#flushPendingBashMessages();
+			// Flush pending writes before switching so restore snapshots reflect committed state.
+			await this.sessionManager.flush();
+		} catch (error) {
+			this.#restoreOwnWakeups(suppressedWakeupIds);
+			throw error;
 		}
-
-		this.#disconnectFromAgent();
-		await this.abort({ goalReason: "internal" });
-
-		await this.#flushPendingBashMessages();
-		// Flush pending writes before switching so restore snapshots reflect committed state.
-		await this.sessionManager.flush();
 		const previousSessionState = this.sessionManager.captureState();
 		const bashTransition = this.#beginBashSessionTransition();
 		// Only same-session reloads compare against the prior context to detect
@@ -16782,6 +16897,10 @@ export class AgentSession {
 					error: String(error),
 				});
 			}
+			// Committed: the old conversation is gone, so its pending wakeup
+			// timers are cancelled for good (delivery was already suppressed
+			// before the pre-switch awaits).
+			if (switchingToDifferentSession) this.#cancelOwnWakeups();
 			this.#finishBashSessionTransition(bashTransition, true);
 			return true;
 		} catch (error) {
@@ -16814,6 +16933,7 @@ export class AgentSession {
 			this.#syncTodoPhasesFromBranch();
 			this.#resetAllAdvisorRuntimes();
 			this.#reconnectToAgent();
+			this.#restoreOwnWakeups(suppressedWakeupIds);
 			this.#finishBashSessionTransition(bashTransition, false);
 			throw error;
 		}
@@ -16843,43 +16963,59 @@ export class AgentSession {
 
 		let skipConversationRestore = false;
 
-		// Emit session_before_branch event (can be cancelled)
-		if (this.#extensionRunner?.hasHandlers("session_before_branch")) {
-			const result = (await this.#extensionRunner.emit({
-				type: "session_before_branch",
-				entryId,
-			})) as SessionBeforeBranchResult | undefined;
-
-			if (result?.cancel) {
-				return { selectedText, cancelled: true };
-			}
-			skipConversationRestore = result?.skipConversationRestore ?? false;
-		}
-
-		// Clear pending messages (bound to old session state)
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
-
-		await this.#flushPendingBashMessages();
-		// Flush pending writes before branching
-		await this.sessionManager.flush();
-		const bashTransition = this.#beginBashSessionTransition();
-		this.#cancelOwnAsyncJobs();
-		this.#abortAutolearnCapture();
-		await this.#drainAutolearnCapture();
-
+		// Suppress this session's wakeup deliveries before the hook/flush awaits
+		// below: a wakeup expiring inside that window must not start a turn in
+		// the conversation being replaced. Restored on hook veto or any
+		// pre-commit failure; cancelled for good only once the branched session
+		// is in place.
+		const suppressedWakeupIds = this.#suppressOwnWakeups();
 		let sessionTransitioned = false;
+
 		try {
-			if (!selectedEntry.parentId) {
-				await this.sessionManager.newSession({ parentSession: previousSessionFile });
-			} else {
-				this.sessionManager.createBranchedSession(selectedEntry.parentId);
+			// Emit session_before_branch event (can be cancelled)
+			if (this.#extensionRunner?.hasHandlers("session_before_branch")) {
+				const result = (await this.#extensionRunner.emit({
+					type: "session_before_branch",
+					entryId,
+				})) as SessionBeforeBranchResult | undefined;
+
+				if (result?.cancel) {
+					return { selectedText, cancelled: true };
+				}
+				skipConversationRestore = result?.skipConversationRestore ?? false;
 			}
-			this.#markBashSessionTransition(bashTransition);
-			sessionTransitioned = true;
+
+			// Clear pending messages (bound to old session state)
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
+
+			await this.#flushPendingBashMessages();
+			// Flush pending writes before branching
+			await this.sessionManager.flush();
+			const bashTransition = this.#beginBashSessionTransition();
+			this.#cancelOwnAsyncJobs();
+			this.#abortAutolearnCapture();
+			await this.#drainAutolearnCapture();
+
+			try {
+				if (!selectedEntry.parentId) {
+					await this.sessionManager.newSession({ parentSession: previousSessionFile });
+				} else {
+					this.sessionManager.createBranchedSession(selectedEntry.parentId);
+				}
+				this.#markBashSessionTransition(bashTransition);
+				sessionTransitioned = true;
+			} finally {
+				this.#finishBashSessionTransition(bashTransition, sessionTransitioned);
+			}
 		} finally {
-			this.#finishBashSessionTransition(bashTransition, sessionTransitioned);
+			// A veto or any pre-commit failure leaves the old session live, so
+			// its suppressed wakeups must deliver again.
+			if (!sessionTransitioned) this.#restoreOwnWakeups(suppressedWakeupIds);
 		}
+		// Committed: the old conversation is gone, so its pending wakeup timers
+		// are cancelled for good.
+		this.#cancelOwnWakeups();
 		this.#rehydrateCheckpointRewindState();
 		this.#syncTodoPhasesFromBranch();
 		this.#freshProviderSessionId = undefined;
@@ -16933,50 +17069,66 @@ export class AgentSession {
 			throw new Error("Cannot branch /btw while session maintenance or user work is still running");
 		}
 
-		if (this.#extensionRunner?.hasHandlers("session_before_branch")) {
-			const result = (await this.#extensionRunner.emit({
-				type: "session_before_branch",
-				entryId: leafId,
-			})) as SessionBeforeBranchResult | undefined;
-
-			if (result?.cancel) {
-				return { cancelled: true, sessionFile: previousSessionFile };
-			}
-		}
-
-		await this.#cancelPostPromptTasks();
-		if (
-			this.isBashRunning ||
-			this.isEvalRunning ||
-			this.isCompacting ||
-			this.isGeneratingHandoff ||
-			this.isRetrying
-		) {
-			throw new Error("Cannot branch /btw while session maintenance or user work is still running");
-		}
-
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
-		this.agent.replaceQueues([], []);
-		if (this.isStreaming) {
-			await this.abort({ goalReason: "internal", reason: "branching /btw" });
-			this.agent.replaceQueues([], []);
-		}
-		await this.#flushPendingBashMessages();
-		await this.sessionManager.flush();
-		const bashTransition = this.#beginBashSessionTransition();
-		this.#cancelOwnAsyncJobs();
-		this.#abortAutolearnCapture();
-		await this.#drainAutolearnCapture();
-
+		// Suppress this session's wakeup deliveries before the hook/abort/flush
+		// awaits below: a wakeup expiring inside that window must not start a
+		// turn in the conversation being replaced. Restored on hook veto or any
+		// pre-commit failure; cancelled for good only once the branched session
+		// is in place.
+		const suppressedWakeupIds = this.#suppressOwnWakeups();
 		let sessionTransitioned = false;
+
 		try {
-			this.sessionManager.createBranchedSession(leafId);
-			this.#markBashSessionTransition(bashTransition);
-			sessionTransitioned = true;
+			if (this.#extensionRunner?.hasHandlers("session_before_branch")) {
+				const result = (await this.#extensionRunner.emit({
+					type: "session_before_branch",
+					entryId: leafId,
+				})) as SessionBeforeBranchResult | undefined;
+
+				if (result?.cancel) {
+					return { cancelled: true, sessionFile: previousSessionFile };
+				}
+			}
+
+			await this.#cancelPostPromptTasks();
+			if (
+				this.isBashRunning ||
+				this.isEvalRunning ||
+				this.isCompacting ||
+				this.isGeneratingHandoff ||
+				this.isRetrying
+			) {
+				throw new Error("Cannot branch /btw while session maintenance or user work is still running");
+			}
+
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
+			this.agent.replaceQueues([], []);
+			if (this.isStreaming) {
+				await this.abort({ goalReason: "internal", reason: "branching /btw" });
+				this.agent.replaceQueues([], []);
+			}
+			await this.#flushPendingBashMessages();
+			await this.sessionManager.flush();
+			const bashTransition = this.#beginBashSessionTransition();
+			this.#cancelOwnAsyncJobs();
+			this.#abortAutolearnCapture();
+			await this.#drainAutolearnCapture();
+
+			try {
+				this.sessionManager.createBranchedSession(leafId);
+				this.#markBashSessionTransition(bashTransition);
+				sessionTransitioned = true;
+			} finally {
+				this.#finishBashSessionTransition(bashTransition, sessionTransitioned);
+			}
 		} finally {
-			this.#finishBashSessionTransition(bashTransition, sessionTransitioned);
+			// A veto or any pre-commit failure leaves the old session live, so
+			// its suppressed wakeups must deliver again.
+			if (!sessionTransitioned) this.#restoreOwnWakeups(suppressedWakeupIds);
 		}
+		// Committed: the old conversation is gone, so its pending wakeup timers
+		// are cancelled for good.
+		this.#cancelOwnWakeups();
 
 		this.#rehydrateCheckpointRewindState();
 		this.sessionManager.appendMessage({

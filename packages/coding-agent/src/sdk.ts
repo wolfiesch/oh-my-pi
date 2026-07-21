@@ -210,7 +210,7 @@ type AsyncResultEntry = {
 
 type AsyncResultJobDetails = {
 	jobId: string;
-	type?: "bash" | "task";
+	type?: "bash" | "task" | "wakeup";
 	label?: string;
 	durationMs?: number;
 };
@@ -1584,6 +1584,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		return preview;
 	};
+	const deliverAsyncResult = async (
+		targetSession: AgentSession,
+		jobId: string,
+		result: string,
+		job?: AsyncJob,
+	): Promise<void> => {
+		if (targetSession.isDisposed || AsyncJobManager.instance()?.isDeliverySuppressed(jobId)) return;
+		const formattedResult = await formatAsyncResultForFollowUp(result);
+		if (targetSession.isDisposed || AsyncJobManager.instance()?.isDeliverySuppressed(jobId)) return;
+
+		const durationMs = job ? Math.max(0, Date.now() - job.startTime) : undefined;
+		targetSession.yieldQueue.enqueue<AsyncResultEntry>("async-result", {
+			jobId,
+			result: formattedResult,
+			job,
+			durationMs,
+		});
+	};
 	// Only the first top-level session in a process owns an AsyncJobManager.
 	// Subagents inherit the parent's manager via `AsyncJobManager.instance()`
 	// (set below), and any additional top-level session spun up in-process
@@ -1592,29 +1610,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// owning session's manager and break the `task`/`bash` async paths
 	// (issue #1923). The `instance()` guard means later sessions also skip
 	// constructing an orphaned manager that nothing would ever route to.
+	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const asyncJobManager =
 		!options.parentTaskPrefix && !AsyncJobManager.instance()
 			? new AsyncJobManager({
 					maxRunningJobs: asyncMaxJobs,
 					onJobComplete: async (jobId, result, job) => {
 						if (!session || asyncJobManager!.isDeliverySuppressed(jobId)) return;
-						const formattedResult = await formatAsyncResultForFollowUp(result);
-						if (asyncJobManager!.isDeliverySuppressed(jobId)) return;
-
-						const durationMs = job ? Math.max(0, Date.now() - job.startTime) : undefined;
-						session.yieldQueue.enqueue<AsyncResultEntry>("async-result", {
-							jobId,
-							result: formattedResult,
-							job,
-							durationMs,
-						});
+						const targetSession =
+							job?.type === "wakeup" && job.ownerId ? agentRegistry.get(job.ownerId)?.session : session;
+						if (!targetSession) return;
+						await deliverAsyncResult(targetSession, jobId, result, job);
 					},
 				})
 			: undefined;
 
 	const scopedAsyncJobManager = asyncJobManager ?? (options.parentTaskPrefix ? AsyncJobManager.instance() : undefined);
 
-	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
 	const resolvedAgentDisplayName =
 		options.agentDisplayName ?? ((options.taskDepth ?? 0) > 0 || options.parentTaskPrefix ? "sub" : "main");
@@ -1690,6 +1702,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
 			getAgentId: () => resolvedAgentId,
+			deliverAsyncResult: (jobId, result, job) => deliverAsyncResult(session, jobId, result, job),
 			getToolByName: name => session?.getToolByName(name),
 			agentRegistry,
 			getSessionSpawns: () => options.spawns ?? "*",
@@ -2988,9 +3001,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			titleSystemPrompt: options.titleSystemPrompt,
 		});
 		hasSession = true;
-		if (asyncJobManager) {
+		if (scopedAsyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {
-				isStale: entry => asyncJobManager.isDeliverySuppressed(entry.jobId),
+				isStale: entry => scopedAsyncJobManager.isDeliverySuppressed(entry.jobId),
 				build: buildAsyncResultBatchMessage,
 			});
 		}

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added model-callable, session-owned one-shot wakeups with automatic follow-up delivery and `hub` inspection or cancellation ([#5838](https://github.com/can1357/oh-my-pi/pull/5838) by [@wolfiesch](https://github.com/wolfiesch)).
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed

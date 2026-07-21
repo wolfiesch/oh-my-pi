@@ -16,7 +16,7 @@ type AsyncEntry = {
 type AsyncDetails = {
 	jobs: Array<{
 		jobId: string;
-		type?: "bash" | "task";
+		type?: "bash" | "task" | "wakeup";
 		label?: string;
 		durationMs?: number;
 	}>;

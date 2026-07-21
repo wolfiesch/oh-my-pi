@@ -42,7 +42,7 @@ export interface HubPeerInfo {
 /** Background-job row surfaced by `wait`/`cancel`/`jobs` results. */
 export interface JobSnapshot {
 	id: string;
-	type: "bash" | "task";
+	type: "bash" | "task" | "wakeup";
 	status: "running" | "completed" | "failed" | "cancelled";
 	label: string;
 	durationMs: number;

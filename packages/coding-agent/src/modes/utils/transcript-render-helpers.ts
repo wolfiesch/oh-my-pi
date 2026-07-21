@@ -31,10 +31,10 @@ export function buildAsyncResultBlock(message: CustomOrHookMessage): TranscriptB
 	const details = (
 		message as CustomMessage<{
 			jobId?: string;
-			type?: "bash" | "task";
+			type?: "bash" | "task" | "wakeup";
 			label?: string;
 			durationMs?: number;
-			jobs?: Array<{ jobId?: string; type?: "bash" | "task"; label?: string; durationMs?: number }>;
+			jobs?: Array<{ jobId?: string; type?: "bash" | "task" | "wakeup"; label?: string; durationMs?: number }>;
 		}>
 	).details;
 	const jobs =
