@@ -1759,6 +1759,7 @@ class LspFileSystem implements FileSystem {
 				this.session.cwd,
 				[{ filePath: path, type: FileChangeType.Deleted }],
 				this.signal,
+				this.session,
 			);
 		}
 	}
@@ -1881,11 +1882,11 @@ export async function executePatchSingle(
 	}
 
 	if (resolvedRename) {
-		invalidateFsScanAfterRename(resolvedPath, resolvedRename);
+		invalidateFsScanAfterRename(resolvedPath, resolvedRename, session);
 	} else if (result.change.type === "delete") {
-		invalidateFsScanAfterDelete(resolvedPath);
+		invalidateFsScanAfterDelete(resolvedPath, session);
 	} else {
-		invalidateFsScanAfterWrite(resolvedPath);
+		invalidateFsScanAfterWrite(resolvedPath, session);
 	}
 	const effectiveRename = result.change.newPath ? rename : undefined;
 

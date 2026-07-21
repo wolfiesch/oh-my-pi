@@ -106,6 +106,37 @@ describe("search tools with external URL paths", () => {
 		expect(loadPage).toHaveBeenCalledTimes(2);
 	});
 
+	it("does not reuse stale grouped results for URL pagination", async () => {
+		let body = "first needle\n";
+		const loadPage = vi.spyOn(scrapers, "loadPage").mockImplementation(async requestedUrl => ({
+			ok: true,
+			status: 200,
+			finalUrl: requestedUrl,
+			contentType: "text/plain",
+			content: body,
+		}));
+		await Bun.write(path.join(testDir, "local.txt"), "local needle\n");
+		const tools = await createTools(createSession(testDir));
+		const tool = tools.find(entry => entry.name === "grep");
+		expect(tool).toBeDefined();
+		const pathScope = "local.txt; https://example.com/live.txt";
+
+		await tool!.execute("search-url-page-1", {
+			pattern: "first|second|local",
+			path: pathScope,
+		});
+		body = "second needle\n";
+		const second = await tool!.execute("search-url-page-2", {
+			pattern: "first|second|local",
+			path: pathScope,
+			skip: 1,
+		});
+
+		expect(resultText(second)).toContain("second needle");
+		expect(resultText(second)).not.toContain("first needle");
+		expect(loadPage).toHaveBeenCalledTimes(2);
+	});
+
 	it("search applies URL line-range selectors after materialization", async () => {
 		stubLoadPage("outside before\nremote needle\noutside after\n", "text/plain");
 		const tools = await createTools(createSession(testDir));

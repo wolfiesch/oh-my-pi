@@ -14,6 +14,7 @@ import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import { truncateForPrompt } from "../tools/approval";
 import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
+import { clearSearchResultCache, type SearchResultCacheOwner } from "../tools/search-result-cache";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
 import {
@@ -25,6 +26,7 @@ import {
 	notifySaved,
 	notifyWorkspaceWatchedFiles,
 	refreshFile,
+	registerSearchCacheOwner,
 	sendNotification,
 	sendRequest,
 	setIdleTimeout,
@@ -211,6 +213,7 @@ async function syncFileContent(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
+	owner?: SearchResultCacheOwner,
 ): Promise<void> {
 	throwIfAborted(signal);
 	await Promise.allSettled(
@@ -220,6 +223,7 @@ async function syncFileContent(
 				return;
 			}
 			const client = await getOrCreateClient(serverConfig, cwd, undefined, signal);
+			if (owner) registerSearchCacheOwner(client, owner);
 			throwIfAborted(signal);
 			await syncContent(client, absolutePath, content, signal);
 		}),
@@ -239,6 +243,7 @@ async function notifyFileSaved(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
+	owner?: SearchResultCacheOwner,
 ): Promise<void> {
 	throwIfAborted(signal);
 	await Promise.allSettled(
@@ -248,6 +253,7 @@ async function notifyFileSaved(
 				return;
 			}
 			const client = await getOrCreateClient(serverConfig, cwd, undefined, signal);
+			if (owner) registerSearchCacheOwner(client, owner);
 			await notifySaved(client, absolutePath, signal);
 		}),
 	);
@@ -1042,6 +1048,14 @@ export interface WritethroughOptions {
 	deferredSignal?: AbortSignal;
 	/** Transform diagnostics before surfacing them after a successful fetch. */
 	transformDiagnostics?: (absPath: string, result: FileDiagnosticsResult) => FileDiagnosticsResult;
+	/**
+	 * Session-scoped search cache to register on every LSP client the
+	 * writethrough touches, so later server-initiated workspace edits can
+	 * invalidate it. Accepts a WeakRef directly so callers (and tests) can
+	 * share an existing ref; held weakly throughout — a pending batch in the
+	 * process-global batch map must never extend a session's lifetime.
+	 */
+	owner?: SearchResultCacheOwner | WeakRef<SearchResultCacheOwner>;
 }
 
 /** Internal resolved form of {@link WritethroughOptions} that the writethrough machinery operates on. */
@@ -1049,6 +1063,7 @@ type ResolvedWritethroughOptions = {
 	enableFormat: boolean;
 	enableDiagnostics: boolean;
 	transformDiagnostics?: (absPath: string, result: FileDiagnosticsResult) => FileDiagnosticsResult;
+	owner?: WeakRef<SearchResultCacheOwner>;
 };
 
 /** Per-file deferred LSP diagnostics wiring for {@link WritethroughCallback}. */
@@ -1110,6 +1125,9 @@ function getOrCreateWritethroughBatch(id: string, options: ResolvedWritethroughO
 		existing.options.enableFormat ||= options.enableFormat;
 		existing.options.enableDiagnostics ||= options.enableDiagnostics;
 		existing.options.transformDiagnostics ??= options.transformDiagnostics;
+		// Prefer a LIVE owner: a dead ref left by a collected session must not
+		// shadow the session that is actually continuing this batch.
+		if (!existing.options.owner?.deref()) existing.options.owner = options.owner;
 		return existing;
 	}
 	const batch: LspWritethroughBatchState = {
@@ -1292,6 +1310,10 @@ async function runLspWritethrough(
 	},
 ): Promise<FileDiagnosticsResult | undefined> {
 	const { enableFormat, enableDiagnostics } = options;
+	// Deref once per write: the batch map holds the owner weakly, so a
+	// collected session simply skips registration without changing write or
+	// diagnostic behavior.
+	const owner = options.owner?.deref();
 
 	let finalContent = content;
 	const writeContent = async (value: string) => (file ? file.write(value) : Bun.write(dst, value));
@@ -1301,7 +1323,7 @@ async function runLspWritethrough(
 		if (writeNotified) return;
 		writeNotified = true;
 		try {
-			await notifyWorkspaceWatchedFiles(cwd, [{ filePath: dst, type: changeType }], notifySignal);
+			await notifyWorkspaceWatchedFiles(cwd, [{ filePath: dst, type: changeType }], notifySignal, owner);
 		} catch (error) {
 			if (notifySignal?.aborted && !signal?.aborted) {
 				// The operation budget died mid-notify while the caller is still
@@ -1359,10 +1381,10 @@ async function runLspWritethrough(
 				formatter = finalContent !== content ? FileFormatResult.FORMATTED : FileFormatResult.UNCHANGED;
 				await writeContent(finalContent);
 				await notifyWriteCommitted(operationSignal);
-				await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal);
+				await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal, owner);
 			} else {
 				// 1. Sync original content to LSP servers
-				await syncFileContent(dst, content, cwd, lspServers, operationSignal);
+				await syncFileContent(dst, content, cwd, lspServers, operationSignal, owner);
 
 				// 2. Format in-memory via LSP
 				if (enableFormat) {
@@ -1372,7 +1394,7 @@ async function runLspWritethrough(
 
 				// 3. If formatted, sync formatted content to LSP servers
 				if (finalContent !== content) {
-					await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal);
+					await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal, owner);
 				}
 
 				// 4. Write to disk
@@ -1385,7 +1407,7 @@ async function runLspWritethrough(
 			}
 
 			// 5. Notify saved to LSP servers
-			await notifyFileSaved(dst, cwd, lspServers, operationSignal);
+			await notifyFileSaved(dst, cwd, lspServers, operationSignal, owner);
 		});
 		synced = true;
 	} catch {
@@ -1475,10 +1497,14 @@ async function flushWritethroughBatch(
 
 /** Create a writethrough callback for LSP aware write operations */
 export function createLspWritethrough(cwd: string, options?: WritethroughOptions): WritethroughCallback {
+	const owner = options?.owner;
 	const resolvedOptions: ResolvedWritethroughOptions = {
 		enableFormat: options?.enableFormat ?? false,
 		enableDiagnostics: options?.enableDiagnostics ?? false,
 		transformDiagnostics: options?.transformDiagnostics,
+		// Hold weakly from here on: pending batches live in a process-global map
+		// and must never pin a session.
+		owner: owner === undefined ? undefined : owner instanceof WeakRef ? owner : new WeakRef(owner),
 	};
 	return async (
 		dst: string,
@@ -1997,6 +2023,10 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				}
 			}
 
+			// Invalidate before the first mutation: a failure after any import
+			// rewrite (or between the rewrites and the on-disk rename) must not
+			// leave stale cached search pages behind.
+			clearSearchResultCache(this.session);
 			for (const [uri, bucket] of acceptedByUri) {
 				const filePath = uriToFile(uri);
 				await applyTextEdits(filePath, bucket.edits);
@@ -2346,6 +2376,10 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 		try {
 			const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
+			// Server-initiated workspace/applyEdit (e.g. triggered by
+			// workspace/executeCommand below) must invalidate this session's
+			// cached search pages too.
+			registerSearchCacheOwner(client, this.session);
 			const targetFile = resolvedFile;
 			const isRustAnalyzerServer =
 				serverName === "rust-analyzer" ||
@@ -2589,7 +2623,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						const appliedAction = await applyCodeAction(selectedAction, {
 							resolveCodeAction: async actionItem =>
 								(await sendRequest(client, "codeAction/resolve", actionItem, signal)) as CodeAction,
-							applyWorkspaceEdit: async edit => applyWorkspaceEdit(edit, this.session.cwd),
+							applyWorkspaceEdit: async edit => applyWorkspaceEdit(edit, this.session.cwd, this.session),
 							executeCommand: async commandItem => {
 								await sendRequest(
 									client,
@@ -2685,7 +2719,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					} else {
 						const shouldApply = apply !== false;
 						if (shouldApply) {
-							const applied = await applyWorkspaceEdit(result, this.session.cwd);
+							const applied = await applyWorkspaceEdit(result, this.session.cwd, this.session);
 							output = `Applied rename:\n${applied.map(a => `  ${a}`).join("\n")}`;
 						} else {
 							const preview = formatWorkspaceEdit(result, this.session.cwd);

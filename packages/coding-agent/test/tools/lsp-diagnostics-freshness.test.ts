@@ -133,6 +133,8 @@ describe("LSP diagnostics freshness", () => {
 			tempDir.path(),
 			[{ filePath, type: lspClient.FileChangeType.Created }],
 			undefined,
+			// No owner: this writethrough was created without a session-scoped cache.
+			undefined,
 		);
 	});
 
@@ -156,6 +158,8 @@ describe("LSP diagnostics freshness", () => {
 		expect(notify).toHaveBeenCalledWith(
 			tempDir.path(),
 			[{ filePath, type: lspClient.FileChangeType.Created }],
+			undefined,
+			// No owner: this writethrough was created without a session-scoped cache.
 			undefined,
 		);
 		expect(loadConfig).not.toHaveBeenCalled();

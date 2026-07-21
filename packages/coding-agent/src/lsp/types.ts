@@ -1,5 +1,6 @@
 import type { ptree } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
+import type { SearchResultCacheOwner } from "../tools/search-result-cache";
 import { TOOL_TIMEOUTS } from "../tools/tool-timeouts";
 
 // =============================================================================
@@ -421,6 +422,13 @@ export interface LspClient {
 	projectLoaded: Promise<void>;
 	/** Call to signal that project loading has completed */
 	resolveProjectLoaded: () => void;
+	/**
+	 * Deduplicated weak refs to session-scoped search caches to invalidate when
+	 * the server itself applies a workspace edit (`workspace/applyEdit`).
+	 * Weak so this process-global client never extends a session's lifetime;
+	 * register via `registerSearchCacheOwner`, which prunes dead refs.
+	 */
+	searchCacheOwners?: Set<WeakRef<SearchResultCacheOwner>>;
 }
 
 // =============================================================================

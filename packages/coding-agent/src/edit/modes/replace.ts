@@ -1109,7 +1109,7 @@ export async function executeReplaceSingle(
 		diagnostics = await writethrough(absolutePath, finalContent, signal, Bun.file(absolutePath), batchRequest, dst =>
 			dst === absolutePath ? beginDeferredDiagnosticsForPath(absolutePath) : undefined,
 		);
-		invalidateFsScanAfterWrite(absolutePath);
+		invalidateFsScanAfterWrite(absolutePath, session);
 	}
 
 	const diffResult = generateDiffString(normalizedContent, result.content, undefined, { path });

@@ -163,9 +163,10 @@ export class HashlineFilesystem extends Filesystem {
 				this.session.cwd,
 				[{ filePath: absolutePath, type: FileChangeType.Deleted }],
 				this.#signal,
+				this.session,
 			);
 		}
-		invalidateFsScanAfterWrite(absolutePath);
+		invalidateFsScanAfterWrite(absolutePath, this.session);
 	}
 
 	async move(fromRelative: string, toRelative: string, content?: string): Promise<void> {
@@ -186,10 +187,11 @@ export class HashlineFilesystem extends Filesystem {
 					{ filePath: toAbsolute, type: FileChangeType.Created },
 				],
 				this.#signal,
+				this.session,
 			);
 		}
-		invalidateFsScanAfterWrite(fromAbsolute);
-		invalidateFsScanAfterWrite(toAbsolute);
+		invalidateFsScanAfterWrite(fromAbsolute, this.session);
+		invalidateFsScanAfterWrite(toAbsolute, this.session);
 	}
 
 	async writeText(relativePath: string, content: string): Promise<WriteResult> {
@@ -211,7 +213,7 @@ export class HashlineFilesystem extends Filesystem {
 			this.#batchRequest,
 			dst => (dst === absolutePath ? this.#beginDeferredDiagnosticsForPath(absolutePath) : undefined),
 		);
-		invalidateFsScanAfterWrite(absolutePath);
+		invalidateFsScanAfterWrite(absolutePath, this.session);
 		this.#diagnosticsByPath.set(relativePath, diagnostics);
 		return { text: finalContent };
 	}

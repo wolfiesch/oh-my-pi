@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { isEnoent, logger, postmortem, ptree, untilAborted } from "@oh-my-pi/pi-utils";
 import { MessageFramer } from "../jsonrpc/message-framing";
+import { clearSearchResultCache, type SearchResultCacheOwner } from "../tools/search-result-cache";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { applyWorkspaceEdit } from "./edits";
 import { getLspmuxCommand, isLspmuxSupported } from "./lspmux";
@@ -437,6 +438,35 @@ async function handleConfigurationRequest(client: LspClient, message: LspJsonRpc
 }
 
 /**
+ * Register a session-scoped search cache owner on a client. Clients are
+ * process-global and typically outlive sessions, so owners are held through
+ * deduplicated WeakRefs; dead refs are pruned on every registration.
+ */
+export function registerSearchCacheOwner(client: LspClient, owner: SearchResultCacheOwner): void {
+	const refs = client.searchCacheOwners ?? new Set<WeakRef<SearchResultCacheOwner>>();
+	client.searchCacheOwners = refs;
+	for (const ref of refs) {
+		const held = ref.deref();
+		if (!held) refs.delete(ref);
+		else if (held === owner) return;
+	}
+	refs.add(new WeakRef(owner));
+}
+
+/**
+ * Clear every live registered owner's search cache and prune refs whose
+ * sessions have been collected. Used whenever the server may have mutated the
+ * workspace, including partially failed `workspace/applyEdit` applications.
+ */
+export function invalidateRegisteredSearchCaches(client: LspClient): void {
+	for (const ref of client.searchCacheOwners ?? []) {
+		const owner = ref.deref();
+		if (owner) clearSearchResultCache(owner);
+		else client.searchCacheOwners?.delete(ref);
+	}
+}
+
+/**
  * Handle workspace/applyEdit requests from the server.
  */
 async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequest): Promise<void> {
@@ -451,11 +481,20 @@ async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequ
 		return;
 	}
 
+	let failure: string | undefined;
 	try {
 		await applyWorkspaceEdit(params.edit, client.cwd);
-		await sendResponse(client, message.id, { applied: true }, "workspace/applyEdit");
 	} catch (err) {
-		await sendResponse(client, message.id, { applied: false, failureReason: String(err) }, "workspace/applyEdit");
+		failure = String(err);
+	}
+	// Invalidate BEFORE acknowledging: the server may have mutated the
+	// workspace even when a later operation failed mid-apply, and anything
+	// sequenced after the response must not observe stale cached pages.
+	invalidateRegisteredSearchCaches(client);
+	if (failure === undefined) {
+		await sendResponse(client, message.id, { applied: true }, "workspace/applyEdit");
+	} else {
+		await sendResponse(client, message.id, { applied: false, failureReason: failure }, "workspace/applyEdit");
 	}
 }
 
@@ -752,6 +791,7 @@ export async function getOrCreateClient(
 			activeProgressTokens: new Set(),
 			projectLoaded,
 			resolveProjectLoaded,
+			searchCacheOwners: new Set(),
 		};
 
 		// Register crash recovery - remove client on process exit
@@ -1044,6 +1084,7 @@ export async function notifyWorkspaceWatchedFiles(
 	cwd: string,
 	changes: readonly WatchedFileChange[],
 	signal?: AbortSignal,
+	owner?: SearchResultCacheOwner,
 ): Promise<void> {
 	throwIfAborted(signal);
 	if (changes.length === 0) return;
@@ -1053,6 +1094,12 @@ export async function notifyWorkspaceWatchedFiles(
 		client => client.status === "ready" && path.resolve(client.cwd) === workspace,
 	);
 	if (activeClients.length === 0) return;
+	if (owner) {
+		// A client reached only through write notifications can still push a
+		// later server-initiated workspace/applyEdit; register the session so
+		// that edit can invalidate its cached search pages.
+		for (const client of activeClients) registerSearchCacheOwner(client, owner);
+	}
 
 	const timeoutSignal = AbortSignal.timeout(WATCHED_FILES_NOTIFY_TIMEOUT_MS);
 	const sendSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;

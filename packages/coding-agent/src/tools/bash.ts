@@ -16,7 +16,11 @@ import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
-import type { ClientBridgeTerminalExitStatus, ClientBridgeTerminalOutput } from "../session/client-bridge";
+import type {
+	ClientBridgeTerminalExitStatus,
+	ClientBridgeTerminalHandle,
+	ClientBridgeTerminalOutput,
+} from "../session/client-bridge";
 import { DEFAULT_MAX_BYTES, enforceInlineByteCap, streamTailUpdates, TailBuffer } from "../session/streaming-output";
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock, markFramedBlockComponent, outputBlockContentWidth } from "../tui/output-block";
@@ -43,6 +47,7 @@ import {
 	previewWindowRows,
 	replaceTabs,
 } from "./render-utils";
+import { clearSearchResultCache, suppressSearchResultCaches } from "./search-result-cache";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
@@ -617,6 +622,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		let latestText = "";
 		let forwardUpdates = options.forwardUpdates;
 		const completion = Promise.withResolvers<ManagedBashJobCompletion>();
+		// A background command can mutate files at any point in its lifetime, so
+		// completion-only invalidation leaves a stale window: drop cached pages at
+		// launch and hold the cache closed until the command itself settles.
+		clearSearchResultCache(this.session);
 
 		const jobId = manager.register(
 			"bash",
@@ -626,21 +635,30 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
 				const wallTimeStart = performance.now();
 				try {
-					const result = await executeBash(options.command, {
-						cwd: options.commandCwd,
-						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
-						timeout: options.timeoutMs ?? 0,
-						signal: runSignal,
-						env: options.resolvedEnv,
-						artifactPath,
-						artifactId,
-						onChunk: chunk => {
-							tailBuffer.append(chunk);
-							latestText = tailBuffer.text();
-							void reportProgress(latestText, { async: { state: "running", jobId, type: "bash" } });
-						},
-						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
-					});
+					let result: BashResult;
+					// Suppress the session's own workspace AND the job's effective
+					// working directory (a `cwd` override may target a different
+					// workspace whose sibling sessions must not serve stale pages).
+					const releaseSearchCache = suppressSearchResultCaches(this.session, options.commandCwd);
+					try {
+						result = await executeBash(options.command, {
+							cwd: options.commandCwd,
+							sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
+							timeout: options.timeoutMs ?? 0,
+							signal: runSignal,
+							env: options.resolvedEnv,
+							artifactPath,
+							artifactId,
+							onChunk: chunk => {
+								tailBuffer.append(chunk);
+								latestText = tailBuffer.text();
+								void reportProgress(latestText, { async: { state: "running", jobId, type: "bash" } });
+							},
+							onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
+						});
+					} finally {
+						releaseSearchCache();
+					}
 					const wallTimeMs = performance.now() - wallTimeStart;
 					const finalResult = await this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
@@ -927,48 +945,59 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) {
 			const bridgeWallTimeStart = performance.now();
 			const shellSpawn = wrapShellLineForClientTerminal(command, this.session.settings.getShellConfig());
-			const handle = await clientBridge.createTerminal({
-				command: shellSpawn.command,
-				args: shellSpawn.args,
-				cwd: commandCwd,
-				env: resolvedEnv
-					? Object.entries(resolvedEnv).map(([name, value]) => ({ name, value: value as string }))
-					: undefined,
-				outputByteLimit: DEFAULT_MAX_BYTES,
-			});
-
-			// Emit partial update so the editor can embed the live terminal card.
-			onUpdate?.({ content: [], details: { terminalId: handle.terminalId } });
-
-			const exitPromise = handle.waitForExit();
-			let exitStatus!: ClientBridgeTerminalExitStatus;
-
-			type BridgeRaceResult =
-				| { kind: "exit"; status: ClientBridgeTerminalExitStatus }
-				| { kind: "poll" }
-				| { kind: "timeout" }
-				| { kind: "aborted" };
-
-			// Set up abort listener before entering the poll loop. The listener
-			// kicks off `handle.kill()` synchronously so a `session/cancel`
-			// arriving mid-poll terminates the remote command immediately,
-			// instead of waiting for the next `currentOutput()` to return.
-			const { promise: abortedP, resolve: resolveAborted } = Promise.withResolvers<void>();
-			let killStarted = false;
-			const fireKill = (): Promise<void> => {
-				if (killStarted) return Promise.resolve();
-				killStarted = true;
-				return handle.kill().catch((error: unknown) => {
-					logger.warn("ACP terminal kill failed", { terminalId: handle.terminalId, error });
-				});
-			};
-			const onAbortSignal = () => {
-				resolveAborted();
-				void fireKill();
-			};
-			signal?.addEventListener("abort", onAbortSignal, { once: true });
-
+			// The remote command can mutate the workspace(s) for its whole run:
+			// hold the session's and the effective command cwd's caches closed
+			// until it settles (release is idempotent, called exactly once in the
+			// outer finally, which also covers createTerminal itself rejecting).
+			const releaseSearchCache = suppressSearchResultCaches(this.session, commandCwd);
+			let handle: ClientBridgeTerminalHandle | undefined;
+			let observedExit = false;
+			let killPromise: Promise<void> | undefined;
 			try {
+				handle = await clientBridge.createTerminal({
+					command: shellSpawn.command,
+					args: shellSpawn.args,
+					cwd: commandCwd,
+					env: resolvedEnv
+						? Object.entries(resolvedEnv).map(([name, value]) => ({ name, value: value as string }))
+						: undefined,
+					outputByteLimit: DEFAULT_MAX_BYTES,
+				});
+				const terminal = handle;
+
+				// Emit partial update so the editor can embed the live terminal card.
+				onUpdate?.({ content: [], details: { terminalId: terminal.terminalId } });
+
+				const exitPromise = terminal.waitForExit();
+				let exitStatus!: ClientBridgeTerminalExitStatus;
+
+				type BridgeRaceResult =
+					| { kind: "exit"; status: ClientBridgeTerminalExitStatus }
+					| { kind: "poll" }
+					| { kind: "timeout" }
+					| { kind: "aborted" };
+
+				// Set up abort listener before entering the poll loop. The listener
+				// kicks off `handle.kill()` synchronously so a `session/cancel`
+				// arriving mid-poll terminates the remote command immediately,
+				// instead of waiting for the next `currentOutput()` to return.
+				const { promise: abortedP, resolve: resolveAborted } = Promise.withResolvers<void>();
+				const fireKill = (): Promise<void> => {
+					// Memoize the in-flight kill so EVERY caller (abort listener,
+					// abort/timeout branches, outer finally) awaits the same RPC —
+					// a boolean guard would let a later await return early and race
+					// suppression release against a kill still in flight.
+					killPromise ??= terminal.kill().catch((error: unknown) => {
+						logger.warn("ACP terminal kill failed", { terminalId: terminal.terminalId, error });
+					});
+					return killPromise;
+				};
+				const onAbortSignal = () => {
+					resolveAborted();
+					void fireKill();
+				};
+				signal?.addEventListener("abort", onAbortSignal, { once: true });
+
 				try {
 					if (signal?.aborted) {
 						await fireKill();
@@ -1003,10 +1032,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 							await fireKill();
 							let current = { output: "", truncated: false };
 							try {
-								current = await handle.currentOutput();
+								current = await terminal.currentOutput();
 							} catch (error) {
 								logger.warn("ACP terminal final output read failed", {
-									terminalId: handle.terminalId,
+									terminalId: terminal.terminalId,
 									error,
 								});
 							}
@@ -1027,6 +1056,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 
 						if (raced.kind === "exit") {
 							exitStatus = raced.status;
+							observedExit = true;
 							break;
 						}
 
@@ -1034,7 +1064,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 						// Race the read against abort so a stuck `terminal/output` RPC does not
 						// delay cancellation.
 						const pollOutput = await Promise.race([
-							handle.currentOutput(),
+							terminal.currentOutput(),
 							abortedP.then(() => undefined as ClientBridgeTerminalOutput | undefined),
 						]);
 						if (pollOutput === undefined) {
@@ -1044,7 +1074,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 						}
 						onUpdate?.({
 							content: [{ type: "text", text: pollOutput.output }],
-							details: { terminalId: handle.terminalId },
+							details: { terminalId: terminal.terminalId },
 						});
 					}
 				} finally {
@@ -1052,7 +1082,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				}
 
 				// Fetch final output; the terminal is released in the outer finally.
-				const finalOutput = await handle.currentOutput();
+				const finalOutput = await terminal.currentOutput();
 
 				// Map exit status: null exitCode with a signal → treat as signal kill (137).
 				const rawExitCode = exitStatus.exitCode;
@@ -1081,14 +1111,33 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				return this.#buildCompletedResult(bridgeResult, timeoutSec, {
 					requestedTimeoutSec,
 					notices: bridgeNotices,
-					terminalId: handle.terminalId,
+					terminalId: terminal.terminalId,
 					wallTimeMs: performance.now() - bridgeWallTimeStart,
 				});
 			} finally {
 				try {
-					await handle.release();
-				} catch (error) {
-					logger.warn("ACP terminal release failed", { terminalId: handle.terminalId, error });
+					if (handle && !observedExit) {
+						// Exceptional pre-exit path (e.g. waitForExit/currentOutput
+						// transport error): the remote process may still be mutating.
+						// Kill (or join the in-flight kill) and await its settlement
+						// BEFORE reopening caches.
+						const terminal = handle;
+						killPromise ??= terminal.kill().catch((error: unknown) => {
+							logger.warn("ACP terminal kill failed", { terminalId: terminal.terminalId, error });
+						});
+					}
+					if (killPromise) await killPromise;
+				} finally {
+					releaseSearchCache();
+					clearSearchResultCache(this.session);
+					if (commandCwd !== this.session.cwd) clearSearchResultCache({ cwd: commandCwd });
+					if (handle) {
+						try {
+							await handle.release();
+						} catch (error) {
+							logger.warn("ACP terminal release failed", { terminalId: handle.terminalId, error });
+						}
+					}
 				}
 			}
 		}
@@ -1104,27 +1153,39 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			pendingNotices.push("pty requested but unavailable in this environment; ran without a terminal");
 		}
 		const wallTimeStart = performance.now();
-		const result: BashResult | BashInteractiveResult = interactiveUi
-			? await runInteractiveBashPty(interactiveUi, {
-					command,
-					cwd: commandCwd,
-					timeoutMs,
-					signal,
-					env: resolvedEnv,
-					artifactPath,
-					artifactId,
-				})
-			: await executeBash(command, {
-					cwd: commandCwd,
-					sessionKey: this.session.getSessionId?.() ?? undefined,
-					timeout: timeoutMs ?? 0,
-					signal,
-					env: resolvedEnv,
-					artifactPath,
-					artifactId,
-					onChunk: streamTailUpdates(tailBuffer, onUpdate),
-					onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
-				});
+		let result: BashResult | BashInteractiveResult;
+		// Foreground direct/PTY execution mutates during the whole run; hold the
+		// shared caches closed for the window instead of clearing only at settle.
+		const releaseSearchCache = suppressSearchResultCaches(this.session, commandCwd);
+		try {
+			result = interactiveUi
+				? await runInteractiveBashPty(interactiveUi, {
+						command,
+						cwd: commandCwd,
+						timeoutMs,
+						signal,
+						env: resolvedEnv,
+						artifactPath,
+						artifactId,
+					})
+				: await executeBash(command, {
+						cwd: commandCwd,
+						sessionKey: this.session.getSessionId?.() ?? undefined,
+						timeout: timeoutMs ?? 0,
+						signal,
+						env: resolvedEnv,
+						artifactPath,
+						artifactId,
+						onChunk: streamTailUpdates(tailBuffer, onUpdate),
+						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
+					});
+		} finally {
+			releaseSearchCache();
+			clearSearchResultCache(this.session);
+			// A `cwd` override mutates a different workspace; its sibling
+			// sessions' cached pages are stale too.
+			if (commandCwd !== this.session.cwd) clearSearchResultCache({ cwd: commandCwd });
+		}
 		const wallTimeMs = performance.now() - wallTimeStart;
 		if (result.cancelled) {
 			// A cancelled result is either a timeout (the command's deadline fired)

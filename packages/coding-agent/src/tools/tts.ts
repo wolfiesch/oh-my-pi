@@ -177,6 +177,8 @@ async function synthesizeXai(
 	}
 	const bytes = new Uint8Array(await response.arrayBuffer());
 	await Bun.write(outputPath, bytes);
+	// The workspace changed: stale cached search pages must not survive.
+	ctx.invalidateFileCaches?.(outputPath);
 	return {
 		content: [
 			{
@@ -190,6 +192,7 @@ async function synthesizeXai(
 
 async function synthesizeLocal(
 	params: TtsSchemaType,
+	ctx: CustomToolContext,
 	cwd: string,
 	outputPath: string,
 	signal: AbortSignal | undefined,
@@ -214,6 +217,8 @@ async function synthesizeLocal(
 	const { wavPath, substituted } = resolveLocalWavPath(outputPath);
 	const wav = encodeWav(audio.pcm, audio.sampleRate);
 	await Bun.write(wavPath, wav);
+	// The workspace changed: stale cached search pages must not survive.
+	ctx.invalidateFileCaches?.(wavPath);
 	const displayPath = formatPathRelativeToCwd(wavPath, cwd);
 	const note = substituted
 		? ` No local MP3 encoder is bundled, so WAV (PCM16) was written instead of the requested container.`
@@ -260,7 +265,7 @@ export const ttsTool: CustomTool<typeof ttsSchema, TtsToolDetails> = {
 			preference === "local" ? false : (await resolveXAIHttpCredentials(ctx.modelRegistry)) !== null;
 		const backend = resolveTtsBackend({ preference, wantsMp3: codec === "mp3", hasXaiCreds });
 
-		if (backend === "local") return synthesizeLocal(params, cwd, outputPath, signal);
+		if (backend === "local") return synthesizeLocal(params, ctx, cwd, outputPath, signal);
 		return synthesizeXai(params, ctx, outputPath, displayPath, codec, signal);
 	},
 };
