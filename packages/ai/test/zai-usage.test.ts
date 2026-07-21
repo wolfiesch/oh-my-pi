@@ -51,7 +51,7 @@ describe("zai usage provider", () => {
 							],
 						},
 						{ type: "TOKENS_LIMIT", percentage: 82, nextResetTime: 1782656863894, unit: 3, number: 5 },
-						{ type: "TOKENS_LIMIT", percentage: 38, nextResetTime: 1783165208993, unit: 6, number: 7 },
+						{ type: "TOKENS_LIMIT", percentage: 38, nextResetTime: 1783165208993, unit: 6, number: 1 },
 					],
 				},
 			}),
@@ -65,7 +65,7 @@ describe("zai usage provider", () => {
 		]);
 		expect(report!.limits.map(limit => limit.label)).toEqual([
 			"ZAI Web Search / Reader / Zread Quota",
-			"ZAI 5 Hours Token Quota",
+			"ZAI 5-hour Token Quota",
 			"ZAI Weekly Token Quota",
 		]);
 		expect(report!.limits.map(limit => limit.scope.windowId)).toEqual(["1mo", "5h", "1w"]);
@@ -75,6 +75,82 @@ describe("zai usage provider", () => {
 			30 * 24 * 60 * 60 * 1000,
 			5 * 60 * 60 * 1000,
 			7 * 24 * 60 * 60 * 1000,
+		]);
+	});
+
+	it("treats numeric weekly token quota counts as the Z.AI rolling day window", async () => {
+		const report = await zaiUsageProvider.fetchUsage!(
+			{ provider: "zai", credential: makeCredential(), signal: undefined },
+			makeCtx({
+				success: true,
+				data: {
+					limits: [
+						{ type: "TOKENS_LIMIT", percentage: 38, nextResetTime: 1783165208993, unit: 6, number: 7 },
+						{ type: "TOKENS_LIMIT", percentage: 12, nextResetTime: 1783765208993, unit: "w", number: 7 },
+					],
+				},
+			}),
+		);
+
+		expect(report).not.toBeNull();
+		expect(report!.limits.map(limit => limit.id)).toEqual(["zai:tokens:1w", "zai:tokens:7w"]);
+		expect(report!.limits.map(limit => limit.label)).toEqual(["ZAI Weekly Token Quota", "ZAI 7-week Token Quota"]);
+		expect(report!.limits.map(limit => limit.scope.windowId)).toEqual(["1w", "7w"]);
+		expect(report!.limits.map(limit => limit.window?.durationMs)).toEqual([
+			7 * 24 * 60 * 60 * 1000,
+			7 * 7 * 24 * 60 * 60 * 1000,
+		]);
+	});
+
+	it("keeps Z.AI quota window ids distinct when units are string-coded or omitted", async () => {
+		const report = await zaiUsageProvider.fetchUsage!(
+			{ provider: "zai", credential: makeCredential(), signal: undefined },
+			makeCtx({
+				success: true,
+				data: {
+					limits: [
+						{ type: "TOKENS_LIMIT", percentage: 82, nextResetTime: 1782656863894, unit: "h", number: 5 },
+						{ type: "TOKENS_LIMIT", percentage: 38, nextResetTime: 1783165208993, unit: "w", number: 1 },
+						{ type: "TOKENS_LIMIT", percentage: 12, nextResetTime: 1783251608993 },
+						{ type: "TOKENS_LIMIT", percentage: 18, nextResetTime: 1783338008993, unit: "rolling" },
+					],
+				},
+			}),
+		);
+
+		expect(report).not.toBeNull();
+		expect(report!.limits.map(limit => limit.id)).toEqual([
+			"zai:tokens:5h",
+			"zai:tokens:1w",
+			"zai:tokens:tokens-limit-reset-1783251608993",
+			"zai:tokens:1urolling-tokens-limit-reset-1783338008993",
+		]);
+		expect(report!.limits.map(limit => limit.scope.windowId)).toEqual([
+			"5h",
+			"1w",
+			"tokens-limit-reset-1783251608993",
+			"1urolling-tokens-limit-reset-1783338008993",
+		]);
+	});
+
+	it("disambiguates duplicate fallback window IDs sharing a reset time on collision", async () => {
+		const report = await zaiUsageProvider.fetchUsage!(
+			{ provider: "zai", credential: makeCredential(), signal: undefined },
+			makeCtx({
+				success: true,
+				data: {
+					limits: [
+						{ type: "TOKENS_LIMIT", percentage: 12, nextResetTime: 1783251608993 },
+						{ type: "TOKENS_LIMIT", percentage: 18, nextResetTime: 1783251608993 },
+					],
+				},
+			}),
+		);
+
+		expect(report).not.toBeNull();
+		expect(report!.limits.map(limit => limit.id)).toEqual([
+			"zai:tokens:tokens-limit-reset-1783251608993",
+			"zai:tokens:tokens-limit-reset-1783251608993-row-2-1",
 		]);
 	});
 });

@@ -7,6 +7,9 @@
 ### Fixed
 
 - Fixed Portkey/gateway custom models whose ids start with `@` (e.g. `@modal/GLM-5-2-FP8`) being rewritten to unrelated bundled wire ids (e.g. `glm-5-2`), which caused `400` responses requiring `x-portkey-config` or `x-portkey-provider`.
+### Changed
+
+- Restructured the TUI usage footer to show one provider-wide account header with stable columns, so each limit row no longer repeats truncated account emails or swaps column order when usage fractions differ; every meter now shows its exact percentage and reset time ([#3721](https://github.com/can1357/oh-my-pi/pull/3721) by [@wolfiesch](https://github.com/wolfiesch)).
 
 ## [17.0.6] - 2026-07-20
 

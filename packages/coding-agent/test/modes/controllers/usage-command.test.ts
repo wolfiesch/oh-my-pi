@@ -27,7 +27,7 @@ describe("CommandController /usage", () => {
 		setThemeInstance(theme);
 	});
 
-	it("renders bars and free percentage for limits that only report remainingFraction", async () => {
+	it("renders usage bars for limits that only report remainingFraction", async () => {
 		const present = vi.fn();
 		const ctx = {
 			session: {},
@@ -61,7 +61,7 @@ describe("CommandController /usage", () => {
 		const firstCall = present.mock.calls[0];
 		expect(firstCall).toBeDefined();
 		const output = renderPresentedBlocks(firstCall?.[0]);
-		expect(output).toContain("25% free");
+		expect(output).toContain("75.0% used");
 		expect(output).toContain("█");
 		expect(output).not.toContain("··········");
 	});
@@ -110,8 +110,7 @@ describe("CommandController /usage", () => {
 		const output = renderPresentedBlocks(firstCall?.[0]);
 		expect(output).toContain("Cursor");
 		expect(output).toContain("gpt-4 requests");
-		expect(output).toContain("70% free");
-		expect(output).toContain("resets in 1d");
+		expect(output).toContain("30.0% used · 1d");
 	});
 
 	it("renders saved reset expiry lines for future and expired credits", async () => {

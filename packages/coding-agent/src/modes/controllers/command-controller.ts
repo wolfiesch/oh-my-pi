@@ -44,7 +44,11 @@ import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-stora
 import type { CompactMode } from "../../session/compact-modes";
 import type { NewSessionOptions } from "../../session/session-entries";
 import { formatShakeSummary, type ShakeMode, type ShakeResult } from "../../session/shake-types";
-import { formatActiveAccountLabel, limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
+import {
+	formatActiveAccountLabel,
+	limitMatchesActiveAccount,
+	reportMatchesActiveAccount,
+} from "../../slash-commands/helpers/active-oauth-account";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
 import { replaceTabs, truncateToWidth } from "../../tools/render-utils";
@@ -1450,10 +1454,6 @@ function formatProviderName(provider: string): string {
 		.join(" ");
 }
 
-function formatNumber(value: number, maxFractionDigits = 1): string {
-	return new Intl.NumberFormat("en-US", { maximumFractionDigits: maxFractionDigits }).format(value);
-}
-
 function resolveProviderAuthMode(authStorage: AuthStorage, provider: string): string {
 	if (authStorage.hasOAuth(provider)) {
 		return "oauth";
@@ -1510,22 +1510,6 @@ function orgSuffix(report: UsageReport): string {
 	return org ? ` (${org})` : "";
 }
 
-function formatAccountLabel(limit: UsageLimit, report: UsageReport, index: number): string {
-	const email = report.metadata?.email;
-	if (typeof email === "string" && email) return `${email}${orgSuffix(report)}`;
-	const accountId =
-		typeof report.metadata?.accountId === "string" && report.metadata.accountId
-			? report.metadata.accountId
-			: limit.scope.accountId || undefined;
-	if (accountId) return `${accountId}${orgSuffix(report)}`;
-	const projectId =
-		typeof report.metadata?.projectId === "string" && report.metadata.projectId
-			? report.metadata.projectId
-			: limit.scope.projectId || undefined;
-	if (projectId) return projectId;
-	return `account ${index + 1}`;
-}
-
 function formatUnlimitedReportLabel(report: UsageReport, index: number): string {
 	const email = report.metadata?.email;
 	if (typeof email === "string" && email) return `${email}${orgSuffix(report)}`;
@@ -1536,6 +1520,246 @@ function formatUnlimitedReportLabel(report: UsageReport, index: number): string 
 	return `account ${index + 1}`;
 }
 
+function resolveReportProjectId(report: UsageReport): string | undefined {
+	const projectId = report.metadata?.projectId;
+	if (typeof projectId === "string" && projectId) return projectId;
+	for (const limit of report.limits) {
+		const scopedProjectId = limit.scope.projectId;
+		if (typeof scopedProjectId === "string" && scopedProjectId) return scopedProjectId;
+	}
+	return undefined;
+}
+
+function resolveReportOrganizationId(report: UsageReport): string | undefined {
+	const metadataOrgId = report.metadata?.orgId;
+	if (typeof metadataOrgId === "string" && metadataOrgId) return metadataOrgId;
+	const metadataOrgName = report.metadata?.orgName;
+	if (typeof metadataOrgName === "string" && metadataOrgName) return metadataOrgName;
+	for (const limit of report.limits) {
+		const scopedOrgId = limit.scope.orgId;
+		if (typeof scopedOrgId === "string" && scopedOrgId) return scopedOrgId;
+	}
+	return undefined;
+}
+
+function resolveReportAccountId(report: UsageReport): string | undefined {
+	const metadataAccountId = report.metadata?.accountId;
+	if (typeof metadataAccountId === "string" && metadataAccountId) return metadataAccountId;
+	const metadataAccountIdAlias = report.metadata?.account_id;
+	if (typeof metadataAccountIdAlias === "string" && metadataAccountIdAlias) return metadataAccountIdAlias;
+	for (const limit of report.limits) {
+		const scopedAccountId = limit.scope.accountId;
+		if (typeof scopedAccountId === "string" && scopedAccountId) return scopedAccountId;
+	}
+	return undefined;
+}
+
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+function toGraphemes(text: string): string[] {
+	const clusters: string[] = [];
+	for (const { segment } of GRAPHEME_SEGMENTER.segment(text)) clusters.push(segment);
+	return clusters;
+}
+
+/**
+ * Shortest stable fragments (min 4 grapheme clusters, prefix or tail —
+ * whichever distinguishes sooner) that tell every account id in a collision
+ * group apart. Ids are first grouped into NFC equivalence classes so
+ * composed-vs-decomposed sequences that render identically share one
+ * canonical identity (never "distinguished" from each other, and never
+ * blocking distinctness for a genuinely different sibling). Slicing works on
+ * grapheme clusters, so astral pairs are never split into lone surrogates.
+ */
+function shortestUniqueIdFragments(ids: readonly string[]): Map<string, string> {
+	const rawsByCanonical = new Map<string, string[]>();
+	for (const id of new Set(ids)) {
+		const canonical = id.normalize("NFC");
+		const raws = rawsByCanonical.get(canonical);
+		if (raws) raws.push(id);
+		else rawsByCanonical.set(canonical, [id]);
+	}
+	const canonicals = [...rawsByCanonical.keys()];
+	const fragments = new Map<string, string>();
+	if (canonicals.length === 1) {
+		// Every id renders identically — nothing can visually distinguish
+		// them, so keep the full canonical identity.
+		for (const raw of rawsByCanonical.get(canonicals[0])!) {
+			fragments.set(raw, canonicals[0]);
+		}
+		return fragments;
+	}
+	const clustersByCanonical = new Map(canonicals.map(canonical => [canonical, toGraphemes(canonical)]));
+	const maxLength = Math.max(...canonicals.map(canonical => clustersByCanonical.get(canonical)!.length));
+	const distinctLength = (slice: (clusters: string[], length: number) => string): number => {
+		for (let length = Math.min(4, maxLength); length <= maxLength; length++) {
+			const seen = new Set(canonicals.map(canonical => slice(clustersByCanonical.get(canonical)!, length)));
+			if (seen.size === canonicals.length) return length;
+		}
+		return maxLength;
+	};
+	const prefixLength = distinctLength((clusters, length) => clusters.slice(0, length).join(""));
+	const tailLength = distinctLength((clusters, length) => clusters.slice(-length).join(""));
+	// Ties prefer the tail: unequal-length ids (one a prefix of another) pass
+	// the prefix distinctness check on length alone, which a tight cell's
+	// front-anchored trim then destroys; tail trims keep the distinguishing
+	// edge instead.
+	const keepEnd = tailLength <= prefixLength;
+	const length = keepEnd ? tailLength : prefixLength;
+	for (const [canonical, raws] of rawsByCanonical) {
+		const clusters = clustersByCanonical.get(canonical)!;
+		const text =
+			clusters.length <= length
+				? canonical
+				: keepEnd
+					? `…${clusters.slice(-length).join("")}`
+					: `${clusters.slice(0, length).join("")}…`;
+		for (const raw of raws) fragments.set(raw, text);
+	}
+	return fragments;
+}
+
+/** Keep as many whole clusters as fit `maxWidth`, anchored at the kept edge. */
+function fitClustersToWidth(clusters: readonly string[], maxWidth: number, keepEnd: boolean): string {
+	let out = "";
+	if (keepEnd) {
+		for (let i = clusters.length - 1; i >= 0; i--) {
+			const next = `${clusters[i]}${out}`;
+			if (visibleWidth(next) > maxWidth) break;
+			out = next;
+		}
+	} else {
+		for (const cluster of clusters) {
+			const next = `${out}${cluster}`;
+			if (visibleWidth(next) > maxWidth) break;
+			out = next;
+		}
+	}
+	return out || clusters[keepEnd ? clusters.length - 1 : 0] || "";
+}
+
+/**
+ * Bare-tier texts for a collision group: every id's rendered cell fitted to
+ * the group's shared budget. Instead of one prefix/tail edge for the whole
+ * group, each NFC identity class gets its own edge: classes (≤2 candidate
+ * texts each, tail preferred) are matched injectively onto texts via
+ * deterministic augmenting paths (Kuhn's bipartite matching, O(classes ×
+ * candidates) per augmentation), so a collision-free combination is found
+ * whenever one exists. Unmatched classes fall back to their tail fit.
+ * NFC-equivalent raw ids always share one class and therefore one text.
+ */
+function planBareFragmentTexts(ids: readonly string[], maxWidth: number): Map<string, string> {
+	const rawsByCanonical = new Map<string, string[]>();
+	for (const id of new Set(ids)) {
+		const canonical = id.normalize("NFC");
+		const raws = rawsByCanonical.get(canonical);
+		if (raws) raws.push(id);
+		else rawsByCanonical.set(canonical, [id]);
+	}
+	const canonicals = [...rawsByCanonical.keys()].sort();
+	const candidates = canonicals.map(canonical => {
+		const clusters = toGraphemes(canonical);
+		// Tail first: account ids usually differ at the end.
+		return [
+			...new Set([fitClustersToWidth(clusters, maxWidth, true), fitClustersToWidth(clusters, maxWidth, false)]),
+		];
+	});
+	const chosen: (string | undefined)[] = new Array(canonicals.length);
+	const textOwner = new Map<string, number>();
+	const augment = (index: number, visited: Set<string>): boolean => {
+		for (const text of candidates[index]) {
+			if (visited.has(text)) continue;
+			visited.add(text);
+			const owner = textOwner.get(text);
+			if (owner === undefined || augment(owner, visited)) {
+				textOwner.set(text, index);
+				chosen[index] = text;
+				return true;
+			}
+		}
+		return false;
+	};
+	for (let index = 0; index < canonicals.length; index++) augment(index, new Set());
+	// No perfect matching exists for these classes: best-effort tails.
+	for (let index = 0; index < canonicals.length; index++) chosen[index] ??= candidates[index][0];
+	const texts = new Map<string, string>();
+	for (const [index, canonical] of canonicals.entries()) {
+		for (const raw of rawsByCanonical.get(canonical)!) texts.set(raw, chosen[index]!);
+	}
+	return texts;
+}
+
+/** Header label for a report column, derived from report metadata or limit scope. */
+function formatReportAccountLabel(report: UsageReport, index: number): string {
+	const projectId = resolveReportProjectId(report);
+	const email = report.metadata?.email;
+	if (typeof email === "string" && email) {
+		const label = projectId && email !== projectId ? `${email} (${projectId})` : email;
+		return `${label}${orgSuffix(report)}`;
+	}
+	const accountId = report.metadata?.accountId;
+	if (typeof accountId === "string" && accountId) {
+		const label = projectId && accountId !== projectId ? `${accountId} (${projectId})` : accountId;
+		return `${label}${orgSuffix(report)}`;
+	}
+	if (projectId) return `${projectId}${orgSuffix(report)}`;
+	for (const limit of report.limits) {
+		const scopedAccountId = limit.scope.accountId;
+		if (typeof scopedAccountId === "string" && scopedAccountId) {
+			const label =
+				projectId && scopedAccountId !== projectId ? `${scopedAccountId} (${projectId})` : scopedAccountId;
+			return `${label}${orgSuffix(report)}`;
+		}
+	}
+	return `account ${index + 1}`;
+}
+
+function formatReportAccountKey(report: UsageReport, index: number): string {
+	const projectId = resolveReportProjectId(report);
+	const organizationId = resolveReportOrganizationId(report);
+	const email = report.metadata?.email;
+	const accountId = report.metadata?.accountId;
+	const emailKey = typeof email === "string" && email ? `email:${email}` : undefined;
+	const metadataAccountKey = typeof accountId === "string" && accountId ? `account:${accountId}` : undefined;
+	let scopedAccountKey: string | undefined;
+	for (const limit of report.limits) {
+		const scopedAccountId = limit.scope.accountId;
+		if (typeof scopedAccountId === "string" && scopedAccountId) {
+			scopedAccountKey = `account:${scopedAccountId}`;
+			break;
+		}
+	}
+	const accountKey = metadataAccountKey ?? scopedAccountKey;
+	const keys = [
+		organizationId ? `org:${organizationId}` : undefined,
+		projectId ? `project:${projectId}` : undefined,
+		emailKey,
+		accountKey,
+	].filter((key): key is string => key !== undefined);
+	return keys.length > 0 ? keys.join("|") : `index:${index}`;
+}
+
+/** Sort reports so the active account is first and the rest are deterministic. */
+function stableAccountOrder(
+	reports: UsageReport[],
+	activeAccount: OAuthAccountIdentity | undefined,
+	fallbackIndices: ReadonlyMap<UsageReport, number>,
+): UsageReport[] {
+	return [...reports].sort((a, b) => {
+		const aActive = reportMatchesActiveAccount(a, activeAccount);
+		const bActive = reportMatchesActiveAccount(b, activeAccount);
+		if (aActive && !bActive) return -1;
+		if (!aActive && bActive) return 1;
+		const aIndex = fallbackIndices.get(a) ?? 0;
+		const bIndex = fallbackIndices.get(b) ?? 0;
+		const labelOrder = formatReportAccountLabel(a, aIndex).localeCompare(formatReportAccountLabel(b, bIndex));
+		if (labelOrder !== 0) return labelOrder;
+		const keyOrder = formatReportAccountKey(a, aIndex).localeCompare(formatReportAccountKey(b, bIndex));
+		if (keyOrder !== 0) return keyOrder;
+		return aIndex - bIndex;
+	});
+}
+
 function formatResetShort(limit: UsageLimit, nowMs: number): string | undefined {
 	const resetsAt = limit.window?.resetsAt;
 	if (resetsAt === undefined) return undefined;
@@ -1543,48 +1767,6 @@ function formatResetShort(limit: UsageLimit, nowMs: number): string | undefined 
 	// rendering a negative delta is meaningless, so drop the suffix in that case.
 	if (resetsAt <= nowMs) return undefined;
 	return formatDuration(resetsAt - nowMs);
-}
-
-function formatAccountHeaderRow(
-	limits: UsageLimit[],
-	reports: UsageReport[],
-	nowMs: number,
-	columnWidth: number,
-	uiTheme: typeof theme,
-	activeAccount?: OAuthAccountIdentity,
-): string[] {
-	const parts = limits.map((limit, index) => {
-		const reset = formatResetShort(limit, nowMs);
-		const report = reports[index];
-		const active = report !== undefined && limitMatchesActiveAccount(report, limit, activeAccount);
-		const label = formatAccountLabel(limit, report, index);
-		return {
-			label: active ? `● ${label}` : label,
-			suffix: reset ? `(${reset})` : "",
-			active,
-		};
-	});
-	const maxSuffixWidth = parts.reduce((max, p) => Math.max(max, visibleWidth(p.suffix)), 0);
-	const gap = maxSuffixWidth > 0 ? 1 : 0;
-	const prefixBudget = columnWidth - maxSuffixWidth - gap;
-
-	// If suffix can't share the cell with at least `x…`, fall back to whole-label truncation.
-	if (prefixBudget < 2) {
-		return parts.map(p => {
-			const full = p.suffix ? `${p.label} ${p.suffix}` : p.label;
-			const cell = padColumn(truncateJobLabel(full, columnWidth), columnWidth);
-			return p.active ? uiTheme.fg("accent", cell) : cell;
-		});
-	}
-
-	return parts.map(p => {
-		const prefix = truncateJobLabel(p.label, prefixBudget);
-		const prefixCell = prefix + " ".repeat(prefixBudget - visibleWidth(prefix));
-		const styledPrefix = p.active ? uiTheme.fg("accent", prefixCell) : prefixCell;
-		if (!p.suffix) return styledPrefix + " ".repeat(maxSuffixWidth + gap);
-		const suffixPad = " ".repeat(maxSuffixWidth - visibleWidth(p.suffix));
-		return `${styledPrefix} ${suffixPad}${uiTheme.fg("dim", p.suffix)}`;
-	});
 }
 
 function padColumn(text: string, width: number): string {
@@ -1603,36 +1785,6 @@ function resolveAggregateStatus(limits: UsageLimit[]): UsageLimit["status"] {
 	}
 	if (hasWarning) return "warning";
 	return "exhausted";
-}
-
-function formatAggregateAmount(limits: UsageLimit[]): string {
-	const fractions = limits
-		.map(limit => resolveUsedFraction(limit))
-		.filter((value): value is number => value !== undefined);
-	if (fractions.length === limits.length && fractions.length > 0) {
-		const sum = fractions.reduce((total, value) => total + value, 0);
-		const avgRemaining = Math.max(0, ((limits.length - sum) / limits.length) * 100);
-		return `${formatNumber(avgRemaining)}% free`;
-	}
-
-	const amounts = limits
-		.map(limit => limit.amount)
-		.filter(amount => amount.used !== undefined && amount.limit !== undefined && amount.limit > 0);
-	if (amounts.length === limits.length && amounts.length > 0) {
-		const totalUsed = amounts.reduce((sum, amount) => sum + (amount.used ?? 0), 0);
-		const totalLimit = amounts.reduce((sum, amount) => sum + (amount.limit ?? 0), 0);
-		const remainingPct = totalLimit > 0 ? Math.max(0, 100 - (totalUsed / totalLimit) * 100) : 0;
-		return `${formatNumber(remainingPct)}% free`;
-	}
-
-	// Count unique accounts from limit scopes — not limits.length.
-	const uniqueAccountIds = new Set(
-		limits.map(limit => limit.scope.accountId).filter((id): id is string => typeof id === "string" && id.length > 0),
-	);
-	if (uniqueAccountIds.size > 0) return `${uniqueAccountIds.size} ${uniqueAccountIds.size === 1 ? "acct" : "accts"}`;
-	// No account IDs available — keep the pre-existing fallback so providers
-	// that don't populate scope.accountId still show a summary.
-	return `${limits.length} accts`;
 }
 
 function resolveResetRange(limits: UsageLimit[], nowMs: number): string | null {
@@ -1699,7 +1851,6 @@ export function formatCompactQuota(
 	}
 	return `Quota: ${lines.join(" │ ")}`;
 }
-
 function resolveStatusIcon(status: UsageLimit["status"], uiTheme: typeof theme): string {
 	if (status === "exhausted") return uiTheme.fg("error", uiTheme.status.error);
 	if (status === "warning") return uiTheme.fg("warning", uiTheme.status.warning);
@@ -1714,7 +1865,10 @@ function resolveStatusColor(status: UsageLimit["status"]): "success" | "warning"
 	return "dim";
 }
 
-function renderUsageBar(limit: UsageLimit, uiTheme: typeof theme, barWidth: number): string {
+function renderUsageBar(limit: UsageLimit | undefined, uiTheme: typeof theme, barWidth: number): string {
+	if (limit === undefined) {
+		return uiTheme.fg("dim", "·".repeat(barWidth));
+	}
 	const fraction = resolveUsedFraction(limit);
 	if (fraction === undefined) {
 		return uiTheme.fg("dim", "·".repeat(barWidth));
@@ -1730,6 +1884,35 @@ function renderUsageBar(limit: UsageLimit, uiTheme: typeof theme, barWidth: numb
 	const empty = "░".repeat(Math.max(0, barWidth - fullCells - (partial ? 1 : 0)));
 	const color = resolveStatusColor(limit.status);
 	return `${uiTheme.fg(color, leading)}${uiTheme.fg("dim", empty)}`;
+}
+
+/** Exact percentage and reset time for a single meter cell. */
+function formatMeterDetails(limit: UsageLimit | undefined, nowMs: number): string {
+	if (limit === undefined) return "—";
+	const fraction = resolveUsedFraction(limit);
+	const parts: string[] = [];
+	if (fraction !== undefined) {
+		parts.push(`${(fraction * 100).toFixed(1)}% used`);
+	} else if (limit.amount.remainingFraction !== undefined) {
+		parts.push(`${(limit.amount.remainingFraction * 100).toFixed(1)}% left`);
+	} else {
+		parts.push("no data");
+	}
+	const reset = formatResetShort(limit, nowMs);
+	if (reset) parts.push(reset);
+	return parts.join(" · ");
+}
+
+function renderAccountHeaderCell(
+	report: UsageReport,
+	label: string,
+	columnWidth: number,
+	uiTheme: typeof theme,
+	activeAccount?: OAuthAccountIdentity,
+): string {
+	const active = reportMatchesActiveAccount(report, activeAccount);
+	const cell = truncateJobLabel(active ? `● ${label}` : label, columnWidth);
+	return padColumn(active ? uiTheme.fg("accent", cell) : cell, columnWidth);
 }
 
 /**
@@ -1779,11 +1962,32 @@ export function renderUsageReports(
 		const providerName = formatProviderName(provider);
 		const activeAccount = resolveActiveAccount?.(provider);
 
+		const reportFallbackIndices = new Map<UsageReport, number>();
+		for (const [index, report] of providerReports.entries()) {
+			reportFallbackIndices.set(report, index);
+		}
+		const reportAccountKeys = new Map<UsageReport, string>();
+		const usedReportKeys = new Set<string>();
+		for (const report of providerReports) {
+			const fallbackIndex = reportFallbackIndices.get(report) ?? 0;
+			const baseKey = formatReportAccountKey(report, fallbackIndex);
+			let key = baseKey;
+			let collision = 0;
+			while (usedReportKeys.has(key)) {
+				collision += 1;
+				key = `${baseKey}|index:${fallbackIndex}-${collision}`;
+			}
+			usedReportKeys.add(key);
+			reportAccountKeys.set(report, key);
+		}
+
 		const limitGroups = new Map<
 			string,
-			{ label: string; windowLabel: string; limits: UsageLimit[]; reports: UsageReport[] }
+			{ label: string; windowLabel: string; limitsByAccountKey: Map<string, UsageLimit> }
 		>();
 		for (const report of providerReports) {
+			const accountKey =
+				reportAccountKeys.get(report) ?? formatReportAccountKey(report, reportFallbackIndices.get(report) ?? 0);
 			for (const limit of report.limits) {
 				const windowId = limit.window?.id ?? limit.scope.windowId ?? "default";
 				const key = `${formatLimitTitle(limit)}|${windowId}`;
@@ -1791,11 +1995,9 @@ export function renderUsageReports(
 				const entry = limitGroups.get(key) ?? {
 					label: formatLimitTitle(limit),
 					windowLabel,
-					limits: [],
-					reports: [],
+					limitsByAccountKey: new Map<string, UsageLimit>(),
 				};
-				entry.limits.push(limit);
-				entry.reports.push(report);
+				entry.limitsByAccountKey.set(accountKey, limit);
 				limitGroups.set(key, entry);
 			}
 		}
@@ -1825,10 +2027,13 @@ export function renderUsageReports(
 					: typeof report.metadata?.accountId === "string" && report.metadata.accountId
 						? report.metadata.accountId
 						: "account";
+			// Same matching rules as the account columns (alias/scope ids,
+			// normalization, decisive account-id, org gate). Reset-only rows have
+			// no limits, so they match on report metadata alone.
 			const isActive =
-				!!activeAccount &&
-				((!!activeAccount.accountId && activeAccount.accountId === report.metadata?.accountId) ||
-					(!!activeAccount.email && activeAccount.email === report.metadata?.email));
+				report.limits.length > 0
+					? reportMatchesActiveAccount(report, activeAccount)
+					: limitMatchesActiveAccount(report, undefined, activeAccount);
 			resetAccountLines.push(
 				`    • ${label}: ${count} saved reset${count === 1 ? "" : "s"}${isActive ? " (active)" : ""}`,
 			);
@@ -1857,53 +2062,120 @@ export function renderUsageReports(
 			for (const line of resetAccountLines) lines.push(uiTheme.fg("dim", line));
 		}
 
+		const providerAccounts = stableAccountOrder(
+			providerReports.filter(report => report.limits.length > 0),
+			activeAccount,
+			reportFallbackIndices,
+		);
+
 		const renderableGroups = Array.from(limitGroups.values()).map(group => {
-			const entries = group.limits.map((limit, index) => ({
-				limit,
-				report: group.reports[index],
-				fraction: resolveUsedFraction(limit),
-				index,
-			}));
-			entries.sort((a, b) => {
-				const aFraction = a.fraction ?? -1;
-				const bFraction = b.fraction ?? -1;
-				if (aFraction !== bFraction) return bFraction - aFraction;
-				return a.index - b.index;
+			const columns = providerAccounts.map(account => {
+				const accountKey =
+					reportAccountKeys.get(account) ??
+					formatReportAccountKey(account, reportFallbackIndices.get(account) ?? 0);
+				return group.limitsByAccountKey.get(accountKey);
 			});
-			const sortedLimits = entries.map(entry => entry.limit);
-			const sortedReports = entries.map(entry => entry.report);
-			return { group, sortedLimits, sortedReports, amountText: formatAggregateAmount(sortedLimits) };
+			return { group, columns };
+		});
+		renderableGroups.sort((left, right) => {
+			const labelOrder = left.group.label.localeCompare(right.group.label);
+			if (labelOrder !== 0) return labelOrder;
+			return left.group.windowLabel.localeCompare(right.group.windowLabel);
 		});
 
-		const sectionCount = renderableGroups.reduce((max, g) => Math.max(max, g.sortedLimits.length), 0);
-		const sectionTrailing = renderableGroups.reduce((max, g) => Math.max(max, visibleWidth(g.amountText)), 0);
-		const sectionColumnWidth = resolveColumnWidth(sectionCount, availableWidth, sectionTrailing);
-		const sectionBarWidth = Math.min(sectionColumnWidth, BAR_WIDTH_MAX);
+		const accountCount = providerAccounts.length;
+		const sectionColumnWidth = resolveColumnWidth(accountCount, availableWidth, 0);
+		const meterWidth = Math.min(BAR_WIDTH_MAX, sectionColumnWidth);
 
-		for (const { group, sortedLimits, sortedReports, amountText } of renderableGroups) {
-			const status = resolveAggregateStatus(sortedLimits);
+		// One provider-wide account header so columns stay aligned across limit groups.
+		if (accountCount > 0) {
+			const baseLabels = providerAccounts.map((report, index) =>
+				formatReportAccountLabel(report, reportFallbackIndices.get(report) ?? index),
+			);
+			const labelCounts = new Map<string, number>();
+			for (const label of baseLabels) labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
+			const activeFlags = providerAccounts.map(report => reportMatchesActiveAccount(report, activeAccount));
+			// Per colliding label group: shortest-unique id fragments plus a
+			// group-wide suffix tier chosen against the tightest marker-adjusted
+			// cell, so sibling columns always disambiguate the same way.
+			const collisionPlans = new Map<
+				string,
+				{
+					fragments: Map<string, string>;
+					tier: "full" | "fragment" | "bare";
+					bareTexts: Map<string, string> | undefined;
+				}
+			>();
+			for (const [label, count] of labelCounts) {
+				if (count <= 1) continue;
+				const memberIds: string[] = [];
+				let minBudget = Number.POSITIVE_INFINITY;
+				for (const [index, report] of providerAccounts.entries()) {
+					if (baseLabels[index] !== label) continue;
+					const id = resolveReportAccountId(report);
+					if (id) memberIds.push(id);
+					minBudget = Math.min(minBudget, sectionColumnWidth - (activeFlags[index] ? 2 : 0));
+				}
+				if (memberIds.length === 0) continue;
+				const fragments = shortestUniqueIdFragments(memberIds);
+				const maxFullSuffix = Math.max(...memberIds.map(id => visibleWidth(` (${id})`)));
+				const maxFragmentSuffix = Math.max(...[...fragments.values()].map(f => visibleWidth(` (${f})`)));
+				const tier =
+					minBudget - maxFullSuffix >= 2 ? "full" : minBudget - maxFragmentSuffix >= 2 ? "fragment" : "bare";
+				collisionPlans.set(label, {
+					fragments,
+					tier,
+					// Bare texts fit to the GROUP's tightest budget so
+					// NFC-equivalent siblings render the same text whether or
+					// not they carry the active marker, and each identity class
+					// gets its own collision-free prefix/tail edge.
+					bareTexts: tier === "bare" ? planBareFragmentTexts(memberIds, minBudget) : undefined,
+				});
+			}
+			const headerCells = providerAccounts.map((report, index) => {
+				let label = baseLabels[index];
+				// Same rendered label on two columns (e.g. one email across
+				// workspaces): disambiguate with the stable account id. The id
+				// (or its shortest-unique fragment) is the only part telling
+				// colliding columns apart, so end-truncation must never eat it:
+				// the base is truncated separately, and in the tightest tier the
+				// base and decorations are dropped so the complete fragment
+				// renders directly. Unique labels render unchanged.
+				const plan = collisionPlans.get(label);
+				const accountId = plan ? resolveReportAccountId(report) : undefined;
+				if (plan && accountId) {
+					const budget = sectionColumnWidth - (activeFlags[index] ? 2 : 0);
+					if (plan.tier === "full") {
+						const suffix = ` (${accountId})`;
+						label = `${truncateJobLabel(label, budget - visibleWidth(suffix))}${suffix}`;
+					} else if (plan.tier === "fragment") {
+						const fragment = plan.fragments.get(accountId) ?? accountId;
+						const suffix = ` (${fragment})`;
+						label = `${truncateJobLabel(label, budget - visibleWidth(suffix))}${suffix}`;
+					} else {
+						label = plan.bareTexts?.get(accountId) ?? accountId;
+					}
+				}
+				return renderAccountHeaderCell(report, label, sectionColumnWidth, uiTheme, activeAccount);
+			});
+
+			lines.push(`  ${headerCells.join(" ")}`.trimEnd());
+		}
+
+		for (const { group, columns } of renderableGroups) {
+			const status = resolveAggregateStatus(columns.filter((limit): limit is UsageLimit => limit !== undefined));
 			const statusIcon = resolveStatusIcon(status, uiTheme);
 
 			const windowSuffix = formatWindowSuffix(group.label, group.windowLabel, uiTheme);
 			lines.push(`${statusIcon} ${uiTheme.bold(group.label)} ${windowSuffix}`.trim());
-			const accountLabels = formatAccountHeaderRow(
-				sortedLimits,
-				sortedReports,
-				nowMs,
-				sectionColumnWidth,
-				uiTheme,
-				activeAccount,
-			);
-			lines.push(`  ${accountLabels.join(" ")}`.trimEnd());
-			const bars = sortedLimits.map(limit =>
-				padColumn(renderUsageBar(limit, uiTheme, sectionBarWidth), sectionColumnWidth),
-			);
-			lines.push(`  ${bars.join(" ")} ${amountText}`.trimEnd());
-			const resetText = sortedLimits.length <= 1 ? resolveResetRange(sortedLimits, nowMs) : null;
-			if (resetText) {
-				lines.push(`  ${uiTheme.fg("dim", resetText)}`.trimEnd());
-			}
-			const notes = [...new Set(sortedLimits.flatMap(limit => limit.notes ?? []))];
+			const bars = columns.map(limit => padColumn(renderUsageBar(limit, uiTheme, meterWidth), sectionColumnWidth));
+			lines.push(`  ${bars.join(" ")}`.trimEnd());
+			const details = columns.map(limit => {
+				const text = replaceTabs(sanitizeText(formatMeterDetails(limit, nowMs)));
+				return padColumn(uiTheme.fg("dim", truncateJobLabel(text, sectionColumnWidth)), sectionColumnWidth);
+			});
+			lines.push(`  ${details.join(" ")}`.trimEnd());
+			const notes = [...new Set(columns.flatMap(limit => limit?.notes ?? []))];
 			if (notes.length > 0) {
 				lines.push(
 					`  ${uiTheme.fg("dim", replaceTabs(truncateToWidth(sanitizeText(notes.map(n => n.replace(/[\r\n]+/g, " ")).join(" • ")), 110)))}`.trimEnd(),
@@ -1914,7 +2186,7 @@ export function renderUsageReports(
 		// Render accounts with no rate limits (e.g. business/enterprise plans).
 		const unlimitedReports = providerReports.filter(report => report.limits.length === 0);
 		for (const report of unlimitedReports) {
-			const label = formatUnlimitedReportLabel(report, 0);
+			const label = formatUnlimitedReportLabel(report, reportFallbackIndices.get(report) ?? 0);
 			const tier = report.metadata?.planType;
 			const tierSuffix = typeof tier === "string" && tier ? ` ${uiTheme.fg("dim", `(${tier})`)}` : "";
 			lines.push(

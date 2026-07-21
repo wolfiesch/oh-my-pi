@@ -36,14 +36,24 @@ export function formatActiveAccountLabel(identity: OAuthAccountIdentity | undefi
  *   recovered at all) matches on the org alone. When neither side carries
  *   an org, the base fallback applies unchanged (providers without orgs
  *   keep their former behavior).
- * - `accountId` ↔ report metadata `accountId`/`account_id` or `limit.scope.accountId`
- * - `email`     ↔ report metadata `email`
  * - `projectId` ↔ report metadata `projectId` or `limit.scope.projectId`
- *   (Google-style providers key usage on the GCP project, not an account id)
+ *   (Google-style providers key usage on the GCP project, not an account id).
+ *   DECISIVE when both sides expose one, and checked BEFORE account/email:
+ *   one account spans many projects with per-project pools, so a report
+ *   attributed to a different project never matches via the shared
+ *   account id or email.
+ * - `accountId` ↔ report metadata `accountId`/`account_id` or `limit.scope.accountId`.
+ *   DECISIVE when both sides expose one: a report that carries a different
+ *   account id is a sibling workspace's pool, so it never falls through to
+ *   the shared-email check (same email ≠ same quota pool).
+ * - `email`     ↔ report metadata `email`
+ *
+ * `limit` is absent for report-level checks (e.g. reset-credit-only rows),
+ * in which case only report metadata participates.
  */
 export function limitMatchesActiveAccount(
 	report: UsageReport,
-	limit: UsageLimit,
+	limit: UsageLimit | undefined,
 	identity: OAuthAccountIdentity | undefined,
 ): boolean {
 	if (!identity) return false;
@@ -60,16 +70,22 @@ export function limitMatchesActiveAccount(
 		if (activeOrgId !== reportOrgId) return false;
 		if (!activeAccountId && !activeEmail && !activeProjectId) return true;
 	}
+	if (activeProjectId) {
+		const reportProjectIds = [
+			normalizeIdentityValue(metadata.projectId),
+			normalizeIdentityValue(limit?.scope.projectId),
+		].filter((value): value is string => value !== undefined);
+		if (reportProjectIds.length > 0) return reportProjectIds.includes(activeProjectId);
+	}
 	if (activeAccountId) {
-		const reportAccountId = normalizeIdentityValue(metadata.accountId) ?? normalizeIdentityValue(metadata.account_id);
-		if (reportAccountId === activeAccountId) return true;
-		if (normalizeIdentityValue(limit.scope.accountId) === activeAccountId) return true;
+		const reportAccountIds = [
+			normalizeIdentityValue(metadata.accountId),
+			normalizeIdentityValue(metadata.account_id),
+			normalizeIdentityValue(limit?.scope.accountId),
+		].filter((value): value is string => value !== undefined);
+		if (reportAccountIds.length > 0) return reportAccountIds.includes(activeAccountId);
 	}
 	if (activeEmail && normalizeIdentityValue(metadata.email) === activeEmail) return true;
-	if (activeProjectId) {
-		if (normalizeIdentityValue(metadata.projectId) === activeProjectId) return true;
-		if (normalizeIdentityValue(limit.scope.projectId) === activeProjectId) return true;
-	}
 	return false;
 }
 

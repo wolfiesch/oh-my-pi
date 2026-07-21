@@ -19,12 +19,8 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 const WEEK_MS = 7 * DAY_MS;
+// Z.AI reports calendar-month quotas as unit 5; durationMs is only a drain-rate estimate.
 const MONTH_MS = 30 * DAY_MS;
-
-interface ZaiUsageDetail {
-	modelCode?: string;
-	usage?: number;
-}
 
 function normalizeZaiBaseUrl(baseUrl?: string): string {
 	if (!baseUrl?.trim()) return DEFAULT_ENDPOINT;
@@ -35,6 +31,13 @@ function normalizeZaiBaseUrl(baseUrl?: string): string {
 	}
 }
 
+type ZaiWindowUnit = number | string;
+
+interface ZaiUsageDetail {
+	modelCode?: string;
+	usage?: number;
+}
+
 interface ZaiUsageLimitItem {
 	type?: string;
 	usage?: number;
@@ -42,7 +45,7 @@ interface ZaiUsageLimitItem {
 	percentage?: number;
 	remaining?: number;
 	nextResetTime?: number;
-	unit?: number;
+	unit?: ZaiWindowUnit;
 	number?: number;
 	usageDetails?: ZaiUsageDetail[];
 }
@@ -77,6 +80,14 @@ function parseUsageDetails(value: unknown): ZaiUsageDetail[] | undefined {
 	return details.length > 0 ? details : undefined;
 }
 
+function parseWindowUnit(value: unknown): ZaiWindowUnit | undefined {
+	const numeric = toNumber(value);
+	if (numeric !== undefined) return numeric;
+	if (typeof value !== "string") return undefined;
+	const unit = value.trim().toLowerCase();
+	return unit ? unit : undefined;
+}
+
 function parseLimitItem(value: unknown): ZaiUsageLimitItem | null {
 	if (!isRecord(value)) return null;
 	const type = typeof value.type === "string" ? value.type : undefined;
@@ -88,7 +99,7 @@ function parseLimitItem(value: unknown): ZaiUsageLimitItem | null {
 		percentage: toNumber(value.percentage),
 		remaining: toNumber(value.remaining),
 		nextResetTime: parseMillis(value.nextResetTime),
-		unit: toNumber(value.unit),
+		unit: parseWindowUnit(value.unit),
 		number: toNumber(value.number),
 		usageDetails: parseUsageDetails(value.usageDetails),
 	};
@@ -132,41 +143,107 @@ function formatDate(value: Date): string {
 	)}:${pad(value.getSeconds())}`;
 }
 
-function formatCountedUnit(count: number, singular: string): string {
-	const suffix = count === 1 ? "" : "s";
-	return `${count} ${singular}${suffix}`;
+function formatWindowLabel(count: number, singular: string, recurring: string): string {
+	return count === 1 ? recurring : `${count}-${singular.toLowerCase()}`;
 }
 
-function buildZaiWindow(parsed: ZaiUsageLimitItem): UsageWindow {
-	const count = parsed.number !== undefined && parsed.number > 0 ? parsed.number : 1;
+function normalizeWindowUnit(unit: ZaiWindowUnit | undefined): "hour" | "day" | "month" | "week" | undefined {
+	switch (unit) {
+		case 3:
+			return "hour";
+		case 4:
+			return "day";
+		case 5:
+			return "month";
+		case 6:
+			return "week";
+	}
+	if (typeof unit !== "string") return undefined;
+	switch (unit) {
+		case "h":
+		case "hr":
+		case "hour":
+		case "hours":
+			return "hour";
+		case "d":
+		case "day":
+		case "days":
+			return "day";
+		case "mo":
+		case "mon":
+		case "month":
+		case "months":
+			return "month";
+		case "w":
+		case "wk":
+		case "week":
+		case "weeks":
+			return "week";
+		default:
+			return undefined;
+	}
+}
+
+function formatUnknownUnitKey(unit: ZaiWindowUnit): string {
+	const key = String(unit)
+		.trim()
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-|-$/g, "");
+	return key || "unknown";
+}
+
+function formatFallbackWindowId(parsed: ZaiUsageLimitItem, fallbackOrdinal: number): string {
+	const typeKey =
+		parsed.type
+			?.toLowerCase()
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/^-|-$/g, "") || "quota";
+	const resetKey = parsed.nextResetTime !== undefined ? `reset-${parsed.nextResetTime}` : `row-${fallbackOrdinal + 1}`;
+	return `${typeKey}-${resetKey}`;
+}
+
+function buildZaiWindow(parsed: ZaiUsageLimitItem, fallbackOrdinal: number, usedFallbackIds: Set<string>): UsageWindow {
+	const count = parsed.unit === 6 ? 1 : parsed.number !== undefined && parsed.number > 0 ? parsed.number : 1;
 	let id: string;
 	let label: string;
 	let durationMs: number | undefined;
-	switch (parsed.unit) {
-		case 3:
+	switch (normalizeWindowUnit(parsed.unit)) {
+		case "hour":
 			id = `${count}h`;
-			label = formatCountedUnit(count, "Hour");
+			label = formatWindowLabel(count, "Hour", "Hourly");
 			durationMs = count * HOUR_MS;
 			break;
-		case 4:
+		case "day":
 			id = `${count}d`;
-			label = formatCountedUnit(count, "Day");
+			label = formatWindowLabel(count, "Day", "Daily");
 			durationMs = count * DAY_MS;
 			break;
-		case 5:
+		case "month":
 			id = `${count}mo`;
-			label = count === 1 ? "Monthly" : formatCountedUnit(count, "Month");
+			label = formatWindowLabel(count, "Month", "Monthly");
 			durationMs = count * MONTH_MS;
 			break;
-		case 6:
-			id = "1w";
-			label = "Weekly";
-			durationMs = WEEK_MS;
+		case "week":
+			id = `${count}w`;
+			label = formatWindowLabel(count, "Week", "Weekly");
+			durationMs = count * WEEK_MS;
 			break;
-		default:
-			id = parsed.unit !== undefined ? `${count}u${parsed.unit}` : "quota";
+		default: {
+			const fallbackId = formatFallbackWindowId(parsed, fallbackOrdinal);
+			const baseId =
+				parsed.unit !== undefined ? `${count}u${formatUnknownUnitKey(parsed.unit)}-${fallbackId}` : fallbackId;
+			let candidateId = baseId;
+			let counter = 1;
+			while (usedFallbackIds.has(candidateId)) {
+				candidateId = `${baseId}-row-${fallbackOrdinal + 1}-${counter}`;
+				counter++;
+			}
+			usedFallbackIds.add(candidateId);
+			id = candidateId;
 			label = "Quota";
 			break;
+		}
 	}
 	return {
 		id,
@@ -254,9 +331,10 @@ async function fetchZaiUsage(params: UsageFetchParams, ctx: UsageFetchContext): 
 
 	const limitsPayload = Array.isArray(payload.data?.limits) ? payload.data?.limits : [];
 	const limits: UsageLimit[] = [];
+	const usedFallbackIds = new Set<string>();
 
-	for (const rawLimit of limitsPayload) {
-		const parsed = parseLimitItem(rawLimit);
+	for (let index = 0; index < limitsPayload.length; index += 1) {
+		const parsed = parseLimitItem(limitsPayload[index]);
 		if (!parsed) continue;
 		if (parsed.type === "TOKENS_LIMIT") {
 			const amount = buildUsageAmount({
@@ -266,7 +344,7 @@ async function fetchZaiUsage(params: UsageFetchParams, ctx: UsageFetchContext): 
 				percentage: parsed.percentage,
 				unit: "tokens",
 			});
-			const window = buildZaiWindow(parsed);
+			const window = buildZaiWindow(parsed, index, usedFallbackIds);
 			limits.push({
 				id: `zai:tokens:${window.id}`,
 				label: `ZAI ${window.label} Token Quota`,
@@ -281,7 +359,7 @@ async function fetchZaiUsage(params: UsageFetchParams, ctx: UsageFetchContext): 
 			});
 		}
 		if (parsed.type === "TIME_LIMIT") {
-			const window = buildZaiWindow(parsed);
+			const window = buildZaiWindow(parsed, index, usedFallbackIds);
 			const amount = buildUsageAmount({
 				used: parsed.currentValue,
 				limit: parsed.usage,

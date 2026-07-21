@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Z.AI usage reporting to preserve distinct 5-hour, weekly, and monthly quota windows instead of rendering duplicate token windows as separate accounts ([#3721](https://github.com/can1357/oh-my-pi/pull/3721) by [@wolfiesch](https://github.com/wolfiesch)).
+
 ## [17.0.6] - 2026-07-20
 
 ### Fixed
