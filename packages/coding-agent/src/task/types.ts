@@ -387,6 +387,7 @@ export interface YieldItem {
 export interface AgentProgress {
 	index: number;
 	id: string;
+	sessionFile?: string;
 	agent: string;
 	agentSource: AgentSource;
 	status: "pending" | "running" | "completed" | "failed" | "aborted";
@@ -491,6 +492,8 @@ export interface SingleResult {
 	abortReason?: string;
 	/** Aggregated usage from the subprocess, accumulated incrementally from message_end events. */
 	usage?: Usage;
+	/** File-backed transcript for the spawned agent session, when one was allocated. */
+	sessionFile?: string;
 	/** Output path for the task result */
 	outputPath?: string;
 	/** Patch path for isolated worktree output */

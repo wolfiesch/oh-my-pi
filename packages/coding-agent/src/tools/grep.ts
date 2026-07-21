@@ -27,11 +27,10 @@ import {
 	fileHyperlink,
 	getTreeBranch,
 	getTreeContinuePrefix,
+	internalResourceHyperlinkResult,
 	renderStatusLine,
 	renderTreeList,
 	truncateToWidth,
-	tryResolveInternalUrlSync,
-	uriHyperlink,
 } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { type ArchiveReader, type ExtractedArchiveFile, openArchive, parseArchivePathCandidates } from "../utils/zip";
@@ -1567,9 +1566,8 @@ function searchScopeMeta(details: GrepToolDetails | undefined): string | undefin
 }
 
 function linkUrlLikeSearchHeader(raw: string, styled: string): { line: string; absPath?: string } {
-	const resolvedPath = tryResolveInternalUrlSync(raw);
-	if (resolvedPath) return { line: fileHyperlink(resolvedPath, styled), absPath: resolvedPath };
-	return { line: uriHyperlink(raw, styled) };
+	const linked = internalResourceHyperlinkResult(raw, styled);
+	return { line: linked.text, absPath: linked.resolvedPath };
 }
 
 function parseSearchDisplayLineNumber(line: string): number | undefined {

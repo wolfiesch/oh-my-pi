@@ -12,7 +12,16 @@ import { settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
 import type { Theme } from "../../modes/theme/theme";
-import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
+import { rebasePersistedArtifactLinkPath } from "../../modes/utils/session-artifact-links";
+import {
+	Ellipsis,
+	fileHyperlink,
+	Hasher,
+	type RenderCache,
+	renderStatusLine,
+	renderTreeList,
+	truncateToWidth,
+} from "../../tui";
 import type { ToolSession } from "..";
 import {
 	formatBadge,
@@ -138,6 +147,7 @@ interface TrackedJobLike {
 	latestDetails?: Record<string, unknown>;
 	resultText?: string;
 	errorText?: string;
+	linkPath?: string;
 }
 
 export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobSnapshot[] {
@@ -175,6 +185,7 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 			...(resolvedModel ? { resolvedModel } : {}),
 			...(latest.resultText ? { resultText: latest.resultText } : {}),
 			...(latest.errorText ? { errorText: latest.errorText } : {}),
+			...(latest.linkPath ? { linkPath: latest.linkPath } : {}),
 		};
 	});
 }
@@ -350,6 +361,8 @@ export function executeJobsSnapshot(
 // TUI Renderer (jobs half)
 // =============================================================================
 
+type JobRenderOptions = RenderResultOptions & { renderContext?: { currentSessionFile?: string } };
+
 interface JobRenderArgs {
 	poll?: string[];
 	cancel?: string[];
@@ -454,7 +467,7 @@ export function jobsRenderCall(args: HubRenderArgs, _options: RenderResultOption
 /** Result frame for job snapshots (wait/cancel/jobs and the agents roster). */
 export function jobsRenderResult(
 	result: { content: Array<{ type: string; text?: string }>; details?: CoordinationDetails; isError?: boolean },
-	options: RenderResultOptions,
+	options: JobRenderOptions,
 	uiTheme: Theme,
 	hubArgs?: HubRenderArgs,
 ): Component {
@@ -559,7 +572,13 @@ export function jobsRenderResult(
 						const typeBadge = formatBadge(job.type, statusToColor(job.status), uiTheme);
 						// Task jobs label themselves with their agent id, which is also
 						// the job id — drop the id column instead of stuttering it twice.
-						const idPart = job.label.trim() === job.id ? "" : ` ${uiTheme.fg("muted", job.id)}`;
+						const linkPath = rebasePersistedArtifactLinkPath(
+							job.linkPath,
+							options.renderContext?.currentSessionFile,
+						);
+						const idText = uiTheme.fg("muted", job.id);
+						const linkedIdText = linkPath ? fileHyperlink(linkPath, idText) : idText;
+						const idPart = job.label.trim() === job.id ? "" : ` ${linkedIdText}`;
 						const rawLabelLines = (job.label || "(no label)").split(/\r?\n/);
 						const maxLabelLines = expanded ? LABEL_LINES_EXPANDED : LABEL_LINES_COLLAPSED;
 						const visibleLabelLines = rawLabelLines
@@ -590,11 +609,13 @@ export function jobsRenderResult(
 						// shimmer band.
 						const live = job.status === "running" && options.spinnerFrame !== undefined;
 						const headRaw = visibleLabelLines[0] ?? "";
-						const headLabel = live
+						const styledHeadLabel = live
 							? shimmerEnabled()
 								? shimmerText(headRaw, uiTheme)
 								: uiTheme.fg("accent", headRaw)
 							: uiTheme.fg("toolOutput", headRaw);
+						const headLabel =
+							linkPath && idPart === "" ? fileHyperlink(linkPath, styledHeadLabel) : styledHeadLabel;
 						lines.push(
 							`${icon}${idPart} ${typeBadge} ${headLabel}${modelText}${modelText ? uiTheme.sep.dot : " "}${durationText}`,
 						);

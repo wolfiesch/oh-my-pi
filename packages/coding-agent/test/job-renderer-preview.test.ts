@@ -5,13 +5,17 @@
  * passes through unchanged.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as url from "node:url";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { prompt } from "@oh-my-pi/pi-utils";
 import taskSummaryTemplate from "../src/prompts/tools/task-summary.md" with { type: "text" };
 import { hubToolRenderer } from "../src/tools/hub";
 
-function renderLines(resultText: string): string {
+function renderLines(resultText: string, linkPath?: string): string {
 	const result = {
 		content: [{ type: "text", text: "" }],
 		details: {
@@ -24,6 +28,7 @@ function renderLines(resultText: string): string {
 					label: "SpawnProbe",
 					durationMs: 8_700,
 					resultText,
+					...(linkPath ? { linkPath } : {}),
 				},
 			],
 		},
@@ -34,6 +39,10 @@ function renderLines(resultText: string): string {
 		theme,
 	);
 	return (component.render(120) as readonly string[]).join("\n");
+}
+
+function extractLinkUris(text: string): string[] {
+	return [...text.matchAll(/\x1b\]8;[^;]*;([^\x1b\x07]+)(?:\x1b\\|\x07)/g)].map(match => match[1]!);
 }
 
 describe("job renderer task-result preview", () => {
@@ -112,6 +121,55 @@ describe("job renderer task-result preview", () => {
 		expect(header!.match(/SpawnProbe/g)).toHaveLength(1);
 	});
 
+	it("rebases persisted job links to the current session artifact child", () => {
+		const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "omp-job-link-"));
+		try {
+			const oldArtifactsDir = path.join(tempRoot, "old-session");
+			const currentArtifactsDir = path.join(tempRoot, "current-session");
+			const outputName = "Worker.txt";
+			const oldLinkPath = path.join(oldArtifactsDir, outputName);
+			const currentLinkPath = path.join(currentArtifactsDir, outputName);
+			fs.mkdirSync(currentArtifactsDir, { recursive: true });
+			fs.writeFileSync(currentLinkPath, "rebased");
+
+			const result = {
+				content: [{ type: "text" as const, text: "" }],
+				details: {
+					op: "wait" as const,
+					jobs: [
+						{
+							id: "SpawnProbe",
+							type: "task" as const,
+							status: "completed" as const,
+							label: "SpawnProbe worker",
+							durationMs: 8_700,
+							resultText: "done",
+							linkPath: oldLinkPath,
+						},
+					],
+				},
+			};
+
+			Settings.instance.override("tui.hyperlinks", "always");
+			const component = hubToolRenderer.renderResult(
+				result,
+				{
+					expanded: true,
+					isPartial: false,
+					renderContext: { currentSessionFile: `${currentArtifactsDir}.jsonl` },
+				} as Parameters<typeof hubToolRenderer.renderResult>[1],
+				theme,
+				{ op: "wait", ids: ["SpawnProbe"] },
+			);
+			const output = (component.render(120) as readonly string[]).join("\n");
+
+			expect(extractLinkUris(output)).toContain(url.pathToFileURL(currentLinkPath).href);
+			expect(extractLinkUris(output)).not.toContain(url.pathToFileURL(oldLinkPath).href);
+			expect(Bun.stripANSI(output)).toContain("SpawnProbe worker");
+		} finally {
+			fs.rmSync(tempRoot, { recursive: true, force: true });
+		}
+	});
 	describe("collapse and filter when turned into a result", () => {
 		const jobsData = [
 			{

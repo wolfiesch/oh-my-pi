@@ -1,4 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -6,6 +8,7 @@ import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/lo
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import {
 	fileHyperlink,
+	internalResourceHyperlink,
 	isHyperlinkEnabled,
 	tryResolveInternalUrlSync,
 	uriHyperlink,
@@ -233,6 +236,59 @@ describe("uriHyperlink", () => {
 	it("leaves text plain for URI targets containing control bytes", () => {
 		setHyperlinkMode("always");
 		expect(uriHyperlink("https://example.com/\x07bad", "bad")).toBe("bad");
+		expect(uriHyperlink("https://example.com/\x90bad", "bad")).toBe("bad");
+	});
+});
+
+describe("internalResourceHyperlink", () => {
+	afterEach(() => {
+		LocalProtocolHandler.resetOverrideForTests();
+	});
+
+	it("returns plain text when hyperlinks are disabled", () => {
+		setHyperlinkMode("off");
+		expect(internalResourceHyperlink("agent://agent-1", "agent-1")).toBe("agent-1");
+	});
+
+	it("wraps arbitrary internal URI targets when hyperlinks are forced", () => {
+		setHyperlinkMode("always");
+		const result = internalResourceHyperlink("agent://agent-1", "agent-1");
+		expect(isHyperlinked(result)).toBe(true);
+		expect(extractLinkUri(result)).toBe("agent://agent-1");
+	});
+
+	it("leaves text plain for URI targets containing control bytes", () => {
+		setHyperlinkMode("always");
+		expect(internalResourceHyperlink("agent://agent-1\x07bad", "agent-1")).toBe("agent-1");
+	});
+
+	it("uses the provided resolved path as a file hyperlink target", () => {
+		setHyperlinkMode("always");
+		const resolvedPath = path.resolve("/tmp/agent-output.md");
+		const result = internalResourceHyperlink("agent://agent-1", "agent-1", { resolvedPath, line: 5, col: 2 });
+		const uri = extractLinkUri(result);
+		const expectedUri = new URL(url.pathToFileURL(resolvedPath).href);
+		expectedUri.searchParams.set("line", "5");
+		expectedUri.searchParams.set("col", "2");
+		expect(uri).toBe(expectedUri.href);
+	});
+
+	it("resolves local URLs to file hyperlinks", async () => {
+		setHyperlinkMode("always");
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-hyperlink-test-"));
+		try {
+			LocalProtocolHandler.setOverride({
+				getArtifactsDir: () => path.join(tempDir, "artifacts"),
+				getSessionId: () => "session-a",
+			});
+			const result = internalResourceHyperlink("local://notes.md", "notes");
+			const expectedPath = path.join(tempDir, "artifacts", "local", "notes.md");
+			expect(extractLinkUri(result)).toBe(url.pathToFileURL(expectedPath).href);
+			expect(result).toContain("notes");
+		} finally {
+			LocalProtocolHandler.resetOverrideForTests();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -247,6 +303,12 @@ describe("urlHyperlink", () => {
 	it("does not wrap non-HTTP URL schemes", () => {
 		setHyperlinkMode("always");
 		expect(urlHyperlink("ftp://example.com/file", "file")).toBe("file");
+	});
+
+	it("leaves text plain for HTTP URLs containing control bytes", () => {
+		setHyperlinkMode("always");
+		expect(urlHyperlink("https://example.com/\x07bad", "bad")).toBe("bad");
+		expect(urlHyperlink("https://example.com/\x90bad", "bad")).toBe("bad");
 	});
 });
 
@@ -270,6 +332,12 @@ describe("urlHyperlinkAlways", () => {
 	it("does not wrap non-HTTP URL schemes", () => {
 		setHyperlinkMode("always");
 		expect(urlHyperlinkAlways("ftp://example.com/file", "file")).toBe("file");
+	});
+
+	it("leaves text plain for HTTP URLs containing control bytes", () => {
+		setHyperlinkMode("always");
+		expect(urlHyperlinkAlways("https://example.com/\x07bad", "bad")).toBe("bad");
+		expect(urlHyperlinkAlways("https://example.com/\x90bad", "bad")).toBe("bad");
 	});
 });
 

@@ -33,6 +33,7 @@ export type TerminalId =
 	| "vscode"
 	| "alacritty"
 	| "warp"
+	| "orca"
 	| "base"
 	| "trueColor";
 
@@ -422,10 +423,15 @@ export function shouldEnableHyperlinksByDefault(
 	return true;
 }
 
-function getFallbackImageProtocol(terminalId: TerminalId): ImageProtocol | null {
-	if (!process.stdout.isTTY) return null;
-	if (terminalId === "vscode" || terminalId === "alacritty") return null;
-	const term = Bun.env.TERM?.toLowerCase() ?? "";
+/** Resolve the multiplexer/TERM fallback image protocol while preserving terminal-specific opt-outs. */
+export function resolveFallbackImageProtocol(
+	terminalId: TerminalId,
+	env: NodeJS.ProcessEnv = Bun.env,
+	stdoutIsTTY: boolean | undefined = process.stdout.isTTY,
+): ImageProtocol | null {
+	if (!stdoutIsTTY) return null;
+	if (terminalId === "vscode" || terminalId === "alacritty" || terminalId === "orca") return null;
+	const term = env.TERM?.toLowerCase() ?? "";
 	if (term.includes("screen") || term.includes("tmux") || term.includes("ghostty")) {
 		return ImageProtocol.Kitty;
 	}
@@ -461,11 +467,12 @@ const KNOWN_TERMINALS = Object.freeze({
 	vscode: new TerminalInfo("vscode", null, true, true, NotifyProtocol.Bell),
 	alacritty: new TerminalInfo("alacritty", null, true, true, NotifyProtocol.Bell),
 	// Warp identifies via TERM_PROGRAM=WarpTerminal and ships the Kitty graphics
-	// protocol on macOS/Linux (direct placement only — no Unicode placeholders, so
+	// protocol on macOS/Linux (direct placement only - no Unicode placeholders, so
 	// detectKittyUnicodePlaceholdersSupport correctly excludes it). It does not
 	// honor OSC 8 yet (the escape renders as visible text), so hyperlinks stay off,
 	// but it does support OSC 9 notifications.
-	warp: new TerminalInfo("warp", ImageProtocol.Kitty, true, false, NotifyProtocol.Osc9),
+	warp: getWarpTerminalInfo(process.platform),
+	orca: new TerminalInfo("orca", null, true, true, NotifyProtocol.Bell),
 });
 
 /** Resolve terminal identity from environment markers used by common emulators. */
@@ -500,7 +507,8 @@ export function detectTerminalId(env: NodeJS.ProcessEnv = Bun.env): TerminalId {
 		if (caseEq(TERM_PROGRAM, "iterm.app")) return "iterm2";
 		if (caseEq(TERM_PROGRAM, "vscode")) return "vscode";
 		if (caseEq(TERM_PROGRAM, "alacritty")) return "alacritty";
-		if (caseEq(TERM_PROGRAM, "warpterminal")) return "warp";
+		if (caseEq(TERM_PROGRAM, "WarpTerminal")) return "warp";
+		if (caseEq(TERM_PROGRAM, "Orca")) return "orca";
 	}
 
 	if (TERM?.toLowerCase().includes("ghostty")) return "ghostty";
@@ -537,7 +545,7 @@ export const TERMINAL: RuntimeTerminal = (() => {
 		// Warp advertises Kitty graphics on macOS/Linux only; drop it on win32.
 		resolved.imageProtocol = resolveWarpImageProtocol();
 	} else if (!resolved.imageProtocol) {
-		const fallbackImageProtocol = getFallbackImageProtocol(resolved.id);
+		const fallbackImageProtocol = resolveFallbackImageProtocol(resolved.id);
 		if (fallbackImageProtocol) resolved.imageProtocol = fallbackImageProtocol;
 	}
 	// Hyperlink (OSC 8) capability. The static per-terminal flag lives on

@@ -10,8 +10,8 @@ import {
 	type UsageLimit,
 	type UsageReport,
 } from "@oh-my-pi/pi-ai";
-import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@oh-my-pi/pi-tui";
-import { formatDuration, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
+import { type Component, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@oh-my-pi/pi-tui";
+import { APP_NAME, formatDuration, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
@@ -43,11 +43,13 @@ import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-storage";
 import type { CompactMode } from "../../session/compact-modes";
 import type { NewSessionOptions } from "../../session/session-entries";
+import { SessionManager } from "../../session/session-manager";
 import { formatShakeSummary, type ShakeMode, type ShakeResult } from "../../session/shake-types";
 import { formatActiveAccountLabel, limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
 import { replaceTabs, truncateToWidth } from "../../tools/render-utils";
+import { fileHyperlink } from "../../tui";
 import {
 	getChangelogPath,
 	parseChangelog,
@@ -68,6 +70,60 @@ function showMarkdownPanel(ctx: InteractiveModeContext, title: string, markdown:
 	ctx.presentCommandOutput(block);
 }
 
+/**
+ * Build the shell command that resumes a session in another terminal.
+ *
+ * Prefer the session id only when the session is in the default managed
+ * directory; custom session directories fall back to a safely quoted path.
+ */
+export function buildResumeCommand(
+	opts: {
+		sessionId?: string;
+		sessionFile?: string;
+		idResolvable?: boolean;
+	},
+	platform: NodeJS.Platform = process.platform,
+): string | undefined {
+	const id = opts.sessionId?.trim();
+	if (opts.idResolvable && id && /^[0-9a-z-]+$/i.test(id)) {
+		return `${APP_NAME} --resume ${id}`;
+	}
+	if (opts.sessionFile && platform !== "win32") {
+		const quoted = `'${opts.sessionFile.replace(/'/g, "'\\''")}'`;
+		return `${APP_NAME} --resume ${quoted}`;
+	}
+	return undefined;
+}
+
+/** Components for the `/fork` success card plus the resume command to copy, if any. */
+export interface ForkCard {
+	components: Component[];
+	resumeCommand: string | undefined;
+}
+
+export function buildForkCard(opts: {
+	sessionFile: string | undefined;
+	sessionId: string;
+	idResolvable: boolean;
+}): ForkCard {
+	const { sessionFile } = opts;
+	const shortPath = sessionFile ? path.win32.basename(sessionFile) : "new session";
+	const displayShort = sessionFile ? fileHyperlink(sessionFile, shortPath) : "new session";
+	const components: Component[] = [
+		new Spacer(1),
+		new Text(`${theme.fg("accent", `${theme.status.success} Session forked to ${displayShort}`)}`, 1, 1),
+	];
+	const resumeCommand = sessionFile
+		? buildResumeCommand({ sessionId: opts.sessionId, sessionFile, idResolvable: opts.idResolvable })
+		: undefined;
+	if (resumeCommand) {
+		components.push(
+			new Text(`  ${theme.fg("muted", "Resume in another terminal:")} ${theme.fg("accent", resumeCommand)}`, 1, 1),
+		);
+	}
+	return { components, resumeCommand };
+}
+
 export class CommandController {
 	constructor(private readonly ctx: InteractiveModeContext) {}
 
@@ -86,7 +142,8 @@ export class CommandController {
 
 		try {
 			const filePath = await this.ctx.session.exportToHtml(arg);
-			this.ctx.showStatus(`Session exported to: ${filePath}`);
+			const filePathDisplay = fileHyperlink(filePath, filePath);
+			this.ctx.showStatus(`Session exported to: ${filePathDisplay}`);
 			this.openInBrowser(filePath);
 		} catch (error: unknown) {
 			this.ctx.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
@@ -254,7 +311,8 @@ export class CommandController {
 		const normalizedPremiumRequests = Math.round((premiumRequests + Number.EPSILON) * 100) / 100;
 
 		let info = `${theme.bold("Session Info")}\n\n`;
-		info += `${theme.fg("dim", "File:")} ${stats.sessionFile ?? "In-memory"}\n`;
+		const displayFile = stats.sessionFile ? fileHyperlink(stats.sessionFile, stats.sessionFile) : "In-memory";
+		info += `${theme.fg("dim", "File:")} ${displayFile}\n`;
 		info += `${theme.fg("dim", "ID:")} ${stats.sessionId}\n\n`;
 		info += `\n${theme.bold("Provider")}\n`;
 		const model = this.ctx.session.model;
@@ -980,16 +1038,32 @@ export class CommandController {
 			this.ctx.showError("Fork failed (session not persisted or cancelled)");
 			return;
 		}
+		// Fork copies session artifacts into a new bucket; rebuild before appending
+		// the card so existing OSC 8 links point at the forked artifact paths.
+		this.ctx.rebuildChatFromMessages();
 
 		this.ctx.statusLine.invalidate();
 		this.ctx.ui.requestRender();
 
 		const sessionFile = this.ctx.session.sessionFile;
-		const shortPath = sessionFile ? sessionFile.split("/").pop() : "new session";
-		this.ctx.present([
-			new Spacer(1),
-			new Text(`${theme.fg("accent", `${theme.status.success} Session forked to ${shortPath}`)}`, 1, 1),
-		]);
+		const cwd = this.ctx.sessionManager.getCwd();
+		const idResolvable =
+			sessionFile !== undefined &&
+			this.ctx.sessionManager.getSessionDir() === SessionManager.getDefaultSessionDir(cwd);
+		const { components, resumeCommand } = buildForkCard({
+			sessionFile,
+			sessionId: this.ctx.sessionManager.getSessionId(),
+			idResolvable,
+		});
+		if (resumeCommand) {
+			try {
+				await copyToClipboard(resumeCommand);
+				this.ctx.showStatus("Resume command copied to clipboard");
+			} catch {
+				// Clipboard is best-effort: the command is still shown in the card.
+			}
+		}
+		this.ctx.present(components);
 	}
 
 	/**
@@ -1077,11 +1151,14 @@ export class CommandController {
 
 		this.ctx.updateEditorBorderColor();
 		await this.ctx.reloadTodos();
+		// Rebuild persisted rows after artifact relocation so OSC 8 payloads rebase to the new session dir.
+		this.ctx.rebuildChatFromMessages();
 		this.ctx.ui.requestRender();
 
+		const displayMoved = fileHyperlink(resolvedPath, resolvedPath);
 		this.ctx.present([
 			new Spacer(1),
-			new Text(`${theme.fg("accent", `${theme.status.success} Moved to ${resolvedPath}`)}`, 1, 1),
+			new Text(`${theme.fg("accent", `${theme.status.success} Session moved to ${displayMoved}`)}`, 1, 1),
 		]);
 	}
 

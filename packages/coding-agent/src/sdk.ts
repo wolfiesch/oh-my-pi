@@ -212,6 +212,7 @@ type AsyncResultJobDetails = {
 	jobId: string;
 	type?: "bash" | "task";
 	label?: string;
+	linkPath?: string;
 	durationMs?: number;
 };
 
@@ -231,6 +232,7 @@ function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessag
 		result: entry.result,
 		type: entry.job?.type,
 		label: entry.job?.label,
+		linkPath: entry.job?.linkPath,
 		durationMs: entry.durationMs,
 	}));
 	const details: AsyncResultDetails = {
@@ -238,6 +240,7 @@ function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessag
 			jobId: job.jobId,
 			type: job.type,
 			label: job.label,
+			linkPath: job.linkPath,
 			durationMs: job.durationMs,
 		})),
 	};

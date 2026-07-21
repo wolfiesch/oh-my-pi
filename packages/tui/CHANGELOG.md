@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept Orca's null image protocol authoritative under tmux/screen fallback terms so unsupported Kitty image sequences are not emitted ([#3616](https://github.com/can1357/oh-my-pi/pull/3616) by [@wolfiesch](https://github.com/wolfiesch)).
+- Fixed Orca terminal detection so `tui.hyperlinks=auto` enables OSC 8 hyperlinks instead of falling back to the unknown true-color profile ([#3616](https://github.com/can1357/oh-my-pi/pull/3616) by [@wolfiesch](https://github.com/wolfiesch)).
+
 ## [17.0.6] - 2026-07-20
 
 ### Fixed

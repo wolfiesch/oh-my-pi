@@ -231,6 +231,7 @@ export interface ToolExecutionOptions {
 	snapshots?: SnapshotStore;
 	showImages?: boolean; // default: true (only used if terminal supports images)
 	editFuzzyThreshold?: number;
+	getSessionFile?: () => string | undefined;
 	editAllowFuzzy?: boolean;
 	/** Live-region probe used to settle detached task progress once the block
 	 * leaves the repaintable transcript region. */
@@ -350,6 +351,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	// Probe into the owning transcript (absent outside the interactive
 	// transcript, e.g. in tests): whether this block is still repaintable.
 	#liveRegion?: TranscriptLiveRegionProbe;
+	#getSessionFile?: () => string | undefined;
 	// One-way latch for a detached (`async.state === "running"`) task block
 	// that left the transcript live region: its rows are commit-eligible
 	// history, so progress renders static gray and further partial snapshots are
@@ -390,6 +392,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		this.#editAllowFuzzy = options.editAllowFuzzy;
 		this.#snapshots = options.snapshots;
 		this.#liveRegion = options.liveRegion;
+		this.#getSessionFile = options.getSessionFile;
 		this.#tool = tool;
 		this.#ui = ui;
 		this.#cwd = cwd;
@@ -1261,6 +1264,8 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 			if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
 			return Math.max(1, Math.min(maxSeconds, value));
 		};
+		const currentSessionFile = this.#getSessionFile?.();
+		if (currentSessionFile) context.currentSessionFile = currentSessionFile;
 
 		if (this.#toolName === "bash") {
 			// Bash needs render context even before a result exists. The renderer uses the pending-call args

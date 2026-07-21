@@ -5,6 +5,7 @@ import {
 	hyperlinksUserOverride,
 	ImageProtocol,
 	NotifyProtocol,
+	resolveFallbackImageProtocol,
 	resolveWarpImageProtocol,
 	shouldEnableHyperlinksByDefault,
 	shouldEnableSynchronizedOutputByDefault,
@@ -20,6 +21,10 @@ describe("detectTerminalId", () => {
 		const env = { TERM: "xterm-256color", TERM_PROGRAM: "", COLORTERM: "truecolor", VTE_VERSION: "8400" };
 
 		expect(detectTerminalId(env)).toBe("trueColor");
+	});
+
+	it("recognizes Orca before the true-color fallback", () => {
+		expect(detectTerminalId({ TERM_PROGRAM: "Orca", COLORTERM: "truecolor" })).toBe("orca");
 	});
 });
 
@@ -114,10 +119,6 @@ describe("shouldEnableSynchronizedOutputByDefault", () => {
 });
 
 describe("Warp terminal capabilities", () => {
-	it("recognizes TERM_PROGRAM=WarpTerminal before the true-color fallback", () => {
-		expect(detectTerminalId({ TERM_PROGRAM: "WarpTerminal", COLORTERM: "truecolor" })).toBe("warp");
-	});
-
 	it("resolves the process-wide Warp terminal id and image protocol from TERM_PROGRAM", async () => {
 		const env: Record<string, string | undefined> = {
 			...Bun.env,
@@ -163,7 +164,7 @@ console.log(JSON.stringify({ id: TERMINAL_ID, imageProtocol: TERMINAL.imageProto
 	});
 
 	it("is Kitty-capable with true color but no OSC 8 hyperlinks", () => {
-		const warp = getTerminalInfo("warp");
+		const warp = getTerminalInfo("warp", "darwin", {});
 		expect(warp.imageProtocol).toBe(ImageProtocol.Kitty);
 		expect(warp.trueColor).toBe(true);
 		expect(warp.hyperlinks).toBe(false);
@@ -207,6 +208,13 @@ console.log(JSON.stringify({ id: TERMINAL_ID, imageProtocol: TERMINAL.imageProto
 	});
 });
 
+describe("Orca terminal capabilities", () => {
+	it("keeps the fallback image protocol null under tmux fallback terms", () => {
+		expect(resolveFallbackImageProtocol("orca", { TERM: "tmux-256color" }, true)).toBeNull();
+		expect(resolveFallbackImageProtocol("orca", { TERM: "screen-256color" }, true)).toBeNull();
+	});
+});
+
 describe("hyperlinksUserOverride", () => {
 	it("returns null when neither override is set", () => {
 		expect(hyperlinksUserOverride({})).toBeNull();
@@ -236,7 +244,7 @@ describe("hyperlinksUserOverride", () => {
 
 describe("shouldEnableHyperlinksByDefault", () => {
 	it("enables hyperlinks on every known direct terminal", () => {
-		for (const id of ["kitty", "ghostty", "wezterm", "iterm2", "alacritty", "vscode"] as const) {
+		for (const id of ["kitty", "ghostty", "wezterm", "iterm2", "alacritty", "vscode", "orca"] as const) {
 			expect(shouldEnableHyperlinksByDefault({}, id)).toBe(true);
 		}
 	});

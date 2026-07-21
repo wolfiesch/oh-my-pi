@@ -111,9 +111,10 @@ describe("task spawn routing", () => {
 			projectAgentsDir: null,
 		});
 		const gate = deferred();
+		const sessionFile = "/tmp/session/Spawnling.jsonl";
 		const runSpy = vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			await gate.promise;
-			return makeResult(options.id ?? "?");
+			return makeResult(options.id ?? "?", { sessionFile });
 		});
 
 		const manager = createManager();
@@ -142,6 +143,7 @@ describe("task spawn routing", () => {
 		expect(job!.resultText).toContain("Spawnling is now idle");
 		expect(job!.resultText).toContain("message it via `hub` to follow up");
 		expect(job!.resultText).toContain("history://Spawnling");
+		expect(job!.linkPath).toBe(sessionFile);
 		expect(runSpy).toHaveBeenCalledTimes(1);
 	});
 

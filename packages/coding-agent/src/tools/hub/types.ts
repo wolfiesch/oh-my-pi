@@ -50,6 +50,7 @@ export interface JobSnapshot {
 	resolvedModel?: string;
 	resultText?: string;
 	errorText?: string;
+	linkPath?: string;
 }
 
 export type CancelStatus = "cancelled" | "not_found" | "already_completed";

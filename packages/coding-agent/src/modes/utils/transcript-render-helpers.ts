@@ -15,9 +15,11 @@ import {
 } from "../../session/messages";
 import { createIrcMessageCard } from "../../tools/hub";
 import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
+import { fileHyperlink } from "../../tui";
 import { canonicalizeMessage } from "../../utils/thinking-display";
 import { TranscriptBlock } from "../components/transcript-container";
 import { theme } from "../theme/theme";
+import { rebasePersistedArtifactLinkPath } from "./session-artifact-links";
 
 type CustomOrHookMessage = Extract<AgentMessage, { role: "custom" | "hookMessage" }>;
 type AssistantAgentMessage = Extract<AgentMessage, { role: "assistant" }>;
@@ -27,14 +29,21 @@ type AssistantAgentMessage = Extract<AgentMessage, { role: "assistant" }>;
  * or a batch of them) as a transcript block of one "Background job completed"
  * row per job.
  */
-export function buildAsyncResultBlock(message: CustomOrHookMessage): TranscriptBlock {
+export function buildAsyncResultBlock(message: CustomOrHookMessage, currentSessionFile?: string): TranscriptBlock {
 	const details = (
 		message as CustomMessage<{
 			jobId?: string;
 			type?: "bash" | "task";
 			label?: string;
 			durationMs?: number;
-			jobs?: Array<{ jobId?: string; type?: "bash" | "task"; label?: string; durationMs?: number }>;
+			linkPath?: string;
+			jobs?: Array<{
+				jobId?: string;
+				type?: "bash" | "task";
+				label?: string;
+				durationMs?: number;
+				linkPath?: string;
+			}>;
 		}>
 	).details;
 	const jobs =
@@ -46,6 +55,7 @@ export function buildAsyncResultBlock(message: CustomOrHookMessage): TranscriptB
 						type: details?.type,
 						label: details?.label,
 						durationMs: details?.durationMs,
+						linkPath: details?.linkPath,
 					},
 				];
 	const block = new TranscriptBlock();
@@ -53,10 +63,11 @@ export function buildAsyncResultBlock(message: CustomOrHookMessage): TranscriptB
 		const jobId = job.jobId ?? "unknown";
 		const typeLabel = job.type ? `[${job.type}]` : "[job]";
 		const duration = typeof job.durationMs === "number" ? formatDuration(job.durationMs) : undefined;
+		const linkPath = rebasePersistedArtifactLinkPath(job.linkPath, currentSessionFile);
 		const line = [
 			theme.fg("success", `${theme.status.done} Background job completed`),
 			theme.fg("dim", typeLabel),
-			theme.fg("accent", jobId),
+			theme.fg("accent", linkPath ? fileHyperlink(linkPath, jobId) : jobId),
 			duration ? theme.fg("dim", `(${duration})`) : undefined,
 		]
 			.filter(Boolean)

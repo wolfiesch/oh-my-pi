@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { RenderResultOptions } from "@oh-my-pi/pi-agent-core";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { bashToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { previewWindowRows } from "@oh-my-pi/pi-coding-agent/tools/render-utils";
@@ -19,6 +20,7 @@ describe("bashToolRenderer", () => {
 
 	afterEach(() => {
 		terminal.imageProtocol = originalProtocol;
+		resetSettingsForTest();
 	});
 
 	it("shows rendered env assignments in the command preview", async () => {
@@ -157,6 +159,9 @@ describe("bashToolRenderer", () => {
 	});
 
 	it("folds raw output artifact notices into the status footer", async () => {
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+		Settings.instance.override("tui.hyperlinks", "always");
 		const theme = await getThemeByName("dark");
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;

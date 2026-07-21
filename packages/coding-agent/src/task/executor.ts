@@ -920,6 +920,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	const progress: AgentProgress = {
 		index,
 		id,
+		sessionFile: args.sessionFile,
 		agent: agent.name,
 		agentSource: agent.source,
 		status: "running",
@@ -1977,6 +1978,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		aborted: wasAborted,
 		abortReason: finalAbortReason,
 		usage: monitor.hasUsage() ? monitor.accumulatedUsage : undefined,
+		sessionFile: args.sessionFile,
 		outputPath,
 		extractedToolData: progress.extractedToolData,
 		retryFailure: progress.retryFailure,

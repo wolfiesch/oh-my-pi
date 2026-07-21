@@ -124,6 +124,7 @@ import {
 	todoMatchesAnyDescription,
 } from "../tools/todo";
 import { vocalizer } from "../tts/vocalizer";
+import { fileHyperlink } from "../tui";
 import { renderTreeList } from "../tui/tree-list";
 import { copyToClipboard } from "../utils/clipboard";
 import type { EventBus } from "../utils/event-bus";
@@ -2397,7 +2398,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.#updatePlanModeStatus();
 		this.sessionManager.appendModeChange("plan", { planFilePath });
-		this.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
+		const displayPlanFile = fileHyperlink(this.#resolvePlanFilePath(planFilePath), planFilePath);
+		this.showStatus(`Plan mode enabled. Plan file: ${displayPlanFile}`);
 	}
 
 	async #restorePlanPreviousModel(prev: { model: Model; thinkingLevel?: ConfiguredThinkingLevel }): Promise<void> {

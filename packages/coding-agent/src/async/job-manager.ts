@@ -33,6 +33,7 @@ export interface AsyncJob {
 	status: "running" | "completed" | "failed" | "cancelled";
 	startTime: number;
 	label: string;
+	linkPath?: string;
 	abortController: AbortController;
 	promise: Promise<void>;
 	resultText?: string;
@@ -87,6 +88,7 @@ export interface AsyncJobRegisterOptions {
 	id?: string;
 	/** Registry id of the agent that owns this job; used to scope cancelAll. */
 	ownerId?: string;
+	linkPath?: string;
 	/** Registry id of the subagent this job runs; see {@link AsyncJob.agentId}. */
 	agentId?: string;
 	onProgress?: (text: string, details?: Record<string, unknown>) => void | Promise<void>;
@@ -170,6 +172,8 @@ export class AsyncJobManager {
 			reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
 			/** Clear the queued flag once the job actually starts executing. */
 			markRunning: () => void;
+			/** Attach a file-backed result target once the running job allocates one. */
+			setLinkPath: (linkPath: string | undefined) => void;
 		}) => Promise<string>,
 		options?: AsyncJobRegisterOptions,
 	): string {
@@ -199,6 +203,7 @@ export class AsyncJobManager {
 			status: "running",
 			startTime,
 			label,
+			linkPath: options?.linkPath,
 			abortController,
 			promise: Promise.resolve(),
 			ownerId: options?.ownerId,
@@ -218,6 +223,9 @@ export class AsyncJobManager {
 				});
 			}
 		};
+		const setLinkPath = (linkPath: string | undefined): void => {
+			job.linkPath = linkPath;
+		};
 		job.promise = (async () => {
 			try {
 				const text = await run({
@@ -227,6 +235,7 @@ export class AsyncJobManager {
 					markRunning: () => {
 						job.queued = false;
 					},
+					setLinkPath,
 				});
 				if (job.status === "cancelled") {
 					job.resultText = text;

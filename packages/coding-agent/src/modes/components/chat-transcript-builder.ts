@@ -66,6 +66,7 @@ export interface ChatTranscriptBuilderDeps {
 	hideThinkingBlock?: () => boolean;
 	proseOnlyThinking?: () => boolean;
 	requestRender: () => void;
+	getSessionFile?: () => string | undefined;
 }
 
 /** Extracts the plain-text content of a user message (string or text blocks). */
@@ -364,6 +365,7 @@ export class ChatTranscriptBuilder {
 					editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
 					editAllowFuzzy: settings.get("edit.fuzzyMatch"),
 					liveRegion: this.container,
+					getSessionFile: this.deps.getSessionFile,
 				},
 				this.deps.getTool?.(content.name),
 				this.deps.ui,
@@ -429,7 +431,7 @@ export class ChatTranscriptBuilder {
 	#appendCustomMessage(message: Extract<AgentMessage, { role: "custom" | "hookMessage" }>): void {
 		if (!message.display) return;
 		if (message.customType === "async-result") {
-			this.container.addChild(buildAsyncResultBlock(message));
+			this.container.addChild(buildAsyncResultBlock(message, this.deps.getSessionFile?.()));
 			return;
 		}
 		if (message.customType === LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE) {
@@ -463,7 +465,9 @@ export class ChatTranscriptBuilder {
 			return;
 		}
 		if (message.customType === BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE) {
-			this.container.addChild(createBackgroundTanDispatchBlock(message as CustomMessage<unknown>));
+			this.container.addChild(
+				createBackgroundTanDispatchBlock(message as CustomMessage<unknown>, this.deps.getSessionFile?.()),
+			);
 			return;
 		}
 		const handoffComponent = createHandoffSummaryMessageComponent(message as CustomMessage<unknown>, this.#expanded);

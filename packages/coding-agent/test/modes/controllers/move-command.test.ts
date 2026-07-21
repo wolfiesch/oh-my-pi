@@ -8,7 +8,7 @@ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/typ
 
 function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void>) {
 	const state = { cwd: sourceDir, movedTo: undefined as string | undefined };
-	const present = vi.fn();
+	const events: string[] = [];
 	const applyCwdChange = vi.fn(async (cwd: string) => {
 		expect(state.cwd).toBe(cwd);
 	});
@@ -32,10 +32,15 @@ function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void
 		applyCwdChange,
 		updateEditorBorderColor: vi.fn(),
 		reloadTodos: vi.fn(async () => {}),
+		rebuildChatFromMessages: vi.fn(() => {
+			events.push("rebuild");
+		}),
 		ui: { requestRender: vi.fn() },
-		present,
+		present: vi.fn(() => {
+			events.push("present");
+		}),
 	} as unknown as InteractiveModeContext;
-	return { ctx, state, present };
+	return { ctx, state, events };
 }
 
 describe("CommandController /move", () => {
@@ -49,7 +54,7 @@ describe("CommandController /move", () => {
 		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-source-"));
 		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));
 		try {
-			const { ctx, state, present } = createMoveContext(sourceDir);
+			const { ctx, state, events } = createMoveContext(sourceDir);
 			const controller = new CommandController(ctx);
 
 			await controller.handleMoveCommand(targetDir);
@@ -59,8 +64,10 @@ describe("CommandController /move", () => {
 			expect(ctx.applyCwdChange).toHaveBeenCalledWith(targetDir);
 			expect(ctx.updateEditorBorderColor).toHaveBeenCalled();
 			expect(ctx.reloadTodos).toHaveBeenCalled();
+			expect(ctx.rebuildChatFromMessages).toHaveBeenCalled();
+			expect(ctx.present).toHaveBeenCalled();
 			expect(ctx.ui.requestRender).toHaveBeenCalledWith();
-			expect(present).toHaveBeenCalled();
+			expect(events).toEqual(["rebuild", "present"]);
 			expect(ctx.showError).not.toHaveBeenCalled();
 		} finally {
 			await fs.rm(sourceDir, { recursive: true, force: true });

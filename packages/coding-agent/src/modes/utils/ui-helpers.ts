@@ -149,7 +149,9 @@ export class UiHelpers {
 			case "custom": {
 				if (message.display) {
 					if (message.customType === "async-result") {
-						this.ctx.chatContainer.addChild(buildAsyncResultBlock(message));
+						this.ctx.chatContainer.addChild(
+							buildAsyncResultBlock(message, this.ctx.viewSession.sessionManager.getSessionFile?.()),
+						);
 						break;
 					}
 					if (message.customType === LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE) {
@@ -191,7 +193,12 @@ export class UiHelpers {
 						break;
 					}
 					if (message.customType === BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE) {
-						this.ctx.chatContainer.addChild(createBackgroundTanDispatchBlock(message as CustomMessage<unknown>));
+						this.ctx.chatContainer.addChild(
+							createBackgroundTanDispatchBlock(
+								message as CustomMessage<unknown>,
+								this.ctx.viewSession.sessionManager.getSessionFile?.(),
+							),
+						);
 						break;
 					}
 					const handoffComponent = createHandoffSummaryMessageComponent(
@@ -467,6 +474,7 @@ export class UiHelpers {
 							editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
 							editAllowFuzzy: settings.get("edit.fuzzyMatch"),
 							liveRegion: this.ctx.chatContainer,
+							getSessionFile: () => this.ctx.viewSession.sessionManager.getSessionFile?.() ?? undefined,
 						},
 						tool,
 						this.ctx.ui,

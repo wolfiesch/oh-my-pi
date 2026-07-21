@@ -12,6 +12,7 @@ import { settings } from "../config/settings";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { formatContextUsage } from "../modes/components/status-line/context-thresholds";
 import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
+import { rebasePersistedArtifactLinkPath } from "../modes/utils/session-artifact-links";
 import { stripGeneratedOutputNotice, stripRawOutputArtifactNotice } from "../tools/output-meta";
 import {
 	capPreviewLines,
@@ -34,7 +35,7 @@ import {
 	parseFindingDetails,
 	type SubmitReviewDetails,
 } from "../tools/review";
-import { framedBlock, renderStatusLine } from "../tui";
+import { fileHyperlink, framedBlock, renderStatusLine } from "../tui";
 import { repairDoubleEncodedJsonString } from "./repair-args";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import type { AgentProgress, SingleResult, TaskItem, TaskParams, TaskToolDetails, YieldItem } from "./types";
@@ -42,6 +43,7 @@ import { assembleYieldResult } from "./yield-assembly";
 
 /** Render context threaded in from `ToolExecutionComponent.#buildRenderContext`. */
 interface TaskRenderContext {
+	currentSessionFile?: string;
 	hasResult?: boolean;
 	/**
 	 * The block left the transcript live region (detached spawn the transcript
@@ -294,6 +296,23 @@ export function formatTaskId(id: string): string {
 	const sanitizedId = sanitizeText(id);
 	const segments = sanitizedId.split(".");
 	return segments.length < 2 ? sanitizedId : segments.join(">");
+}
+
+function formatLiveProgressId(progress: AgentProgress, currentSessionFile?: string): string {
+	const displayId = formatTaskId(progress.id);
+	const linkPath = rebasePersistedArtifactLinkPath(progress.sessionFile, currentSessionFile);
+	return linkPath ? fileHyperlink(linkPath, displayId) : displayId;
+}
+
+function formatFinalResultId(result: SingleResult, currentSessionFile?: string): string {
+	const displayId = formatTaskId(result.id);
+	const linkPath = rebasePersistedArtifactLinkPath(result.outputPath, currentSessionFile);
+	return linkPath ? fileHyperlink(linkPath, displayId) : displayId;
+}
+
+function formatPatchPath(patchPath: string, currentSessionFile?: string): string {
+	const linkPath = rebasePersistedArtifactLinkPath(patchPath, currentSessionFile) ?? patchPath;
+	return fileHyperlink(linkPath, linkPath);
 }
 
 const MISSING_YIELD_WARNING_PREFIX = "SYSTEM WARNING: Subagent exited without calling yield tool";
@@ -888,6 +907,7 @@ function renderAgentProgress(
 	frozen = false,
 	seenNestedTasks?: WeakSet<object>,
 	nestedDepth = 0,
+	currentSessionFile?: string,
 ): string[] {
 	const lines: string[] = [];
 
@@ -902,7 +922,7 @@ function renderAgentProgress(
 	// Main status line: id: description [status] · stats · ⟨agent⟩
 	const trimmedDescription = progress.description?.trim();
 	const description = trimmedDescription ? previewLine(sanitizeText(trimmedDescription), 64) : undefined;
-	const displayId = formatTaskId(progress.id);
+	const displayId = formatLiveProgressId(progress, currentSessionFile);
 	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
 	const indent = prefix ? `${prefix} ` : "";
 	let statusLine: string;
@@ -1079,6 +1099,7 @@ function renderAgentProgress(
 			frozen,
 			seenNestedTasks,
 			nestedDepth,
+			currentSessionFile,
 		);
 		for (const line of nestedLines) {
 			lines.push(`${continuePrefix}${line}`);
@@ -1209,6 +1230,7 @@ function renderAgentResult(
 	theme: Theme,
 	seenNestedTasks?: WeakSet<object>,
 	nestedDepth = 0,
+	currentSessionFile?: string,
 ): string[] {
 	const lines: string[] = [];
 
@@ -1238,7 +1260,7 @@ function renderAgentResult(
 	// Main status line: id: description [status] · stats · ⟨agent⟩
 	const trimmedDescription = result.description ? sanitizeText(result.description).trim() : undefined;
 	const description = trimmedDescription ? previewLine(trimmedDescription, 64) : undefined;
-	const displayId = formatTaskId(result.id);
+	const displayId = formatFinalResultId(result, currentSessionFile);
 	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
 	let statusLine = `${prefix ? `${prefix} ` : ""}${theme.fg(iconColor, icon)} ${theme.fg(
 		success && !needsWarning ? "text" : "accent",
@@ -1327,6 +1349,7 @@ function renderAgentResult(
 					theme,
 					seenNestedTasks,
 					nestedDepth,
+					currentSessionFile,
 				)) {
 					deferredToolLines.push(`${continuePrefix}${line}`);
 				}
@@ -1380,7 +1403,9 @@ function renderAgentResult(
 	}
 
 	if (result.patchPath && !aborted && result.exitCode === 0) {
-		lines.push(`${continuePrefix}${theme.fg("dim", `Patch: ${result.patchPath}`)}`);
+		lines.push(
+			`${continuePrefix}${theme.fg("dim", `Patch: ${formatPatchPath(result.patchPath, currentSessionFile)}`)}`,
+		);
 	} else if (result.branchName && !aborted && result.exitCode === 0) {
 		lines.push(`${continuePrefix}${theme.fg("dim", `Branch: ${result.branchName}`)}`);
 	}
@@ -1560,6 +1585,7 @@ export function renderResult(
 	return framedBlock(theme, width => {
 		const { expanded, isPartial, spinnerFrame } = options;
 		const frozen = options.renderContext?.frozen === true;
+		const currentSessionFile = options.renderContext?.currentSessionFile;
 		const lines: string[] = [];
 
 		// Result rows win once any exist; progress rows for spawns without a
@@ -1577,13 +1603,26 @@ export function renderResult(
 				lines.push(formatHiddenProgressLine(ordered.slice(0, ordered.length - visible.length), theme));
 			}
 			for (const progress of visible) {
-				lines.push(...renderAgentProgress(progress, "", "  ", expanded, theme, spinnerFrame, frozen));
+				lines.push(
+					...renderAgentProgress(
+						progress,
+						"",
+						"  ",
+						expanded,
+						theme,
+						spinnerFrame,
+						frozen,
+						undefined,
+						0,
+						currentSessionFile,
+					),
+				);
 			}
 		} else if (details.results && details.results.length > 0) {
 			const ordered = orderResultsForDisplay(details.results);
 			const visible = expanded ? ordered : selectCollapsedResults(ordered);
 			for (const res of visible) {
-				lines.push(...renderAgentResult(res, "", "  ", expanded, theme));
+				lines.push(...renderAgentResult(res, "", "  ", expanded, theme, undefined, 0, currentSessionFile));
 			}
 			if (visible.length < ordered.length) {
 				const hint = formatExpandHint(theme, false, true);
@@ -1602,7 +1641,20 @@ export function renderResult(
 					)
 				: [];
 			for (const progress of supplementalProgress) {
-				lines.push(...renderAgentProgress(progress, "", "  ", expanded, theme, spinnerFrame, frozen));
+				lines.push(
+					...renderAgentProgress(
+						progress,
+						"",
+						"  ",
+						expanded,
+						theme,
+						spinnerFrame,
+						frozen,
+						undefined,
+						0,
+						currentSessionFile,
+					),
+				);
 			}
 
 			const summaryParts: string[] = [];
@@ -1697,6 +1749,7 @@ function renderNestedTaskResults(
 	theme: Theme,
 	seen: WeakSet<object> = new WeakSet<object>(),
 	depth = 0,
+	currentSessionFile?: string,
 ): string[] {
 	const lines: string[] = [];
 	for (const details of detailsList) {
@@ -1718,7 +1771,9 @@ function renderNestedTaskResults(
 		const hiddenCount = ordered.length - visible.length;
 		visible.forEach((result, index) => {
 			const { prefix, continuePrefix } = nestedMarkers(hiddenCount === 0 && index === visible.length - 1, theme);
-			lines.push(...renderAgentResult(result, prefix, continuePrefix, expanded, theme, seen, depth + 1));
+			lines.push(
+				...renderAgentResult(result, prefix, continuePrefix, expanded, theme, seen, depth + 1, currentSessionFile),
+			);
 		});
 		if (hiddenCount > 0) {
 			const { prefix } = nestedMarkers(true, theme);
@@ -1742,6 +1797,7 @@ function renderNestedTaskTree(
 	frozen = false,
 	seen: WeakSet<object> = new WeakSet<object>(),
 	depth = 0,
+	currentSessionFile?: string,
 ): string[] {
 	const lines: string[] = [];
 	for (const details of detailsList) {
@@ -1761,7 +1817,18 @@ function renderNestedTaskTree(
 			const hiddenCount = ordered.length - visible.length;
 			visible.forEach((result, index) => {
 				const { prefix, continuePrefix } = nestedMarkers(hiddenCount === 0 && index === visible.length - 1, theme);
-				lines.push(...renderAgentResult(result, prefix, continuePrefix, expanded, theme, seen, depth + 1));
+				lines.push(
+					...renderAgentResult(
+						result,
+						prefix,
+						continuePrefix,
+						expanded,
+						theme,
+						seen,
+						depth + 1,
+						currentSessionFile,
+					),
+				);
 			});
 			if (hiddenCount > 0) {
 				const { prefix } = nestedMarkers(true, theme);
@@ -1788,6 +1855,7 @@ function renderNestedTaskTree(
 						frozen,
 						seen,
 						depth + 1,
+						currentSessionFile,
 					),
 				);
 			});

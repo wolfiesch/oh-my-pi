@@ -1047,7 +1047,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return manager.register(
 			"task",
 			agentId,
-			async ({ signal: runSignal, reportProgress, markRunning }) => {
+			async ({ signal: runSignal, reportProgress, markRunning, setLinkPath }) => {
 				const startedAt = Date.now();
 				const semaphore = this.#getSpawnSemaphore();
 				let semaphoreHeld = false;
@@ -1123,6 +1123,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					);
 					const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 					const singleResult = result.details?.results[0];
+					setLinkPath(singleResult?.sessionFile);
 					// A missing result means the sync path failed at the tool level
 					// (results: []) — treat it as a failure, not success.
 					const resultFailed = !singleResult || (singleResult.aborted ?? false) || singleResult.exitCode !== 0;

@@ -775,6 +775,10 @@ export class EventController {
 							showImages: settings.get("terminal.showImages"),
 							editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
 							editAllowFuzzy: settings.get("edit.fuzzyMatch"),
+							getSessionFile: () =>
+								this.ctx.viewSession.sessionManager?.getSessionFile?.() ??
+								this.ctx.sessionManager.getSessionFile?.() ??
+								undefined,
 						},
 						tool,
 						this.ctx.ui,
@@ -968,6 +972,10 @@ export class EventController {
 					editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
 					editAllowFuzzy: settings.get("edit.fuzzyMatch"),
 					liveRegion: this.ctx.chatContainer,
+					getSessionFile: () =>
+						this.ctx.viewSession.sessionManager?.getSessionFile?.() ??
+						this.ctx.sessionManager.getSessionFile?.() ??
+						undefined,
 				},
 				tool,
 				this.ctx.ui,

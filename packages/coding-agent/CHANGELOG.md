@@ -7,6 +7,15 @@
 ### Fixed
 
 - Fixed Portkey/gateway custom models whose ids start with `@` (e.g. `@modal/GLM-5-2-FP8`) being rewritten to unrelated bundled wire ids (e.g. `glm-5-2`), which caused `400` responses requiring `x-portkey-config` or `x-portkey-provider`.
+### Added
+
+- Added OSC 8 hyperlinks for TUI-rendered task ids, task output paths, patch paths, and `/tan` background job ids when terminal hyperlink support is enabled ([#3616](https://github.com/can1357/oh-my-pi/pull/3616) by [@wolfiesch](https://github.com/wolfiesch)).
+- Added a copy-on-resume affordance to the `/fork` success card: forking now shows a ready-to-run `omp --resume <session>` command and copies it to the clipboard so the forked session can be opened in another terminal. The command prefers the shell-safe session id when the session lives in its default-managed directory and falls back to a POSIX single-quoted path otherwise; it is suppressed on Windows ([#3616](https://github.com/can1357/oh-my-pi/pull/3616) by [@wolfiesch](https://github.com/wolfiesch)).
+
+### Fixed
+
+- Fixed async/backgrounded bash commands not associating their output with the allocated artifact path, enabling OSC 8 hyperlink navigation in the TUI ([#3616](https://github.com/can1357/oh-my-pi/pull/3616) by [@wolfiesch](https://github.com/wolfiesch)).
+- Fixed live task progress agent labels to link to the spawned agent's transcript file when available, instead of emitting an internal `history://` target that terminal apps cannot open directly ([#3616](https://github.com/can1357/oh-my-pi/pull/3616) by [@wolfiesch](https://github.com/wolfiesch)).
 
 ## [17.0.6] - 2026-07-20
 
