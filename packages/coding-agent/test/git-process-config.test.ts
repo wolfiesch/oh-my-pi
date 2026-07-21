@@ -69,6 +69,45 @@ describe("git subprocess config", () => {
 		]);
 	});
 
+	it("adds external diff hardening only when requested", async () => {
+		const spawnCalls: SpawnCall[] = [];
+		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));
+
+		await git.diff("/work/pi", { noExternal: true });
+
+		expect(spawnCalls).toHaveLength(1);
+		expect(spawnCalls[0]?.cmd).toEqual([
+			"git",
+			"-c",
+			"core.fsmonitor=false",
+			"-c",
+			"core.untrackedCache=false",
+			"--no-optional-locks",
+			"diff",
+			"--no-ext-diff",
+			"--no-textconv",
+			"--no-color",
+		]);
+	});
+
+	it("leaves external diff and textconv enabled by default", async () => {
+		const spawnCalls: SpawnCall[] = [];
+		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));
+
+		await git.diff("/work/pi");
+
+		expect(spawnCalls).toHaveLength(1);
+		expect(spawnCalls[0]?.cmd).toEqual([
+			"git",
+			"-c",
+			"core.fsmonitor=false",
+			"-c",
+			"core.untrackedCache=false",
+			"--no-optional-locks",
+			"diff",
+		]);
+	});
+
 	it("disables fsmonitor and untracked cache for mutating commands", async () => {
 		const spawnCalls: SpawnCall[] = [];
 		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));

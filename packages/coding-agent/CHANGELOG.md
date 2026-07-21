@@ -7,6 +7,10 @@
 ### Fixed
 
 - Fixed Portkey/gateway custom models whose ids start with `@` (e.g. `@modal/GLM-5-2-FP8`) being rewritten to unrelated bundled wire ids (e.g. `glm-5-2`), which caused `400` responses requiring `x-portkey-config` or `x-portkey-provider`.
+### Added
+
+- Added `read` support for `vcs://state` and `vcs://diff[/path]`, giving the advisor and other read-only sessions a safe way to inspect git state and patch text without introducing an advisor-only `git` tool. The protocol validates `base` refs, normalizes path scopes from the caller cwd, rejects repo escapes, and disables external diff/textconv commands for VCS reads ([#3416](https://github.com/can1357/oh-my-pi/pull/3416) by [@wolfiesch](https://github.com/wolfiesch)).
+- Added an opt-in `DiffOptions.noExternal` flag to `utils/git` that passes `--no-ext-diff --no-textconv`, so a diff cannot execute a repo-configured `diff.external`/`GIT_EXTERNAL_DIFF` or per-driver `textconv` program. `vcs://diff` and `vcs://state` set it; existing callers (commit/changelog prompts) are unchanged and keep honoring configured textconv ([#3416](https://github.com/can1357/oh-my-pi/pull/3416) by [@wolfiesch](https://github.com/wolfiesch)).
 
 ## [17.0.6] - 2026-07-20
 

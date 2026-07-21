@@ -19,6 +19,7 @@ Read files, directories, archives, SQLite, images, documents, internal resources
 - Documents → extracted text. Notebooks → editable cells. Images → {{#if INSPECT_IMAGE_ENABLED}}metadata; call `inspect_image`{{else}}decoded inline{{/if}}. `:raw` bypasses converters.
 - URLs → reader-mode clean text/markdown; `:raw` → untouched HTML. Bare `host:port` needs trailing slash.
 - Internal URIs — all schemes take selectors. `artifact://<id>` recovers spilled output; page with `:N-M`/`:raw:N-M`.
+- `vcs://state` — changed files + stat + untracked for the current repo; `vcs://diff[/path]` — patch text. Paths are caller-cwd-relative; query: `base=<ref>`, `staged=true`, repeated `file=<path>`. `:raw` for exact patch bytes; line selectors page large diffs.
 - `ssh://host/<path>` reads remote file/dir (UTF-8, ≤1 MiB); bare `ssh://` lists hosts; also `write`/`search`-able.
   Literal `:`, `?`, `#` → percent-encode (`%3A`/`%3F`/`%23`). Requires POSIX shell (else `ssh` tool).
 

@@ -95,6 +95,8 @@ A `WATCHDOG.yml` roster entry may broaden this with `tools: [...]`, selecting an
 
 Advisor grants are not routed through the primary agent's approval wrapper. The advisor pool is built from the built-in tool factories against its own `-advisor` `ToolSession` and then filtered by `WATCHDOG.yml`; it is not the primary `toolRegistry` wrapped with `ExtensionToolWrapper`. Granting write- or exec-tier tools therefore lets the advisor invoke those tools directly, subject to the tool's own runtime guards but not to `tools.approvalMode` / `tools.approval.<tool>` prompts. Keep mutating grants narrow and trusted.
 
+VCS inspection uses the `read` tool's internal protocol instead of an advisor-only tool. `vcs://state` reports changed files, stat output, and untracked files; `vcs://diff[/path]` returns patch text. Both support `base=<ref>`, `staged=true`, and repeated `file=<path>` query params. The protocol sets `DiffOptions.noExternal` so git reads cannot run repo-configured external diff or textconv commands, validates `base` through `git.ref.commit`, and normalizes path scopes from the caller cwd before passing them to git.
+
 The `advise` tool accepts one note and an optional severity:
 
 | Severity | Delivery | Intended use |

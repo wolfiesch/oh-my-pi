@@ -58,13 +58,25 @@ export interface DiffOptions {
 	readonly binary?: boolean;
 	readonly cached?: boolean;
 	readonly env?: Record<string, string | undefined>;
+	readonly literalPaths?: boolean;
 	readonly files?: readonly string[];
 	readonly head?: string;
 	readonly nameOnly?: boolean;
+	/**
+	 * Pass `--no-ext-diff --no-textconv --no-color` so the diff cannot run a
+	 * repo-configured `diff.external`/`GIT_EXTERNAL_DIFF` or per-driver
+	 * `textconv` program, and cannot inherit forced color from repo/global config.
+	 * Opt-in (default off) to preserve existing behavior for callers that
+	 * intentionally surface textconv'd or colored diffs (e.g. commit/changelog
+	 * prompts); set by callers that must read plain, inert patch bytes from
+	 * untrusted repo config, such as the `vcs://` read protocol.
+	 */
+	readonly noExternal?: boolean;
 	readonly noIndex?: { left: string; right: string };
 	readonly numstat?: boolean;
 	readonly signal?: AbortSignal;
 	readonly stat?: boolean;
+	readonly z?: boolean;
 }
 
 export interface StatusOptions {
@@ -358,6 +370,7 @@ async function collectSubprocessResult(
 
 interface CommandOptions {
 	readonly env?: Record<string, string | undefined>;
+	readonly config?: readonly (readonly [key: string, value: string])[];
 	readonly maxOutputBytes?: number;
 	readonly readOnly?: boolean;
 	readonly signal?: AbortSignal;
@@ -400,7 +413,8 @@ function formatCommandFailure(
 }
 
 async function git(cwd: string, args: readonly string[], options: CommandOptions = {}): Promise<GitCommandResult> {
-	const commandArgs = withShortLivedGitConfig(options.readOnly ? withNoOptionalLocks(args) : [...args]);
+	const baseArgs = withShortLivedGitConfig(options.readOnly ? withNoOptionalLocks(args) : [...args]);
+	const commandArgs = options.config ? withGitConfig(baseArgs, options.config) : baseArgs;
 	const child = Bun.spawn(["git", ...commandArgs], {
 		cwd,
 		env: buildGitEnv(options.env),
@@ -422,6 +436,15 @@ function withNoOptionalLocks(args: readonly string[]): string[] {
 function withShortLivedGitConfig(args: readonly string[]): string[] {
 	const prefix: string[] = [];
 	for (const [key, value] of SHORT_LIVED_GIT_CONFIG) {
+		if (hasGitConfig(args, key, value)) continue;
+		prefix.push("-c", `${key}=${value}`);
+	}
+	return [...prefix, ...args];
+}
+
+function withGitConfig(args: readonly string[], config: readonly (readonly [key: string, value: string])[]): string[] {
+	const prefix: string[] = [];
+	for (const [key, value] of config) {
 		if (hasGitConfig(args, key, value)) continue;
 		prefix.push("-c", `${key}=${value}`);
 	}
@@ -518,8 +541,8 @@ export async function withRepoLock<T>(cwd: string, fn: () => Promise<T>, signal?
 function splitLines(text: string): string[] {
 	return text
 		.split("\n")
-		.map(line => line.trim())
-		.filter(Boolean);
+		.map(line => (line.endsWith("\r") ? line.slice(0, -1) : line))
+		.filter(line => line.length > 0);
 }
 
 function trimScalar(text: string | undefined): string | undefined {
@@ -533,11 +556,19 @@ function trimScalar(text: string | undefined): string | undefined {
 
 function buildDiffArgs(options: DiffOptions): string[] {
 	const args = ["diff"];
+	// Opt-in: `--no-ext-diff`/`--no-textconv` override any repo-config
+	// `diff.external`, `GIT_EXTERNAL_DIFF`, or per-driver textconv program, while
+	// `--no-color` overrides forced `color.ui`/`color.diff`. Hardened, read-only
+	// diff callers then receive plain patch bytes and never execute arbitrary
+	// external commands from untrusted repo config. Off by default so callers that
+	// rely on configured textconv or color (commit/changelog prompts) are unchanged.
+	if (options.noExternal) args.push("--no-ext-diff", "--no-textconv", "--no-color");
 	if (options.binary) args.push("--binary");
 	if (options.cached) args.push("--cached");
 	if (options.nameOnly) args.push("--name-only");
 	if (options.stat) args.push("--stat");
 	if (options.numstat) args.push("--numstat");
+	if (options.z) args.push("-z");
 	if (options.noIndex) {
 		args.push("--no-index", options.noIndex.left, options.noIndex.right);
 		return args;
@@ -1179,16 +1210,17 @@ function parseStatusPorcelain(text: string): GitStatusSummary {
 export const diff = Object.assign(
 	async function diff(cwd: string, options: DiffOptions = {}): Promise<string> {
 		const args = buildDiffArgs(options);
+		const config = options.literalPaths ? ([["core.quotePath", "false"]] as const) : undefined;
 		if (options.allowFailure) {
-			return (await git(cwd, args, { env: options.env, readOnly: true, signal: options.signal })).stdout;
+			return (await git(cwd, args, { config, env: options.env, readOnly: true, signal: options.signal })).stdout;
 		}
-		return runText(cwd, args, { env: options.env, readOnly: true, signal: options.signal });
+		return runText(cwd, args, { config, env: options.env, readOnly: true, signal: options.signal });
 	},
 	{
 		/** List changed file paths. */
 		async changedFiles(
 			cwd: string,
-			options: Pick<DiffOptions, "cached" | "files" | "signal"> = {},
+			options: Pick<DiffOptions, "cached" | "files" | "literalPaths" | "signal"> = {},
 		): Promise<string[]> {
 			return splitLines(await diff(cwd, { ...options, nameOnly: true }));
 		},
@@ -1635,7 +1667,7 @@ export const show = Object.assign(
 	{
 		/** Get the path prefix of the current directory relative to the repo root. */
 		async prefix(cwd: string, signal?: AbortSignal): Promise<string> {
-			return (await runText(cwd, ["rev-parse", "--show-prefix"], { readOnly: true, signal })).trim();
+			return (await runText(cwd, ["rev-parse", "--show-prefix"], { readOnly: true, signal })).replace(/\r?\n$/, "");
 		},
 	},
 );
@@ -1805,6 +1837,23 @@ export const ref = {
 		const repository = await resolveRepository(cwd);
 		if (repository && refName.startsWith("refs/")) return readRef(repository, refName, signal);
 		const result = await git(cwd, ["rev-parse", refName], { readOnly: true, signal });
+		if (result.exitCode !== 0) return null;
+		return result.stdout.trim() || null;
+	},
+
+	/**
+	 * Resolve a user-supplied ref to a commit SHA, requiring it to actually name
+	 * a commit-ish. Uses `rev-parse --verify <ref>^{commit}`, so a value that is
+	 * only a path (e.g. `main` when no `main` branch exists but a `main` file
+	 * does) fails instead of being silently reinterpreted as a pathspec, and a
+	 * tree/blob ref is rejected. `--end-of-options` prevents a leading `-` from
+	 * being parsed as an option. Returns `null` when the ref does not resolve.
+	 */
+	async commit(cwd: string, refName: string, signal?: AbortSignal): Promise<string | null> {
+		const result = await git(cwd, ["rev-parse", "--verify", "--quiet", "--end-of-options", `${refName}^{commit}`], {
+			readOnly: true,
+			signal,
+		});
 		if (result.exitCode !== 0) return null;
 		return result.stdout.trim() || null;
 	},
@@ -2162,17 +2211,38 @@ export const ls = {
 	/** List files tracked or untracked by git. */
 	async files(
 		cwd: string,
-		options: { others?: boolean; excludeStandard?: boolean; signal?: AbortSignal } = {},
+		options: {
+			others?: boolean;
+			excludeStandard?: boolean;
+			files?: readonly string[];
+			literalPaths?: boolean;
+			signal?: AbortSignal;
+			z?: boolean;
+		} = {},
 	): Promise<string[]> {
 		const args = ["ls-files"];
 		if (options.others) args.push("--others");
 		if (options.excludeStandard) args.push("--exclude-standard");
-		return splitLines(await runText(cwd, args, { readOnly: true, signal: options.signal }));
+		if (options.z) args.push("-z");
+		if (options.files?.length) args.push("--", ...options.files);
+		const config = options.literalPaths ? ([["core.quotePath", "false"]] as const) : undefined;
+		const text = await runText(cwd, args, { config, readOnly: true, signal: options.signal });
+		return (options.z ? text.split("\0") : splitLines(text)).filter(record => record.length > 0);
 	},
 
-	/** List untracked files (excludes ignored). */
-	async untracked(cwd: string, signal?: AbortSignal): Promise<string[]> {
-		return ls.files(cwd, { others: true, excludeStandard: true, signal });
+	/** List untracked files (excludes ignored), optionally scoped to pathspecs. */
+	async untracked(
+		cwd: string,
+		options: { files?: readonly string[]; literalPaths?: boolean; signal?: AbortSignal; z?: boolean } = {},
+	): Promise<string[]> {
+		return ls.files(cwd, {
+			others: true,
+			excludeStandard: true,
+			files: options.files,
+			literalPaths: options.literalPaths,
+			signal: options.signal,
+			z: options.z,
+		});
 	},
 
 	/** List paths present in a ref, optionally filtered to specific paths. */

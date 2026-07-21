@@ -1,5 +1,5 @@
 /**
- * Internal URL router for internal protocols (`agent://`, `artifact://`, `history://`, `issue://`, `local://`, `mcp://`, `memory://`, `omp://`, `pr://`, `rule://`, `skill://`, `ssh://`, `vault://`, and `xd://`).
+ * Internal URL router for internal protocols (`agent://`, `artifact://`, `history://`, `issue://`, `local://`, `mcp://`, `memory://`, `omp://`, `pr://`, `rule://`, `skill://`, `ssh://`, `vault://`, `vcs://`, and `xd://`).
  *
  * One process-global router with one handler per scheme. Access via
  * `InternalUrlRouter.instance()`. Handlers are stateless; per-session and
@@ -26,6 +26,7 @@ import type {
 	WriteContext,
 } from "./types";
 import { VaultProtocolHandler } from "./vault-protocol";
+import { VcsProtocolHandler } from "./vcs-protocol";
 import { XdProtocolHandler } from "./xd-protocol";
 
 export class InternalUrlRouter {
@@ -39,6 +40,7 @@ export class InternalUrlRouter {
 		this.register(new ArtifactProtocolHandler());
 		this.register(new MemoryProtocolHandler());
 		this.register(new LocalProtocolHandler());
+		this.register(new VcsProtocolHandler());
 		this.register(new VaultProtocolHandler());
 		this.register(new SkillProtocolHandler());
 		this.register(new RuleProtocolHandler());

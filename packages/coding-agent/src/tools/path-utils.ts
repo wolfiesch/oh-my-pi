@@ -43,6 +43,7 @@ const INTERNAL_SCHEMES_WITH_SELECTORS: Record<string, true> = {
 	rule: true,
 	skill: true,
 	ssh: true,
+	vcs: true,
 	vault: true,
 };
 // Schemes whose resource URIs are server-defined and may legitimately end
@@ -63,6 +64,7 @@ const TOP_LEVEL_INTERNAL_URL_PREFIXES = [
 	"mcp://",
 	"ssh://",
 	"vault://",
+	"vcs://",
 ] as const;
 
 function normalizeUnicodeSpaces(str: string): string {
@@ -402,7 +404,14 @@ export function splitInternalUrlSel(rawPath: string): { path: string; sel?: stri
 	if (scheme === "ssh" && rawPath.indexOf("/", schemeEnd) === -1) {
 		return { path: rawPath };
 	}
-	let path = rawPath;
+	const selectorEnd =
+		scheme === "vcs"
+			? [rawPath.indexOf("?", schemeEnd), rawPath.indexOf("#", schemeEnd)]
+					.filter(index => index !== -1)
+					.reduce((first, index) => Math.min(first, index), rawPath.length)
+			: rawPath.length;
+	const suffix = rawPath.slice(selectorEnd);
+	let path = rawPath.slice(0, selectorEnd);
 	const chunks: string[] = [];
 	while (true) {
 		const colon = path.lastIndexOf(":");
@@ -414,7 +423,7 @@ export function splitInternalUrlSel(rawPath: string): { path: string; sel?: stri
 		path = path.slice(0, colon);
 	}
 	if (chunks.length === 0) return { path: rawPath };
-	return { path, sel: chunks.join(":") };
+	return { path: `${path}${suffix}`, sel: chunks.join(":") };
 }
 
 /**

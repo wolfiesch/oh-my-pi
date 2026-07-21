@@ -113,6 +113,19 @@ describe("splitInternalUrlSel", () => {
 		});
 	});
 
+	it("preserves selector-shaped VCS query values while peeling pathname selectors", () => {
+		expect(splitInternalUrlSel("vcs://diff?file=foo:raw")).toEqual({
+			path: "vcs://diff?file=foo:raw",
+		});
+		expect(splitInternalUrlSel("vcs://diff?file=foo:1-5")).toEqual({
+			path: "vcs://diff?file=foo:1-5",
+		});
+		expect(splitInternalUrlSel("vcs://diff/path:raw?file=foo:1-5")).toEqual({
+			path: "vcs://diff/path?file=foo:1-5",
+			sel: "raw",
+		});
+	});
+
 	it("returns the input unchanged for non-URL strings", () => {
 		expect(splitInternalUrlSel("/abs/path:1-50")).toEqual({ path: "/abs/path:1-50" });
 		expect(splitInternalUrlSel("plain-text")).toEqual({ path: "plain-text" });
