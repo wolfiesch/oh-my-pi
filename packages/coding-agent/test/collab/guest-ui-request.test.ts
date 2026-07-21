@@ -240,6 +240,7 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
 		eventController: { handleEvent: () => Promise.resolve() },
+		refreshTerminalTitle: () => {},
 		syncRunningSubagentBadge: () => {},
 		showHookSelector: (
 			title: string,
@@ -472,6 +473,7 @@ function makeHostContext(): InteractiveModeContext {
 		},
 		ui: { requestRender: () => {} },
 		showStatus: () => {},
+		pushTerminalTitleAttention: () => () => {},
 		collabHost: undefined,
 	} as unknown as InteractiveModeContext;
 }

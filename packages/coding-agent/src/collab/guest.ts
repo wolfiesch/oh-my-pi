@@ -18,6 +18,7 @@
 import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { Component } from "@oh-my-pi/pi-tui";
 import { getConfigRootDir, logger } from "@oh-my-pi/pi-utils";
 import type { AgentHubRemote, AgentHubRemoteTranscript } from "../modes/components/agent-hub";
 import type { InteractiveModeContext } from "../modes/types";
@@ -25,7 +26,6 @@ import { AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
 import { shouldDisableReasoning, toReasoningEffort } from "../thinking";
-import { setSessionTerminalTitle } from "../utils/title-generator";
 import { importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
 import {
@@ -85,7 +85,8 @@ interface PendingSnapshot {
 /** Minimal context surface the idle-state reconciler mutates. */
 export interface GuestIdleReconcilerCtx {
 	statusLine: { markActivityEnd: () => void };
-	loadingAnimation: { stop: () => void } | undefined;
+	statusContainer: { removeChild: (child: Component) => void };
+	loadingAnimation: (Component & { stop: () => void }) | undefined;
 }
 
 /**
@@ -103,8 +104,10 @@ export interface GuestIdleReconcilerCtx {
 export function reconcileGuestIdleHostState(ctx: GuestIdleReconcilerCtx, isStreaming: boolean): void {
 	if (isStreaming) return;
 	ctx.statusLine.markActivityEnd();
-	if (ctx.loadingAnimation) {
-		ctx.loadingAnimation.stop();
+	const loader = ctx.loadingAnimation;
+	if (loader) {
+		loader.stop();
+		ctx.statusContainer.removeChild(loader);
 		ctx.loadingAnimation = undefined;
 	}
 }
@@ -155,6 +158,7 @@ export class CollabGuestLink {
 	/** False until the first assistant message_start (real or synthesized) since (re)sync. */
 	#assistantStreamSynced = false;
 	state: CollabSessionState | null = null;
+	#terminalTitleOptions: { sessionName?: string | undefined; cwd?: string | undefined } | undefined;
 	/** Local mirror of the host's agent ecosystem (refs carry `session: null`). */
 	readonly agentRegistry = new AgentRegistry();
 	/** Per-agent `hasSessionFile` from the last snapshot; gates remote transcript fetches. */
@@ -204,6 +208,10 @@ export class CollabGuestLink {
 	/** True when this guest joined through a read-only (view) link. */
 	get readOnly(): boolean {
 		return this.#readOnly;
+	}
+
+	get terminalTitleOptions(): { sessionName?: string | undefined; cwd?: string | undefined } | undefined {
+		return this.#terminalTitleOptions;
 	}
 
 	/** Shows the read-only status hint when applicable; true when the action must be dropped. */
@@ -333,6 +341,7 @@ export class CollabGuestLink {
 
 		this.#ctx.collabGuest = this;
 		this.#ctx.syncRunningSubagentBadge();
+		this.#ctx.refreshTerminalTitle(this.#terminalTitleOptions);
 	}
 
 	/** User-initiated leave (or post-disconnect cleanup): restore the previous session. */
@@ -417,7 +426,11 @@ export class CollabGuestLink {
 		this.#applyAgentSnapshots(pending.agents);
 		this.#ctx.syncRunningSubagentBadge();
 		this.#assistantStreamSynced = false;
-		setSessionTerminalTitle(pending.state.sessionName ?? pending.header.title, pending.state.cwd);
+		this.#terminalTitleOptions = {
+			sessionName: pending.state.sessionName ?? pending.header.title,
+			cwd: pending.state.cwd,
+		};
+		this.#ctx.refreshTerminalTitle(this.#terminalTitleOptions);
 		this.#ctx.chatContainer.clear();
 		this.#ctx.renderInitialMessages({ clearTerminalHistory: true });
 		await this.#ctx.reloadTodos();
@@ -480,9 +493,11 @@ export class CollabGuestLink {
 			case "state": {
 				this.state = frame.state;
 				this.#applyHostState(frame.state);
-				setSessionTerminalTitle(frame.state.sessionName, frame.state.cwd);
 				this.#updateStatusSegment();
 				reconcileGuestIdleHostState(this.#ctx, frame.state.isStreaming);
+				// Idle reconciliation clears loader-owned title state before the refresh.
+				this.#terminalTitleOptions = { sessionName: frame.state.sessionName, cwd: frame.state.cwd };
+				this.#ctx.refreshTerminalTitle(this.#terminalTitleOptions);
 				this.#ctx.statusLine.invalidate();
 				this.#ctx.ui.requestRender();
 				break;
@@ -691,6 +706,18 @@ export class CollabGuestLink {
 			this.#ctx.loadingAnimation.stop();
 			this.#ctx.loadingAnimation = undefined;
 		}
+		if (this.#ctx.autoCompactionLoader) {
+			this.#ctx.autoCompactionLoader.stop();
+			this.#ctx.autoCompactionLoader = undefined;
+		}
+		if (this.#ctx.compactionLoader) {
+			this.#ctx.compactionLoader.stop();
+			this.#ctx.compactionLoader = undefined;
+		}
+		if (this.#ctx.retryLoader) {
+			this.#ctx.retryLoader.stop();
+			this.#ctx.retryLoader = undefined;
+		}
 	}
 
 	async #restoreLocalSession(): Promise<void> {
@@ -711,7 +738,7 @@ export class CollabGuestLink {
 			return;
 		}
 		await this.#ctx.session.newSession();
-		setSessionTerminalTitle(this.#ctx.sessionManager.getSessionName(), this.#ctx.sessionManager.getCwd());
+		this.#ctx.refreshTerminalTitle();
 		this.#ctx.statusLine.invalidate();
 		this.#ctx.statusLine.resetActiveTime();
 		this.#ctx.ui.requestRender();

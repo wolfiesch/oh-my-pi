@@ -42,6 +42,7 @@ describe("/handoff command", () => {
 			if (isGeneratingHandoff) abortHandoff();
 		});
 		const requestRender = vi.fn();
+		const releaseTerminalTitleRunning = vi.fn();
 		const ctx = {
 			sessionManager: {
 				getEntries: () => [{ type: "message" }, { type: "message" }],
@@ -64,6 +65,7 @@ describe("/handoff command", () => {
 			ui: { requestRender, requestComponentRender: vi.fn() },
 			editor: { onEscape: originalOnEscape },
 			rebuildChatFromMessages: vi.fn(),
+			pushTerminalTitleRunning: vi.fn(() => releaseTerminalTitleRunning),
 			statusLine: { invalidate: vi.fn() },
 			updateEditorTopBorder: vi.fn(),
 			updateEditorBorderColor: vi.fn(),
@@ -88,6 +90,8 @@ describe("/handoff command", () => {
 		expect(statusContainer.children).toHaveLength(0);
 		expect(ctx.editor.onEscape).toBe(originalOnEscape);
 		expect(ctx.session.handoff).toHaveBeenCalledWith("focus on tests");
+		expect(ctx.pushTerminalTitleRunning).toHaveBeenCalledTimes(1);
+		expect(releaseTerminalTitleRunning).toHaveBeenCalledTimes(1);
 	});
 
 	it("refuses to hand off while a response is streaming", async () => {

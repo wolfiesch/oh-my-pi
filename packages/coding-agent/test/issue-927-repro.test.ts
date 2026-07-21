@@ -10,7 +10,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { setTerminalHeadless, TempDir } from "@oh-my-pi/pi-utils";
 
 describe("issue #927 optimistic pending spinner", () => {
 	let authStorage: AuthStorage;
@@ -72,5 +72,53 @@ describe("issue #927 optimistic pending spinner", () => {
 		expect(mode.optimisticUserMessageSignature).toBeUndefined();
 		expect(mode.locallySubmittedUserSignatures.has("/extension-no-turn\u00000")).toBe(false);
 		expect(mode.statusContainer.children.length).toBe(0);
+	});
+
+	it("refreshes the terminal title around pending-submission loaders", () => {
+		const refreshTerminalTitle = vi.spyOn(mode, "refreshTerminalTitle");
+
+		mode.startPendingSubmission({ text: "cancel me" });
+		expect(mode.loadingAnimation).toBeDefined();
+
+		mode.cancelPendingSubmission();
+
+		expect(mode.loadingAnimation).toBeUndefined();
+		expect(refreshTerminalTitle).toHaveBeenCalledTimes(2);
+	});
+
+	it("preserves hook-owned titles until terminal state titles are enabled", () => {
+		const previousHeadless = setTerminalHeadless(false);
+		const originalTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		try {
+			Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+			const write = process.stdout.write as typeof process.stdout.write & {
+				mock: { calls: unknown[][] };
+				mockClear(): void;
+			};
+
+			mode.refreshTerminalTitle();
+			expect(write.mock.calls.at(-1)?.[0]).toEqual(expect.stringMatching(/^\x1b]0;π:/));
+			write.mockClear();
+
+			mode.setExtensionTerminalTitle("hook title");
+			expect(write.mock.calls.at(-1)?.[0]).toBe("\x1b]0;hook title\x07");
+			write.mockClear();
+
+			mode.refreshTerminalTitle();
+			expect(write.mock.calls).toEqual([]);
+
+			mode.settings.set("terminal.showTitleState", true);
+			mode.startPendingSubmission({ text: "running title" });
+
+			const titleWrites = write.mock.calls.map(call => String(call[0]));
+			expect(titleWrites.some(title => title.startsWith("\x1b]0;") && title !== "\x1b]0;hook title\x07")).toBe(true);
+		} finally {
+			setTerminalHeadless(previousHeadless);
+			if (originalTTY) {
+				Object.defineProperty(process.stdout, "isTTY", originalTTY);
+			} else {
+				Reflect.deleteProperty(process.stdout, "isTTY");
+			}
+		}
 	});
 });

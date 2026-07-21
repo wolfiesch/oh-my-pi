@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { generateSessionTitle } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
+import { formatSessionTerminalTitle, generateSessionTitle } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
 import { logger } from "@oh-my-pi/pi-utils";
 
 function getModelOrThrow(id: string): Model<Api> {
@@ -568,5 +568,38 @@ describe("title generator", () => {
 		await generateSessionTitle("Some message", registry, currentSettings);
 		expect(mockComplete).toHaveBeenCalled();
 		expect(mockComplete.mock.calls[0]?.[0]).toBe(smolModel);
+	});
+});
+describe("terminal title formatting", () => {
+	it("uses the session name when present", () => {
+		expect(formatSessionTerminalTitle("Build title state", "/tmp/repo")).toBe("π: Build title state");
+	});
+
+	it("uses the cwd basename when the session name is missing", () => {
+		expect(formatSessionTerminalTitle(undefined, "/tmp/repo")).toBe("π: repo");
+	});
+
+	it("prefixes running state", () => {
+		expect(formatSessionTerminalTitle("Build title state", "/tmp/repo", { state: "running", stateSymbol: "R" })).toBe(
+			"R π: Build title state",
+		);
+	});
+
+	it("prefixes waiting state", () => {
+		expect(formatSessionTerminalTitle("Build title state", "/tmp/repo", { state: "waiting", stateSymbol: "W" })).toBe(
+			"W π: Build title state",
+		);
+	});
+
+	it("prefixes needs-attention state", () => {
+		expect(
+			formatSessionTerminalTitle("Build title state", "/tmp/repo", { state: "needs_attention", stateSymbol: "!" }),
+		).toBe("! π: Build title state");
+	});
+
+	it("leaves idle state unprefixed", () => {
+		expect(formatSessionTerminalTitle("Build title state", "/tmp/repo", { state: "idle", stateSymbol: "X" })).toBe(
+			"π: Build title state",
+		);
 	});
 });

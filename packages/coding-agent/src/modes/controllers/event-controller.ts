@@ -168,6 +168,10 @@ export class EventController {
 			todo_auto_clear: e => this.#handleTodoAutoClear(e),
 			irc_message: e => this.#handleIrcMessage(e),
 			notice: e => this.#handleNotice(e),
+			post_prompt_work_drained: async () => {
+				this.ctx.refreshTerminalTitle();
+				this.ctx.ui.requestRender();
+			},
 			thinking_level_changed: async () => {
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
@@ -428,6 +432,7 @@ export class EventController {
 		this.ctx.statusLine.markActivityStart();
 		this.#setTerminalProgress(true);
 		this.ctx.ensureLoadingAnimation();
+		this.ctx.refreshTerminalTitle();
 		this.ctx.ui.requestRender();
 	}
 
@@ -1194,6 +1199,7 @@ export class EventController {
 		this.#resolveDisplaceableTodo();
 		this.ctx.flushPendingCommandOutput();
 		this.#lastAssistantComponent = undefined;
+		this.ctx.refreshTerminalTitle();
 		this.ctx.ui.requestRender();
 		this.#scheduleIdleCompaction();
 		this.#scheduleIdleRecap();
@@ -1225,6 +1231,14 @@ export class EventController {
 		if (!this.ctx.viewSession.isStreaming) return;
 		if (this.ctx.autoCompactionLoader || this.ctx.retryLoader) return;
 		this.ctx.ensureLoadingAnimation();
+	}
+
+	#refreshTerminalTitleAfterCompactionEnd(): void {
+		if (!this.ctx.session.isCompacting && !this.ctx.viewSession.isCompacting) {
+			this.ctx.refreshTerminalTitle();
+			return;
+		}
+		setTimeout(() => this.ctx.refreshTerminalTitle(), 0);
 	}
 
 	/**
@@ -1270,6 +1284,7 @@ export class EventController {
 			getSymbolTheme().spinnerFrames,
 		);
 		this.ctx.statusContainer.addChild(this.ctx.autoCompactionLoader);
+		this.ctx.refreshTerminalTitle();
 		this.ctx.ui.requestRender();
 	}
 
@@ -1351,6 +1366,7 @@ export class EventController {
 		}
 		await this.ctx.flushCompactionQueue({ willRetry: event.willRetry });
 		this.#ensureWorkingLoaderWhileStreaming();
+		this.#refreshTerminalTitleAfterCompactionEnd();
 		this.ctx.ui.requestRender();
 	}
 
@@ -1374,6 +1390,7 @@ export class EventController {
 			getSymbolTheme().spinnerFrames,
 		);
 		this.ctx.statusContainer.addChild(this.ctx.retryLoader);
+		this.ctx.refreshTerminalTitle();
 		this.ctx.ui.requestRender();
 	}
 
@@ -1401,6 +1418,7 @@ export class EventController {
 			this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
 		}
 		this.#ensureWorkingLoaderWhileStreaming();
+		this.ctx.refreshTerminalTitle();
 		this.ctx.ui.requestRender();
 	}
 

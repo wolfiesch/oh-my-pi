@@ -67,7 +67,6 @@ import {
 import { shortenPath } from "../../tools/render-utils";
 import { copyToClipboard } from "../../utils/clipboard";
 import { repo } from "../../utils/git";
-import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "../components/advisor-config";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AgentHubOverlayComponent } from "../components/agent-hub";
@@ -442,6 +441,10 @@ export class SelectorController {
 				break;
 
 			// Settings with UI side effects
+			case "terminal.showTitleState":
+				this.ctx.refreshTerminalTitle();
+				break;
+
 			case "terminal.showImages":
 			case "showImages": {
 				const visible = value as boolean;
@@ -1185,6 +1188,7 @@ export class SelectorController {
 
 					// Set up escape handler and loader if summarizing
 					let summaryLoader: Loader | undefined;
+					let releaseTitleRunning: (() => void) | undefined;
 					const originalOnEscape = this.ctx.editor.onEscape;
 
 					if (wantsSummary) {
@@ -1200,6 +1204,7 @@ export class SelectorController {
 							getSymbolTheme().spinnerFrames,
 						);
 						this.ctx.statusContainer.addChild(summaryLoader);
+						releaseTitleRunning = this.ctx.pushTerminalTitleRunning();
 						this.ctx.ui.requestRender();
 					}
 
@@ -1233,6 +1238,7 @@ export class SelectorController {
 					} finally {
 						if (summaryLoader) {
 							summaryLoader.stop();
+							releaseTitleRunning?.();
 							this.ctx.statusContainer.disposeChildren();
 						}
 						this.ctx.editor.onEscape = originalOnEscape;
@@ -1332,12 +1338,7 @@ export class SelectorController {
 	}
 
 	#refreshSessionTerminalTitle(): void {
-		const sessionManager = this.ctx.sessionManager as {
-			getSessionName?: () => string | undefined;
-			getCwd: () => string;
-			titleSource?: "auto" | "user" | undefined;
-		};
-		setSessionTerminalTitle(sessionManager.getSessionName?.(), sessionManager.getCwd());
+		this.ctx.refreshTerminalTitle();
 	}
 
 	async #detachActiveSessionBeforeDeletion(sessionPath: string): Promise<boolean> {

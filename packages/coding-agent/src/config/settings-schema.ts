@@ -878,6 +878,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"terminal.showTitleState": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Terminal Title State",
+			description: "Prefix the terminal title with the agent run state",
+		},
+	},
+
 	"tui.textSizing": {
 		type: "boolean",
 		default: false,

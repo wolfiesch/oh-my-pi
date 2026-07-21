@@ -130,7 +130,14 @@ import type { EventBus } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
 import { messageHasDisplayableThinking } from "../utils/thinking-display";
-import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
+import {
+	popTerminalTitle,
+	pushTerminalTitle,
+	type SessionTerminalTitleOptions,
+	setSessionTerminalTitle,
+	setTerminalTitle,
+	type TerminalTitleRunState,
+} from "../utils/title-generator";
 import { aggregateVibeWorkerTokensPerSecond, VibeSessionRegistry } from "../vibe/runtime";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
@@ -169,7 +176,12 @@ import {
 	parseLoopLimitArgs,
 } from "./loop-limit";
 import { OAuthManualInputManager } from "./oauth-manual-input";
-import { countRunningSubagentBadgeAgents, getRunningSubagentBadgeRegistry } from "./running-subagent-badge";
+import {
+	countRunningSubagentBadgeAgents,
+	getRunningSubagentBadgeRegistry,
+	handleRunningSubagentRegistryChange,
+	resolveTerminalTitleBaseState,
+} from "./running-subagent-badge";
 import {
 	type ObservableSession,
 	type SessionObserverChangeKind,
@@ -239,6 +251,21 @@ function workingMessagePalettes(accent: WorkingMessageAccent): { main: ShimmerPa
 		workingMessagePaletteCache.set(accent, entry);
 	}
 	return entry;
+}
+
+export interface BuildSessionTerminalTitleOptionsInput {
+	showTitleState: boolean;
+	state: TerminalTitleRunState;
+	stateSymbol: string | undefined;
+}
+
+export function buildSessionTerminalTitleOptions(
+	input: BuildSessionTerminalTitleOptionsInput,
+): SessionTerminalTitleOptions {
+	return {
+		state: input.showTitleState ? input.state : "idle",
+		stateSymbol: input.showTitleState ? input.stateSymbol : undefined,
+	};
 }
 
 function renderWorkingMessage(message: string, accent?: WorkingMessageAccent): string {
@@ -356,6 +383,11 @@ class AnchoredLiveContainer extends Container implements NativeScrollbackLiveReg
 /** How long the ctrl+p model-role cycle chip track lingers above the editor
  *  before it auto-clears, mirroring the todo HUD's auto-clear timer. */
 const MODEL_CYCLE_TRACK_CLEAR_MS = 4000;
+const TERMINAL_TITLE_STATE_SYMBOL_KEYS = {
+	running: "status.running",
+	waiting: "status.pending",
+	needs_attention: "status.warning",
+} as const;
 
 const SUBAGENT_HUD_VISIBLE_LIMIT = 8;
 const SUBAGENT_OBSERVER_UI_COALESCE_MS = 100;
@@ -491,7 +523,12 @@ export class InteractiveMode implements InteractiveModeContext {
 	lastAssistantUsage: Usage | undefined = undefined;
 	loadingAnimation: Loader | undefined = undefined;
 	autoCompactionLoader: Loader | undefined = undefined;
+	compactionLoader: Loader | undefined = undefined;
 	retryLoader: Loader | undefined = undefined;
+	#terminalTitleAttentionDepth = 0;
+	#terminalTitleRunningDepth = 0;
+	#terminalTitleOwner: "session" | "extension" = "session";
+	#planReviewTitleAttentionRelease: (() => void) | undefined;
 	#pendingWorkingMessage: string | undefined;
 	#workingMessageAccentCacheKey?: WorkingMessageAccentCacheKey;
 	#workingMessageAccentCacheValue?: WorkingMessageAccent;
@@ -599,6 +636,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.autoCompactionLoader) {
 			this.autoCompactionLoader.stop();
 			this.autoCompactionLoader = undefined;
+		}
+		if (this.compactionLoader) {
+			this.compactionLoader.stop();
+			this.compactionLoader = undefined;
 		}
 		if (this.retryLoader) {
 			this.retryLoader.stop();
@@ -971,7 +1012,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// the initial welcome frame does not append over the previous run's scrollback.
 		this.ui.start({ clearScrollback: options.clearInitialTerminalHistory === true });
 		pushTerminalTitle();
-		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
+		this.refreshTerminalTitle();
 		this.updateEditorBorderColor();
 		// Single side-effect point for title changes: every setSessionName caller
 		// (first-input titling, /rename, extension renames, plan seeding, replan
@@ -980,7 +1021,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// all of which can reach setSessionName during init.
 		this.#eventBusUnsubscribers.push(
 			this.sessionManager.onSessionNameChanged(() => {
-				setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
+				this.refreshTerminalTitle();
 				this.#handleSessionAccentInputsChanged();
 			}),
 		);
@@ -1226,9 +1267,90 @@ export class InteractiveMode implements InteractiveModeContext {
 		resetCapabilities();
 		await this.refreshSkillState();
 		await this.refreshSlashCommandState(newCwd);
-		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
+		this.refreshTerminalTitle();
 		this.statusLine.invalidate();
 		this.ui.requestRender();
+	}
+
+	#terminalTitleBaseState(): Exclude<TerminalTitleRunState, "needs_attention"> {
+		const registry = getRunningSubagentBadgeRegistry(this.collabGuest);
+		return resolveTerminalTitleBaseState({
+			sessionStreaming: this.session.isStreaming,
+			sessionCompacting: this.session.isCompacting,
+			viewSessionStreaming: this.viewSession.isStreaming,
+			viewSessionCompacting: this.viewSession.isCompacting,
+			sessionPostPromptWork: this.session.hasPostPromptWork,
+			viewSessionPostPromptWork: this.viewSession.hasPostPromptWork,
+			collabHostStreaming: this.collabGuest?.state?.isStreaming === true,
+			hasLoadingAnimation: Boolean(this.loadingAnimation),
+			hasCompactionLoader: Boolean(this.compactionLoader),
+			hasAutoCompactionLoader: Boolean(this.autoCompactionLoader),
+			hasRetryLoader: Boolean(this.retryLoader),
+			runningTitleDepth: this.#terminalTitleRunningDepth,
+			hasInputCallback: Boolean(this.onInputCallback),
+			runningSubagentCount: countRunningSubagentBadgeAgents(registry),
+		});
+	}
+
+	#terminalTitleState(): TerminalTitleRunState {
+		if (this.#terminalTitleAttentionDepth > 0) {
+			return "needs_attention";
+		}
+		return this.#terminalTitleBaseState();
+	}
+
+	#terminalTitleStateSymbol(state: TerminalTitleRunState): string | undefined {
+		if (state === "idle") {
+			return undefined;
+		}
+		return theme.symbol(TERMINAL_TITLE_STATE_SYMBOL_KEYS[state]);
+	}
+
+	refreshTerminalTitle(options?: { sessionName?: string | undefined; cwd?: string | undefined }): void {
+		if (!this.settings.get("terminal.showTitleState") && this.#terminalTitleOwner === "extension") return;
+		const showTitleState = this.settings.get("terminal.showTitleState");
+		const state = showTitleState ? this.#terminalTitleState() : "idle";
+		// Collab lifecycle callbacks often refresh without args; keep the host title fields.
+		const titleOptions = options ?? this.collabGuest?.terminalTitleOptions;
+		this.#terminalTitleOwner = "session";
+		setSessionTerminalTitle(
+			titleOptions?.sessionName ?? this.sessionManager.getSessionName(),
+			titleOptions?.cwd ?? this.sessionManager.getCwd(),
+			buildSessionTerminalTitleOptions({
+				showTitleState,
+				state,
+				stateSymbol: this.#terminalTitleStateSymbol(state),
+			}),
+		);
+	}
+
+	setExtensionTerminalTitle(title: string): void {
+		this.#terminalTitleOwner = "extension";
+		setTerminalTitle(title);
+	}
+
+	pushTerminalTitleAttention(): () => void {
+		let released = false;
+		this.#terminalTitleAttentionDepth += 1;
+		this.refreshTerminalTitle();
+		return () => {
+			if (released) return;
+			released = true;
+			this.#terminalTitleAttentionDepth = Math.max(0, this.#terminalTitleAttentionDepth - 1);
+			this.refreshTerminalTitle();
+		};
+	}
+
+	pushTerminalTitleRunning(): () => void {
+		let released = false;
+		this.#terminalTitleRunningDepth += 1;
+		this.refreshTerminalTitle();
+		return () => {
+			if (released) return;
+			released = true;
+			this.#terminalTitleRunningDepth = Math.max(0, this.#terminalTitleRunningDepth - 1);
+			this.refreshTerminalTitle();
+		};
 	}
 
 	async getUserInput(): Promise<SubmittedUserInput> {
@@ -1238,8 +1360,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		const { promise, resolve } = Promise.withResolvers<SubmittedUserInput>();
 		this.onInputCallback = input => {
 			this.onInputCallback = undefined;
+			this.refreshTerminalTitle();
 			resolve(input);
 		};
+		this.refreshTerminalTitle();
 		this.#scheduleLoopAutoSubmit();
 		this.#scheduleGoalContinuation();
 
@@ -1649,7 +1773,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#agentRegistryUnsubscribe?.();
 			this.#agentRegistrySubscriptionTarget = registry;
 			this.#agentRegistryUnsubscribe = registry.onChange(() => {
-				this.syncRunningSubagentBadge();
+				handleRunningSubagentRegistryChange({
+					syncRunningSubagentBadge: () => this.syncRunningSubagentBadge(),
+					refreshTerminalTitle: options => this.refreshTerminalTitle(options),
+					requestRender: () => this.ui.requestRender(),
+				});
 			});
 		}
 		const count = countRunningSubagentBadgeAgents(registry);
@@ -2673,11 +2801,14 @@ export class InteractiveMode implements InteractiveModeContext {
 			mouseTracking: false,
 		});
 		this.ui.setFocus(overlay);
+		this.#planReviewTitleAttentionRelease = this.pushTerminalTitleAttention();
 		this.ui.requestRender();
 		return promise;
 	}
 
 	#hidePlanReview(): void {
+		this.#planReviewTitleAttentionRelease?.();
+		this.#planReviewTitleAttentionRelease = undefined;
 		this.#planReviewOverlayHandle?.hide();
 		this.#planReviewOverlayHandle = undefined;
 		this.#planReviewOverlay = undefined;
@@ -4062,6 +4193,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				getSymbolTheme().spinnerFrames,
 			);
 			this.statusContainer.addChild(this.loadingAnimation);
+			this.refreshTerminalTitle();
 		} else if (!this.statusContainer.children.includes(this.loadingAnimation)) {
 			this.statusContainer.disposeChildren();
 			this.statusContainer.addChild(this.loadingAnimation);
@@ -4078,6 +4210,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (clearStatusContainer) {
 			this.statusContainer.disposeChildren();
 		}
+		this.refreshTerminalTitle();
 	}
 
 	setWorkingMessage(message?: string): void {

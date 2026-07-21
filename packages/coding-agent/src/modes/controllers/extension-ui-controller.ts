@@ -1,5 +1,6 @@
 import type { Component, OverlayHandle, TUI } from "@oh-my-pi/pi-tui";
 import { Container, Spacer, Text } from "@oh-my-pi/pi-tui";
+import { logger } from "@oh-my-pi/pi-utils";
 import type { CollabUiRequestDraft, CollabUiSelectItem } from "@oh-my-pi/pi-wire";
 import { KeybindingsManager } from "../../config/keybindings";
 import type {
@@ -28,7 +29,6 @@ import { HookSelectorComponent, type HookSelectorSlider } from "../../modes/comp
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "../../modes/types";
 import { normalizeCustomMessagePayload, USER_INTERRUPT_LABEL } from "../../session/messages";
-import { setSessionTerminalTitle, setTerminalTitle } from "../../utils/title-generator";
 
 const MAX_WIDGET_LINES = 10;
 const ASK_OTHER_OPTION = "Other (type your own)";
@@ -88,7 +88,7 @@ export class ExtensionUiController {
 			setStatus: (key, text) => this.setHookStatus(key, text),
 			setWorkingMessage: message => this.ctx.setWorkingMessage(message),
 			setWidget: (key, content, options) => this.setHookWidget(key, content, options),
-			setTitle: title => setTerminalTitle(title),
+			setTitle: title => this.ctx.setExtensionTerminalTitle(title),
 			custom: (factory, options) => this.showHookCustom(factory, options),
 			setEditorText: text => {
 				this.ctx.editor.setText(text);
@@ -193,10 +193,10 @@ export class ExtensionUiController {
 				this.clearExtensionTerminalInputListeners();
 				this.clearHookWidgets();
 				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
+				this.ctx.refreshTerminalTitle();
 				if (!success) {
 					return { cancelled: true };
 				}
-				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 
 				// Call setup callback if provided
 				if (options?.setup) {
@@ -255,7 +255,7 @@ export class ExtensionUiController {
 				if (!result) {
 					return { cancelled: true };
 				}
-				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+				this.ctx.refreshTerminalTitle();
 				this.ctx.renderInitialMessages({ clearTerminalHistory: true });
 				await this.ctx.reloadTodos();
 				return { cancelled: false };
@@ -413,6 +413,7 @@ export class ExtensionUiController {
 				this.clearExtensionTerminalInputListeners();
 				this.clearHookWidgets();
 				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
+				this.ctx.refreshTerminalTitle();
 				if (!success) {
 					return { cancelled: true };
 				}
@@ -472,6 +473,7 @@ export class ExtensionUiController {
 				if (!result) {
 					return { cancelled: true };
 				}
+				this.ctx.refreshTerminalTitle();
 				this.ctx.renderInitialMessages({ clearTerminalHistory: true });
 				await this.ctx.reloadTodos();
 				return { cancelled: false };
@@ -998,47 +1000,84 @@ export class ExtensionUiController {
 		const savedText = this.ctx.editor.getText();
 		const keybindings = KeybindingsManager.inMemory();
 
-		const { promise, resolve } = Promise.withResolvers<T>();
+		const { promise, resolve, reject } = Promise.withResolvers<T>();
 		let component: (Component & { dispose?(): void }) | undefined;
 		let overlayHandle: OverlayHandle | undefined;
 		let closed = false;
+		// One attention token for the entire custom-UI lifecycle: acquired here
+		// (never per path, so nested dialogs the component opens stack their own
+		// depth) and released exactly once by whichever settle path runs first —
+		// done(), factory rejection, or a dispose racing the factory.
+		const releaseTitleAttention = this.ctx.pushTerminalTitleAttention();
+
+		// Teardown must never break settlement: a throwing extension dispose (or
+		// overlay/editor teardown) is contained and logged — consistent with how
+		// session/widget disposal failures are handled — so the token release and
+		// promise resolution below are unconditional.
+		const disposeSafely = (target: { dispose?(): void } | undefined) => {
+			try {
+				target?.dispose?.();
+			} catch (error) {
+				logger.warn("Extension custom UI dispose failed", { error });
+			}
+		};
 
 		const close = (result: T) => {
 			if (closed) return;
 			closed = true;
-			component?.dispose?.();
-			overlayHandle?.hide();
-			overlayHandle = undefined;
-			if (!options?.overlay) {
-				this.ctx.editorContainer.clear();
-				this.ctx.editorContainer.addChild(this.ctx.editor);
-				this.ctx.editor.setText(savedText);
+			try {
+				disposeSafely(component);
+				overlayHandle?.hide();
+				overlayHandle = undefined;
+				if (!options?.overlay) {
+					this.ctx.editorContainer.clear();
+					this.ctx.editorContainer.addChild(this.ctx.editor);
+					this.ctx.editor.setText(savedText);
+				}
+				this.ctx.ui.setFocus(this.ctx.editor);
+				this.ctx.ui.requestRender();
+			} catch (error) {
+				logger.warn("Extension custom UI teardown failed", { error });
+			} finally {
+				releaseTitleAttention();
+				resolve(result);
 			}
-			this.ctx.ui.setFocus(this.ctx.editor);
-			this.ctx.ui.requestRender();
-			resolve(result);
 		};
 
-		Promise.try(() => factory(this.ctx.ui, theme, keybindings, close)).then(c => {
-			if (closed) {
-				c.dispose?.();
-				return;
-			}
-			component = c;
-			if (options?.overlay) {
-				overlayHandle = this.ctx.ui.showOverlay(component, {
-					anchor: "bottom-center",
-					width: "100%",
-					maxHeight: "100%",
-					margin: 0,
-				});
-				return;
-			}
-			this.ctx.editorContainer.clear();
-			this.ctx.editorContainer.addChild(component);
-			this.ctx.ui.setFocus(component);
-			this.ctx.ui.requestRender();
-		});
+		// Any failure before the component is interactive — factory rejection or a
+		// throwing mount — releases the attention token and rejects the outer
+		// promise instead of stranding a needs_attention title on a hung promise.
+		const fail = (error: unknown): void => {
+			if (closed) return;
+			closed = true;
+			releaseTitleAttention();
+			reject(error instanceof Error ? error : new Error(String(error)));
+		};
+
+		Promise.try(() => factory(this.ctx.ui, theme, keybindings, close))
+			.then(c => {
+				if (closed) {
+					// done() won the race: the late component was never mounted, so it
+					// is only disposed — the token was already released by close().
+					disposeSafely(c);
+					return;
+				}
+				component = c;
+				if (options?.overlay) {
+					overlayHandle = this.ctx.ui.showOverlay(component, {
+						anchor: "bottom-center",
+						width: "100%",
+						maxHeight: "100%",
+						margin: 0,
+					});
+					return;
+				}
+				this.ctx.editorContainer.clear();
+				this.ctx.editorContainer.addChild(component);
+				this.ctx.ui.setFocus(component);
+				this.ctx.ui.requestRender();
+			})
+			.catch(fail);
 		return promise;
 	}
 
@@ -1085,7 +1124,16 @@ export class ExtensionUiController {
 		const instructions = typeof instructionsOrOptions === "string" ? instructionsOrOptions : undefined;
 		const options =
 			instructionsOrOptions && typeof instructionsOrOptions === "object" ? instructionsOrOptions : undefined;
-		await this.ctx.session.compact(instructions, options);
+		// Capture the promise before awaiting so the title flips to compacting
+		// immediately, and always refresh on settle (success or rejection) so a
+		// failed extension compaction cannot strand a running title.
+		const compaction = this.ctx.session.compact(instructions, options);
+		this.ctx.refreshTerminalTitle();
+		try {
+			await compaction;
+		} finally {
+			this.ctx.refreshTerminalTitle();
+		}
 	}
 
 	async #updateSessionName(name: string): Promise<void> {
@@ -1131,6 +1179,7 @@ export class ExtensionUiController {
 		let settled = false;
 		let started = false;
 		let hide: (() => void) | undefined;
+		let releaseTitleAttention: (() => void) | undefined;
 
 		function onAbort(): void {
 			settle(undefined);
@@ -1142,6 +1191,8 @@ export class ExtensionUiController {
 			signal?.removeEventListener("abort", onAbort);
 			if (started) {
 				hide?.();
+				releaseTitleAttention?.();
+				releaseTitleAttention = undefined;
 				this.#dialogActive = false;
 				this.#advanceDialogQueue();
 			}
@@ -1158,10 +1209,13 @@ export class ExtensionUiController {
 			this.#dialogActive = true;
 			try {
 				hide = present(settle);
+				releaseTitleAttention = this.ctx.pushTerminalTitleAttention();
 			} catch (error) {
 				settled = true;
 				signal?.removeEventListener("abort", onAbort);
 				this.#dialogActive = false;
+				releaseTitleAttention?.();
+				releaseTitleAttention = undefined;
 				reject(error);
 				this.#advanceDialogQueue();
 			}

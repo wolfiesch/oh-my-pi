@@ -20,7 +20,7 @@ import { Container, Spacer } from "@oh-my-pi/pi-tui";
  * in-memory Container instances and a session stub whose `compact()` outcome we
  * drive.
  */
-function buildCtx(compact: InteractiveModeContext["session"]["compact"]) {
+function buildCtx(compact: InteractiveModeContext["session"]["compact"], opts?: { sessionCompacting?: boolean }) {
 	const chatContainer = new Container();
 	const statusContainer = new Container();
 	// Pre-existing transcript content. The regression we defend leaked an extra
@@ -37,16 +37,22 @@ function buildCtx(compact: InteractiveModeContext["session"]["compact"]) {
 		statusChildrenAtRebuild = statusContainer.children.length;
 	});
 	const showError = vi.fn();
+	const showWarning = vi.fn();
+	const refreshTerminalTitle = vi.fn();
 	const ctx = {
 		loadingAnimation: undefined,
+		compactionLoader: undefined,
 		chatContainer,
 		statusContainer,
 		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
-		session: { compact },
+		session: { compact, isCompacting: opts?.sessionCompacting ?? false },
+		viewSession: { isCompacting: false },
 		rebuildChatFromMessages,
+		refreshTerminalTitle,
 		statusLine: { invalidate: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
 		showError,
+		showWarning,
 		flushCompactionQueue: vi.fn(async () => undefined),
 		// executeCompaction consults display.collapseCompacted on the ok path to
 		// decide whether the rebuild replaces the terminal transcript.
@@ -58,7 +64,9 @@ function buildCtx(compact: InteractiveModeContext["session"]["compact"]) {
 		chatContainer,
 		statusContainer,
 		rebuildChatFromMessages,
+		refreshTerminalTitle,
 		showError,
+		showWarning,
 		statusAtRebuild: () => statusChildrenAtRebuild,
 	};
 }
@@ -82,6 +90,31 @@ describe("executeCompaction UI lifecycle", () => {
 
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+
+	it("refreshes the terminal title while the manual compaction loader is active", async () => {
+		let ctx: InteractiveModeContext | undefined;
+		let refreshTerminalTitle: { mock: { calls: unknown[][] } } | undefined;
+		let loaderDuringCompact: unknown;
+		let refreshCountDuringCompact = 0;
+		const compact = vi.fn(async (): Promise<CompactionResult<unknown>> => {
+			if (!ctx || !refreshTerminalTitle) throw new Error("Expected context");
+			loaderDuringCompact = ctx.compactionLoader;
+			refreshCountDuringCompact = refreshTerminalTitle.mock.calls.length;
+			return { summary: "", firstKeptEntryId: "", tokensBefore: 0 };
+		});
+		const built = buildCtx(compact);
+		ctx = built.ctx;
+		refreshTerminalTitle = built.refreshTerminalTitle;
+
+		const controller = new CommandController(ctx);
+		const outcome = await controller.executeCompaction();
+
+		expect(outcome).toBe("ok");
+		expect(loaderDuringCompact).toBeDefined();
+		expect(refreshCountDuringCompact).toBe(1);
+		expect(ctx.compactionLoader).toBeUndefined();
+		expect(built.refreshTerminalTitle).toHaveBeenCalledTimes(2);
 	});
 
 	it("leaves the transcript untouched and drains the loader when compaction is cancelled", async () => {
@@ -122,5 +155,45 @@ describe("executeCompaction UI lifecycle", () => {
 		// finally that runs afterward: the status container was already empty at
 		// the instant rebuildChatFromMessages ran (1 leaked loader without the fix).
 		expect(statusAtRebuild()).toBe(0);
+	});
+
+	it("stops and releases a stale compaction loader before installing a new one", async () => {
+		const compact = vi.fn(
+			async (): Promise<CompactionResult<unknown>> => ({ summary: "", firstKeptEntryId: "", tokensBefore: 0 }),
+		);
+		const { ctx } = buildCtx(compact);
+		const staleStop = vi.fn();
+		// A loader left behind by an aborted flow: no compaction is running, so
+		// executeCompaction must reclaim ownership instead of leaking its ticker.
+		const staleLoader = { stop: staleStop } as unknown as InteractiveModeContext["compactionLoader"];
+		ctx.compactionLoader = staleLoader;
+
+		const controller = new CommandController(ctx);
+		const outcome = await controller.executeCompaction();
+
+		expect(outcome).toBe("ok");
+		expect(staleStop).toHaveBeenCalledTimes(1);
+		expect(compact).toHaveBeenCalledTimes(1);
+		expect(ctx.compactionLoader).toBeUndefined();
+	});
+
+	it("rejects a second compaction while an active one owns the loader", async () => {
+		const compact = vi.fn(
+			async (): Promise<CompactionResult<unknown>> => ({ summary: "", firstKeptEntryId: "", tokensBefore: 0 }),
+		);
+		const { ctx, showWarning } = buildCtx(compact, { sessionCompacting: true });
+		const activeStop = vi.fn();
+		const activeLoader = { stop: activeStop } as unknown as InteractiveModeContext["compactionLoader"];
+		ctx.compactionLoader = activeLoader;
+
+		const controller = new CommandController(ctx);
+		const outcome = await controller.executeCompaction();
+
+		expect(outcome).toBe("failed");
+		expect(showWarning).toHaveBeenCalledWith("Compaction already in progress.");
+		// The in-flight compaction keeps its loader: not stopped, not replaced.
+		expect(activeStop).not.toHaveBeenCalled();
+		expect(ctx.compactionLoader).toBe(activeLoader);
+		expect(compact).not.toHaveBeenCalled();
 	});
 });

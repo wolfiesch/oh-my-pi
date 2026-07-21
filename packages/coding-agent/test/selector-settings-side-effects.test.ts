@@ -54,6 +54,17 @@ describe("selector setting side effects", () => {
 		expect(requestRender).toHaveBeenCalledTimes(1);
 	});
 
+	it("refreshes the terminal title when title state display changes", () => {
+		const refreshTerminalTitle = vi.fn();
+		const controller = new SelectorController({
+			refreshTerminalTitle,
+		} as unknown as InteractiveModeContext);
+
+		controller.handleSettingChange("terminal.showTitleState", false);
+
+		expect(refreshTerminalTitle).toHaveBeenCalledTimes(1);
+	});
+
 	it("invalidates the UI and requests a repaint when tui.tight changes", () => {
 		const invalidate = vi.fn();
 		const requestRender = vi.fn();

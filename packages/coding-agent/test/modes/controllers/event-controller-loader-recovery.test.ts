@@ -71,6 +71,7 @@ function createContext(options: { terminalProgress?: boolean } = {}) {
 		showStatus: vi.fn(),
 		showWarning: vi.fn(),
 		showError: vi.fn(),
+		refreshTerminalTitle: vi.fn(),
 		editor: { getText: () => "" },
 		sessionManager: { getSessionName: () => "test-session" },
 		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn(), terminal: { setProgress } },

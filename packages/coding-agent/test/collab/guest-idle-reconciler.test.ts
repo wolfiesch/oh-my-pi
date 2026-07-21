@@ -20,6 +20,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { StatusLineComponent } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
+import { type Component, Container } from "@oh-my-pi/pi-tui";
 
 beforeAll(async () => {
 	resetSettingsForTest();
@@ -38,16 +39,28 @@ interface Fixture {
 	ctx: GuestIdleReconcilerCtx;
 	markActivityEnd: Mock<() => void>;
 	loaderStop: Mock<() => void>;
+	statusContainer: Container;
+	loader: Component | undefined;
 }
 
 function makeCtx(hasLoader: boolean): Fixture {
 	const markActivityEnd: Mock<() => void> = mock(() => {});
 	const loaderStop: Mock<() => void> = mock(() => {});
+	const statusContainer = new Container();
+	const loader = hasLoader
+		? ({
+				stop: loaderStop,
+				render: () => ["Working…"],
+				invalidate: () => {},
+			} as Component & { stop: () => void })
+		: undefined;
+	if (loader) statusContainer.addChild(loader);
 	const ctx: GuestIdleReconcilerCtx = {
 		statusLine: { markActivityEnd },
-		loadingAnimation: hasLoader ? { stop: loaderStop } : undefined,
+		statusContainer,
+		loadingAnimation: loader,
 	};
-	return { ctx, markActivityEnd, loaderStop };
+	return { ctx, markActivityEnd, loaderStop, statusContainer, loader };
 }
 
 function makeSession(): ConstructorParameters<typeof StatusLineComponent>[0] {
@@ -86,12 +99,13 @@ function makeSession(): ConstructorParameters<typeof StatusLineComponent>[0] {
 
 describe("reconcileGuestIdleHostState", () => {
 	it("closes the active-time window and stops the loader when the host reports idle", () => {
-		const { ctx, markActivityEnd, loaderStop } = makeCtx(true);
+		const { ctx, markActivityEnd, loaderStop, statusContainer, loader } = makeCtx(true);
 		reconcileGuestIdleHostState(ctx, false);
 		expect(markActivityEnd).toHaveBeenCalledTimes(1);
 		expect(loaderStop).toHaveBeenCalledTimes(1);
 		// Loader is cleared so a second reconciliation does not re-stop it.
 		expect(ctx.loadingAnimation).toBeUndefined();
+		expect(statusContainer.children).not.toContain(loader);
 	});
 
 	it("is a no-op while the host is still streaming so live turns keep the meter open", () => {
@@ -133,6 +147,7 @@ describe("reconcileGuestSnapshotHostState", () => {
 
 		const ctx: GuestSnapshotActivityReconcilerCtx = {
 			statusLine,
+			statusContainer: new Container(),
 			loadingAnimation: undefined,
 		};
 		reconcileGuestSnapshotHostState(ctx, false);

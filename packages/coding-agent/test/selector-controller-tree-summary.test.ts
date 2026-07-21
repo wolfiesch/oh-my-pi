@@ -97,6 +97,7 @@ function createHarness(summaryChoice = "No summary"): TreeSummaryHarness {
 		},
 		renderInitialMessages: vi.fn(),
 		reloadTodos: vi.fn(async () => {}),
+		pushTerminalTitleRunning: () => () => {},
 		session: {
 			navigateTree,
 			abortBranchSummary: vi.fn(),

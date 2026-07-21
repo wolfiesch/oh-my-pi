@@ -373,9 +373,29 @@ function getFallbackTerminalTitle(cwd: string | undefined): string | undefined {
 	return sanitizeTerminalTitlePart(baseName);
 }
 
-export function formatSessionTerminalTitle(sessionName: string | undefined, cwd?: string): string {
+export type TerminalTitleRunState = "idle" | "running" | "waiting" | "needs_attention";
+
+export interface SessionTerminalTitleOptions {
+	state?: TerminalTitleRunState;
+	stateSymbol?: string;
+}
+
+const DEFAULT_TERMINAL_TITLE_STATE_SYMBOLS = {
+	running: "●",
+	waiting: "○",
+	needs_attention: "!",
+} satisfies Record<Exclude<TerminalTitleRunState, "idle">, string>;
+
+export function formatSessionTerminalTitle(
+	sessionName: string | undefined,
+	cwd?: string,
+	options: SessionTerminalTitleOptions = {},
+): string {
 	const label = sanitizeTerminalTitlePart(sessionName) ?? getFallbackTerminalTitle(cwd);
-	return label ? `${DEFAULT_TERMINAL_TITLE}: ${label}` : DEFAULT_TERMINAL_TITLE;
+	const baseTitle = label ? `${DEFAULT_TERMINAL_TITLE}: ${label}` : DEFAULT_TERMINAL_TITLE;
+	if (!options.state || options.state === "idle") return baseTitle;
+	const symbol = sanitizeTerminalTitlePart(options.stateSymbol ?? DEFAULT_TERMINAL_TITLE_STATE_SYMBOLS[options.state]);
+	return symbol ? `${symbol} ${baseTitle}` : baseTitle;
 }
 
 /**
@@ -386,8 +406,12 @@ export function setTerminalTitle(title: string): void {
 	process.stdout.write(`\x1b]0;${sanitizeTerminalTitlePart(title) ?? DEFAULT_TERMINAL_TITLE}\x07`);
 }
 
-export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: string): void {
-	setTerminalTitle(formatSessionTerminalTitle(sessionName, cwd));
+export function setSessionTerminalTitle(
+	sessionName: string | undefined,
+	cwd?: string,
+	options?: SessionTerminalTitleOptions,
+): void {
+	setTerminalTitle(formatSessionTerminalTitle(sessionName, cwd, options));
 }
 
 /**

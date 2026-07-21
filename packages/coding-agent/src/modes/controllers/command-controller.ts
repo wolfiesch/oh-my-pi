@@ -56,7 +56,6 @@ import {
 } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
-import { setSessionTerminalTitle } from "../../utils/title-generator";
 
 function showMarkdownPanel(ctx: InteractiveModeContext, title: string, markdown: string): void {
 	const block = new TranscriptBlock();
@@ -925,9 +924,12 @@ export class CommandController {
 				await Bun.sleep(10);
 			}
 		}
-		if (!(await this.ctx.session.newSession(options))) return;
+		if (!(await this.ctx.session.newSession(options))) {
+			this.ctx.refreshTerminalTitle();
+			return;
+		}
 		this.ctx.resetObserverRegistry();
-		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+		this.ctx.refreshTerminalTitle();
 
 		this.ctx.statusLine.invalidate();
 		this.ctx.statusLine.resetActiveTime();
@@ -1276,9 +1278,21 @@ export class CommandController {
 		beforeFlush?: (outcome: CompactionOutcome) => void | Promise<void>,
 		mode?: CompactMode,
 	): Promise<CompactionOutcome> {
+		// An in-flight compaction already owns the loader and the title state;
+		// starting another would clobber both, so reject instead of stealing.
+		if (this.ctx.compactionLoader && (this.ctx.session.isCompacting || this.ctx.viewSession.isCompacting)) {
+			this.ctx.showWarning("Compaction already in progress.");
+			return "failed";
+		}
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
 			this.ctx.loadingAnimation = undefined;
+		}
+		// A stale loader (left behind by an aborted flow) must be stopped and
+		// released before a new one takes ownership, or its ticker leaks.
+		if (this.ctx.compactionLoader) {
+			this.ctx.compactionLoader.stop();
+			this.ctx.compactionLoader = undefined;
 		}
 		this.ctx.statusContainer.disposeChildren();
 
@@ -1290,7 +1304,9 @@ export class CommandController {
 			label,
 			getSymbolTheme().spinnerFrames,
 		);
+		this.ctx.compactionLoader = compactingLoader;
 		this.ctx.statusContainer.addChild(compactingLoader);
+		this.ctx.refreshTerminalTitle();
 		this.ctx.ui.requestRender();
 
 		let outcome: CompactionOutcome = "ok";
@@ -1310,7 +1326,11 @@ export class CommandController {
 			await this.ctx.session.compact(instructions, options);
 
 			compactingLoader.stop();
+			if (this.ctx.compactionLoader === compactingLoader) {
+				this.ctx.compactionLoader = undefined;
+			}
 			this.ctx.statusContainer.disposeChildren();
+			this.ctx.refreshTerminalTitle();
 			this.ctx.rebuildChatFromMessages();
 
 			this.ctx.statusLine.invalidate();
@@ -1334,6 +1354,10 @@ export class CommandController {
 			}
 		} finally {
 			compactingLoader.stop();
+			if (this.ctx.compactionLoader === compactingLoader) {
+				this.ctx.compactionLoader = undefined;
+				this.ctx.refreshTerminalTitle();
+			}
 			this.ctx.statusContainer.disposeChildren();
 		}
 		// Run the caller's pre-flush hook (e.g. the plan-approval model transition)
@@ -1373,6 +1397,7 @@ export class CommandController {
 			getSymbolTheme().spinnerFrames,
 		);
 		this.ctx.statusContainer.addChild(handoffLoader);
+		const releaseTitleRunning = this.ctx.pushTerminalTitleRunning();
 		this.ctx.ui.requestRender();
 
 		try {
@@ -1407,6 +1432,7 @@ export class CommandController {
 			}
 		} finally {
 			handoffLoader.stop();
+			releaseTitleRunning();
 			this.ctx.statusContainer.disposeChildren();
 		}
 		this.ctx.ui.requestRender(true, { clearScrollback: true });

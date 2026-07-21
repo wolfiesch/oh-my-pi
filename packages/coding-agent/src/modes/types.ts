@@ -192,6 +192,7 @@ export interface InteractiveModeContext {
 	lastAssistantUsage: Usage | undefined;
 	loadingAnimation: Loader | undefined;
 	autoCompactionLoader: Loader | undefined;
+	compactionLoader: Loader | undefined;
 	retryLoader: Loader | undefined;
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
@@ -218,6 +219,10 @@ export interface InteractiveModeContext {
 	init(options?: InteractiveModeInitOptions): Promise<void>;
 	playWelcomeIntro(): void;
 	shutdown(): Promise<void>;
+	refreshTerminalTitle(options?: { sessionName?: string | undefined; cwd?: string | undefined }): void;
+	setExtensionTerminalTitle(title: string): void;
+	pushTerminalTitleAttention(): () => void;
+	pushTerminalTitleRunning(): () => void;
 	checkShutdownRequested(): Promise<void>;
 
 	// Extension UI integration

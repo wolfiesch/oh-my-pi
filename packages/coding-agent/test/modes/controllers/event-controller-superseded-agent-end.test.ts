@@ -34,6 +34,7 @@ function createContext() {
 		editor: { getText: () => "" },
 		sessionManager: { getSessionName: () => "test-session" },
 		ensureLoadingAnimation: vi.fn(),
+		refreshTerminalTitle: vi.fn(),
 		ui: { requestRender: vi.fn() },
 		viewSession: { isCompacting: false, getLastAssistantMessage: () => undefined },
 		session: {

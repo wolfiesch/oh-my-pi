@@ -50,6 +50,7 @@ interface Harness {
 		resetTranscriptAnchors: () => number;
 		renderInitialMessages: () => number;
 		mainUnsubscribe: () => number;
+		refreshTerminalTitle: () => number;
 	};
 }
 
@@ -61,6 +62,7 @@ function makeHarness(): Harness {
 	let resetTranscriptAnchors = 0;
 	let renderInitialMessages = 0;
 	let mainUnsubscribe = 0;
+	let refreshTerminalTitle = 0;
 
 	const ctx = {
 		session: main.session,
@@ -88,6 +90,9 @@ function makeHarness(): Harness {
 			renderInitialMessages++;
 		},
 		updateEditorBorderColor() {},
+		refreshTerminalTitle: () => {
+			refreshTerminalTitle++;
+		},
 		ui: { requestRender() {} },
 		showStatus() {},
 		collabGuest: undefined,
@@ -109,6 +114,7 @@ function makeHarness(): Harness {
 			resetTranscriptAnchors: () => resetTranscriptAnchors,
 			renderInitialMessages: () => renderInitialMessages,
 			mainUnsubscribe: () => mainUnsubscribe,
+			refreshTerminalTitle: () => refreshTerminalTitle,
 		},
 	};
 }
@@ -187,6 +193,18 @@ describe("SessionFocusController", () => {
 			[parent.session, "Parent"],
 			[h.main.session, undefined],
 		]);
+	});
+
+	it("refreshes terminal title state after the viewed session changes", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+
+		await h.controller.focusAgent("Worker");
+		expect(h.counts.refreshTerminalTitle()).toBe(1);
+
+		await h.controller.unfocus();
+		expect(h.counts.refreshTerminalTitle()).toBe(2);
 	});
 
 	it("parking the focused agent auto-unfocuses back to the main session", async () => {

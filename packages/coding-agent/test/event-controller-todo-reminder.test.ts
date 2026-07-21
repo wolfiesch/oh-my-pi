@@ -24,6 +24,7 @@ function createContext() {
 		// handlers). Leaving it false matches the implicit assumption in this
 		// fixture: the todo HUD lifecycle is independent of the working loader.
 		viewSession: { isStreaming: false },
+		refreshTerminalTitle: vi.fn(),
 		setTodos: vi.fn(),
 		present,
 	} as unknown as InteractiveModeContext;

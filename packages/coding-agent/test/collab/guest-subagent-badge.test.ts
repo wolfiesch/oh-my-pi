@@ -42,7 +42,13 @@ function makeAgents(ids: string[]): AgentSnapshot[] {
 	}));
 }
 
-function makeGuestContext(counts: number[]): InteractiveModeContext {
+type TitleRefreshRecord = {
+	options: { sessionName?: string | undefined; cwd?: string | undefined } | undefined;
+	hadLoader: boolean;
+	hasGuest: boolean;
+};
+
+function makeGuestContext(counts: number[], titleRefreshes: TitleRefreshRecord[]): InteractiveModeContext {
 	let statusLineCount = 0;
 	const ctx = {
 		collabGuest: undefined as CollabGuestLink | undefined,
@@ -63,13 +69,16 @@ function makeGuestContext(counts: number[]): InteractiveModeContext {
 				setDisableReasoning: () => {},
 			},
 		},
-		statusContainer: { clear: () => {} },
+		statusContainer: { clear: () => {}, removeChild: () => {} },
 		pendingMessagesContainer: { clear: () => {} },
 		compactionQueuedMessages: [],
 		streamingComponent: undefined,
 		streamingMessage: undefined,
 		pendingTools: new Map(),
 		loadingAnimation: undefined,
+		autoCompactionLoader: undefined,
+		compactionLoader: undefined,
+		retryLoader: undefined,
 		statusLine: {
 			setSubagentCount: (count: number) => {
 				statusLineCount = count;
@@ -93,6 +102,13 @@ function makeGuestContext(counts: number[]): InteractiveModeContext {
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
 		eventController: { handleEvent: () => Promise.resolve() },
+		refreshTerminalTitle: (options?: { sessionName?: string | undefined; cwd?: string | undefined }) => {
+			titleRefreshes.push({
+				options,
+				hadLoader: ctx.loadingAnimation !== undefined,
+				hasGuest: ctx.collabGuest !== undefined,
+			});
+		},
 		syncRunningSubagentBadge: () => {
 			const registry = getRunningSubagentBadgeRegistry(ctx.collabGuest);
 			const count = countRunningSubagentBadgeAgents(registry);
@@ -141,7 +157,8 @@ describe("collab guest running-subagents badge", () => {
 		await hostOpen.promise;
 
 		const counts: number[] = [];
-		const ctx = makeGuestContext(counts);
+		const titleRefreshes: TitleRefreshRecord[] = [];
+		const ctx = makeGuestContext(counts, titleRefreshes);
 		const guest = new CollabGuestLink(ctx);
 
 		try {
@@ -149,6 +166,59 @@ describe("collab guest running-subagents badge", () => {
 			expect(ctx.collabGuest).toBe(guest);
 			expect(counts).toEqual([0, 1]);
 			expect(ctx.statusLine.subagentCount).toBe(1);
+			expect(titleRefreshes).toEqual([
+				{ options: { sessionName: "host session", cwd: "/tmp" }, hadLoader: false, hasGuest: false },
+				{ options: { sessionName: "host session", cwd: "/tmp" }, hadLoader: false, hasGuest: true },
+			]);
+
+			let stoppedLoader = false;
+			const stateRefresh = Promise.withResolvers<void>();
+			const recordRefresh = ctx.refreshTerminalTitle.bind(ctx);
+			ctx.refreshTerminalTitle = options => {
+				recordRefresh(options);
+				stateRefresh.resolve();
+			};
+			ctx.loadingAnimation = {
+				stop: () => {
+					stoppedLoader = true;
+				},
+			} as unknown as typeof ctx.loadingAnimation;
+			hostSocket.send({ t: "state", state: { ...makeState(), sessionName: "renamed host", cwd: "/renamed" } });
+			await stateRefresh.promise;
+			expect(stoppedLoader).toBe(true);
+			expect(guest.terminalTitleOptions).toEqual({ sessionName: "renamed host", cwd: "/renamed" });
+			expect(titleRefreshes.at(-1)).toEqual({
+				options: { sessionName: "renamed host", cwd: "/renamed" },
+				hadLoader: false,
+				hasGuest: true,
+			});
+
+			let autoCompactionStopped = false;
+			let compactionStopped = false;
+			let retryStopped = false;
+			let hadMaintenanceLoaderAtRefresh = true;
+			ctx.autoCompactionLoader = {
+				stop: () => {
+					autoCompactionStopped = true;
+				},
+			} as unknown as typeof ctx.autoCompactionLoader;
+			ctx.compactionLoader = {
+				stop: () => {
+					compactionStopped = true;
+				},
+			} as unknown as typeof ctx.compactionLoader;
+			ctx.retryLoader = {
+				stop: () => {
+					retryStopped = true;
+				},
+			} as unknown as typeof ctx.retryLoader;
+			const recordSnapshotRefresh = ctx.refreshTerminalTitle.bind(ctx);
+			ctx.refreshTerminalTitle = options => {
+				hadMaintenanceLoaderAtRefresh = Boolean(
+					ctx.autoCompactionLoader || ctx.compactionLoader || ctx.retryLoader,
+				);
+				recordSnapshotRefresh(options);
+			};
 
 			nextWelcomeAgents = makeAgents(["remote-one", "remote-two"]);
 			const secondSnapshot = Promise.withResolvers<void>();
@@ -160,11 +230,31 @@ describe("collab guest running-subagents badge", () => {
 			sendWelcome(nextWelcomeAgents);
 			await secondSnapshot.promise;
 			expect(ctx.statusLine.subagentCount).toBe(2);
+			expect(autoCompactionStopped).toBe(true);
+			expect(compactionStopped).toBe(true);
+			expect(retryStopped).toBe(true);
+			expect(ctx.autoCompactionLoader).toBeUndefined();
+			expect(ctx.compactionLoader).toBeUndefined();
+			expect(ctx.retryLoader).toBeUndefined();
+			expect(hadMaintenanceLoaderAtRefresh).toBe(false);
+			expect(titleRefreshes).toEqual([
+				{ options: { sessionName: "host session", cwd: "/tmp" }, hadLoader: false, hasGuest: false },
+				{ options: { sessionName: "host session", cwd: "/tmp" }, hadLoader: false, hasGuest: true },
+				{ options: { sessionName: "renamed host", cwd: "/renamed" }, hadLoader: false, hasGuest: true },
+				{ options: { sessionName: "host session", cwd: "/tmp" }, hadLoader: false, hasGuest: true },
+			]);
 
 			await guest.leave("test cleanup");
 			expect(ctx.collabGuest).toBeUndefined();
 			expect(ctx.statusLine.subagentCount).toBe(0);
 			expect(counts.at(-1)).toBe(0);
+			expect(titleRefreshes).toEqual([
+				{ options: { sessionName: "host session", cwd: "/tmp" }, hadLoader: false, hasGuest: false },
+				{ options: { sessionName: "host session", cwd: "/tmp" }, hadLoader: false, hasGuest: true },
+				{ options: { sessionName: "renamed host", cwd: "/renamed" }, hadLoader: false, hasGuest: true },
+				{ options: { sessionName: "host session", cwd: "/tmp" }, hadLoader: false, hasGuest: true },
+				{ options: undefined, hadLoader: false, hasGuest: false },
+			]);
 		} finally {
 			hostSocket.close();
 			writeSpy.mockRestore();

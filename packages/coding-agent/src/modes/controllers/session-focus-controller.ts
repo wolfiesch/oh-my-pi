@@ -107,6 +107,7 @@ export class SessionFocusController {
 		// Mid-turn attach: no agent_start will arrive; arm the loader/turn state manually.
 		if (target.isStreaming) await this.ctx.eventController.handleEvent({ type: "agent_start" });
 		this.ctx.updateEditorBorderColor();
+		this.ctx.refreshTerminalTitle();
 		this.ctx.ui.requestRender();
 	}
 }

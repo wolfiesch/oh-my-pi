@@ -78,6 +78,7 @@ function createContext(
 		statusContainer: { clear: vi.fn() },
 		statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn(), markActivityEnd: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
+		refreshTerminalTitle: vi.fn(),
 		editor: { getText: () => options.editorText ?? "" },
 		sessionManager: { getSessionName: () => options.sessionName },
 		todoPhases: options.todoPhases ?? [],
