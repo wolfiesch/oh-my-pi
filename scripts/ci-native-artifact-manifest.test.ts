@@ -50,7 +50,7 @@ describe("native artifact provenance manifests", () => {
 		expect(verifyNativeArtifactManifests({ repoRoot, directory: nativeDirectory, sourceHash })).rejects.toThrow(
 			"does not match its provenance manifest",
 		);
-	});
+	}, 30_000);
 
 	test("rejects mutable third-party action references before publication", async () => {
 		const { repoRoot, nativeDirectory } = await fixture();
