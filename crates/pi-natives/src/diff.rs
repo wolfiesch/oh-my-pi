@@ -79,7 +79,7 @@ struct Component {
 	count:   usize,
 	added:   bool,
 	removed: bool,
-	prev:    Option<Rc<Component>>,
+	prev:    Option<Rc<Self>>,
 }
 
 /// Frontier state for one diagonal: furthest old-position reached plus the
@@ -139,15 +139,16 @@ fn add_to_path(path: &PathState, added: bool, removed: bool, old_pos_inc: isize)
 }
 
 /// Convert the winning component chain into forward-ordered runs.
-fn build_runs(mut last: Option<Rc<Component>>) -> Vec<Run> {
+fn build_runs(last: Option<Rc<Component>>) -> Vec<Run> {
 	let mut runs = Vec::new();
-	while let Some(component) = last {
+	let mut cursor = last.as_deref();
+	while let Some(component) = cursor {
 		runs.push(Run {
 			count:   component.count,
 			added:   component.added,
 			removed: component.removed,
 		});
-		last = component.prev.clone();
+		cursor = component.prev.as_deref();
 	}
 	runs.reverse();
 	runs
@@ -244,10 +245,15 @@ fn intern_exact<'a>(old_tokens: &[&'a str], new_tokens: &[&'a str]) -> (Vec<u32>
 		let next = ids.len() as u32;
 		*ids.entry(token).or_insert(next)
 	}
-	let mut ids: HashMap<&'a str, u32> =
-		HashMap::with_capacity(old_tokens.len() + new_tokens.len());
-	let old_ids = old_tokens.iter().map(|token| assign(&mut ids, token)).collect();
-	let new_ids = new_tokens.iter().map(|token| assign(&mut ids, token)).collect();
+	let mut ids: HashMap<&'a str, u32> = HashMap::with_capacity(old_tokens.len() + new_tokens.len());
+	let old_ids = old_tokens
+		.iter()
+		.map(|token| assign(&mut ids, token))
+		.collect();
+	let new_ids = new_tokens
+		.iter()
+		.map(|token| assign(&mut ids, token))
+		.collect();
 	(old_ids, new_ids)
 }
 
@@ -311,8 +317,10 @@ pub fn diff_lines(old_text: String, new_text: String) -> Vec<DiffChange> {
 
 /// Diff `oldText.split("\n")` against `newText.split("\n")` with jsdiff
 /// `diffArrays` semantics (exact string equality, empty lines preserved),
-/// returning only run lengths. Callers that map line numbers — like hashline
-/// recovery — need the counts, not another copy of the text.
+/// returning only run lengths.
+///
+/// Callers that map line numbers — like hashline recovery — need the counts,
+/// not another copy of the text.
 #[napi]
 pub fn diff_line_runs(old_text: String, new_text: String) -> Vec<DiffRun> {
 	let old_tokens: Vec<&str> = old_text.split('\n').collect();
@@ -455,7 +463,7 @@ pub fn structured_patch_hunks(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// jsdiff's `extendedWordChars` class: Latin-script word characters.
-fn is_word_char(c: char) -> bool {
+const fn is_word_char(c: char) -> bool {
 	matches!(c,
 		'a'..='z'
 		| 'A'..='Z'
@@ -470,10 +478,10 @@ fn is_word_char(c: char) -> bool {
 		| '\u{1e00}'..='\u{1eff}')
 }
 
-/// JavaScript's `\s` / `String.prototype.trim` whitespace set (WhiteSpace +
-/// LineTerminator productions). Every member is a single UTF-16 code unit, so
+/// JavaScript's `\s` / `String.prototype.trim` whitespace set (`WhiteSpace` +
+/// `LineTerminator` productions). Every member is a single UTF-16 code unit, so
 /// char-level scans here match jsdiff's code-unit-level scans exactly.
-fn is_js_whitespace(c: char) -> bool {
+const fn is_js_whitespace(c: char) -> bool {
 	matches!(
 		c,
 		'\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
@@ -541,14 +549,13 @@ fn word_tokens(text: &str) -> Vec<String> {
 	for part in parts {
 		let part_is_ws = part.chars().next().is_some_and(is_js_whitespace);
 		if part_is_ws {
-			match prev_part {
-				None => tokens.push(part.to_string()),
-				Some(_) => {
-					let last = tokens
-						.last_mut()
-						.expect("tokens non-empty after first part");
-					last.push_str(part);
-				},
+			if prev_part.is_none() {
+				tokens.push(part.to_string());
+			} else {
+				let last = tokens
+					.last_mut()
+					.expect("tokens non-empty after first part");
+				last.push_str(part);
 			}
 		} else if let Some(prev) =
 			prev_part.filter(|p| p.chars().next().is_some_and(is_js_whitespace))
@@ -766,8 +773,10 @@ fn word_post_process(changes: &mut [DiffChange]) {
 }
 
 /// Word diff with jsdiff `diffWords(oldText, newText)` semantics (default
-/// options): tokens carry surrounding whitespace, equality ignores it, and
-/// the post-pass dedupes whitespace across change boundaries.
+/// options).
+///
+/// Tokens carry surrounding whitespace, equality ignores it, and the
+/// post-pass dedupes whitespace across change boundaries.
 #[napi]
 pub fn diff_words(old_text: String, new_text: String) -> Vec<DiffChange> {
 	let old_tokens = word_tokens(&old_text);
