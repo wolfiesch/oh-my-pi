@@ -95,6 +95,11 @@ const fastWorkspacePackages = [
 	"packages/agent",
 ];
 
+// The AI suite exercises local streaming servers and cross-process OAuth races.
+// On shared runners those tests can exceed Bun's 5s default while eight files
+// execute concurrently, even though isolated runs complete in about 1s.
+const workspaceTestTimeoutMs = new Map([["packages/ai", 10_000]]);
+
 // These suites cover the native package, TUI/browser-ish behavior, local servers,
 // or coding-agent-adjacent benchmark paths. Keep them low-concurrency and in jobs
 // that have downloaded the Linux x64 native addon artifacts.
@@ -220,10 +225,17 @@ function shellQuote(value: string): string {
 
 function workspaceTestCommand(pkg: string, parallel: number, options: { extraArgs?: string[] } = {}): TestCommand {
 	const { extraArgs = [] } = options;
+	const timeoutMs = workspaceTestTimeoutMs.get(pkg);
 	return {
 		label: pkg,
 		cwd: pkg,
-		command: ["bun", "test", `--parallel=${parallel}`, ...extraArgs],
+		command: [
+			"bun",
+			"test",
+			`--parallel=${parallel}`,
+			...(timeoutMs === undefined ? [] : [`--timeout=${timeoutMs}`]),
+			...extraArgs,
+		],
 	};
 }
 
