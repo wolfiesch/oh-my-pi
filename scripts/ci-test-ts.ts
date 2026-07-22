@@ -118,6 +118,7 @@ const localOnlyWorkspacePackages = ["packages/mnemopi", "python/robomp/web"];
 // `ci-test-ts.test.ts` entry used to sit here but the file never existed — bun
 // silently ignores unmatched filters when at least one other filter matches.)
 const repoScriptTests = [
+	"scripts/ci-native-artifact-manifest.test.ts",
 	"scripts/ci-concurrency.test.ts",
 	"scripts/ci-build-native.test.ts",
 	"scripts/ci-release-notes.test.ts",
@@ -355,6 +356,7 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 						...onlyFailuresArgs,
 						"scripts/ci-concurrency.test.ts",
 						"scripts/ci-build-native.test.ts",
+						"scripts/ci-native-artifact-manifest.test.ts",
 						"scripts/fix-dts-extensions.test.ts",
 					],
 				},
