@@ -3,7 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { createNativeArtifactManifest, verifyNativeArtifactManifests } from "./ci-native-artifact-manifest";
+import {
+	commandVersion,
+	createNativeArtifactManifest,
+	verifyNativeArtifactManifests,
+} from "./ci-native-artifact-manifest";
 
 const temporaryRoots: string[] = [];
 
@@ -31,6 +35,10 @@ async function fixture(): Promise<{ repoRoot: string; nativeDirectory: string }>
 }
 
 describe("native artifact provenance manifests", () => {
+	test("treats an unavailable optional toolchain executable as absent", () => {
+		expect(commandVersion("omp-definitely-missing-toolchain", ["--version"])).toBeNull();
+	});
+
 	test("bind downloaded binaries to the source, workflow, actions, and toolchains", async () => {
 		const { repoRoot, nativeDirectory } = await fixture();
 		const sourceHash = "a".repeat(64);

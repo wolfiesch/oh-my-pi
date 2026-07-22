@@ -95,10 +95,15 @@ async function workflowIdentity(repoRoot: string): Promise<{
 	return { workflowHash: hasher.digest("hex"), actionPins: [...pins].sort() };
 }
 
-function commandVersion(command: string, args: string[]): string | null {
-	const result = Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "pipe" });
-	if (result.exitCode !== 0) return null;
-	return result.stdout.toString().trim();
+export function commandVersion(command: string, args: string[]): string | null {
+	try {
+		const result = Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) return null;
+		return result.stdout.toString().trim();
+	} catch (error) {
+		if (error !== null && typeof error === "object" && "code" in error && error.code === "ENOENT") return null;
+		throw error;
+	}
 }
 
 function requireSourceHash(sourceHash: string): void {
