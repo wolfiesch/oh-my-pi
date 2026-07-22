@@ -30,9 +30,9 @@ jobs:
   manage:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: mitchellh/vouch/action/manage-by-discussion@v1
+      - uses: mitchellh/vouch/action/manage-by-discussion@d66fa29a64600490892131ad87597c30c91fcac4 # v1
         with:
           discussion-number: ${{ github.event.discussion.number }}
           comment-node-id: ${{ github.event.comment.node_id }}

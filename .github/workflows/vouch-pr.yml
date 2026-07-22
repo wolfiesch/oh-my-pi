@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - id: vouch
-        uses: mitchellh/vouch/action/check-pr@v1
+        uses: mitchellh/vouch/action/check-pr@d66fa29a64600490892131ad87597c30c91fcac4 # v1
         with:
           pr-number: ${{ github.event.pull_request.number }}
           auto-close: true
