@@ -4,6 +4,7 @@
  * Usage: bun bench/diff.ts
  * Records git sha, scenario, and iteration counts; prints a markdown table.
  */
+import * as os from "node:os";
 import { diffLines as nativeDiffLines, structuredPatchHunks } from "../native/index.js";
 import * as Diff from "diff";
 
@@ -47,8 +48,9 @@ function bench(fn: () => unknown): { meanMs: number; iterations: number } {
 	return { meanMs: (performance.now() - start) / ITERATIONS, iterations: ITERATIONS };
 }
 
-const sha = Bun.spawnSync(["git", "rev-parse", "HEAD"]).stdout.toString().trim();
-console.log(`# diff bench — sha ${sha}, warmup ${WARMUP}, iterations ${ITERATIONS}/scenario\n`);
+const sha = Bun.env.BENCH_SHA ?? Bun.spawnSync(["git", "rev-parse", "HEAD"]).stdout.toString().trim();
+console.log(`# diff bench — sha ${sha}, warmup ${WARMUP}, iterations ${ITERATIONS}/scenario`);
+console.log(`# host: ${os.cpus()[0]?.model ?? "unknown"}, ${os.platform()}-${os.arch()}, bun ${Bun.version}\n`);
 console.log("| scenario | jsdiff diffLines | native diffLines | speedup | jsdiff structuredPatch | native hunks | speedup |");
 console.log("|---|---|---|---|---|---|---|");
 
@@ -59,9 +61,15 @@ for (const lines of [100, 5_000, 50_000].filter(n => n <= MAX_LINES)) {
 		const oldText = buildDoc(rng, lines);
 		const newText = mutate(rng, oldText, density);
 		const jsLines = bench(() => Diff.diffLines(oldText, newText));
-		const natLines = bench(() => nativeDiffLines(oldText, newText));
+		// Native timings include the isWellFormed() guards the production call
+		// sites pay before choosing the native path.
+		const natLines = bench(() =>
+			oldText.isWellFormed() && newText.isWellFormed() ? nativeDiffLines(oldText, newText) : undefined,
+		);
 		const jsPatch = bench(() => Diff.structuredPatch("", "", oldText, newText, "", "", { context: 3 }));
-		const natPatch = bench(() => structuredPatchHunks(oldText, newText, 3));
+		const natPatch = bench(() =>
+			oldText.isWellFormed() && newText.isWellFormed() ? structuredPatchHunks(oldText, newText, 3) : undefined,
+		);
 		const fmt = (ms: number) => (ms >= 1 ? `${ms.toFixed(2)}ms` : `${(ms * 1000).toFixed(1)}µs`);
 		console.log(
 			`| ${lines} lines / ${density * 100}% edits | ${fmt(jsLines.meanMs)} | ${fmt(natLines.meanMs)} | ${(jsLines.meanMs / natLines.meanMs).toFixed(1)}x | ${fmt(jsPatch.meanMs)} | ${fmt(natPatch.meanMs)} | ${(jsPatch.meanMs / natPatch.meanMs).toFixed(1)}x |`,
