@@ -110,7 +110,7 @@ runs:
            target: ${{ steps.resolve.outputs.bare_target }}
       - name: Install Rust toolchain (GitHub-hosted)
         if: steps.detect.outputs.on_infra == 'false'
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
         with:
            toolchain: nightly-2026-04-29
            components: ${{ inputs.rust_checks == 'true' && 'clippy, rustfmt' || '' }}
@@ -176,7 +176,7 @@ runs:
       # RustFS sccache are the reuse layers, so there is no second cache restore.
       - name: Cache Rust target/ (GitHub-hosted)
         if: steps.detect.outputs.on_infra == 'false'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
            shared-key: native-${{ inputs.platform }}-${{ inputs.arch }}-${{ inputs.variant || 'default' }}-h${{ inputs.hash }}
            cache-on-failure: true
@@ -191,7 +191,7 @@ runs:
            version: "0.15.0"
       - name: Setup sccache (GitHub-hosted)
         if: steps.detect.outputs.on_infra == 'false'
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Enable sccache for cargo
         # CARGO_INCREMENTAL=0 is required: sccache silently skips caching when
         # incremental is enabled, turning the wrapper into a no-op. The backend is
@@ -219,7 +219,7 @@ runs:
            crate: cargo-nextest
       - name: Install cargo-nextest (GitHub-hosted)
         if: steps.detect.outputs.on_infra == 'false' && inputs.target == ''
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2
         with:
            tool: nextest
 
@@ -239,7 +239,7 @@ runs:
            version: "0.16.0"
       - name: Setup zig (GitHub-hosted, non-MSVC cross)
         if: steps.detect.outputs.on_infra == 'false' && steps.resolve.outputs.cross_target != '' && !endsWith(steps.resolve.outputs.cross_target, '-msvc')
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
            version: 0.16.0
       - name: Ensure baked cargo-zigbuild (omp-kata, non-MSVC cross)
@@ -250,7 +250,7 @@ runs:
            crate: cargo-zigbuild
       - name: Install cargo-zigbuild (GitHub-hosted, non-MSVC cross)
         if: steps.detect.outputs.on_infra == 'false' && steps.resolve.outputs.cross_target != '' && !endsWith(steps.resolve.outputs.cross_target, '-msvc')
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2
         with:
            tool: cargo-zigbuild
       - name: Install LLVM tooling (GitHub-hosted, MSVC cross)
@@ -267,12 +267,12 @@ runs:
            crate: cargo-xwin
       - name: Install cargo-xwin (GitHub-hosted, MSVC cross)
         if: steps.detect.outputs.on_infra == 'false' && endsWith(steps.resolve.outputs.cross_target, '-msvc')
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2
         with:
            tool: cargo-xwin
       - name: Cache cargo-xwin Windows SDK
         if: endsWith(steps.resolve.outputs.cross_target, '-msvc')
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
            path: ~/.cache/cargo-xwin
            key: cargo-xwin-${{ runner.os }}-v1
@@ -302,11 +302,24 @@ runs:
            TARGET_ARCH: ${{ inputs.arch }}
            TARGET_VARIANTS: ${{ inputs.variant }}
         run: bun run ci:build:native
+      - name: Create native artifact provenance manifest
+        shell: bash
+        run: |
+           bun scripts/ci-native-artifact-manifest.ts create \
+             --directory packages/natives/native \
+             --source-hash "${{ inputs.hash }}" \
+             --platform "${{ inputs.platform }}" \
+             --arch "${{ inputs.arch }}" \
+             --variant "${{ inputs.variant }}" \
+             --target "${{ inputs.target }}" \
+             --glibc "${{ inputs.glibc }}"
       - name: Upload native addon(s)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
            name: pi-natives-${{ inputs.platform }}-${{ inputs.arch }}${{ inputs.variant && format('-{0}', inputs.variant) || '' }}-h${{ inputs.hash }}
-           path: packages/natives/native/pi_natives.${{ inputs.platform }}-${{ inputs.arch }}*.node
+           path: |
+              packages/natives/native/pi_natives.${{ inputs.platform }}-${{ inputs.arch }}*.node
+              packages/natives/native/pi_natives.${{ inputs.platform }}-${{ inputs.arch }}*.manifest.json
            if-no-files-found: error
            # Explicit so the native_artifact_lookup canary keeps working even if
            # org defaults shift; bump if Rust source ever stays stable for >90 days
