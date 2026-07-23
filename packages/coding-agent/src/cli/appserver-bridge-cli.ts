@@ -86,6 +86,10 @@ function session(value: unknown): SessionRecord {
 	return item as unknown as SessionRecord;
 }
 
+function sessionReference(value: SessionRecord): SessionRecord {
+	return { ...value, entriesLoaded: false, entries: [] };
+}
+
 function operationContext(
 	value: unknown,
 	abortSignal: AbortSignal,
@@ -206,9 +210,10 @@ async function dispatch(
 				optionalString(params.title, "session title"),
 			);
 		}
-		case "session.list":
+		case "session.list": {
 			exact(params, [], "session.list params");
-			return runtime.sessionAuthority.list();
+			return (await runtime.sessionAuthority.list()).map(sessionReference);
+		}
 		case "session.archive":
 			exact(params, ["session", "archivedAt"], "session.archive params");
 			await runtime.sessionAuthority.archive(session(params.session), string(params.archivedAt, "archive time"));

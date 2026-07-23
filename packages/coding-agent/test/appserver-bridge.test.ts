@@ -5,6 +5,7 @@ import {
 	encodeOmpAuthorityBridgeFrame,
 	OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES,
 	OMP_AUTHORITY_BRIDGE_PROTOCOL,
+	type SessionRecord,
 } from "@oh-my-pi/appserver";
 import { runOmpAuthorityBridge } from "../src/cli/appserver-bridge-cli";
 
@@ -33,7 +34,7 @@ class AsyncQueue implements AsyncIterable<string> {
 	}
 }
 
-function session() {
+function session(): SessionRecord {
 	return {
 		sessionId: sessionId("session-test"),
 		path: "/tmp/session-test.jsonl",
@@ -46,8 +47,7 @@ function session() {
 	};
 }
 
-function runtime() {
-	const record = session();
+function runtime(record: SessionRecord = session()) {
 	const sessionAuthority = {
 		create: async () => ({ ...record }),
 		list: async () => [record],
@@ -137,6 +137,48 @@ describe("thin OMP authority bridge", () => {
 				ok: true,
 				result: { terminalId: "terminal-test" },
 			}),
+		);
+	});
+
+	test("emits sparse session-list records before the bridge frame is encoded", async () => {
+		const input = new AsyncQueue();
+		const output: string[] = [];
+		const large: SessionRecord = {
+			...session(),
+			entries: [
+				{
+					id: "large-entry" as never,
+					parentId: null,
+					hostId: hostId("host-test"),
+					sessionId: sessionId("session-test"),
+					kind: "message",
+					timestamp: new Date(0).toISOString(),
+					data: { text: "x".repeat(OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES + 1) },
+				},
+			],
+		};
+		const running = runOmpAuthorityBridge({
+			runtime: runtime(large),
+			input,
+			write: line => {
+				output.push(line);
+			},
+			identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
+		});
+		input.push(request("list-large", "session.list", {}));
+		input.close();
+		await running;
+
+		const response = output
+			.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)))
+			.find(frame => frame.type === "response" && frame.id === "list-large");
+		expect(response).toMatchObject({
+			type: "response",
+			ok: true,
+			result: [{ ...large, entriesLoaded: false, entries: [] }],
+		});
+		expect(Buffer.byteLength(output.find(line => line.includes('"list-large"'))!, "utf8")).toBeLessThanOrEqual(
+			OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES,
 		);
 	});
 

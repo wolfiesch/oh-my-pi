@@ -27,6 +27,10 @@
 
 ### Fixed
 
+- Fixed the T4 authority bridge serializing loaded transcript bodies in
+  `session.list`; inventory responses now emit sparse session references before
+  the bounded JSON frame is encoded.
+
 - Fixed appserver restart loops when a crashed owner's Unix socket was inactive but its PID still appeared alive because it had not been reaped or had been reused. Recovery now confirms the completed socket is unreachable twice and revalidates every ownership file before reclaiming it.
 - Fixed large session histories blocking appserver socket startup and repeatedly parsing every transcript body. Startup now publishes the transport before discovery, sends a complete initial inventory after bounded previews finish, and loads a transcript body only when that session is opened. Oversized non-header records are skipped without hiding the whole session.
 - Fixed appserver Agent View cancellation aborting the parent RPC process instead of the selected live subagent. Cancellation now targets only validated worker subagents, survives the requesting client disconnecting after dispatch, publishes a non-resumable terminal `cancelled` lifecycle state before hard release, and cannot revive or park an agent after that release begins.
