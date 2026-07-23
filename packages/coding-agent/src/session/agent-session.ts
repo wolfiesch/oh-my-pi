@@ -7636,8 +7636,8 @@ export class AgentSession {
 		// No observer can see a new xd:// device without the active write tool.
 		this.#mountedXdevToolNames = nextMounted;
 		this.#xdevRegistry?.reconcile(mountedTools);
-		this.#notifyXdevMountDelta(previousMounted);
 		this.agent.setTools(tools);
+		this.#notifyXdevMountDelta(previousMounted);
 		if (rebuiltSystemPrompt && rebuiltSignature) {
 			if (this.#lastAppliedToolSignature !== undefined) this.#clearInheritedProviderPromptCacheKey();
 			this.#baseSystemPrompt = rebuiltSystemPrompt;

@@ -690,6 +690,12 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			{ xdevRegistry, lazyWrite: true },
 		);
 		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
+		let activeAtNotice: string[] | undefined;
+		session.subscribe(event => {
+			if (event.type === "notice" && event.source === "xdev") {
+				activeAtNotice = session.getActiveToolNames();
+			}
+		});
 
 		const refresh = session.refreshMCPTools([search]);
 		await rebuildStarted;
@@ -705,6 +711,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(session.getMountedXdevToolNames()).toContain(search.name);
 		expect(session.getActiveToolNames()).toContain("write");
 		expect(session.getActiveToolNames()).not.toContain(search.name);
+		expect(activeAtNotice).toContain("write");
 	});
 
 	it("rolls back MCP catalog replacement when prompt rebuild fails", async () => {
