@@ -208,6 +208,27 @@ describe("RPC frame encoding", () => {
 		expect(decoded).toEqual(frame);
 	});
 
+	it("accepts a chunked logical frame at the exact physical-frame boundary", () => {
+		const frame = {
+			id: "request-boundary",
+			type: "response",
+			command: "get_state",
+			success: true,
+			data: { payload: "" },
+		};
+		const emptyBytes = Buffer.byteLength(JSON.stringify(frame), "utf8");
+		frame.data.payload = "x".repeat(MAX_RPC_FRAME_BYTES - emptyBytes);
+		expect(Buffer.byteLength(JSON.stringify(frame), "utf8")).toBe(MAX_RPC_FRAME_BYTES);
+
+		const encoder = new RpcFrameEncoder();
+		encoder.setProtocolVersion(2);
+		const decoder = new RpcFrameDecoder();
+		let decoded: object | undefined;
+		for (const line of encoder.encode(frame).trimEnd().split("\n")) decoded = decoder.push(JSON.parse(line));
+
+		expect(decoded).toEqual(frame);
+	});
+
 	it("preserves terminal message counts above the protocol v2 ceiling", () => {
 		const encoder = new RpcFrameEncoder();
 		encoder.setProtocolVersion(2);

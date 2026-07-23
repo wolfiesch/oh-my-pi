@@ -147,7 +147,7 @@ export class RpcFrameDecoder {
 			count < 2 ||
 			count > Math.ceil(MAX_RPC_REASSEMBLED_BYTES / RPC_CHUNK_PAYLOAD_BYTES) ||
 			index >= count ||
-			byteLength <= MAX_RPC_FRAME_BYTES ||
+			byteLength < MAX_RPC_FRAME_BYTES ||
 			byteLength > MAX_RPC_REASSEMBLED_BYTES
 		)
 			throw new Error("invalid rpc chunk metadata");

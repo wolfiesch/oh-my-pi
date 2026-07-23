@@ -164,7 +164,7 @@ class _RpcFrameDecoder:
             or count < 2
             or count > max_chunk_count
             or index >= count
-            or byte_length <= _MAX_RPC_FRAME_BYTES
+            or byte_length < _MAX_RPC_FRAME_BYTES
             or byte_length > _MAX_RPC_REASSEMBLED_BYTES
             or not isinstance(data, str)
             or not data

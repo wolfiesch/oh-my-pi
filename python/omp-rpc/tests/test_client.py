@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import os
 import shutil
 import signal
@@ -11,6 +13,7 @@ import time
 import unittest
 
 from omp_rpc import RpcClient, RpcCommandError, RpcConcurrencyError, RpcError, host_tool
+from omp_rpc.client import _RpcFrameDecoder
 
 
 FAKE_SERVER = textwrap.dedent(
@@ -734,6 +737,38 @@ class RpcClientTests(unittest.TestCase):
             request_timeout=2.0,
             **kwargs,
         )
+
+    def test_protocol_v2_decoder_accepts_exact_logical_boundary(self) -> None:
+        frame = {
+            "id": "request-boundary",
+            "type": "response",
+            "command": "get_state",
+            "success": True,
+            "data": {"payload": ""},
+        }
+        encoded_empty = json.dumps(frame, separators=(",", ":")).encode("utf-8")
+        frame["data"]["payload"] = "x" * (1024 * 1024 - len(encoded_empty))
+        encoded = json.dumps(frame, separators=(",", ":")).encode("utf-8")
+        self.assertEqual(len(encoded), 1024 * 1024)
+
+        decoder = _RpcFrameDecoder()
+        chunk_size = 256 * 1024
+        count = (len(encoded) + chunk_size - 1) // chunk_size
+        decoded = None
+        for index in range(count):
+            chunk = encoded[index * chunk_size : (index + 1) * chunk_size]
+            decoded = decoder.push(
+                {
+                    "type": "rpc_chunk",
+                    "chunkId": "exact-boundary",
+                    "index": index,
+                    "count": count,
+                    "byteLength": len(encoded),
+                    "data": base64.b64encode(chunk).decode("ascii"),
+                }
+            )
+
+        self.assertEqual(decoded, frame)
 
     def test_command_builder_supports_common_rpc_options(self) -> None:
         client = RpcClient(
