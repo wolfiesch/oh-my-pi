@@ -671,6 +671,42 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(session.getMountedXdevToolNames()).toContain(search.name);
 	});
 
+	it("publishes an xd:// device atomically with its lazy write transport", async () => {
+		let releaseRebuild!: () => void;
+		let markRebuildStarted!: () => void;
+		const rebuildStarted = new Promise<void>(resolve => {
+			markRebuildStarted = resolve;
+		});
+		const rebuildGate = new Promise<void>(resolve => {
+			releaseRebuild = resolve;
+		});
+		const xdevRegistry = new XdevRegistry([]);
+		const { session } = newSession(
+			async toolNames => {
+				markRebuildStarted();
+				await rebuildGate;
+				return `tools:${toolNames.join(",")}`;
+			},
+			{ xdevRegistry, lazyWrite: true },
+		);
+		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
+
+		const refresh = session.refreshMCPTools([search]);
+		await rebuildStarted;
+
+		expect(xdevRegistry.entries().map(entry => entry.name)).not.toContain(search.name);
+		expect(session.getMountedXdevToolNames()).not.toContain(search.name);
+		expect(session.getActiveToolNames()).not.toContain("write");
+
+		releaseRebuild();
+		await refresh;
+
+		expect(xdevRegistry.entries().map(entry => entry.name)).toContain(search.name);
+		expect(session.getMountedXdevToolNames()).toContain(search.name);
+		expect(session.getActiveToolNames()).toContain("write");
+		expect(session.getActiveToolNames()).not.toContain(search.name);
+	});
+
 	it("rolls back MCP catalog replacement when prompt rebuild fails", async () => {
 		let failRebuild = false;
 		let date = "2026-07-16";
