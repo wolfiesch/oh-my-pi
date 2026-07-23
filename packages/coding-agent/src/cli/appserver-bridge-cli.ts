@@ -1,6 +1,8 @@
-import type { DeviceCapability } from "@oh-my-pi/app-wire";
+import { randomUUID } from "node:crypto";
+import { type DeviceCapability, MAX_ARRAY_ITEMS } from "@oh-my-pi/app-wire";
 import {
 	decodeOmpAuthorityBridgeClientFrame,
+	decodeOmpAuthorityBridgeServerFrame,
 	encodeOmpAuthorityBridgeFrame,
 	OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES,
 	OMP_AUTHORITY_BRIDGE_PROTOCOL,
@@ -14,6 +16,23 @@ import { createDefaultAppserverRuntime } from "./appserver-cli";
 import { getCodingAgentAppserverIdentity } from "./appserver-identity";
 
 type Runtime = Awaited<ReturnType<typeof createDefaultAppserverRuntime>>;
+const MAX_SESSION_LIST_SNAPSHOTS = 4;
+const SESSION_LIST_SNAPSHOT_TTL_MS = 30_000;
+
+interface SessionListSnapshot {
+	readonly references: readonly SessionRecord[];
+	readonly offset: number;
+	readonly expiresAt: number;
+	readonly complete: boolean;
+	readonly totalCount: number;
+}
+
+interface SessionListPage {
+	readonly sessions: readonly SessionRecord[];
+	readonly nextCursor?: string;
+	readonly complete: boolean;
+	readonly totalCount: number;
+}
 
 const BASE_METHODS = [
 	"host.info",
@@ -87,7 +106,104 @@ function session(value: unknown): SessionRecord {
 }
 
 function sessionReference(value: SessionRecord): SessionRecord {
-	return { ...value, entriesLoaded: false, entries: [] };
+	return {
+		sessionId: value.sessionId,
+		path: value.path,
+		cwd: value.cwd,
+		projectId: value.projectId,
+		...(value.projectName === undefined ? {} : { projectName: value.projectName }),
+		title: value.title,
+		updatedAt: value.updatedAt,
+		status: value.status,
+		...(value.archivedAt === undefined ? {} : { archivedAt: value.archivedAt }),
+		...(value.model === undefined ? {} : { model: value.model }),
+		...(value.thinking === undefined ? {} : { thinking: value.thinking }),
+		...(value.runtime === undefined ? {} : { runtime: value.runtime }),
+		entriesLoaded: false,
+		entries: [],
+	};
+}
+
+function sessionListPage(
+	id: string,
+	snapshot: SessionListSnapshot,
+	snapshots: Map<string, SessionListSnapshot>,
+): SessionListPage {
+	const nextCursor = randomUUID();
+	let lower = snapshot.offset;
+	let upper = snapshot.references.length;
+	while (lower < upper) {
+		const end = Math.ceil((lower + upper) / 2);
+		const result: SessionListPage = {
+			sessions: snapshot.references.slice(snapshot.offset, end),
+			...(end < snapshot.references.length ? { nextCursor } : {}),
+			complete: snapshot.complete,
+			totalCount: snapshot.totalCount,
+		};
+		try {
+			const encoded = encodeOmpAuthorityBridgeFrame({
+				v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+				type: "response",
+				id,
+				ok: true,
+				result,
+			});
+			decodeOmpAuthorityBridgeServerFrame(JSON.parse(encoded));
+			lower = end;
+		} catch {
+			upper = end - 1;
+		}
+	}
+	if (lower === snapshot.offset && snapshot.offset < snapshot.references.length)
+		throw Object.assign(new Error("one session exceeds the bridge line limit"), { code: "BOUNDS" });
+	const result: SessionListPage = {
+		sessions: snapshot.references.slice(snapshot.offset, lower),
+		...(lower < snapshot.references.length ? { nextCursor } : {}),
+		complete: snapshot.complete,
+		totalCount: snapshot.totalCount,
+	};
+	if (result.nextCursor) {
+		snapshots.set(result.nextCursor, {
+			references: snapshot.references,
+			offset: lower,
+			expiresAt: Date.now() + SESSION_LIST_SNAPSHOT_TTL_MS,
+			complete: snapshot.complete,
+			totalCount: snapshot.totalCount,
+		});
+	}
+	return result;
+}
+
+async function listSessionPage(
+	runtime: Runtime,
+	id: string,
+	params: Record<string, unknown>,
+	snapshots: Map<string, SessionListSnapshot>,
+): Promise<SessionListPage> {
+	const now = Date.now();
+	for (const [cursor, snapshot] of snapshots) if (snapshot.expiresAt <= now) snapshots.delete(cursor);
+	const cursor = params.cursor === undefined ? undefined : string(params.cursor, "session.list cursor");
+	exact(params, cursor === undefined ? [] : ["cursor"], "session.list params");
+	if (cursor !== undefined) {
+		const snapshot = snapshots.get(cursor);
+		snapshots.delete(cursor);
+		if (!snapshot) throw Object.assign(new Error("session inventory cursor is unavailable"), { code: "NOT_FOUND" });
+		return sessionListPage(id, snapshot, snapshots);
+	}
+	if (snapshots.size >= MAX_SESSION_LIST_SNAPSHOTS)
+		throw Object.assign(new Error("too many session inventory snapshots"), { code: "BOUNDS" });
+	const sessions = await runtime.sessionAuthority.list();
+	return sessionListPage(
+		id,
+		{
+			references: sessions.slice(0, MAX_ARRAY_ITEMS).map(sessionReference),
+			offset: 0,
+			expiresAt: now + SESSION_LIST_SNAPSHOT_TTL_MS,
+			complete: sessions.length <= MAX_ARRAY_ITEMS,
+			totalCount: sessions.length,
+		},
+		snapshots,
+	);
 }
 
 function operationContext(
@@ -197,6 +313,7 @@ async function dispatch(
 	frame: Extract<OmpAuthorityBridgeClientFrame, { type: "request" }>,
 	abortSignal: AbortSignal,
 	emitTerminalOutput: (value: unknown) => void,
+	sessionListSnapshots: Map<string, SessionListSnapshot>,
 ): Promise<unknown> {
 	const params = frame.params;
 	switch (frame.method) {
@@ -211,8 +328,7 @@ async function dispatch(
 			);
 		}
 		case "session.list": {
-			exact(params, [], "session.list params");
-			return (await runtime.sessionAuthority.list()).map(sessionReference);
+			return listSessionPage(runtime, frame.id, params, sessionListSnapshots);
 		}
 		case "session.archive":
 			exact(params, ["session", "archivedAt"], "session.archive params");
@@ -309,6 +425,7 @@ export async function runOmpAuthorityBridge(options: OmpAuthorityBridgeRunnerOpt
 	});
 	const controllers = new Map<string, AbortController>();
 	const requests = new Set<Promise<void>>();
+	const sessionListSnapshots = new Map<string, SessionListSnapshot>();
 	for await (const line of lines(input)) {
 		if (!line) continue;
 		const frame = decodeOmpAuthorityBridgeClientFrame(JSON.parse(line));
@@ -329,9 +446,15 @@ export async function runOmpAuthorityBridge(options: OmpAuthorityBridgeRunnerOpt
 		if (controllers.has(frame.id)) throw new Error("duplicate bridge request id");
 		const controller = new AbortController();
 		controllers.set(frame.id, controller);
-		const request = dispatch(runtime, frame, controller.signal, payload => {
-			void write({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "event", id: frame.id, event: "terminal", payload });
-		})
+		const request = dispatch(
+			runtime,
+			frame,
+			controller.signal,
+			payload => {
+				void write({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "event", id: frame.id, event: "terminal", payload });
+			},
+			sessionListSnapshots,
+		)
 			.then(
 				result =>
 					write({
