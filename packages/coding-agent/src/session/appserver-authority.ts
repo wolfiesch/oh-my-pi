@@ -385,7 +385,8 @@ export function createAppserverAuthority(): SessionAuthority {
 
 export const appserverLockCheck: LockCheckHook = session => {
 	const inspection = inspectSessionLock(session.path);
-	if (inspection.status !== "missing") throw new Error(`session lock is ${inspection.status}`);
+	if (inspection.status !== "missing" && inspection.status !== "stale")
+		throw new Error(`session lock is ${inspection.status}`);
 };
 
 export type AppserverSessionLockStatus = "missing" | "live" | "suspect" | "stale" | "malformed";

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { hostId, projectId, sessionId } from "@oh-my-pi/app-wire";
+import { hostId, MAX_ARRAY_ITEMS, projectId, sessionId } from "@oh-my-pi/app-wire";
 import {
 	decodeOmpAuthorityBridgeServerFrame,
 	encodeOmpAuthorityBridgeFrame,
@@ -47,10 +47,10 @@ function session(): SessionRecord {
 	};
 }
 
-function runtime(record: SessionRecord = session()) {
+function runtime(record: SessionRecord = session(), records: readonly SessionRecord[] = [record]) {
 	const sessionAuthority = {
 		create: async () => ({ ...record }),
-		list: async () => [record],
+		list: async () => records,
 		archive: async () => {},
 		restore: async () => {},
 		delete: async () => {},
@@ -175,11 +175,100 @@ describe("thin OMP authority bridge", () => {
 		expect(response).toMatchObject({
 			type: "response",
 			ok: true,
-			result: [{ ...large, entriesLoaded: false, entries: [] }],
+			result: { sessions: [{ ...large, entriesLoaded: false, entries: [] }] },
 		});
 		expect(Buffer.byteLength(output.find(line => line.includes('"list-large"'))!, "utf8")).toBeLessThanOrEqual(
 			OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES,
 		);
+	});
+
+	test("returns a complete bounded session inventory", async () => {
+		const input = new AsyncQueue();
+		const output: string[] = [];
+		const collected: unknown[] = [];
+		const continuationCursors = new Set<string>();
+		let pageNumber = 0;
+		const sessions = Array.from({ length: MAX_ARRAY_ITEMS }, (_, index) => ({
+			...session(),
+			sessionId: sessionId(`session-${index}`),
+			path: `/tmp/session-${index}.jsonl`,
+			title: `Session ${index} ${"x".repeat(2048)}`,
+		}));
+		const running = runOmpAuthorityBridge({
+			runtime: runtime(session(), sessions),
+			input,
+			write: line => {
+				output.push(line);
+				const frame = decodeOmpAuthorityBridgeServerFrame(JSON.parse(line));
+				if (frame.type !== "response" || !frame.id.startsWith("list-page-") || !frame.ok) return;
+				if (!frame.result || typeof frame.result !== "object" || Array.isArray(frame.result))
+					throw new Error("session list page is unavailable");
+				const page = frame.result as Record<string, unknown>;
+				if (!Array.isArray(page.sessions)) throw new Error("session list page sessions are unavailable");
+				collected.push(...page.sessions);
+				if (typeof page.nextCursor === "string") {
+					if (continuationCursors.has(page.nextCursor)) throw new Error("session list cursor repeated");
+					continuationCursors.add(page.nextCursor);
+					pageNumber += 1;
+					input.push(request(`list-page-${pageNumber}`, "session.list", { cursor: page.nextCursor }));
+				} else {
+					input.close();
+				}
+			},
+			identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
+		});
+		input.push(request("list-page-0", "session.list", {}));
+		await running;
+
+		const responseLines = output.filter(line => line.includes('"id":"list-page-'));
+		expect(responseLines.length).toBeGreaterThan(2);
+		expect(continuationCursors.size).toBe(responseLines.length - 1);
+		expect(responseLines.every(line => Buffer.byteLength(line, "utf8") <= OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES)).toBe(
+			true,
+		);
+		expect(collected).toHaveLength(MAX_ARRAY_ITEMS);
+		const lastIndex = MAX_ARRAY_ITEMS - 1;
+		expect(collected[0]).toMatchObject({ sessionId: "session-0" });
+		expect(collected[lastIndex]).toMatchObject({ sessionId: `session-${lastIndex}` });
+	});
+
+	test("marks an over-limit inventory partial instead of treating omissions as complete", async () => {
+		const input = new AsyncQueue();
+		const output: string[] = [];
+		const sessions = Array.from({ length: MAX_ARRAY_ITEMS + 1 }, (_, index) => ({
+			...session(),
+			sessionId: sessionId(`session-${index}`),
+			path: `/tmp/session-${index}.jsonl`,
+		}));
+		const running = runOmpAuthorityBridge({
+			runtime: runtime(session(), sessions),
+			input,
+			write: line => {
+				output.push(line);
+			},
+			identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
+		});
+		input.push(request("list-too-large", "session.list", {}));
+		input.close();
+		await running;
+
+		const response = output
+			.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)))
+			.find(frame => frame.type === "response" && frame.id === "list-too-large");
+		expect(response).toMatchObject({
+			v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+			type: "response",
+			id: "list-too-large",
+			ok: true,
+			result: {
+				complete: false,
+				totalCount: MAX_ARRAY_ITEMS + 1,
+			},
+		});
+		if (response?.type !== "response" || !response.ok)
+			throw new Error("partial session inventory response is unavailable");
+		const page = response.result as { sessions: unknown[] };
+		expect(page.sessions).toHaveLength(MAX_ARRAY_ITEMS);
 	});
 
 	test("rejects malformed frames before invoking authority code", async () => {

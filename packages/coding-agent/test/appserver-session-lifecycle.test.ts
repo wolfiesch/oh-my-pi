@@ -4,9 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { decodeServerFrame, hostId, projectId, sessionId } from "@oh-my-pi/app-wire";
 import { SessionProjection } from "@oh-my-pi/appserver";
-import { createAppserverRuntime } from "../src/session/appserver-authority";
+import { appserverLockCheck, createAppserverRuntime } from "../src/session/appserver-authority";
 import { AppserverSessionLifecycleStore } from "../src/session/appserver-session-lifecycle";
-import { acquireSessionLock } from "../src/session/session-lock";
+import { acquireSessionLock, lockPathForSession } from "../src/session/session-lock";
 
 const roots: string[] = [];
 
@@ -174,6 +174,22 @@ describe("appserver session lifecycle authority", () => {
 		await expect(fs.stat(transcript.slice(0, -6))).rejects.toMatchObject({ code: "ENOENT" });
 		expect((await runtime.discovery.list()).map(value => value.sessionId)).not.toContain(record!.sessionId);
 		expect((await fs.readdir(sessionsDir)).some(name => name.startsWith(".omp-appserver-delete-"))).toBe(false);
+	});
+
+	test("final appserver lock gate allows a stale owner but rejects a live owner", async () => {
+		const { sessionsDir } = await fixture();
+		const transcript = await writeSession(sessionsDir, "session-lock-gate");
+		const record = { path: transcript } as Parameters<typeof appserverLockCheck>[0];
+		const competing = acquireSessionLock(transcript);
+		const lockPath = lockPathForSession(transcript);
+		const staleRecord = JSON.parse(await fs.readFile(lockPath, "utf8")) as Record<string, unknown>;
+		expect(() => appserverLockCheck(record)).toThrow("session lock is live");
+		competing.release();
+
+		staleRecord.pid = 2_147_483_647;
+		staleRecord.heartbeatAt = 0;
+		await fs.writeFile(lockPath, JSON.stringify(staleRecord), { mode: 0o600 });
+		expect(() => appserverLockCheck(record)).not.toThrow();
 	});
 
 	test("restart rolls back an uncommitted same-filesystem tombstone", async () => {

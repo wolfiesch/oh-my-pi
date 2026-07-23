@@ -27,6 +27,13 @@
 
 ### Fixed
 
+- Fixed the T4 authority bridge paging a sparse, snapshot-consistent
+  1,000-session inventory across bounded frames and explicitly marking
+  over-limit inventories partial, so omissions can never be mistaken for
+  deletions.
+- Fixed T4 lifecycle actions rejecting a provably stale OMP session lock after
+  its owning runtime exited, while continuing to reject live, suspect, and
+  malformed locks.
 - Fixed deferred MCP discovery briefly publishing a new `xd://` device before
   its `write` transport became active.
 - Fixed the T4 authority bridge serializing loaded transcript bodies in
