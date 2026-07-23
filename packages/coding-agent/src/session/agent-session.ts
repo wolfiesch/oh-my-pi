@@ -982,7 +982,11 @@ export interface AgentSessionConfig {
 	/** Current session message-to-LLM conversion pipeline */
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** System prompt builder that can consider tool availability. Returns ordered provider-facing blocks. */
-	rebuildSystemPrompt?: (toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>;
+	rebuildSystemPrompt?: (
+		toolNames: string[],
+		tools: Map<string, AgentTool>,
+		xdevRegistry?: XdevRegistry,
+	) => Promise<{ systemPrompt: string[] }>;
 	/** Local calendar date provider used by prompt-cache invalidation. Defaults to the host local date. */
 	getLocalCalendarDate?: () => string;
 	/** Entries of tools mounted under `xd://` (name + one-line summary), for /tools display. */
@@ -2107,7 +2111,11 @@ export class AgentSession {
 	#preferWebsockets: boolean | undefined;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#rebuildSystemPrompt:
-		| ((toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>)
+		| ((
+				toolNames: string[],
+				tools: Map<string, AgentTool>,
+				xdevRegistry?: XdevRegistry,
+		  ) => Promise<{ systemPrompt: string[] }>)
 		| undefined;
 	#getLocalCalendarDate: () => string;
 	#getMcpServerInstructions: (() => Map<string, string> | undefined) | undefined;
@@ -7596,13 +7604,12 @@ export class AgentSession {
 		}
 
 		const previousMounted = this.#mountedXdevToolNames;
-		const previousMountedTools = [...previousMounted].flatMap(name => {
-			const tool = this.#xdevRegistry?.get(name);
-			return tool ? [tool] : [];
-		});
+		const nextMounted = new Set(mountedTools.map(tool => tool.name));
+		const prospectiveXdevRegistry = this.#xdevRegistry?.withDynamic(mountedTools);
 		const previousActiveToolNames = this.getActiveToolNames();
-		this.#mountedXdevToolNames = new Set(mountedTools.map(tool => tool.name));
-		this.#xdevRegistry?.reconcile(mountedTools);
+		// Tool metadata can depend on the prospective active set, so prompt
+		// construction needs the new predicates even though public runtime state
+		// remains unchanged until the rebuild succeeds.
 		this.#setActiveToolNames?.(validToolNames);
 
 		let rebuiltSystemPrompt: string[] | undefined;
@@ -7611,20 +7618,26 @@ export class AgentSession {
 			if (this.#rebuildSystemPrompt) {
 				const signature = this.#computeAppliedToolSignature(validToolNames, tools);
 				if (signature !== this.#lastAppliedToolSignature) {
-					const built = await this.#rebuildSystemPrompt(validToolNames, this.#toolRegistry);
+					const built = await this.#rebuildSystemPrompt(
+						validToolNames,
+						this.#toolRegistry,
+						prospectiveXdevRegistry,
+					);
 					rebuiltSystemPrompt = built.systemPrompt;
 					rebuiltSignature = signature;
 				}
 			}
 		} catch (error) {
-			this.#mountedXdevToolNames = previousMounted;
-			this.#xdevRegistry?.reconcile(previousMountedTools);
 			this.#setActiveToolNames?.(previousActiveToolNames);
 			throw error;
 		}
 
-		this.#notifyXdevMountDelta(previousMounted);
+		// Publish the registry and its transport tools in one synchronous commit.
+		// No observer can see a new xd:// device without the active write tool.
+		this.#mountedXdevToolNames = nextMounted;
+		this.#xdevRegistry?.reconcile(mountedTools);
 		this.agent.setTools(tools);
+		this.#notifyXdevMountDelta(previousMounted);
 		if (rebuiltSystemPrompt && rebuiltSignature) {
 			if (this.#lastAppliedToolSignature !== undefined) this.#clearInheritedProviderPromptCacheKey();
 			this.#baseSystemPrompt = rebuiltSystemPrompt;

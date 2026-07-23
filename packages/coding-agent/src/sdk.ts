@@ -2461,6 +2461,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const rebuildSystemPrompt = async (
 			toolNames: string[],
 			tools: Map<string, AgentTool>,
+			xdevRegistry = toolSession.xdevRegistry,
 		): Promise<BuildSystemPromptResult> => {
 			toolContextStore.setToolNames(toolNames);
 			const promptTools = buildSystemPromptToolMetadata(tools);
@@ -2517,8 +2518,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd,
-				xdevTools: toolSession.xdevRegistry?.entries() ?? [],
-				xdevDocs: toolSession.xdevRegistry?.docsAll() ?? "",
+				xdevTools: xdevRegistry?.entries() ?? [],
+				xdevDocs: xdevRegistry?.docsAll() ?? "",
 				autoQaEnabled: !restrictToolNames && isAutoQaEnabled(settings),
 				resolvedCustomPrompt: options.customSystemPrompt,
 				skills: session?.skills ?? skills,

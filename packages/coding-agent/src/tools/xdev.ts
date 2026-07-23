@@ -208,6 +208,17 @@ export class XdevRegistry {
 		this.#dynamic = next;
 	}
 
+	/**
+	 * Build a detached view with a prospective dynamic mount set. Prompt
+	 * rebuilds use this preview so async work cannot expose new devices through
+	 * the live registry before their top-level transport tools are active.
+	 */
+	withDynamic(tools: Iterable<Tool>): XdevRegistry {
+		const preview = new XdevRegistry(this.#builtins.values());
+		preview.reconcile(tools);
+		return preview;
+	}
+
 	get size(): number {
 		return this.#builtins.size + this.#dynamic.size;
 	}

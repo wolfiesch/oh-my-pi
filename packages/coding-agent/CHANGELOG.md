@@ -27,6 +27,8 @@
 
 ### Fixed
 
+- Fixed deferred MCP discovery briefly publishing a new `xd://` device before
+  its `write` transport became active.
 - Fixed the T4 authority bridge serializing loaded transcript bodies in
   `session.list`; inventory responses now emit sparse session references before
   the bounded JSON frame is encoded.
