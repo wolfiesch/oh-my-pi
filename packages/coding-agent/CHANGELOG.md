@@ -14,6 +14,7 @@
 - Added the `/continue-in-t4` slash command, which persists the current TUI session and exits through the normal clean teardown so the session can be continued in T4; nothing is taken over while the TUI is still running.
 - Added lock-aware appserver observation of sessions owned by another OMP process, such as an external TUI. The session is followed read-only from complete transcript records on disk; the appserver takes writable control only when the owner's lock is freshly missing — live, suspect, stale, or malformed locks are never seized — and the session stays read-only in a reconciling state until the promoted child reports it loaded the exact transcript the observer last saw.
 - Added a `session.fork` authority-bridge method so a session owned by another writer, or a historic session with no lock, can be copied into a new session the appserver owns. The source is only read: its lock, writer, and bytes are untouched. The copy records the parent in its header and is handed over unlocked so the new owner can start its own writer.
+- Added a durable authority-protocol marker to newly created session transcripts so compatible T4 hosts can safely reclaim short-lived OMP sessions after their writer lock is released.
 
 ### Changed
 
