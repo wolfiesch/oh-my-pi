@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { stat } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { type DeviceCapability, MAX_ARRAY_ITEMS } from "@oh-my-pi/app-wire";
 import {
 	decodeOmpAuthorityBridgeClientFrame,
@@ -103,7 +103,7 @@ function optionalString(value: unknown, label: string): string | undefined {
 
 async function directory(path: string): Promise<boolean> {
 	try {
-		return (await stat(path)).isDirectory();
+		return (await fs.stat(path)).isDirectory();
 	} catch {
 		return false;
 	}
@@ -357,7 +357,7 @@ async function dispatch(
 			// caller may name an existing directory; nothing is substituted
 			// silently, so an absent choice still means the source's own cwd.
 			const target = optionalString(params.cwd, "fork working directory") ?? source.cwd;
-			if (!isAbsolute(target)) throw new Error("fork working directory must be absolute");
+			if (!path.isAbsolute(target)) throw new Error("fork working directory must be absolute");
 			if (!(await directory(target))) throw new Error("fork working directory does not exist");
 			// forkFrom writes the copy's header and storage slug for this cwd, so
 			// the choice survives rediscovery rather than living only in memory.
