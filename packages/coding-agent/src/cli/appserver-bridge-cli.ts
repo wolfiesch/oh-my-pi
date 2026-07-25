@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { stat } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 import { type DeviceCapability, MAX_ARRAY_ITEMS } from "@oh-my-pi/app-wire";
 import {
 	decodeOmpAuthorityBridgeClientFrame,
@@ -97,6 +99,14 @@ function string(value: unknown, label: string): string {
 
 function optionalString(value: unknown, label: string): string | undefined {
 	return value === undefined ? undefined : string(value, label);
+}
+
+async function directory(path: string): Promise<boolean> {
+	try {
+		return (await stat(path)).isDirectory();
+	} catch {
+		return false;
+	}
 }
 
 function session(value: unknown): SessionRecord {
@@ -330,7 +340,7 @@ async function dispatch(
 			);
 		}
 		case "session.fork": {
-			exact(params, ["session"], "session.fork params");
+			exact(params, ["session", ...(params.cwd === undefined ? [] : ["cwd"])], "session.fork params");
 			// The supplied record carries no authority of its own. Resolve the
 			// source from OMP's own inventory by id and ignore the sent path, so
 			// this method can never be aimed at an arbitrary file.
@@ -342,7 +352,16 @@ async function dispatch(
 			// forkFrom only reads the source: it loads and migrates the entries,
 			// resolves blob refs, then writes a new file with a fresh id naming
 			// the parent. The source keeps its writer and its bytes.
-			const forked = await SessionManager.forkFrom(source.path, source.cwd);
+			// A historic transcript routinely names a project directory that has
+			// since been deleted, and a copy has to live somewhere real. The
+			// caller may name an existing directory; nothing is substituted
+			// silently, so an absent choice still means the source's own cwd.
+			const target = optionalString(params.cwd, "fork working directory") ?? source.cwd;
+			if (!isAbsolute(target)) throw new Error("fork working directory must be absolute");
+			if (!(await directory(target))) throw new Error("fork working directory does not exist");
+			// forkFrom writes the copy's header and storage slug for this cwd, so
+			// the choice survives rediscovery rather than living only in memory.
+			const forked = await SessionManager.forkFrom(source.path, target);
 			try {
 				const forkedFile = forked.getSessionFile();
 				if (!forkedFile) throw new Error("forked session was not written");
@@ -353,7 +372,7 @@ async function dispatch(
 				return {
 					sessionId: forked.getSessionId(),
 					path: forkedFile,
-					cwd: source.cwd,
+					cwd: target,
 					...(forkedTitle === undefined ? {} : { title: forkedTitle }),
 					entries: [],
 				};

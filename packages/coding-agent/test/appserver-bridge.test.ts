@@ -387,4 +387,93 @@ describe("thin OMP authority bridge", () => {
 			setAgentDir(previousAgentDir);
 		}
 	});
+
+	// Historic transcripts routinely name a project directory that has since been
+	// deleted. The copy is a new session and has to live somewhere real, so the
+	// caller may name an existing directory for it.
+	test("forks a session whose recorded directory is gone into a caller-chosen one", async () => {
+		using tempDir = TempDir.createSync("@omp-bridge-fork-cwd-");
+		const previousAgentDir = getAgentDir();
+		setAgentDir(path.join(tempDir.path(), "agent"));
+		try {
+			const goneCwd = path.join(tempDir.path(), "deleted-project");
+			const chosenCwd = path.join(tempDir.path(), "chosen-project");
+			const sessionDir = path.join(tempDir.path(), "sessions");
+			await fs.mkdir(chosenCwd, { recursive: true });
+			await fs.mkdir(sessionDir, { recursive: true });
+			const sourceFile = path.join(sessionDir, "gone-source.jsonl");
+			const timestamp = new Date().toISOString();
+			const sourceText = `${JSON.stringify({
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "bridge-fork-gone",
+				timestamp,
+				cwd: goneCwd,
+			})}\n${JSON.stringify({
+				type: "message",
+				id: "message-1",
+				parentId: null,
+				timestamp,
+				message: { role: "user", content: "carried across", timestamp: Date.now() },
+			})}\n`;
+			await Bun.write(sourceFile, sourceText);
+			const record: SessionRecord = {
+				...session(),
+				sessionId: sessionId("bridge-fork-gone"),
+				path: sourceFile,
+				cwd: goneCwd,
+			};
+			const input = new AsyncQueue();
+			const output: string[] = [];
+			const running = runOmpAuthorityBridge({
+				runtime: runtime(record),
+				input,
+				write: line => {
+					output.push(line);
+				},
+				identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
+			});
+			input.push(
+				encodeOmpAuthorityBridgeFrame({
+					v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+					type: "request",
+					id: "fork-gone",
+					method: "session.fork",
+					params: { session: record, cwd: chosenCwd },
+				}),
+			);
+			input.push(
+				encodeOmpAuthorityBridgeFrame({
+					v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+					type: "request",
+					id: "fork-missing",
+					method: "session.fork",
+					params: { session: record, cwd: path.join(tempDir.path(), "not-there") },
+				}),
+			);
+			input.close();
+			await running;
+			const frames = output.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)));
+			const forked = frames.find(frame => frame.type === "response" && frame.id === "fork-gone");
+			if (forked?.type !== "response") throw new Error("expected a fork response");
+			if (!forked.ok) throw new Error("fork request was rejected");
+			const result = forked.result;
+			if (!result || typeof result !== "object") throw new Error("expected a fork result");
+			if (!("cwd" in result) || typeof result.cwd !== "string") throw new Error("expected a fork cwd");
+			if (!("path" in result) || typeof result.path !== "string") throw new Error("expected a fork path");
+			// The copy runs where the caller asked, and the header carries it, so
+			// the choice survives rediscovery instead of living only in memory.
+			expect(result.cwd).toBe(chosenCwd);
+			expect(await Bun.file(result.path).text()).toContain(chosenCwd);
+			expect(await Bun.file(result.path).text()).toContain("carried across");
+			// The source is still only read.
+			expect(await Bun.file(sourceFile).text()).toBe(sourceText);
+			// A directory that does not exist is refused rather than substituted.
+			const refused = frames.find(frame => frame.type === "response" && frame.id === "fork-missing");
+			if (refused?.type !== "response") throw new Error("expected a refusal response");
+			expect(refused.ok).toBe(false);
+		} finally {
+			setAgentDir(previousAgentDir);
+		}
+	});
 });
