@@ -63,14 +63,18 @@ SOURCE_BUN_HOME="$WORK_DIR/bun-source"
 section "Tarball install smoke"
 TARBALL_DIR="$WORK_DIR/tarballs"
 mkdir -p "$TARBALL_DIR"
-t4_host_service_file="$(bun -e '
-   const manifest = await Bun.file("vendor/t4-host/manifest.json").json();
-   const pkg = manifest.packages.find((entry) => entry.name === "@t4-code/host-service");
-   if (!pkg?.file) throw new Error("host-service vendor manifest entry is missing");
-   process.stdout.write(pkg.file);
-')"
+read_vendor_file() {
+   bun -e "
+      const manifest = await Bun.file('vendor/t4-host/manifest.json').json();
+      const pkg = manifest.packages.find((entry) => entry.name === '$1');
+      if (!pkg?.file) throw new Error('$1 vendor manifest entry is missing');
+      process.stdout.write(pkg.file);
+   "
+}
+t4_host_service_file="$(read_vendor_file "@t4-code/host-service")"
+t4_host_wire_file="$(read_vendor_file "@t4-code/host-wire")"
 cp "$ROOT_DIR/vendor/t4-host/$t4_host_service_file" "$TARBALL_DIR/"
-cp "$ROOT_DIR/vendor/t4-host/t4-code-host-wire-0.1.30.tgz" "$TARBALL_DIR/"
+cp "$ROOT_DIR/vendor/t4-host/$t4_host_wire_file" "$TARBALL_DIR/"
 host_tag="$(bun -e "process.stdout.write(\`\${process.platform}-\${process.arch}\`)")"
 
 # Native addon split: the published core ships only the loader (no `.node`); the

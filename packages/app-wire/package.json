@@ -31,6 +31,6 @@
     "fix": "biome check --write --unsafe .",
     "fmt": "biome format --write ."
   },
-  "dependencies": { "@t4-code/host-wire": "0.1.30" },
+  "dependencies": { "@t4-code/host-wire": "0.1.31" },
   "engines": { "bun": ">=1.3.14" }
 }

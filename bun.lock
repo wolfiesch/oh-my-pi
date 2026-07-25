@@ -5,8 +5,8 @@
     "": {
       "name": "omp",
       "dependencies": {
-        "@t4-code/host-service": "./vendor/t4-host/t4-code-host-service-0.1.30-2712b18.tgz",
-        "@t4-code/host-wire": "./vendor/t4-host/t4-code-host-wire-0.1.30.tgz",
+        "@t4-code/host-service": "./vendor/t4-host/t4-code-host-service-0.1.31.tgz",
+        "@t4-code/host-wire": "./vendor/t4-host/t4-code-host-wire-0.1.31.tgz",
         "sherpa-onnx": "1.13.2",
         "sherpa-onnx-darwin-arm64": "1.13.3",
         "sherpa-onnx-node": "1.13.2",
@@ -59,15 +59,15 @@
       "name": "@oh-my-pi/app-wire",
       "version": "0.6.2",
       "dependencies": {
-        "@t4-code/host-wire": "0.1.30",
+        "@t4-code/host-wire": "0.1.31",
       },
     },
     "packages/appserver": {
       "name": "@oh-my-pi/appserver",
       "version": "0.1.0",
       "dependencies": {
-        "@t4-code/host-service": "0.1.30",
-        "@t4-code/host-wire": "0.1.30",
+        "@t4-code/host-service": "0.1.31",
+        "@t4-code/host-wire": "0.1.31",
       },
     },
     "packages/catalog": {
@@ -419,8 +419,8 @@
   },
   "overrides": {
     "@ark/schema": "0.56.2",
-    "@t4-code/host-service": "./vendor/t4-host/t4-code-host-service-0.1.30-2712b18.tgz",
-    "@t4-code/host-wire": "./vendor/t4-host/t4-code-host-wire-0.1.30.tgz",
+    "@t4-code/host-service": "./vendor/t4-host/t4-code-host-service-0.1.31.tgz",
+    "@t4-code/host-wire": "./vendor/t4-host/t4-code-host-wire-0.1.31.tgz",
   },
   "catalog": {
     "@agentclientprotocol/sdk": "1.2.1",
@@ -968,9 +968,9 @@
 
     "@so-ric/colorspace": ["@so-ric/colorspace@1.1.6", "", { "dependencies": { "color": "^5.0.2", "text-hex": "1.0.x" } }, "sha512-/KiKkpHNOBgkFJwu9sh48LkHSMYGyuTcSFK/qMBdnOAlrRJzRSXAOFB5qwzaVQuDl8wAvHVMkaASQDReTahxuw=="],
 
-    "@t4-code/host-service": ["@t4-code/host-service@./vendor/t4-host/t4-code-host-service-0.1.30-2712b18.tgz", { "dependencies": { "@agentclientprotocol/sdk": "1.2.1", "@t4-code/host-wire": "0.1.30" } }, "sha512-CHj3cnoBzN/5ks3DWkbew6Fu+YBqaCp2GSye7SdMAqCq9z0sZNMxV9Ig/RxOWLugmKj+stsBnXiPyLYwICW97A=="],
+    "@t4-code/host-service": ["@t4-code/host-service@./vendor/t4-host/t4-code-host-service-0.1.31.tgz", { "dependencies": { "@agentclientprotocol/sdk": "1.2.1", "@t4-code/host-wire": "0.1.31" } }, "sha512-Ck9+YO3uDBxFmAhIvhcMGm2gDkg8Af8/IsWikInor8WSh/wXX2Ube7R0D4bXkgWUE+FKGJlj/K9xBd1oG0Ehtg=="],
 
-    "@t4-code/host-wire": ["@t4-code/host-wire@./vendor/t4-host/t4-code-host-wire-0.1.30.tgz", {}, "sha512-jE3gHnp96LbH+MDK5DxWD4EDMPXuHW91XJjuO2/sq1XWgNEXGHf6bM4JI7mOIbls8Xx4PZ3wT7MpXqGRgTd1dA=="],
+    "@t4-code/host-wire": ["@t4-code/host-wire@./vendor/t4-host/t4-code-host-wire-0.1.31.tgz", {}, "sha512-izbuqSzdr1+skAsryPZDiYjcoC+IIF4N2/M32OCiGhPdaMHHhLoi/5RWhcqdqNJwzLC4O8m0jfnLUBHiQYH68Q=="],
 
     "@tailwindcss/node": ["@tailwindcss/node@4.3.2", "", { "dependencies": { "@jridgewell/remapping": "^2.3.5", "enhanced-resolve": "5.21.6", "jiti": "^2.7.0", "lightningcss": "1.32.0", "magic-string": "^0.30.21", "source-map-js": "^1.2.1", "tailwindcss": "4.3.2" } }, "sha512-yWP/sqEcBLaD8JuA6zNwxoYKr75qxTioYwlRwekj5Jr/I5GXnoJfjetH/psLUIv74cYTH2lBUEzBkinthoYcBg=="],
 
