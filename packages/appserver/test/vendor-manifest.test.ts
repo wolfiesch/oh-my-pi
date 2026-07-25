@@ -19,12 +19,12 @@ describe("vendored T4 host artifacts", () => {
 		const manifest = (await Bun.file(resolve(vendor, "manifest.json")).json()) as VendorManifest;
 		expect(manifest.schemaVersion).toBe(1);
 		expect(manifest.source).toEqual({
-			repository: "https://github.com/LycaonLLC/t4-code.git",
-			commit: "2712b18c9ca843925733a5126143b2647d7b1108",
-			tree: "59ce8d481b53d253db189a0dd6fbc46bfda0fdc3",
+			repository: "https://github.com/wolfiesch/omperator.git",
+			commit: "7a9e73f264253142db6f348298a9426929137656",
+			tree: "4d99f8af4e02e915a27404eee9a823612a92a340",
 		});
 		for (const artifact of manifest.packages) {
-			expect(artifact.file).toMatch(/^t4-code-host-(?:service|wire)-0\.1\.30(?:-[0-9a-f]{7})?\.tgz$/u);
+			expect(artifact.file).toMatch(/^t4-code-host-(?:service|wire)-0\.1\.31(?:-[0-9a-f]{7})?\.tgz$/u);
 			const digest = new Bun.CryptoHasher("sha256")
 				.update(await Bun.file(resolve(vendor, artifact.file)).arrayBuffer())
 				.digest("hex");
