@@ -59,7 +59,7 @@ describe("CI workflow product release contract", () => {
 		}
 	});
 
-	it("publishes exactly the five supported product binary assets", () => {
+	it("publishes the five supported product binaries and provenance-bound native addons", () => {
 		const strategy = config(job("release_binary").strategy, "release_binary.strategy");
 		const matrix = config(strategy.matrix, "release_binary.strategy.matrix");
 		if (!Array.isArray(matrix.include)) throw new Error("release_binary.strategy.matrix.include is not a list");
@@ -85,8 +85,23 @@ describe("CI workflow product release contract", () => {
 			"binary download inputs",
 		);
 		expect(artifactDownload.pattern).toBe("omp-binary-*");
+		const nativeDownload = config(
+			step("release_github", "Download Linux x64 native addons").with,
+			"native addon download inputs",
+		);
+		expect(nativeDownload.pattern).toBe(
+			"pi-natives-linux-x64-*-h${{ needs.native_artifact_lookup.outputs.source-hash }}",
+		);
+		expect(nativeDownload["run-id"]).toBe("${{ steps.native-source.outputs.artifact-run-id }}");
+		const manifestCommand = step("release_github", "Generate native addon provenance manifest").run;
+		expect(manifestCommand).toContain('--commit "$GITHUB_SHA"');
+		expect(manifestCommand).toContain('--source-hash "${{ needs.native_artifact_lookup.outputs.source-hash }}"');
 		const releaseUpload = config(step("release_github", "Create GitHub Release").with, "GitHub release inputs");
-		expect(String(releaseUpload.files).trim()).toBe("packages/coding-agent/binaries/omp-*");
+		expect(String(releaseUpload.files).trim().split(/\r?\n/u)).toEqual([
+			"packages/coding-agent/binaries/omp-*",
+			"packages/natives/native/pi_natives.linux-x64-*.node",
+			"omp-native-addons.json",
+		]);
 	});
 
 	it("keeps every npm mutation and Homebrew update upstream-only", () => {
