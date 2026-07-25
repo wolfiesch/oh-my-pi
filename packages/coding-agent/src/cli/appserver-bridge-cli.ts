@@ -12,6 +12,7 @@ import {
 	type SessionRecord,
 } from "@oh-my-pi/appserver";
 import { getBlobsDir } from "@oh-my-pi/pi-utils/dirs";
+import { SessionManager } from "../session/session-manager";
 import { createDefaultAppserverRuntime } from "./appserver-cli";
 import { getCodingAgentAppserverIdentity } from "./appserver-identity";
 
@@ -37,6 +38,7 @@ interface SessionListPage {
 const BASE_METHODS = [
 	"host.info",
 	"session.create",
+	"session.fork",
 	"session.list",
 	"session.archive",
 	"session.restore",
@@ -326,6 +328,41 @@ async function dispatch(
 				string(params.cwd, "session cwd"),
 				optionalString(params.title, "session title"),
 			);
+		}
+		case "session.fork": {
+			exact(params, ["session"], "session.fork params");
+			// The supplied record carries no authority of its own. Resolve the
+			// source from OMP's own inventory by id and ignore the sent path, so
+			// this method can never be aimed at an arbitrary file.
+			const requested = session(params.session);
+			const source = (await runtime.sessionAuthority.list()).find(
+				candidate => candidate.sessionId === requested.sessionId,
+			);
+			if (!source) throw new Error("unknown session");
+			// forkFrom only reads the source: it loads and migrates the entries,
+			// resolves blob refs, then writes a new file with a fresh id naming
+			// the parent. The source keeps its writer and its bytes.
+			const forked = await SessionManager.forkFrom(source.path, source.cwd);
+			try {
+				const forkedFile = forked.getSessionFile();
+				if (!forkedFile) throw new Error("forked session was not written");
+				const forkedTitle = forked.getSessionName();
+				// The transcript body stays out of this response: it would not fit
+				// a bounded frame. The host reads the copy back through
+				// discovery.load.
+				return {
+					sessionId: forked.getSessionId(),
+					path: forkedFile,
+					cwd: source.cwd,
+					...(forkedTitle === undefined ? {} : { title: forkedTitle }),
+					entries: [],
+				};
+			} finally {
+				// The atomic rewrite inside forkFrom takes the new file's lock and
+				// starts its heartbeat. Hand the copy over unlocked, or the host
+				// sees its own fork as live elsewhere and refuses to write it.
+				await forked.dispose();
+			}
 		}
 		case "session.list": {
 			return listSessionPage(runtime, frame.id, params, sessionListSnapshots);

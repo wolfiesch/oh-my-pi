@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { hostId, MAX_ARRAY_ITEMS, projectId, sessionId } from "@oh-my-pi/app-wire";
 import {
 	decodeOmpAuthorityBridgeServerFrame,
@@ -7,7 +9,10 @@ import {
 	OMP_AUTHORITY_BRIDGE_PROTOCOL,
 	type SessionRecord,
 } from "@oh-my-pi/appserver";
+import { getAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { runOmpAuthorityBridge } from "../src/cli/appserver-bridge-cli";
+import { CURRENT_SESSION_VERSION } from "../src/session/session-entries";
+import { inspectSessionLock } from "../src/session/session-lock";
 
 class AsyncQueue implements AsyncIterable<string> {
 	readonly #values: string[] = [];
@@ -303,5 +308,83 @@ describe("thin OMP authority bridge", () => {
 		});
 		input.push("x".repeat(OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES + 1));
 		await expect(running).rejects.toThrow("bridge input exceeds the line limit");
+	});
+
+	test("forks a session into an unlocked copy and never writes the source", async () => {
+		using tempDir = TempDir.createSync("@omp-bridge-fork-");
+		const previousAgentDir = getAgentDir();
+		setAgentDir(path.join(tempDir.path(), "agent"));
+		try {
+			const cwd = path.join(tempDir.path(), "project");
+			const sessionDir = path.join(tempDir.path(), "sessions");
+			await fs.mkdir(cwd, { recursive: true });
+			await fs.mkdir(sessionDir, { recursive: true });
+			const sourceFile = path.join(sessionDir, "source.jsonl");
+			const timestamp = new Date().toISOString();
+			const sourceText = `${JSON.stringify({
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "bridge-fork-source",
+				timestamp,
+				cwd,
+			})}\n${JSON.stringify({
+				type: "message",
+				id: "message-1",
+				parentId: null,
+				timestamp,
+				message: { role: "user", content: "carried across", timestamp: Date.now() },
+			})}\n`;
+			await Bun.write(sourceFile, sourceText);
+			const record: SessionRecord = {
+				...session(),
+				sessionId: sessionId("bridge-fork-source"),
+				path: sourceFile,
+				cwd,
+			};
+			const input = new AsyncQueue();
+			const output: string[] = [];
+			const running = runOmpAuthorityBridge({
+				runtime: runtime(record),
+				input,
+				write: line => {
+					output.push(line);
+				},
+				identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
+			});
+			input.push(
+				encodeOmpAuthorityBridgeFrame({
+					v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+					type: "request",
+					id: "fork-1",
+					method: "session.fork",
+					params: { session: record },
+				}),
+			);
+			input.close();
+			await running;
+			const frames = output.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)));
+			expect(frames[0]).toMatchObject({
+				type: "ready",
+				methods: expect.arrayContaining(["session.fork"]),
+			});
+			const forked = frames.find(frame => frame.type === "response" && frame.id === "fork-1");
+			if (forked?.type !== "response") throw new Error("expected a fork response");
+			if (!forked.ok) throw new Error("fork request was rejected");
+			const result = forked.result;
+			if (!result || typeof result !== "object") throw new Error("expected a fork result");
+			if (!("path" in result) || typeof result.path !== "string") throw new Error("expected a fork path");
+			if (!("sessionId" in result) || typeof result.sessionId !== "string")
+				throw new Error("expected a fork session id");
+			expect(result.path).not.toBe(sourceFile);
+			expect(result.sessionId).not.toBe("bridge-fork-source");
+			// The source is read, never written.
+			expect(await Bun.file(sourceFile).text()).toBe(sourceText);
+			// The copy carries the history and arrives unlocked, so the host can
+			// start its own writer instead of seeing the fork as live elsewhere.
+			expect(await Bun.file(result.path).text()).toContain("carried across");
+			expect(inspectSessionLock(result.path).status).toBe("missing");
+		} finally {
+			setAgentDir(previousAgentDir);
+		}
 	});
 });
