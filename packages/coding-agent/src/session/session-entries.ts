@@ -4,6 +4,8 @@ import type { StructuredSubagentSchemaMode } from "../task/types";
 
 export const CURRENT_SESSION_VERSION = 3;
 
+export const T4_AUTHORITY_PROTOCOL = "t4-omp-authority/1";
+
 export const SESSION_TITLE_SLOT_BYTES = 256;
 
 export const SESSION_TITLE_SLOT_ENTRY_TYPE = "title";
@@ -35,6 +37,8 @@ export interface SessionHeader {
 	parentSession?: string;
 	/** Provider prompt-cache identity inherited by exact-route full forks. */
 	providerPromptCacheKey?: string;
+	/** Durable proof that this transcript was created by the T4-compatible runtime. */
+	authorityProtocol?: typeof T4_AUTHORITY_PROTOCOL;
 }
 
 export interface NewSessionOptions {
