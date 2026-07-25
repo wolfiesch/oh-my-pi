@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { T4_AUTHORITY_PROTOCOL } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -11,6 +12,7 @@ function expectUuidV7SessionId(session: SessionManager): string {
 	const header = session.getHeader();
 	if (!header) throw new Error("Expected session header");
 	expect(header.id).toBe(sessionId);
+	expect(header.authorityProtocol).toBe(T4_AUTHORITY_PROTOCOL);
 	return sessionId;
 }
 

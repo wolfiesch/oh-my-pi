@@ -50,6 +50,7 @@ import {
 	type SessionMessageEntry,
 	type SessionTitleSource,
 	type SessionTreeNode,
+	T4_AUTHORITY_PROTOCOL,
 	type ThinkingLevelChangeEntry,
 	TITLE_CHANGE_ENTRY_TYPE,
 	type TitleChangeEntry,
@@ -837,6 +838,7 @@ export class SessionManager {
 			cwd: this.#cwd,
 			parentSession: options?.parentSession,
 			providerPromptCacheKey: options?.providerPromptCacheKey,
+			authorityProtocol: T4_AUTHORITY_PROTOCOL,
 		};
 		this.#titleUpdatedAt = timestamp;
 
@@ -1157,6 +1159,7 @@ export class SessionManager {
 			cwd: this.#cwd,
 			parentSession: parentSessionId,
 			providerPromptCacheKey: this.#header.providerPromptCacheKey ?? parentSessionId,
+			authorityProtocol: T4_AUTHORITY_PROTOCOL,
 		};
 		this.#sessionName = this.#header.title;
 		this.#titleSource = this.#header.titleSource;
@@ -1940,6 +1943,7 @@ export class SessionManager {
 			timestamp,
 			cwd: this.#cwd,
 			parentSession: this.#persist ? sourceSessionFile : undefined,
+			authorityProtocol: T4_AUTHORITY_PROTOCOL,
 		};
 
 		const labels: LabelEntry[] = [];
@@ -2025,6 +2029,7 @@ export class SessionManager {
 			id,
 			timestamp,
 			cwd: path.resolve(cwd),
+			authorityProtocol: T4_AUTHORITY_PROTOCOL,
 		};
 		const file = path.join(sessionDir, `${fileSafeTimestamp(timestamp)}_${id}.jsonl`);
 		storage.writeTextSync(file, `${serializeTitleSlot({ updatedAt: timestamp })}${JSON.stringify(header)}\n`);
