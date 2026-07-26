@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { decodeCatalog, decodeCommandResult, hostId } from "@oh-my-pi/app-wire";
+import { YAML } from "bun";
 import { Settings, type SettingsDesktopSnapshot } from "../src/config/settings.ts";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema.ts";
 import { controlMetadata, SENSITIVE_SETTINGS } from "../src/session/desktop-config-authority/authority.ts";
@@ -30,6 +34,16 @@ function fakeSettings(initial: Record<string, unknown> = {}): DesktopSettingsPor
 			values.set(path, value);
 			configured.add(path);
 			source.set(path, "global");
+		},
+		setProject(path, value) {
+			values.set(path, value);
+			configured.add(path);
+			source.set(path, "project");
+		},
+		clearProject(path) {
+			values.delete(path);
+			configured.delete(path);
+			source.delete(path);
 		},
 		override(path, value) {
 			values.set(path, value);
@@ -68,6 +82,22 @@ function fakeSettings(initial: Record<string, unknown> = {}): DesktopSettingsPor
 
 function authority(settings = fakeSettings()) {
 	return new DesktopConfigAuthority({ settings, hostId: "test-host", platform: "linux" });
+}
+
+function desktopPort(settings: Settings): DesktopSettingsPort {
+	return {
+		get: path => settings.get(path),
+		isConfigured: path => settings.isConfigured(path),
+		set: (path, value) => settings.set(path, value as never),
+		setProject: (path, value) => settings.setProject(path, value as never),
+		clearProject: path => settings.clearProject(path),
+		override: (path, value) => settings.override(path, value as never),
+		clearOverride: path => settings.clearOverride(path),
+		flush: () => settings.flush(),
+		getDesktopSnapshot: path => settings.getDesktopSnapshot(path),
+		restoreDesktopSnapshot: snapshot => settings.restoreDesktopSnapshot(snapshot),
+		clearGlobal: path => settings.clearGlobal(path),
+	};
 }
 
 describe("DesktopConfigAuthority", () => {
@@ -139,6 +169,85 @@ describe("DesktopConfigAuthority", () => {
 		});
 		expect(controlMetadata({ type: "array", ui: { ordered: true } })).toMatchObject({ ordered: true });
 		expect(controlMetadata({ type: "string", ui: { secret: true } })).toMatchObject({ secret: true });
+	});
+
+	test("advertises project scope only for non-host-local settings and refuses host-local writes", async () => {
+		const frame = await authority().catalogGet({ kind: "setting" });
+		expect(frame.items.find(item => item.name === "appserver.remoteAddress")?.metadata?.scopes).toEqual([
+			"global",
+			"session",
+		]);
+		expect(frame.items.find(item => item.name === "compaction.enabled")?.metadata?.scopes).toContain("project");
+		await expect(
+			authority().settingsWrite({
+				path: "appserver.remoteAddress",
+				value: "127.0.0.1",
+				scope: "project",
+			}),
+		).rejects.toThrow("host-local setting cannot be written to project scope");
+	});
+
+	test("persists project writes without disturbing sibling native settings", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-settings-"));
+		const projectDir = path.join(root, "project");
+		const agentDir = path.join(root, "agent");
+		const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+		const initial = {
+			compaction: { enabled: false },
+			untouched: { nested: "keep" },
+		};
+		fs.mkdirSync(projectDir, { recursive: true });
+		fs.mkdirSync(agentDir, { recursive: true });
+		await Bun.write(projectConfigPath, YAML.stringify(initial, null, 2));
+		try {
+			const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+			const result = await authority(desktopPort(settings)).settingsWrite({
+				path: "compaction.enabled",
+				value: true,
+				scope: "project",
+			});
+			expect(JSON.stringify(result)).not.toContain(projectDir);
+
+			expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual({
+				compaction: { enabled: true },
+				untouched: { nested: "keep" },
+			});
+			expect(await Bun.file(path.join(agentDir, "config.yml")).exists()).toBe(false);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("persists rollback when a later project edit fails", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-rollback-"));
+		const projectDir = path.join(root, "project");
+		const agentDir = path.join(root, "agent");
+		const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+		const initial = { untouched: { nested: "keep" } };
+		fs.mkdirSync(projectDir, { recursive: true });
+		fs.mkdirSync(agentDir, { recursive: true });
+		await Bun.write(projectConfigPath, YAML.stringify(initial, null, 2));
+		try {
+			const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+			const port = desktopPort(settings);
+			const setProject = port.setProject;
+			port.setProject = (settingPath, value) => {
+				if (settingPath === "display.showTokenUsage") throw new Error("simulated second edit failure");
+				setProject(settingPath, value);
+			};
+			await expect(
+				authority(port).settingsWrite({
+					edits: [
+						{ path: "compaction.enabled", value: false, scope: "project" },
+						{ path: "display.showTokenUsage", value: true, scope: "project" },
+					],
+				}),
+			).rejects.toThrow("settings write failed");
+
+			expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual(initial);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	test("reads deterministic effective settings and redacts sensitive values", () => {

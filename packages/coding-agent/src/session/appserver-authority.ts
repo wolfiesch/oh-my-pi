@@ -85,6 +85,8 @@ function settingsPort(settings: Settings): DesktopSettingsPort {
 		get: path => settings.get(path),
 		isConfigured: path => settings.isConfigured(path),
 		set: (path, value) => settings.set(path, value as never),
+		setProject: (path, value) => settings.setProject(path, value as never),
+		clearProject: path => settings.clearProject(path),
 		override: (path, value) => settings.override(path, value as never),
 		clearOverride: path => settings.clearOverride(path),
 		flush: () => settings.flush(),

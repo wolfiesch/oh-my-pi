@@ -13,7 +13,7 @@ import {
 import type { ModelRegistry } from "../../config/model-registry.ts";
 import { getKnownRoleIds, getRoleInfo } from "../../config/model-roles.ts";
 import type { SettingsDesktopSnapshot } from "../../config/settings.ts";
-import { SETTINGS_SCHEMA, type SettingPath } from "../../config/settings-schema.ts";
+import { isHostLocal, SETTINGS_SCHEMA, type SettingPath } from "../../config/settings-schema.ts";
 import type { AgentRegistry } from "../../registry/agent-registry.ts";
 import { BUILTIN_SLASH_COMMAND_DEFS } from "../../slash-commands/builtin-registry.ts";
 import { loadBundledAgents } from "../../task/agents.ts";
@@ -43,6 +43,8 @@ export interface DesktopSettingsPort {
 	get(path: SettingPath): unknown;
 	isConfigured?(path: SettingPath): boolean;
 	set(path: SettingPath, value: unknown): void;
+	setProject(path: SettingPath, value: unknown): void;
+	clearProject(path: SettingPath): void;
 	override?(path: SettingPath, value: unknown): void;
 	clearOverride?(path: SettingPath): void;
 	flush?(): Promise<void> | void;
@@ -452,7 +454,7 @@ export class DesktopConfigAuthority {
 					effectiveSource: sourceFor(this.#settings, path as SettingPath),
 					configured,
 					sensitive,
-					scopes: ["global", "session"],
+					scopes: isHostLocal(path as SettingPath) ? ["global", "session"] : ["global", "session", "project"],
 					platform: this.#platform,
 					availability: this.#platform === "darwin" || path !== "power.sleepPrevention",
 					...(ui?.tab ? { tab: ui.tab } : {}),
@@ -520,7 +522,7 @@ export class DesktopConfigAuthority {
 	}
 	#validateEdit(edit: SettingsWriteEdit): {
 		path: SettingPath;
-		scope: "global" | "session";
+		scope: "global" | "session" | "project";
 		reset: boolean;
 		def: SettingDefinition;
 	} {
@@ -529,9 +531,12 @@ export class DesktopConfigAuthority {
 		const def = settingDefinition(path);
 		if (!def) throw new Error(`unknown setting path: ${path}`);
 		const scope = edit.scope ?? "global";
-		if (scope !== "global" && scope !== "session") throw new Error(`unsupported settings scope: ${scope}`);
+		if (scope !== "global" && scope !== "session" && scope !== "project")
+			throw new Error(`unsupported settings scope: ${scope}`);
 		if (settingSensitive(path))
 			throw new Error("sensitive setting values cannot be written through desktop authority");
+		if (scope === "project" && isHostLocal(path as SettingPath))
+			throw new Error(`host-local setting cannot be written to project scope: ${path}`);
 		const reset = edit.reset === true;
 		if (!reset) {
 			const controlType = edit.controlType ?? edit.type;
@@ -544,19 +549,27 @@ export class DesktopConfigAuthority {
 	}
 	#applyEdit(
 		edit: SettingsWriteEdit,
-		normalized: { path: SettingPath; scope: "global" | "session"; reset: boolean },
+		normalized: { path: SettingPath; scope: "global" | "session" | "project"; reset: boolean },
 	): void {
 		if (normalized.reset) {
 			if (normalized.scope === "session") {
 				if (!this.#settings.clearOverride) throw new Error("session reset unavailable");
 				this.#settings.clearOverride(normalized.path);
-			} else this.#settings.clearGlobal(normalized.path);
+			} else if (normalized.scope === "project") {
+				this.#settings.clearProject(normalized.path);
+			} else {
+				this.#settings.clearGlobal(normalized.path);
+			}
 			return;
 		}
 		if (normalized.scope === "session") {
 			if (!this.#settings.override) throw new Error("session overrides unavailable");
 			this.#settings.override(normalized.path, edit.value);
-		} else this.#settings.set(normalized.path, edit.value);
+		} else if (normalized.scope === "project") {
+			this.#settings.setProject(normalized.path, edit.value);
+		} else {
+			this.#settings.set(normalized.path, edit.value);
+		}
 	}
 	#restartRequired(def: SettingDefinition): boolean {
 		if (typeof def.restartRequired === "boolean") return def.restartRequired;
