@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { decodeCatalog, decodeCommandResult, hostId } from "@oh-my-pi/app-wire";
 import { Settings, type SettingsDesktopSnapshot } from "../src/config/settings.ts";
+import { SETTINGS_SCHEMA } from "../src/config/settings-schema.ts";
+import { controlMetadata, SENSITIVE_SETTINGS } from "../src/session/desktop-config-authority/authority.ts";
 import { DesktopConfigAuthority, type DesktopSettingsPort } from "../src/session/desktop-config-authority/index.ts";
 
 function fakeSettings(initial: Record<string, unknown> = {}): DesktopSettingsPort {
@@ -69,6 +71,76 @@ function authority(settings = fakeSettings()) {
 }
 
 describe("DesktopConfigAuthority", () => {
+	test("keeps the declared sensitive setting allow-list synchronized with the schema", () => {
+		const expected = [
+			"auth.broker.token",
+			"dev.autoqaPush.token",
+			"hindsight.apiToken",
+			"mnemopi.embeddingApiKey",
+			"mnemopi.llmApiKey",
+			"searxng.basicPassword",
+			"searxng.token",
+		];
+		expect([...SENSITIVE_SETTINGS]).toEqual(expected);
+		for (const path of SENSITIVE_SETTINGS) expect(Object.hasOwn(SETTINGS_SCHEMA, path)).toBe(true);
+	});
+
+	test("reads and writes token-named settings that are not sensitive", async () => {
+		const settings = fakeSettings({
+			"display.showTokenUsage": true,
+			"compaction.thresholdTokens": 25_000,
+		});
+		const config = authority(settings);
+		const frame = config.settingsRead({
+			paths: ["display.showTokenUsage", "compaction.thresholdTokens"],
+		});
+		expect(frame.settings["display.showTokenUsage"]).toMatchObject({
+			default: false,
+			effective: true,
+			sensitive: false,
+		});
+		expect(frame.settings["compaction.thresholdTokens"]).toMatchObject({
+			default: -1,
+			effective: 25_000,
+			sensitive: false,
+		});
+
+		await expect(
+			config.settingsWrite({
+				edits: [
+					{ path: "display.showTokenUsage", value: false },
+					{ path: "compaction.thresholdTokens", value: 50_000 },
+				],
+			}),
+		).resolves.toMatchObject({ accepted: true });
+		expect(settings.get("display.showTokenUsage")).toBe(false);
+		expect(settings.get("compaction.thresholdTokens")).toBe(50_000);
+	});
+
+	test("still redacts and rejects declared sensitive settings", async () => {
+		const config = authority(fakeSettings({ "hindsight.apiToken": "do-not-return" }));
+		const frame = config.settingsRead({ path: "hindsight.apiToken" });
+		expect(frame.settings["hindsight.apiToken"]).toMatchObject({ sensitive: true, configured: true });
+		expect(frame.settings["hindsight.apiToken"]).not.toHaveProperty("effective");
+		expect(frame.settings["hindsight.apiToken"]).not.toHaveProperty("default");
+		expect(JSON.stringify(frame)).not.toContain("do-not-return");
+		await expect(config.settingsWrite({ path: "hindsight.apiToken", value: "replacement" })).rejects.toThrow(
+			"sensitive setting values cannot be written",
+		);
+	});
+
+	test("forwards schema UI metadata used by desktop controls", async () => {
+		const frame = await authority().catalogGet({ kind: "setting" });
+		expect(frame.items.find(item => item.name === "mnemopi.autoRecall")?.metadata).toMatchObject({
+			condition: "mnemopiActive",
+		});
+		expect(frame.items.find(item => item.name === "advisor.subagents")?.metadata).toMatchObject({
+			condition: "advisorEnabled",
+		});
+		expect(controlMetadata({ type: "array", ui: { ordered: true } })).toMatchObject({ ordered: true });
+		expect(controlMetadata({ type: "string", ui: { secret: true } })).toMatchObject({ secret: true });
+	});
+
 	test("reads deterministic effective settings and redacts sensitive values", () => {
 		const settings = fakeSettings({ "auth.broker.token": "do-not-return", "compaction.enabled": true });
 		const first = authority(settings).settingsRead({ paths: ["compaction.enabled", "auth.broker.token"] });

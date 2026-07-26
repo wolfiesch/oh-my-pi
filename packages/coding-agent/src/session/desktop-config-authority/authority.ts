@@ -25,6 +25,15 @@ const MAX_DEPTH = 8;
 const MAX_NODES = 5000;
 const MAX_STRING = 8192;
 const SECRET_KEY = /(?:password|passwd|secret|token|credential|api[_-]?key|private[_-]?key|access[_-]?key|auth)/iu;
+export const SENSITIVE_SETTINGS: ReadonlySet<string> = new Set([
+	"auth.broker.token",
+	"dev.autoqaPush.token",
+	"hindsight.apiToken",
+	"mnemopi.embeddingApiKey",
+	"mnemopi.llmApiKey",
+	"searxng.basicPassword",
+	"searxng.token",
+]);
 const SETTING_TYPES = new Set(["boolean", "number", "string", "enum", "array", "record"]);
 const CATALOG_KINDS = new Set(["tool", "model", "command", "setting", "skill", "agent", "provider", "mode"]);
 type SettingControlType = "boolean" | "number" | "string" | "enum" | "array" | "record";
@@ -131,7 +140,12 @@ function secretKey(key: string): boolean {
 }
 function safeMetadata(value: unknown, depth = 0, state = { nodes: 0 }, key = ""): unknown {
 	if (++state.nodes > MAX_NODES || depth > MAX_DEPTH) return "<redacted-bounds>";
-	if (secretKey(key) || typeof value === "function" || typeof value === "bigint" || value === undefined)
+	if (
+		(secretKey(key) && !(key === "secret" && typeof value === "boolean")) ||
+		typeof value === "function" ||
+		typeof value === "bigint" ||
+		value === undefined
+	)
 		return undefined;
 	if (typeof value === "string") return pathSafe(text(value) ?? "");
 	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
@@ -158,12 +172,12 @@ function settingDefinition(path: string): SettingDefinition | undefined {
 		: undefined;
 }
 function settingSensitive(path: string): boolean {
-	return path.split(".").some(secretKey);
+	return SENSITIVE_SETTINGS.has(path);
 }
 function sourceFor(settings: DesktopSettingsPort, path: SettingPath): string {
 	return settings.getDesktopSnapshot(path).source;
 }
-function controlMetadata(def: SettingDefinition): Record<string, unknown> {
+export function controlMetadata(def: SettingDefinition): Record<string, unknown> {
 	const result: Record<string, unknown> = { controlType: def.type };
 	if (Array.isArray(def.values)) result.options = def.values.slice(0, 256);
 	const ui = def.ui;
@@ -180,6 +194,9 @@ function controlMetadata(def: SettingDefinition): Record<string, unknown> {
 				};
 			})
 			.filter(Boolean);
+	for (const key of ["ordered", "secret"]) {
+		if (ui?.[key] !== undefined) result[key] = safeMetadata(ui[key]);
+	}
 	for (const key of [
 		"min",
 		"max",
@@ -440,6 +457,7 @@ export class DesktopConfigAuthority {
 					availability: this.#platform === "darwin" || path !== "power.sleepPrevention",
 					...(ui?.tab ? { tab: ui.tab } : {}),
 					...(ui?.group ? { group: ui.group } : {}),
+					...(ui?.condition ? { condition: ui.condition } : {}),
 				};
 				return [
 					{
