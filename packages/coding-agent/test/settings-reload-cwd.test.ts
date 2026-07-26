@@ -20,6 +20,19 @@ it("applies project role mutations over active runtime overrides", () => {
 	settings.clearProjectModelRole("smol");
 	expect(settings.getModelRole("smol")).toBeUndefined();
 });
+it("preserves runtime model-role provenance for whole-map project edits", () => {
+	const settings = Settings.isolated({ modelRoleStorage: "project" });
+	settings.overrideModelRoles({ smol: "anthropic/runtime" });
+
+	settings.setProject("modelRoles", { smol: "anthropic/project" });
+	expect(settings.getModelRole("smol")).toBe("anthropic/project");
+	expect(settings.getModelRoleProvenance("smol")).toBe("runtime");
+	expect(settings.isProjectModelRoleRuntimeOverrideActive("smol")).toBe(true);
+
+	settings.clearProject("modelRoles");
+	expect(settings.getModelRole("smol")).toBeUndefined();
+	expect(settings.isProjectModelRoleRuntimeOverrideActive("smol")).toBe(false);
+});
 
 it("reports effective model-role provenance across merge precedence", () => {
 	const settings = Settings.isolated({});
@@ -271,6 +284,59 @@ describe("Settings.reloadForCwd", () => {
 			expect(settings.getCwd()).toBe(path.normalize(bareProject));
 			expect(settings.get("compaction.enabled")).toBe(true);
 		});
+		it("clearing a native project path reveals the discovered fallback immediately and after reload", async () => {
+			const projectConfigPath = path.join(scopedProject, ".omp", "config.yml");
+			await Bun.write(
+				projectConfigPath,
+				YAML.stringify({ compaction: { enabled: true }, untouched: { nested: "keep" } }, null, 2),
+			);
+			const settings = await Settings.init({ cwd: scopedProject, agentDir });
+			expect(settings.get("compaction.enabled")).toBe(true);
+
+			settings.clearProject("compaction.enabled");
+			expect(settings.get("compaction.enabled")).toBe(false);
+			await settings.flush();
+			expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual({
+				untouched: { nested: "keep" },
+			});
+
+			const reloaded = await Settings.loadIsolated({ cwd: scopedProject, agentDir });
+			expect(reloaded.get("compaction.enabled")).toBe(false);
+		});
+
+		it("preserves an external project file edit made during the debounce window", async () => {
+			const projectConfigPath = path.join(startDir, ".omp", "config.yml");
+			await Bun.write(projectConfigPath, YAML.stringify({ untouched: "before" }, null, 2));
+			const settings = await Settings.init({ cwd: startDir, agentDir });
+
+			settings.setProject("compaction.enabled", false);
+			await Bun.write(
+				projectConfigPath,
+				YAML.stringify({ untouched: "external", externalOnly: { nested: true } }, null, 2),
+			);
+			await settings.flush();
+
+			expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual({
+				compaction: { enabled: false },
+				externalOnly: { nested: true },
+				untouched: "external",
+			});
+		});
+
+		it("keeps a debounced project write bound to the cwd where it was accepted", async () => {
+			const settings = await Settings.init({ cwd: startDir, agentDir });
+			const firstConfigPath = path.join(startDir, ".omp", "config.yml");
+			const secondConfigPath = path.join(bareProject, ".omp", "config.yml");
+
+			settings.setProject("compaction.enabled", false);
+			await settings.reloadForCwd(bareProject);
+			await settings.flush();
+
+			expect(YAML.parse(await Bun.file(firstConfigPath).text())).toEqual({
+				compaction: { enabled: false },
+			});
+			expect(await Bun.file(secondConfigPath).exists()).toBe(false);
+		});
 		it("keeps failed project writes bound to their original cwd", async () => {
 			const settings = await Settings.init({ cwd: startDir, agentDir });
 			settings.setProjectModelRole("default", "anthropic/project");
@@ -321,7 +387,7 @@ describe("Settings.reloadForCwd", () => {
 			expect(settings.getProjectModelRole("default")).toBe("anthropic/external");
 		});
 
-		it("reapplies only native model roles over normal project-provider precedence", async () => {
+		it("overlays native project settings over discovered-provider values", async () => {
 			await Bun.write(
 				path.join(scopedProject, ".claude", "settings.json"),
 				JSON.stringify({
@@ -338,7 +404,7 @@ describe("Settings.reloadForCwd", () => {
 
 			expect(settings.getModelRole("default")).toBe("anthropic/native");
 			expect(settings.getProjectModelRole("default")).toBe("anthropic/native");
-			expect(settings.get("compaction.enabled")).toBe(true);
+			expect(settings.get("compaction.enabled")).toBe(false);
 		});
 
 		it("merges concurrent role writes under the project file lock", async () => {

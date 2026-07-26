@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { decodeCatalog, decodeCommandResult, hostId } from "@oh-my-pi/app-wire";
+import { YAML } from "bun";
 import { Settings, type SettingsDesktopSnapshot } from "../src/config/settings.ts";
+import { SETTINGS_SCHEMA } from "../src/config/settings-schema.ts";
+import { controlMetadata, SENSITIVE_SETTINGS } from "../src/session/desktop-config-authority/authority.ts";
 import { DesktopConfigAuthority, type DesktopSettingsPort } from "../src/session/desktop-config-authority/index.ts";
 
 function fakeSettings(initial: Record<string, unknown> = {}): DesktopSettingsPort {
@@ -28,6 +34,16 @@ function fakeSettings(initial: Record<string, unknown> = {}): DesktopSettingsPor
 			values.set(path, value);
 			configured.add(path);
 			source.set(path, "global");
+		},
+		setProject(path, value) {
+			values.set(path, value);
+			configured.add(path);
+			source.set(path, "project");
+		},
+		clearProject(path) {
+			values.delete(path);
+			configured.delete(path);
+			source.delete(path);
 		},
 		override(path, value) {
 			values.set(path, value);
@@ -68,7 +84,243 @@ function authority(settings = fakeSettings()) {
 	return new DesktopConfigAuthority({ settings, hostId: "test-host", platform: "linux" });
 }
 
+function desktopPort(settings: Settings): DesktopSettingsPort {
+	return {
+		get: path => settings.get(path),
+		isConfigured: path => settings.isConfigured(path),
+		set: (path, value) => settings.set(path, value as never),
+		setProject: (path, value) => settings.setProject(path, value as never),
+		clearProject: path => settings.clearProject(path),
+		override: (path, value) => settings.override(path, value as never),
+		clearOverride: path => settings.clearOverride(path),
+		flush: () => settings.flush(),
+		getDesktopSnapshot: path => settings.getDesktopSnapshot(path),
+		restoreDesktopSnapshot: snapshot => settings.restoreDesktopSnapshot(snapshot),
+		clearGlobal: path => settings.clearGlobal(path),
+	};
+}
+
 describe("DesktopConfigAuthority", () => {
+	test("keeps the declared sensitive setting allow-list synchronized with the schema", () => {
+		const expected = [
+			"auth.broker.token",
+			"dev.autoqaPush.token",
+			"hindsight.apiToken",
+			"mnemopi.embeddingApiKey",
+			"mnemopi.llmApiKey",
+			"searxng.basicPassword",
+			"searxng.token",
+		];
+		expect([...SENSITIVE_SETTINGS]).toEqual(expected);
+		for (const path of SENSITIVE_SETTINGS) expect(Object.hasOwn(SETTINGS_SCHEMA, path)).toBe(true);
+	});
+
+	test("reads and writes token-named settings that are not sensitive", async () => {
+		const settings = fakeSettings({
+			"display.showTokenUsage": true,
+			"compaction.thresholdTokens": 25_000,
+		});
+		const config = authority(settings);
+		const frame = config.settingsRead({
+			paths: ["display.showTokenUsage", "compaction.thresholdTokens"],
+		});
+		expect(frame.settings["display.showTokenUsage"]).toMatchObject({
+			default: false,
+			effective: true,
+			sensitive: false,
+		});
+		expect(frame.settings["compaction.thresholdTokens"]).toMatchObject({
+			default: -1,
+			effective: 25_000,
+			sensitive: false,
+		});
+
+		await expect(
+			config.settingsWrite({
+				edits: [
+					{ path: "display.showTokenUsage", value: false },
+					{ path: "compaction.thresholdTokens", value: 50_000 },
+				],
+			}),
+		).resolves.toMatchObject({ accepted: true });
+		expect(settings.get("display.showTokenUsage")).toBe(false);
+		expect(settings.get("compaction.thresholdTokens")).toBe(50_000);
+	});
+
+	test("still redacts and rejects declared sensitive settings", async () => {
+		const config = authority(fakeSettings({ "hindsight.apiToken": "do-not-return" }));
+		const frame = config.settingsRead({ path: "hindsight.apiToken" });
+		expect(frame.settings["hindsight.apiToken"]).toMatchObject({ sensitive: true, configured: true });
+		expect(frame.settings["hindsight.apiToken"]).not.toHaveProperty("effective");
+		expect(frame.settings["hindsight.apiToken"]).not.toHaveProperty("default");
+		expect(JSON.stringify(frame)).not.toContain("do-not-return");
+		await expect(config.settingsWrite({ path: "hindsight.apiToken", value: "replacement" })).rejects.toThrow(
+			"sensitive setting values cannot be written",
+		);
+	});
+
+	test("forwards schema UI metadata used by desktop controls", async () => {
+		const frame = await authority().catalogGet({ kind: "setting" });
+		expect(frame.items.find(item => item.name === "mnemopi.autoRecall")?.metadata).toMatchObject({
+			condition: "mnemopiActive",
+		});
+		expect(frame.items.find(item => item.name === "advisor.subagents")?.metadata).toMatchObject({
+			condition: "advisorEnabled",
+		});
+		expect(controlMetadata({ type: "array", ui: { ordered: true } })).toMatchObject({ ordered: true });
+		expect(controlMetadata({ type: "string", ui: { secret: true } })).toMatchObject({ secret: true });
+	});
+
+	test("advertises project scope only for non-host-local settings and refuses host-local writes", async () => {
+		const frame = await authority().catalogGet({ kind: "setting" });
+		expect(frame.items.find(item => item.name === "appserver.remoteAddress")?.metadata?.scopes).toEqual([
+			"global",
+			"session",
+		]);
+		expect(frame.items.find(item => item.name === "compaction.enabled")?.metadata?.scopes).toContain("project");
+		await expect(
+			authority().settingsWrite({
+				path: "appserver.remoteAddress",
+				value: "127.0.0.1",
+				scope: "project",
+			}),
+		).rejects.toThrow("host-local setting cannot be written to project scope");
+	});
+
+	test("persists project writes without disturbing sibling native settings", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-settings-"));
+		const projectDir = path.join(root, "project");
+		const agentDir = path.join(root, "agent");
+		const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+		const initial = {
+			compaction: { enabled: false },
+			untouched: { nested: "keep" },
+		};
+		fs.mkdirSync(projectDir, { recursive: true });
+		fs.mkdirSync(agentDir, { recursive: true });
+		await Bun.write(projectConfigPath, YAML.stringify(initial, null, 2));
+		try {
+			const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+			const result = await authority(desktopPort(settings)).settingsWrite({
+				path: "compaction.enabled",
+				value: true,
+				scope: "project",
+			});
+			expect(JSON.stringify(result)).not.toContain(projectDir);
+
+			expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual({
+				compaction: { enabled: true },
+				untouched: { nested: "keep" },
+			});
+			expect(await Bun.file(path.join(agentDir, "config.yml")).exists()).toBe(false);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("preserves an external edit made while a project write is pending", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-external-"));
+		const projectDir = path.join(root, "project");
+		const agentDir = path.join(root, "agent");
+		const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+		fs.mkdirSync(projectDir, { recursive: true });
+		fs.mkdirSync(agentDir, { recursive: true });
+		await Bun.write(projectConfigPath, YAML.stringify({ untouched: { nested: "keep" } }, null, 2));
+		try {
+			const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+			// Queue our edit, then let another process append to the same file
+			// before the debounced saver runs. The saver re-reads under the lock and
+			// patches only its own paths, so the foreign key must survive.
+			settings.setProject("compaction.enabled", true);
+			await Bun.write(
+				projectConfigPath,
+				YAML.stringify({ untouched: { nested: "keep" }, addedByAnotherProcess: true }, null, 2),
+			);
+			await settings.flush();
+
+			expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual({
+				untouched: { nested: "keep" },
+				addedByAnotherProcess: true,
+				compaction: { enabled: true },
+			});
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a cwd switch drains pending project writes to the old root, never the new one", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-cwd-"));
+		const projectA = path.join(root, "a");
+		const projectB = path.join(root, "b");
+		const agentDir = path.join(root, "agent");
+		const configA = path.join(projectA, ".omp", "config.yml");
+		const configB = path.join(projectB, ".omp", "config.yml");
+		for (const dir of [projectA, projectB, agentDir]) fs.mkdirSync(dir, { recursive: true });
+		await Bun.write(configA, YAML.stringify({ marker: "a" }, null, 2));
+		await Bun.write(configB, YAML.stringify({ marker: "b" }, null, 2));
+		try {
+			const settings = await Settings.loadIsolated({ cwd: projectA, agentDir });
+			// Queue against A and switch without flushing ourselves. Two mechanisms
+			// must combine to keep A's edit out of B: `reloadForCwd` drains pending
+			// writes before moving, and the save queue is keyed by the root bound
+			// when the edit was accepted. Dropping either one sends A's change to B.
+			settings.setProject("compaction.enabled", true);
+			await settings.reloadForCwd(projectB);
+
+			expect(YAML.parse(await Bun.file(configA).text())).toEqual({
+				marker: "a",
+				compaction: { enabled: true },
+			});
+			expect(YAML.parse(await Bun.file(configB).text())).toEqual({ marker: "b" });
+
+			// And the switch really did land: a later edit belongs to B alone.
+			settings.setProject("compaction.enabled", false);
+			await settings.flush();
+			expect(YAML.parse(await Bun.file(configB).text())).toEqual({
+				marker: "b",
+				compaction: { enabled: false },
+			});
+			expect(YAML.parse(await Bun.file(configA).text())).toEqual({
+				marker: "a",
+				compaction: { enabled: true },
+			});
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("persists rollback when a later project edit fails", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-rollback-"));
+		const projectDir = path.join(root, "project");
+		const agentDir = path.join(root, "agent");
+		const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+		const initial = { untouched: { nested: "keep" } };
+		fs.mkdirSync(projectDir, { recursive: true });
+		fs.mkdirSync(agentDir, { recursive: true });
+		await Bun.write(projectConfigPath, YAML.stringify(initial, null, 2));
+		try {
+			const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+			const port = desktopPort(settings);
+			const setProject = port.setProject;
+			port.setProject = (settingPath, value) => {
+				if (settingPath === "display.showTokenUsage") throw new Error("simulated second edit failure");
+				setProject(settingPath, value);
+			};
+			await expect(
+				authority(port).settingsWrite({
+					edits: [
+						{ path: "compaction.enabled", value: false, scope: "project" },
+						{ path: "display.showTokenUsage", value: true, scope: "project" },
+					],
+				}),
+			).rejects.toThrow("settings write failed");
+
+			expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual(initial);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("reads deterministic effective settings and redacts sensitive values", () => {
 		const settings = fakeSettings({ "auth.broker.token": "do-not-return", "compaction.enabled": true });
 		const first = authority(settings).settingsRead({ paths: ["compaction.enabled", "auth.broker.token"] });
