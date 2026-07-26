@@ -6,7 +6,7 @@ import { decodeCatalog, decodeCommandResult, hostId } from "@oh-my-pi/app-wire";
 import { YAML } from "bun";
 import { Settings, type SettingsDesktopSnapshot } from "../src/config/settings.ts";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema.ts";
-import { controlMetadata, SENSITIVE_SETTINGS } from "../src/session/desktop-config-authority/authority.ts";
+import { SENSITIVE_SETTINGS } from "../src/session/desktop-config-authority/authority.ts";
 import { DesktopConfigAuthority, type DesktopSettingsPort } from "../src/session/desktop-config-authority/index.ts";
 
 function fakeSettings(initial: Record<string, unknown> = {}): DesktopSettingsPort {
@@ -167,8 +167,29 @@ describe("DesktopConfigAuthority", () => {
 		expect(frame.items.find(item => item.name === "advisor.subagents")?.metadata).toMatchObject({
 			condition: "advisorEnabled",
 		});
-		expect(controlMetadata({ type: "array", ui: { ordered: true } })).toMatchObject({ ordered: true });
-		expect(controlMetadata({ type: "string", ui: { secret: true } })).toMatchObject({ secret: true });
+		// Asserted through `catalogGet`, not against `controlMetadata` directly: a
+		// synthetic call stays green if `#settingItems` stops forwarding these,
+		// which is the desktop behavior worth guarding. This branch's real schema
+		// declares neither flag, so a synthetic schema supplies them.
+		const probe = new DesktopConfigAuthority({
+			settings: fakeSettings(),
+			hostId: "test-host",
+			platform: "linux",
+			schema: {
+				"probe.ordered": { type: "array", default: [], ui: { label: "Ordered", ordered: true } },
+				"probe.secret": { type: "string", default: "", ui: { label: "Secret", secret: true } },
+			},
+		});
+		const probed = await probe.catalogGet({ kind: "setting" });
+		expect(probed.items.find(item => item.name === "probe.ordered")?.metadata).toMatchObject({ ordered: true });
+		// `ui.secret` maps onto the canonical `sensitive` field: `boundedMetadata`
+		// rejects a bare `secret` metadata key, and `sensitive` is what carries the
+		// decoder's redaction invariant. Assert the redaction, not just the flag.
+		const secretItem = probed.items.find(item => item.name === "probe.secret");
+		expect(secretItem?.metadata?.sensitive).toBe(true);
+		expect(secretItem?.metadata).not.toHaveProperty("secret");
+		expect(secretItem?.metadata?.default).toBeUndefined();
+		expect(secretItem?.metadata?.effective).toBeUndefined();
 	});
 
 	test("advertises project scope only for non-host-local settings and refuses host-local writes", async () => {
@@ -188,7 +209,7 @@ describe("DesktopConfigAuthority", () => {
 	});
 
 	test("persists project writes without disturbing sibling native settings", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-settings-"));
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "desktop-project-settings-"));
 		const projectDir = path.join(root, "project");
 		const agentDir = path.join(root, "agent");
 		const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
@@ -196,8 +217,8 @@ describe("DesktopConfigAuthority", () => {
 			compaction: { enabled: false },
 			untouched: { nested: "keep" },
 		};
-		fs.mkdirSync(projectDir, { recursive: true });
-		fs.mkdirSync(agentDir, { recursive: true });
+		await fs.promises.mkdir(projectDir, { recursive: true });
+		await fs.promises.mkdir(agentDir, { recursive: true });
 		await Bun.write(projectConfigPath, YAML.stringify(initial, null, 2));
 		try {
 			const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
@@ -214,17 +235,17 @@ describe("DesktopConfigAuthority", () => {
 			});
 			expect(await Bun.file(path.join(agentDir, "config.yml")).exists()).toBe(false);
 		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
+			await fs.promises.rm(root, { recursive: true, force: true });
 		}
 	});
 
 	test("preserves an external edit made while a project write is pending", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-external-"));
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "desktop-project-external-"));
 		const projectDir = path.join(root, "project");
 		const agentDir = path.join(root, "agent");
 		const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
-		fs.mkdirSync(projectDir, { recursive: true });
-		fs.mkdirSync(agentDir, { recursive: true });
+		await fs.promises.mkdir(projectDir, { recursive: true });
+		await fs.promises.mkdir(agentDir, { recursive: true });
 		await Bun.write(projectConfigPath, YAML.stringify({ untouched: { nested: "keep" } }, null, 2));
 		try {
 			const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
@@ -244,18 +265,18 @@ describe("DesktopConfigAuthority", () => {
 				compaction: { enabled: true },
 			});
 		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
+			await fs.promises.rm(root, { recursive: true, force: true });
 		}
 	});
 
 	test("a cwd switch drains pending project writes to the old root, never the new one", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-cwd-"));
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "desktop-project-cwd-"));
 		const projectA = path.join(root, "a");
 		const projectB = path.join(root, "b");
 		const agentDir = path.join(root, "agent");
 		const configA = path.join(projectA, ".omp", "config.yml");
 		const configB = path.join(projectB, ".omp", "config.yml");
-		for (const dir of [projectA, projectB, agentDir]) fs.mkdirSync(dir, { recursive: true });
+		for (const dir of [projectA, projectB, agentDir]) await fs.promises.mkdir(dir, { recursive: true });
 		await Bun.write(configA, YAML.stringify({ marker: "a" }, null, 2));
 		await Bun.write(configB, YAML.stringify({ marker: "b" }, null, 2));
 		try {
@@ -285,18 +306,18 @@ describe("DesktopConfigAuthority", () => {
 				compaction: { enabled: true },
 			});
 		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
+			await fs.promises.rm(root, { recursive: true, force: true });
 		}
 	});
 
 	test("persists rollback when a later project edit fails", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-rollback-"));
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "desktop-project-rollback-"));
 		const projectDir = path.join(root, "project");
 		const agentDir = path.join(root, "agent");
 		const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
 		const initial = { untouched: { nested: "keep" } };
-		fs.mkdirSync(projectDir, { recursive: true });
-		fs.mkdirSync(agentDir, { recursive: true });
+		await fs.promises.mkdir(projectDir, { recursive: true });
+		await fs.promises.mkdir(agentDir, { recursive: true });
 		await Bun.write(projectConfigPath, YAML.stringify(initial, null, 2));
 		try {
 			const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
@@ -317,7 +338,7 @@ describe("DesktopConfigAuthority", () => {
 
 			expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual(initial);
 		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
+			await fs.promises.rm(root, { recursive: true, force: true });
 		}
 	});
 

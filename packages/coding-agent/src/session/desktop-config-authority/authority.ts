@@ -71,6 +71,8 @@ export interface OperationContextLike {
 }
 export interface DesktopConfigAuthorityOptions {
 	settings: DesktopSettingsPort;
+	/** Schema backing the catalog. Defaults to SETTINGS_SCHEMA; overridden in tests. */
+	schema?: Record<string, unknown>;
 	hostId?: string;
 	platform?: string;
 	modelRegistry?:
@@ -165,21 +167,25 @@ function safeMetadata(value: unknown, depth = 0, state = { nodes: 0 }, key = "")
 	}
 	return result;
 }
-function settingDefinition(path: string): SettingDefinition | undefined {
-	const candidate = (SETTINGS_SCHEMA as unknown as Record<string, unknown>)[path];
+function settingDefinition(path: string, schema: Record<string, unknown>): SettingDefinition | undefined {
+	const candidate = schema[path];
 	if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return undefined;
 	const def = candidate as Record<string, unknown>;
 	return typeof def.type === "string" && SETTING_TYPES.has(def.type)
 		? (def as unknown as SettingDefinition)
 		: undefined;
 }
-function settingSensitive(path: string): boolean {
-	return SENSITIVE_SETTINGS.has(path);
+function settingSensitive(path: string, def?: SettingDefinition): boolean {
+	// `ui.secret` maps onto the protocol's canonical `sensitive` field rather
+	// than travelling as its own metadata key: `boundedMetadata` rejects
+	// secret-like keys outright, and `sensitive` is what carries the decoder's
+	// redaction invariant.
+	return SENSITIVE_SETTINGS.has(path) || def?.ui?.secret === true;
 }
 function sourceFor(settings: DesktopSettingsPort, path: SettingPath): string {
 	return settings.getDesktopSnapshot(path).source;
 }
-export function controlMetadata(def: SettingDefinition): Record<string, unknown> {
+function controlMetadata(def: SettingDefinition): Record<string, unknown> {
 	const result: Record<string, unknown> = { controlType: def.type };
 	if (Array.isArray(def.values)) result.options = def.values.slice(0, 256);
 	const ui = def.ui;
@@ -196,7 +202,7 @@ export function controlMetadata(def: SettingDefinition): Record<string, unknown>
 				};
 			})
 			.filter(Boolean);
-	for (const key of ["ordered", "secret"]) {
+	for (const key of ["ordered"]) {
 		if (ui?.[key] !== undefined) result[key] = safeMetadata(ui[key]);
 	}
 	for (const key of [
@@ -425,24 +431,26 @@ function unsupportedItem(kind: CatalogItem["kind"], id: string, reason: string):
 
 export class DesktopConfigAuthority {
 	readonly #settings: DesktopSettingsPort;
+	readonly #schema: Record<string, unknown>;
 	readonly #hostId: string;
 	readonly #platform: string;
 	readonly #options: DesktopConfigAuthorityOptions;
 	constructor(options: DesktopConfigAuthorityOptions) {
 		if (!options?.settings) throw new Error("settings is required");
 		this.#settings = options.settings;
+		this.#schema = options.schema ?? (SETTINGS_SCHEMA as unknown as Record<string, unknown>);
 		this.#hostId = options.hostId ?? "desktop";
 		this.#platform = options.platform ?? process.platform;
 		this.#options = options;
 	}
 	#settingItems(): CatalogItem[] {
-		return Object.keys(SETTINGS_SCHEMA)
+		return Object.keys(this.#schema)
 			.sort()
 			.flatMap(path => {
-				const def = settingDefinition(path);
+				const def = settingDefinition(path, this.#schema);
 				if (!def) return [];
 				const ui = def.ui;
-				const sensitive = settingSensitive(path);
+				const sensitive = settingSensitive(path, def);
 				const configured = this.#settings.isConfigured?.(path as SettingPath) ?? false;
 				const metadata: Record<string, unknown> = {
 					path,
@@ -474,10 +482,10 @@ export class DesktopConfigAuthority {
 	}
 	#revisionData(paths?: readonly string[]): Record<string, unknown> {
 		const settings: Record<string, unknown> = {};
-		for (const path of [...(paths && paths.length > 0 ? paths : Object.keys(SETTINGS_SCHEMA))].sort()) {
-			const def = settingDefinition(path);
+		for (const path of [...(paths && paths.length > 0 ? paths : Object.keys(this.#schema))].sort()) {
+			const def = settingDefinition(path, this.#schema);
 			if (!def) continue;
-			const sensitive = settingSensitive(path);
+			const sensitive = settingSensitive(path, def);
 			settings[path] = safeMetadata({
 				...controlMetadata(def),
 				...(sensitive
@@ -501,16 +509,17 @@ export class DesktopConfigAuthority {
 		if (paths && paths.length > MAX_PATHS) throw new Error("too many settings paths");
 		if (args.category) {
 			const category = args.category;
-			paths = Object.keys(SETTINGS_SCHEMA).filter(
+			paths = Object.keys(this.#schema).filter(
 				path =>
 					path === category ||
 					path.startsWith(`${category}.`) ||
-					settingDefinition(path)?.ui?.tab === category ||
-					settingDefinition(path)?.ui?.group === category,
+					settingDefinition(path, this.#schema)?.ui?.tab === category ||
+					settingDefinition(path, this.#schema)?.ui?.group === category,
 			);
 		}
 		if (paths)
-			for (const path of paths) if (!settingDefinition(path)) throw new Error(`unknown setting path: ${path}`);
+			for (const path of paths)
+				if (!settingDefinition(path, this.#schema)) throw new Error(`unknown setting path: ${path}`);
 		const hostIdVal = context?.hostId ? hostId(context.hostId) : hostId(this.#hostId);
 		return {
 			v: "omp-app/1",
@@ -528,12 +537,12 @@ export class DesktopConfigAuthority {
 	} {
 		if (!edit || typeof edit.path !== "string") throw new Error("invalid settings edit");
 		const path = edit.path;
-		const def = settingDefinition(path);
+		const def = settingDefinition(path, this.#schema);
 		if (!def) throw new Error(`unknown setting path: ${path}`);
 		const scope = edit.scope ?? "global";
 		if (scope !== "global" && scope !== "session" && scope !== "project")
 			throw new Error(`unsupported settings scope: ${scope}`);
-		if (settingSensitive(path))
+		if (settingSensitive(path, def))
 			throw new Error("sensitive setting values cannot be written through desktop authority");
 		if (scope === "project" && isHostLocal(path as SettingPath))
 			throw new Error(`host-local setting cannot be written to project scope: ${path}`);
