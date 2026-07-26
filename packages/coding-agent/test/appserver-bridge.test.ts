@@ -160,6 +160,7 @@ describe("thin OMP authority bridge", () => {
 				type: "session",
 				version: CURRENT_SESSION_VERSION,
 				id: "session-test",
+				title: "x".repeat(32 * 1024),
 				timestamp: new Date(0).toISOString(),
 				cwd: "/tmp/project",
 				authorityProtocol: OMP_AUTHORITY_BRIDGE_PROTOCOL,
@@ -249,6 +250,49 @@ describe("thin OMP authority bridge", () => {
 			type: "response",
 			ok: true,
 			result: { authorityProtocol: OMP_AUTHORITY_BRIDGE_PROTOCOL },
+		});
+	});
+
+	test("does not trust an authority marker supplied by a bridge client", async () => {
+		using tempDir = TempDir.createSync("@omp-bridge-untrusted-");
+		const sessionPath = path.join(tempDir.path(), "session.jsonl");
+		await Bun.write(
+			sessionPath,
+			`${JSON.stringify({
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "session-test",
+				timestamp: new Date(0).toISOString(),
+				cwd: "/tmp/project",
+			})}\n`,
+		);
+		const claimed = {
+			...session(),
+			path: sessionPath,
+			authorityProtocol: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+		};
+		const input = new AsyncQueue();
+		const output: string[] = [];
+		const running = runOmpAuthorityBridge({
+			runtime: runtime(claimed),
+			input,
+			write: line => {
+				output.push(line);
+			},
+			identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
+		});
+		input.push(request("load-untrusted", "discovery.load", { session: claimed }));
+		input.close();
+		await running;
+		const response = output
+			.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)))
+			.find(frame => frame.type === "response" && frame.id === "load-untrusted");
+		expect(response).toMatchObject({
+			type: "response",
+			ok: true,
+			result: expect.not.objectContaining({
+				authorityProtocol: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+			}),
 		});
 	});
 

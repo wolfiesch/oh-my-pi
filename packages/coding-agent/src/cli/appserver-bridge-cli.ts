@@ -14,7 +14,7 @@ import {
 	type SessionRecord,
 } from "@oh-my-pi/appserver";
 import { getBlobsDir } from "@oh-my-pi/pi-utils/dirs";
-import { T4_AUTHORITY_PROTOCOL } from "../session/session-entries";
+import { SESSION_TITLE_SLOT_BYTES, T4_AUTHORITY_PROTOCOL } from "../session/session-entries";
 import { SessionManager } from "../session/session-manager";
 import { createDefaultAppserverRuntime } from "./appserver-cli";
 import { getCodingAgentAppserverIdentity } from "./appserver-identity";
@@ -23,7 +23,7 @@ type Runtime = Awaited<ReturnType<typeof createDefaultAppserverRuntime>>;
 type AuthoritySessionRecord = SessionRecord & { readonly authorityProtocol?: typeof T4_AUTHORITY_PROTOCOL };
 const MAX_SESSION_LIST_SNAPSHOTS = 4;
 const SESSION_LIST_SNAPSHOT_TTL_MS = 30_000;
-const SESSION_HEADER_PREFIX_BYTES = 16 * 1024;
+const SESSION_HEADER_PREFIX_BYTES = OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES + SESSION_TITLE_SLOT_BYTES + 2;
 const SESSION_HEADER_READ_CONCURRENCY = 32;
 
 interface SessionListSnapshot {
@@ -141,10 +141,12 @@ async function transcriptAuthorityProtocol(sessionPath: string): Promise<typeof 
 
 async function withTranscriptAuthority(value: SessionRecord): Promise<AuthoritySessionRecord> {
 	const authorityProtocol = await transcriptAuthorityProtocol(value.path);
+	const unverified: Record<string, unknown> = { ...value };
+	delete unverified.authorityProtocol;
 	return {
-		...value,
+		...unverified,
 		...(authorityProtocol === undefined ? {} : { authorityProtocol }),
-	};
+	} as unknown as AuthoritySessionRecord;
 }
 
 async function sessionReference(value: SessionRecord): Promise<AuthoritySessionRecord> {
