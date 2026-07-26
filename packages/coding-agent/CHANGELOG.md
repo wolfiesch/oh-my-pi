@@ -29,6 +29,9 @@
 
 ### Fixed
 
+- Fixed the T4 authority bridge omitting OMP's durable handoff marker from sparse
+  session inventory and transcript-load responses, allowing external GUIs to
+  identify compatible lockless sessions without parsing OMP's private files.
 - Fixed the T4 authority bridge paging a sparse, snapshot-consistent
   1,000-session inventory across bounded frames and explicitly marking
   over-limit inventories partial, so omissions can never be mistaken for

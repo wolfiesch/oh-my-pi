@@ -89,7 +89,11 @@ function runtime(record: SessionRecord = session(), records: readonly SessionRec
 	} as never;
 }
 
-function request(id: string, method: "session.list" | "operation.termOpen", params: Record<string, unknown>) {
+function request(
+	id: string,
+	method: "session.list" | "discovery.load" | "operation.termOpen",
+	params: Record<string, unknown>,
+) {
 	return encodeOmpAuthorityBridgeFrame({
 		v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
 		type: "request",
@@ -146,10 +150,24 @@ describe("thin OMP authority bridge", () => {
 	});
 
 	test("emits sparse session-list records before the bridge frame is encoded", async () => {
+		using tempDir = TempDir.createSync("@omp-bridge-list-");
 		const input = new AsyncQueue();
 		const output: string[] = [];
+		const sessionPath = path.join(tempDir.path(), "session.jsonl");
+		await Bun.write(
+			sessionPath,
+			`${JSON.stringify({
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "session-test",
+				timestamp: new Date(0).toISOString(),
+				cwd: "/tmp/project",
+				authorityProtocol: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+			})}\n`,
+		);
 		const large: SessionRecord = {
 			...session(),
+			path: sessionPath,
 			entries: [
 				{
 					id: "large-entry" as never,
@@ -180,11 +198,58 @@ describe("thin OMP authority bridge", () => {
 		expect(response).toMatchObject({
 			type: "response",
 			ok: true,
-			result: { sessions: [{ ...large, entriesLoaded: false, entries: [] }] },
+			result: {
+				sessions: [
+					{
+						...large,
+						authorityProtocol: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+						entriesLoaded: false,
+						entries: [],
+					},
+				],
+			},
 		});
 		expect(Buffer.byteLength(output.find(line => line.includes('"list-large"'))!, "utf8")).toBeLessThanOrEqual(
 			OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES,
 		);
+	});
+
+	test("preserves the transcript authority marker when loading a session", async () => {
+		using tempDir = TempDir.createSync("@omp-bridge-load-");
+		const sessionPath = path.join(tempDir.path(), "session.jsonl");
+		await Bun.write(
+			sessionPath,
+			`${JSON.stringify({
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "session-test",
+				timestamp: new Date(0).toISOString(),
+				cwd: "/tmp/project",
+				authorityProtocol: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+			})}\n`,
+		);
+		const record: SessionRecord = { ...session(), path: sessionPath };
+		const input = new AsyncQueue();
+		const output: string[] = [];
+		const running = runOmpAuthorityBridge({
+			runtime: runtime(record),
+			input,
+			write: line => {
+				output.push(line);
+			},
+			identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
+		});
+		input.push(request("load-1", "discovery.load", { session: record }));
+		input.close();
+		await running;
+		const response = output
+			.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)))
+			.find(frame => frame.type === "response" && frame.id === "load-1");
+		expect(response).toMatchObject({
+			type: "response",
+			ok: true,
+			result: { authorityProtocol: OMP_AUTHORITY_BRIDGE_PROTOCOL },
+		});
 	});
 
 	test("returns a complete bounded session inventory", async () => {
