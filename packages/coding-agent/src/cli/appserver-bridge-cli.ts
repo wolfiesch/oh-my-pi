@@ -14,16 +14,20 @@ import {
 	type SessionRecord,
 } from "@oh-my-pi/appserver";
 import { getBlobsDir } from "@oh-my-pi/pi-utils/dirs";
+import { SESSION_TITLE_SLOT_BYTES, T4_AUTHORITY_PROTOCOL } from "../session/session-entries";
 import { SessionManager } from "../session/session-manager";
 import { createDefaultAppserverRuntime } from "./appserver-cli";
 import { getCodingAgentAppserverIdentity } from "./appserver-identity";
 
 type Runtime = Awaited<ReturnType<typeof createDefaultAppserverRuntime>>;
+type AuthoritySessionRecord = SessionRecord & { readonly authorityProtocol?: typeof T4_AUTHORITY_PROTOCOL };
 const MAX_SESSION_LIST_SNAPSHOTS = 4;
 const SESSION_LIST_SNAPSHOT_TTL_MS = 30_000;
+const SESSION_HEADER_PREFIX_BYTES = OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES + SESSION_TITLE_SLOT_BYTES + 2;
+const SESSION_HEADER_READ_CONCURRENCY = 32;
 
 interface SessionListSnapshot {
-	readonly references: readonly SessionRecord[];
+	readonly references: readonly AuthoritySessionRecord[];
 	readonly offset: number;
 	readonly expiresAt: number;
 	readonly complete: boolean;
@@ -31,7 +35,7 @@ interface SessionListSnapshot {
 }
 
 interface SessionListPage {
-	readonly sessions: readonly SessionRecord[];
+	readonly sessions: readonly AuthoritySessionRecord[];
 	readonly nextCursor?: string;
 	readonly complete: boolean;
 	readonly totalCount: number;
@@ -117,20 +121,50 @@ function session(value: unknown): SessionRecord {
 	return item as unknown as SessionRecord;
 }
 
-function sessionReference(value: SessionRecord): SessionRecord {
+async function transcriptAuthorityProtocol(sessionPath: string): Promise<typeof T4_AUTHORITY_PROTOCOL | undefined> {
+	try {
+		const prefix = await Bun.file(sessionPath).slice(0, SESSION_HEADER_PREFIX_BYTES).text();
+		for (const line of prefix.split(/\r?\n/u)) {
+			if (!line) continue;
+			const entry: unknown = JSON.parse(line);
+			if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+			const record = entry as Record<string, unknown>;
+			if (record.type === "title") continue;
+			if (record.type !== "session") return undefined;
+			return record.authorityProtocol === T4_AUTHORITY_PROTOCOL ? T4_AUTHORITY_PROTOCOL : undefined;
+		}
+		return undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function withTranscriptAuthority(value: SessionRecord): Promise<AuthoritySessionRecord> {
+	const authorityProtocol = await transcriptAuthorityProtocol(value.path);
+	const unverified: Record<string, unknown> = { ...value };
+	delete unverified.authorityProtocol;
 	return {
-		sessionId: value.sessionId,
-		path: value.path,
-		cwd: value.cwd,
-		projectId: value.projectId,
-		...(value.projectName === undefined ? {} : { projectName: value.projectName }),
-		title: value.title,
-		updatedAt: value.updatedAt,
-		status: value.status,
-		...(value.archivedAt === undefined ? {} : { archivedAt: value.archivedAt }),
-		...(value.model === undefined ? {} : { model: value.model }),
-		...(value.thinking === undefined ? {} : { thinking: value.thinking }),
-		...(value.runtime === undefined ? {} : { runtime: value.runtime }),
+		...unverified,
+		...(authorityProtocol === undefined ? {} : { authorityProtocol }),
+	} as unknown as AuthoritySessionRecord;
+}
+
+async function sessionReference(value: SessionRecord): Promise<AuthoritySessionRecord> {
+	const authoritative = await withTranscriptAuthority(value);
+	return {
+		sessionId: authoritative.sessionId,
+		path: authoritative.path,
+		cwd: authoritative.cwd,
+		projectId: authoritative.projectId,
+		...(authoritative.projectName === undefined ? {} : { projectName: authoritative.projectName }),
+		title: authoritative.title,
+		updatedAt: authoritative.updatedAt,
+		status: authoritative.status,
+		...(authoritative.archivedAt === undefined ? {} : { archivedAt: authoritative.archivedAt }),
+		...(authoritative.model === undefined ? {} : { model: authoritative.model }),
+		...(authoritative.thinking === undefined ? {} : { thinking: authoritative.thinking }),
+		...(authoritative.runtime === undefined ? {} : { runtime: authoritative.runtime }),
+		...(authoritative.authorityProtocol === undefined ? {} : { authorityProtocol: authoritative.authorityProtocol }),
 		entriesLoaded: false,
 		entries: [],
 	};
@@ -205,10 +239,17 @@ async function listSessionPage(
 	if (snapshots.size >= MAX_SESSION_LIST_SNAPSHOTS)
 		throw Object.assign(new Error("too many session inventory snapshots"), { code: "BOUNDS" });
 	const sessions = await runtime.sessionAuthority.list();
+	const bounded = sessions.slice(0, MAX_ARRAY_ITEMS);
+	const references: AuthoritySessionRecord[] = [];
+	for (let offset = 0; offset < bounded.length; offset += SESSION_HEADER_READ_CONCURRENCY) {
+		references.push(
+			...(await Promise.all(bounded.slice(offset, offset + SESSION_HEADER_READ_CONCURRENCY).map(sessionReference))),
+		);
+	}
 	return sessionListPage(
 		id,
 		{
-			references: sessions.slice(0, MAX_ARRAY_ITEMS).map(sessionReference),
+			references,
 			offset: 0,
 			expiresAt: now + SESSION_LIST_SNAPSHOT_TTL_MS,
 			complete: sessions.length <= MAX_ARRAY_ITEMS,
@@ -401,7 +442,7 @@ async function dispatch(
 		case "discovery.load":
 			exact(params, ["session"], "discovery.load params");
 			if (!runtime.discovery.load) throw Object.assign(new Error("unsupported"), { code: "UNSUPPORTED" });
-			return runtime.discovery.load(session(params.session));
+			return withTranscriptAuthority(await runtime.discovery.load(session(params.session)));
 		case "discovery.page":
 			exact(params, ["session", "args"], "discovery.page params");
 			if (!runtime.discovery.page) throw Object.assign(new Error("unsupported"), { code: "UNSUPPORTED" });
