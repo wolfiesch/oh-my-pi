@@ -218,6 +218,77 @@ describe("DesktopConfigAuthority", () => {
 		}
 	});
 
+	test("preserves an external edit made while a project write is pending", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-external-"));
+		const projectDir = path.join(root, "project");
+		const agentDir = path.join(root, "agent");
+		const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+		fs.mkdirSync(projectDir, { recursive: true });
+		fs.mkdirSync(agentDir, { recursive: true });
+		await Bun.write(projectConfigPath, YAML.stringify({ untouched: { nested: "keep" } }, null, 2));
+		try {
+			const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+			// Queue our edit, then let another process append to the same file
+			// before the debounced saver runs. The saver re-reads under the lock and
+			// patches only its own paths, so the foreign key must survive.
+			settings.setProject("compaction.enabled", true);
+			await Bun.write(
+				projectConfigPath,
+				YAML.stringify({ untouched: { nested: "keep" }, addedByAnotherProcess: true }, null, 2),
+			);
+			await settings.flush();
+
+			expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual({
+				untouched: { nested: "keep" },
+				addedByAnotherProcess: true,
+				compaction: { enabled: true },
+			});
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a cwd switch drains pending project writes to the old root, never the new one", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-cwd-"));
+		const projectA = path.join(root, "a");
+		const projectB = path.join(root, "b");
+		const agentDir = path.join(root, "agent");
+		const configA = path.join(projectA, ".omp", "config.yml");
+		const configB = path.join(projectB, ".omp", "config.yml");
+		for (const dir of [projectA, projectB, agentDir]) fs.mkdirSync(dir, { recursive: true });
+		await Bun.write(configA, YAML.stringify({ marker: "a" }, null, 2));
+		await Bun.write(configB, YAML.stringify({ marker: "b" }, null, 2));
+		try {
+			const settings = await Settings.loadIsolated({ cwd: projectA, agentDir });
+			// Queue against A and switch without flushing ourselves. Two mechanisms
+			// must combine to keep A's edit out of B: `reloadForCwd` drains pending
+			// writes before moving, and the save queue is keyed by the root bound
+			// when the edit was accepted. Dropping either one sends A's change to B.
+			settings.setProject("compaction.enabled", true);
+			await settings.reloadForCwd(projectB);
+
+			expect(YAML.parse(await Bun.file(configA).text())).toEqual({
+				marker: "a",
+				compaction: { enabled: true },
+			});
+			expect(YAML.parse(await Bun.file(configB).text())).toEqual({ marker: "b" });
+
+			// And the switch really did land: a later edit belongs to B alone.
+			settings.setProject("compaction.enabled", false);
+			await settings.flush();
+			expect(YAML.parse(await Bun.file(configB).text())).toEqual({
+				marker: "b",
+				compaction: { enabled: false },
+			});
+			expect(YAML.parse(await Bun.file(configA).text())).toEqual({
+				marker: "a",
+				compaction: { enabled: true },
+			});
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("persists rollback when a later project edit fails", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-rollback-"));
 		const projectDir = path.join(root, "project");
