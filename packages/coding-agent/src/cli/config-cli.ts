@@ -53,6 +53,10 @@ const ALL_SETTING_PATHS = Object.keys(SETTINGS_SCHEMA) as SettingPath[];
 /** Printed instead of a credential value in human output only. */
 const REDACTED = "********";
 
+function hasConfiguredCredential(path: SettingPath, value: unknown): boolean {
+	return isCredential(path) && value !== undefined && value !== "";
+}
+
 /** Find setting definition by path */
 function findSettingDef(path: string): CliSettingDef | undefined {
 	if (!(path in SETTINGS_SCHEMA)) return undefined;
@@ -291,10 +295,9 @@ async function handleList(flags: { json?: boolean }): Promise<void> {
 		const result: Record<string, { value?: unknown; redacted?: true; type: string; description: string }> = {};
 		for (const def of defs) {
 			const value = settings.get(def.path);
-			result[def.path] =
-				isCredential(def.path) && value !== undefined
-					? { redacted: true, type: def.type, description: def.description }
-					: { value, type: def.type, description: def.description };
+			result[def.path] = hasConfiguredCredential(def.path, value)
+				? { redacted: true, type: def.type, description: def.description }
+				: { value, type: def.type, description: def.description };
 		}
 		await writeStdout(`${JSON.stringify(result, null, 2)}\n`);
 		return;
@@ -324,7 +327,7 @@ async function handleList(flags: { json?: boolean }): Promise<void> {
 			// single-value request and is left alone. An unset credential keeps its
 			// ordinary empty rendering: masking it would imply one is configured.
 			const value = settings.get(def.path);
-			const valueStr = isCredential(def.path) && value !== undefined ? REDACTED : formatValue(value);
+			const valueStr = hasConfiguredCredential(def.path, value) ? REDACTED : formatValue(value);
 			const typeStr = getTypeDisplay(def);
 			console.log(`  ${chalk.white(def.path)} = ${valueStr} ${chalk.dim(typeStr)}`);
 		}

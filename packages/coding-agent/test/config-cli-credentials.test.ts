@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { runConfigCommand } from "@oh-my-pi/pi-coding-agent/cli/config-cli";
-import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { isCredential, SETTINGS_SCHEMA, type SettingPath } from "../src/config/settings-schema";
@@ -75,7 +75,7 @@ describe("credential masking reaches every surface", () => {
  * so these drive the real command and read its real output.
  */
 describe("config list output", () => {
-	const SECRET = "sk-live-do-not-print-me";
+	const SECRET = "credential-value-not-for-output";
 	let agentDir: TempDir | undefined;
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
@@ -112,14 +112,15 @@ describe("config list output", () => {
 
 	async function jsonList(): Promise<{ raw: string; parsed: Record<string, Record<string, unknown>> }> {
 		let raw = "";
-		const write = vi
-			.spyOn(process.stdout, "write")
-			.mockImplementation(((chunk: string | Uint8Array, ...rest: unknown[]) => {
-				raw += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
-				const done = rest.find(argument => typeof argument === "function");
-				if (typeof done === "function") (done as (error?: Error | null) => void)(null);
-				return true;
-			}) as typeof process.stdout.write);
+		const write = vi.spyOn(process.stdout, "write").mockImplementation(((
+			chunk: string | Uint8Array,
+			...rest: unknown[]
+		) => {
+			raw += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+			const done = rest.find(argument => typeof argument === "function");
+			if (typeof done === "function") (done as (error?: Error | null) => void)(null);
+			return true;
+		}) as typeof process.stdout.write);
 		await runConfigCommand({ action: "list", flags: { json: true } });
 		write.mockRestore();
 		return { raw, parsed: JSON.parse(raw) as Record<string, Record<string, unknown>> };
@@ -149,6 +150,30 @@ describe("config list output", () => {
 		expect(output).not.toContain("searxng.token = ********");
 		const { parsed } = await jsonList();
 		expect(parsed["searxng.token"]).not.toHaveProperty("redacted");
+	});
+
+	it("treats a cleared credential as unset in human and JSON output", async () => {
+		await runConfigCommand({ action: "set", key: "searxng.token", value: "", flags: { json: true } });
+
+		const output = await humanList();
+		expect(output).not.toContain("searxng.token = ********");
+		const { parsed } = await jsonList();
+		expect(parsed["searxng.token"]).not.toHaveProperty("redacted");
+		expect(parsed["searxng.token"]).toMatchObject({ value: "" });
+	});
+
+	it("fails closed for malformed non-string credential values", async () => {
+		const malformedValue = "malformed-credential-value";
+		await runConfigCommand({ action: "get", key: "searxng.token", flags: { json: true } });
+		settings.set("searxng.token", { nested: malformedValue } as never);
+
+		const output = await humanList();
+		expect(output).toContain("searxng.token = ********");
+		expect(output).not.toContain(malformedValue);
+		const { raw, parsed } = await jsonList();
+		expect(raw).not.toContain(malformedValue);
+		expect(parsed["searxng.token"]).toMatchObject({ redacted: true });
+		expect(parsed["searxng.token"]).not.toHaveProperty("value");
 	});
 
 	it("leaves the Hindsight server URL readable", async () => {
