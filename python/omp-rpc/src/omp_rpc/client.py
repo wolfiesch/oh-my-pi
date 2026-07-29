@@ -1358,7 +1358,9 @@ class RpcClient:
 
                 event_payloads = self._events.snapshot_from(start_index)
                 if any(
-                    payload.get("type") == "agent_end" for payload in event_payloads
+                    payload.get("type") == "agent_end"
+                    and payload.get("isTerminal") is not False
+                    for payload in event_payloads
                 ):
                     events = tuple(
                         cast(RpcAgentEvent, parse_notification(payload))
@@ -1903,8 +1905,16 @@ class RpcClient:
                 payload_type = payload.get("type")
                 if payload_type in ("tool_execution_update", "tool_execution_end"):
                     self._normalize_host_tool_event(payload)
-                notification = parse_notification(payload)
-                listener_notification = parse_notification(payload)
+                try:
+                    notification = parse_notification(payload)
+                    listener_notification = parse_notification(payload)
+                except (TypeError, ValueError) as exc:
+                    notification = UnknownNotification(
+                        _clone_json_object(payload), parse_error=str(exc)
+                    )
+                    listener_notification = UnknownNotification(
+                        _clone_json_object(payload), parse_error=str(exc)
+                    )
                 self._dispatch_listeners(
                     "notification",
                     listener_notification.type,
@@ -1954,7 +1964,10 @@ class RpcClient:
 
                 listener_event = cast(RpcAgentEvent, listener_notification)
                 self._append_event(payload)
-                if listener_event.type == "agent_end":
+                if (
+                    isinstance(listener_event, AgentEndEvent)
+                    and listener_event.is_terminal is not False
+                ):
                     self._mark_agent_run_completed()
                 self._dispatch_listeners(
                     "event", listener_event.type, self._event_listeners, listener_event

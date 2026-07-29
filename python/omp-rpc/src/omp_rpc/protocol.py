@@ -36,17 +36,30 @@ ExtensionUiMethod: TypeAlias = Literal[
     "setWidget",
     "setTitle",
     "set_editor_text",
+    "open_url",
 ]
 InteractiveExtensionUiMethod: TypeAlias = Literal[
     "select", "confirm", "input", "editor"
 ]
 PassiveExtensionUiMethod: TypeAlias = Literal[
-    "notify", "setStatus", "setWidget", "setTitle", "set_editor_text"
+    "notify",
+    "setStatus",
+    "setWidget",
+    "setTitle",
+    "set_editor_text",
+    "open_url",
 ]
 ValueExtensionUiMethod: TypeAlias = Literal["select", "input", "editor"]
 
 PASSIVE_EXTENSION_UI_METHODS: Final[frozenset[PassiveExtensionUiMethod]] = frozenset(
-    {"notify", "setStatus", "setWidget", "setTitle", "set_editor_text"}
+    {
+        "notify",
+        "setStatus",
+        "setWidget",
+        "setTitle",
+        "set_editor_text",
+        "open_url",
+    }
 )
 INTERACTIVE_EXTENSION_UI_METHODS: Final[frozenset[InteractiveExtensionUiMethod]] = (
     frozenset({"select", "confirm", "input", "editor"})
@@ -85,6 +98,7 @@ _EXTENSION_UI_METHOD_VALUES: Final[frozenset[str]] = frozenset(
         "setWidget",
         "setTitle",
         "set_editor_text",
+        "open_url",
     }
 )
 _AGENT_MESSAGE_ROLE_VALUES: Final[frozenset[str]] = frozenset(
@@ -123,10 +137,10 @@ _ASSISTANT_DONE_REASON_VALUES: Final[frozenset[str]] = frozenset(
 )
 _ASSISTANT_ERROR_REASON_VALUES: Final[frozenset[str]] = frozenset({"aborted", "error"})
 _AUTO_COMPACTION_REASON_VALUES: Final[frozenset[str]] = frozenset(
-    {"threshold", "overflow", "idle"}
+    {"threshold", "overflow", "idle", "incomplete"}
 )
 _AUTO_COMPACTION_ACTION_VALUES: Final[frozenset[str]] = frozenset(
-    {"context-full", "handoff"}
+    {"context-full", "handoff", "shake", "snapcompact"}
 )
 
 
@@ -779,6 +793,13 @@ class TodoPhase:
 
 
 @dataclass(slots=True, frozen=True)
+class ContextUsage:
+    tokens: int
+    context_window: int
+    percent: float
+
+
+@dataclass(slots=True, frozen=True)
 class SessionState:
     model: ModelInfo | None
     thinking_level: ThinkingLevel | None
@@ -799,6 +820,7 @@ class SessionState:
     fast_mode_enabled: bool = False
     fast_mode_active: bool = False
     tokens_per_second: float | None = None
+    context_usage: ContextUsage | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -934,6 +956,9 @@ class ExtensionUiRequest:
     widget_lines: tuple[str, ...] | None = None
     widget_placement: WidgetPlacement | None = None
     text: str | None = None
+    url: str | None = None
+    launch_url: str | None = None
+    instructions: str | None = None
     type: Literal["extension_ui_request"] = "extension_ui_request"
 
     def is_passive(self) -> bool:
@@ -967,6 +992,7 @@ class AgentEndEvent:
     messages: tuple[AgentMessage, ...]
     type: Literal["agent_end"] = "agent_end"
     message_count: int | None = field(default=None, kw_only=True)
+    is_terminal: bool | None = field(default=None, kw_only=True)
 
 
 @dataclass(slots=True, frozen=True)
@@ -1029,14 +1055,14 @@ class ToolExecutionEndEvent:
 
 @dataclass(slots=True, frozen=True)
 class AutoCompactionStartEvent:
-    reason: Literal["threshold", "overflow", "idle"]
-    action: Literal["context-full", "handoff"]
+    reason: Literal["threshold", "overflow", "idle", "incomplete"]
+    action: Literal["context-full", "handoff", "shake", "snapcompact"]
     type: Literal["auto_compaction_start"] = "auto_compaction_start"
 
 
 @dataclass(slots=True, frozen=True)
 class AutoCompactionEndEvent:
-    action: Literal["context-full", "handoff"]
+    action: Literal["context-full", "handoff", "shake", "snapcompact"]
     result: CompactionResult | None
     aborted: bool
     will_retry: bool
@@ -1100,6 +1126,7 @@ class TodoAutoClearEvent:
 class UnknownNotification:
     payload: JsonObject
     type: Literal["unknown"] = "unknown"
+    parse_error: str | None = field(default=None, kw_only=True)
 
 
 RpcAgentEvent: TypeAlias = (
@@ -1393,6 +1420,11 @@ def parse_session_state(payload: JsonObject) -> SessionState:
         fast_mode_enabled=bool(payload.get("fastModeEnabled", False)),
         fast_mode_active=bool(payload.get("fastModeActive", False)),
         tokens_per_second=_optional_float(payload, "tokensPerSecond"),
+        context_usage=parse_context_usage(
+            _optional_json_object(
+                payload.get("contextUsage"), field="sessionState.contextUsage"
+            )
+        ),
     )
 
 
@@ -1557,6 +1589,16 @@ def parse_session_stats(payload: JsonObject) -> SessionStats:
     )
 
 
+def parse_context_usage(payload: JsonObject | None) -> ContextUsage | None:
+    if payload is None:
+        return None
+    return ContextUsage(
+        tokens=int(payload.get("tokens", 0)),
+        context_window=int(payload.get("contextWindow", 0)),
+        percent=float(payload.get("percent", 0.0)),
+    )
+
+
 def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
     return ExtensionUiRequest(
         id=_require_str(payload, "id"),
@@ -1601,6 +1643,9 @@ def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
             ),
         ),
         text=_optional_str(payload, "text"),
+        url=_optional_str(payload, "url"),
+        launch_url=_optional_str(payload, "launchUrl"),
+        instructions=_optional_str(payload, "instructions"),
     )
 
 
@@ -1653,6 +1698,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
                 cast(JsonValue | None, payload.get("messages"))
             ),
             message_count=_optional_int(payload, "messageCount"),
+            is_terminal=_optional_bool(payload, "isTerminal"),
         )
     if event_type == "turn_start":
         return TurnStartEvent()
@@ -1744,7 +1790,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
     if event_type == "auto_compaction_start":
         return AutoCompactionStartEvent(
             reason=cast(
-                Literal["threshold", "overflow", "idle"],
+                Literal["threshold", "overflow", "idle", "incomplete"],
                 _require_literal(
                     payload.get("reason", "threshold"),
                     _AUTO_COMPACTION_REASON_VALUES,
@@ -1752,7 +1798,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
                 ),
             ),
             action=cast(
-                Literal["context-full", "handoff"],
+                Literal["context-full", "handoff", "shake", "snapcompact"],
                 _require_literal(
                     payload.get("action", "context-full"),
                     _AUTO_COMPACTION_ACTION_VALUES,
@@ -1764,7 +1810,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         result_payload = payload.get("result")
         return AutoCompactionEndEvent(
             action=cast(
-                Literal["context-full", "handoff"],
+                Literal["context-full", "handoff", "shake", "snapcompact"],
                 _require_literal(
                     payload.get("action", "context-full"),
                     _AUTO_COMPACTION_ACTION_VALUES,
