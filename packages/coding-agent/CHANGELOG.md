@@ -94,11 +94,11 @@
 
 - Removed the dangling `MCPManager.setOnNotification` single-slot setter, which had no callers in the runtime. Replaced by `MCPManager.addNotificationListener` — multi-listener, per-listener error isolation, returns an unsubscribe function.
 - Added a runtime-validated RPC command registry and capability manifest, including explicit serial, concurrent, and control scheduling metadata in the ready frame and TypeScript/Python client APIs.
+- Added correlated RPC operation IDs with exactly-once completed, failed, or aborted outcomes for prompts and abort-and-prompt requests.
+
 ### Fixed
 
 - Fixed the Python RPC client dropping current context, compaction, OAuth URL, and terminal-settlement fields, and made additive notification variants observable without stopping the stdout reader.
-### Fixed
-
 - Fixed the TypeScript RPC client silently dropping prompt results, extension output and errors, session/config updates, host URI requests, and unknown future frames.
 
 ## [17.1.8] - 2026-07-28

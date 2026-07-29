@@ -7,6 +7,9 @@ from omp_rpc import (
     AutoCompactionEndEvent,
     AutoCompactionStartEvent,
     ExtensionUiRequest,
+    OperationAbortedEvent,
+    OperationCompletedEvent,
+    OperationFailedEvent,
     ReadyEvent,
     SessionState,
     TodoReminderEvent,
@@ -18,6 +21,42 @@ from omp_rpc import (
 
 
 class ProtocolParsingTests(unittest.TestCase):
+    def test_parse_operation_terminal_notifications(self) -> None:
+        completed = parse_notification(
+            {
+                "type": "operation_completed",
+                "operationId": "operation-1",
+                "requestId": "request-1",
+                "command": "prompt",
+                "agentInvoked": True,
+            }
+        )
+        failed = parse_notification(
+            {
+                "type": "operation_failed",
+                "operationId": "operation-2",
+                "command": "prompt",
+                "error": "no model",
+                "code": "prompt_scheduling_failed",
+            }
+        )
+        aborted = parse_notification(
+            {
+                "type": "operation_aborted",
+                "operationId": "operation-3",
+                "command": "abort_and_prompt",
+                "reason": "user",
+            }
+        )
+
+        self.assertIsInstance(completed, OperationCompletedEvent)
+        self.assertTrue(completed.agent_invoked)
+        self.assertEqual(completed.request_id, "request-1")
+        self.assertIsInstance(failed, OperationFailedEvent)
+        self.assertEqual(failed.code, "prompt_scheduling_failed")
+        self.assertIsInstance(aborted, OperationAbortedEvent)
+        self.assertEqual(aborted.reason, "user")
+
     def test_parse_ready_capability_manifest(self) -> None:
         notification = parse_notification(
             {

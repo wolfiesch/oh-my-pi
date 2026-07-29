@@ -103,6 +103,7 @@ if (Bun.env.MOCK_RPC_CLIENT_FRAMES === "1") {
 
 const captureFile = Bun.env.MOCK_RPC_CAPTURE_FILE;
 let captureText = "";
+let operationSequence = 0;
 
 // Bun's `console` is an AsyncIterable over stdin lines.
 for await (const raw of console) {
@@ -237,6 +238,47 @@ for await (const raw of console) {
 					success: true,
 					data: { schemes },
 				});
+				continue;
+			}
+			if (Bun.env.MOCK_RPC_OPERATIONS === "1" && frame.type === "prompt") {
+				const operationId = `operation-${++operationSequence}`;
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: { operationId },
+				});
+				await Bun.sleep(5);
+				if (frame.message === "local") {
+					writeFrame({
+						type: "operation_completed",
+						operationId,
+						requestId: id,
+						command: "prompt",
+						agentInvoked: false,
+					});
+				} else if (frame.message === "fail") {
+					writeFrame({
+						type: "operation_failed",
+						operationId,
+						requestId: id,
+						command: "prompt",
+						error: "fixture scheduling failure",
+						code: "prompt_scheduling_failed",
+					});
+				} else {
+					writeFrame({ type: "agent_start" });
+					writeFrame({ type: "agent_end", messages: [], isTerminal: false });
+					writeFrame({ type: "agent_end", messages: [], isTerminal: true });
+					writeFrame({
+						type: "operation_completed",
+						operationId,
+						requestId: id,
+						command: "prompt",
+						agentInvoked: true,
+					});
+				}
 				continue;
 			}
 			writeFrame({

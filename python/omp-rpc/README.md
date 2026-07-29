@@ -219,8 +219,9 @@ allows:
 
 - id-less `parse` and unknown-command failures are correlated back to the
   waiting request when they can be matched unambiguously
-- late `prompt` / `abort_and_prompt` scheduling failures cause
-  `prompt_and_wait()` and `wait_for_idle()` to raise instead of timing out
+- accepted `prompt` / `abort_and_prompt` calls return an operation ID, and
+  `prompt_and_wait()` settles on the correlated completed, failed, or aborted
+  operation instead of guessing from `agent_end`
 - unmatched background error responses are exposed through
   `client.protocol_errors` and `client.on_protocol_error(...)`
 - listener exceptions no longer kill the stdout reader thread; they are exposed

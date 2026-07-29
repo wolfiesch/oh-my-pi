@@ -139,7 +139,38 @@ export interface RpcAvailableCommandsUpdateFrame {
 export interface RpcPromptResultFrame {
 	type: "prompt_result";
 	id?: string;
+	operationId?: string;
 	agentInvoked: boolean;
+}
+
+export type RpcOperationCommand = "prompt" | "abort_and_prompt";
+
+interface RpcOperationFrameBase {
+	operationId: string;
+	requestId?: string;
+	command: RpcOperationCommand;
+}
+
+export type RpcOperationTerminalFrame =
+	| (RpcOperationFrameBase & {
+			type: "operation_completed";
+			agentInvoked: boolean;
+	  })
+	| (RpcOperationFrameBase & {
+			type: "operation_failed";
+			error: string;
+			code?: string;
+	  })
+	| (RpcOperationFrameBase & {
+			type: "operation_aborted";
+			reason: string;
+	  });
+
+export interface RpcOperationAccepted {
+	/** Absent on older servers that acknowledge prompts without operation tracking. */
+	operationId?: string;
+	/** Present when the server knows at acknowledgement time that no agent turn will run. */
+	agentInvoked?: boolean;
 }
 
 export type RpcCommandSchedulingClass = "serial" | "concurrent" | "control";
@@ -254,11 +285,11 @@ export type RpcResponse =
 	  }
 
 	// Prompting (async - events follow)
-	| { id?: string; type: "response"; command: "prompt"; success: true; data?: { agentInvoked: boolean } }
+	| { id?: string; type: "response"; command: "prompt"; success: true; data?: RpcOperationAccepted }
 	| { id?: string; type: "response"; command: "steer"; success: true }
 	| { id?: string; type: "response"; command: "follow_up"; success: true }
 	| { id?: string; type: "response"; command: "abort"; success: true }
-	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
+	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true; data?: RpcOperationAccepted }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
 
 	// State

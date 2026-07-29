@@ -44,10 +44,14 @@ from .protocol import (
     ModelInfo,
     ReadyEvent,
     RpcCapabilityManifest,
+    OperationAbortedEvent,
+    OperationCompletedEvent,
+    OperationFailedEvent,
     RetryFallbackAppliedEvent,
     RetryFallbackSucceededEvent,
     RpcAgentEvent,
     RpcNotification,
+    RpcOperationEvent,
     SessionState,
     SessionStats,
     SteeringMode,
@@ -90,6 +94,7 @@ UiRequestListener = Callable[[ExtensionUiRequest], None]
 ExtensionErrorListener = Callable[[ExtensionError], None]
 ReadyListener = Callable[[ReadyEvent], None]
 UnknownNotificationListener = Callable[[UnknownNotification], None]
+OperationTerminalListener = Callable[[RpcOperationEvent], None]
 AgentStartListener = Callable[[AgentStartEvent], None]
 AgentEndListener = Callable[[AgentEndEvent], None]
 TurnStartListener = Callable[[TurnStartEvent], None]
@@ -522,6 +527,8 @@ class RpcClient:
         self._scheduled_agent_runs = 0
         self._completed_agent_runs = 0
         self._last_schedule_async_error_index = 0
+        self._operation_results: dict[str, RpcOperationEvent] = {}
+        self._active_operation_ids: set[str] = set()
         self._ui_requests: queue.Queue[ExtensionUiRequest] = queue.Queue()
         self._stderr_chunks = _BoundedHistory[str](self._max_stderr_chunks)
         self._closed_error: BaseException | None = None
@@ -544,6 +551,7 @@ class RpcClient:
         self._typed_event_listeners: dict[str, list[AgentEventListener]] = {}
         self._ready_listeners: list[ReadyListener] = []
         self._unknown_notification_listeners: list[UnknownNotificationListener] = []
+        self._operation_terminal_listeners: list[OperationTerminalListener] = []
         self._ui_request_listeners: list[UiRequestListener] = []
         self._extension_error_listeners: list[ExtensionErrorListener] = []
         self._protocol_error_listeners: list[ProtocolErrorListener] = []
@@ -588,6 +596,8 @@ class RpcClient:
         self._frame_decoder = _RpcFrameDecoder()
         self._events.clear()
         self._async_errors.clear()
+        self._operation_results.clear()
+        self._active_operation_ids.clear()
         self._scheduled_agent_runs = 0
         self._completed_agent_runs = 0
         self._last_schedule_async_error_index = 0
@@ -831,6 +841,14 @@ class RpcClient:
         self._unknown_notification_listeners.append(listener)
         return lambda: self._remove_listener(
             self._unknown_notification_listeners, listener
+        )
+
+    def on_operation_terminal(
+        self, listener: OperationTerminalListener
+    ) -> Callable[[], None]:
+        self._operation_terminal_listeners.append(listener)
+        return lambda: self._remove_listener(
+            self._operation_terminal_listeners, listener
         )
 
     def install_headless_ui(
@@ -1145,14 +1163,19 @@ class RpcClient:
         *,
         images: Sequence[ImageContent] | None = None,
         streaming_behavior: StreamingBehavior | None = None,
-    ) -> None:
-        self._request(
+    ) -> str | None:
+        response = self._request(
             "prompt",
             message=message,
             images=list(images) if images is not None else None,
             streamingBehavior=streaming_behavior,
         )
+        operation_id = response.get("operationId")
+        if isinstance(operation_id, str):
+            self._register_operation(operation_id)
+            return operation_id
         self._mark_agent_run_scheduled()
+        return None
 
     def steer(
         self, message: str, *, images: Sequence[ImageContent] | None = None
@@ -1177,13 +1200,18 @@ class RpcClient:
 
     def abort_and_prompt(
         self, message: str, *, images: Sequence[ImageContent] | None = None
-    ) -> None:
-        self._request(
+    ) -> str | None:
+        response = self._request(
             "abort_and_prompt",
             message=message,
             images=list(images) if images is not None else None,
         )
+        operation_id = response.get("operationId")
+        if isinstance(operation_id, str):
+            self._register_operation(operation_id)
+            return operation_id
         self._mark_agent_run_scheduled()
+        return None
 
     def prompt_and_wait(
         self,
@@ -1198,9 +1226,15 @@ class RpcClient:
         try:
             start_index = self._current_event_index()
             start_async_error_index = self._current_async_error_index()
-            self.prompt(message, images=images, streaming_behavior=streaming_behavior)
-            events = self._wait_for_agent_end(
-                start_index, start_async_error_index, timeout=timeout
+            operation_id = self.prompt(
+                message, images=images, streaming_behavior=streaming_behavior
+            )
+            events = (
+                self._wait_for_operation(operation_id, start_index, timeout=timeout)
+                if operation_id is not None
+                else self._wait_for_agent_end(
+                    start_index, start_async_error_index, timeout=timeout
+                )
             )
             return self._build_prompt_turn(events)
         finally:
@@ -1213,11 +1247,7 @@ class RpcClient:
             if self._is_agent_idle():
                 self._check_async_errors()
                 return
-            start_index = self._current_event_index()
-            start_async_error_index = self._current_async_error_index()
-            self._wait_for_agent_end(
-                start_index, start_async_error_index, timeout=timeout
-            )
+            self._wait_until_idle(timeout=timeout)
         finally:
             self._prompt_lifecycle.release(operation)
 
@@ -1254,9 +1284,25 @@ class RpcClient:
             self._completed_agent_runs += 1
             self._event_condition.notify_all()
 
+    def _register_operation(self, operation_id: str) -> None:
+        with self._event_condition:
+            if operation_id in self._operation_results:
+                return
+            if (
+                not self._active_operation_ids
+                and self._scheduled_agent_runs == self._completed_agent_runs
+            ):
+                self._last_schedule_async_error_index = (
+                    self._async_errors.current_index()
+                )
+            self._active_operation_ids.add(operation_id)
+
     def _is_agent_idle(self) -> bool:
         with self._event_condition:
-            return self._scheduled_agent_runs == self._completed_agent_runs
+            return (
+                self._scheduled_agent_runs == self._completed_agent_runs
+                and not self._active_operation_ids
+            )
 
     def _check_async_errors(self) -> None:
         with self._event_condition:
@@ -1374,6 +1420,63 @@ class RpcClient:
                         f"Timed out waiting for agent_end. Stderr: {self.stderr}"
                     )
                 self._event_condition.wait(remaining)
+
+    def _wait_for_operation(
+        self,
+        operation_id: str,
+        start_index: int,
+        timeout: float | None = None,
+    ) -> tuple[RpcAgentEvent, ...]:
+        deadline = time.monotonic() + (timeout if timeout is not None else 60.0)
+        with self._event_condition:
+            while True:
+                if self._closed_error is not None:
+                    raise RpcProcessExitError(str(self._closed_error))
+                if start_index < self._events.offset:
+                    raise RpcError(
+                        "Event history limit was exceeded while waiting for an RPC operation. "
+                        "Increase max_event_history to retain more streamed events."
+                    )
+
+                terminal = self._operation_results.pop(operation_id, None)
+                if terminal is not None:
+                    if isinstance(terminal, OperationFailedEvent):
+                        raise RpcCommandError(
+                            terminal.command, terminal.error, terminal.code
+                        )
+                    if isinstance(terminal, OperationAbortedEvent):
+                        raise RpcCommandError(
+                            terminal.command, terminal.reason, "operation_aborted"
+                        )
+                    return tuple(
+                        cast(RpcAgentEvent, parse_notification(payload))
+                        for payload in self._events.snapshot_from(start_index)
+                    )
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RpcTimeoutError(
+                        f"Timed out waiting for operation {operation_id}. Stderr: {self.stderr}"
+                    )
+                self._event_condition.wait(remaining)
+
+    def _wait_until_idle(self, timeout: float | None = None) -> None:
+        deadline = time.monotonic() + (timeout if timeout is not None else 60.0)
+        with self._event_condition:
+            while (
+                self._scheduled_agent_runs != self._completed_agent_runs
+                or self._active_operation_ids
+            ):
+                if self._closed_error is not None:
+                    raise RpcProcessExitError(str(self._closed_error))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RpcTimeoutError(
+                        f"Timed out waiting for RPC client to become idle. "
+                        f"Stderr: {self.stderr}"
+                    )
+                self._event_condition.wait(remaining)
+        self._check_async_errors()
 
     def _request(self, command_type: str, **payload: JsonValue) -> JsonObject:
         process = self._require_process()
@@ -1959,6 +2062,32 @@ class RpcClient:
                         listener_notification.type,
                         self._unknown_notification_listeners,
                         cast(UnknownNotification, listener_notification),
+                    )
+                    continue
+
+                if isinstance(
+                    notification,
+                    (
+                        OperationCompletedEvent,
+                        OperationFailedEvent,
+                        OperationAbortedEvent,
+                    ),
+                ):
+                    with self._event_condition:
+                        self._active_operation_ids.discard(notification.operation_id)
+                        if len(self._operation_results) >= 128:
+                            self._operation_results.pop(
+                                next(iter(self._operation_results))
+                            )
+                        self._operation_results[notification.operation_id] = (
+                            notification
+                        )
+                        self._event_condition.notify_all()
+                    self._dispatch_listeners(
+                        "operation_terminal",
+                        listener_notification.type,
+                        self._operation_terminal_listeners,
+                        cast(RpcOperationEvent, listener_notification),
                     )
                     continue
 

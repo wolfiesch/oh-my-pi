@@ -198,6 +198,9 @@ export const RPC_COMMAND_DEFINITIONS = {
 
 const RPC_EVENT_CAPABILITIES = [
 	"ready",
+	"operation_completed",
+	"operation_failed",
+	"operation_aborted",
 	"prompt_result",
 	"available_commands_update",
 	"command_output",

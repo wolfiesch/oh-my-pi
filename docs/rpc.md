@@ -92,9 +92,10 @@ Legacy clients may ignore the added ready fields and remain on v1. V1 retains it
 6. Host URI requests/cancellations (`host_uri_request`, `host_uri_cancel`)
 7. Extension errors (`{ type: "extension_error", extensionPath, event, error }`)
 8. Available-commands updates (`{ type: "available_commands_update", commands }`), emitted at startup and whenever command metadata changes
-9. Prompt lifecycle hints (`{ type: "prompt_result", id?, agentInvoked }`) for scheduled prompts that later resolve without invoking the agent
-10. Subagent frames (`subagent_lifecycle`, `subagent_progress`, `subagent_event`), gated by `set_subagent_subscription`
-11. Builtin slash-command side channels (`command_output`, `session_info_update`, `config_update`)
+9. Exactly-once operation outcomes (`operation_completed`, `operation_failed`, `operation_aborted`)
+10. Legacy prompt lifecycle hints (`{ type: "prompt_result", id?, operationId?, agentInvoked }`) for local-only prompts
+11. Subagent frames (`subagent_lifecycle`, `subagent_progress`, `subagent_event`), gated by `set_subagent_subscription`
+12. Builtin slash-command side channels (`command_output`, `session_info_update`, `config_update`)
 
 ### Inbound frame categories (stdin)
 
@@ -118,9 +119,14 @@ Important edge behavior from runtime:
 - Each command has an advertised scheduling class. `serial` commands preserve
   input order, `concurrent` commands run independently, and `control` commands
   can overtake blocked serial work so abort and steering remain responsive.
-- `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails.
-- `prompt` success responses may include `data.agentInvoked`. `false` means the prompt completed locally without an agent turn; `true` means the prompt produced agent lifecycle events; omitted means the host must rely on session events for completion.
-- `abort_and_prompt` does not currently emit `data.agentInvoked` or `prompt_result`; hosts should treat it as the legacy abort-then-schedule path and rely on session events or same-id scheduling errors.
+- Accepted `prompt` and `abort_and_prompt` responses carry
+  `data.operationId`. The request `id` acknowledges transport acceptance; the
+  operation ID correlates the eventual semantic result.
+- Every accepted operation emits exactly one `operation_completed`,
+  `operation_failed`, or `operation_aborted` frame. A scheduling failure is
+  never emitted as a second response with the already-consumed request ID.
+- `agent_end` remains a streaming session event. It is not the operation
+  completion primitive, and `agent_end.isTerminal: false` never settles a wait.
 
 ## Command Schema (canonical)
 
@@ -237,19 +243,36 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
   "type": "response",
   "command": "prompt",
   "success": true,
-  "data": { "agentInvoked": false }
+  "data": {
+    "operationId": "op_123",
+    "agentInvoked": false
+  }
 }
 ```
 
-`data.agentInvoked: false` is a completion signal for local-only prompts, including slash commands that produce output without starting an agent turn. `data.agentInvoked: true` means the prompt produced agent lifecycle events; those events can be emitted before or after the prompt response depending on the command path. Older runtimes may omit `data`; hosts should then rely on `agent_end`, custom message completion, or `prompt_result`.
-
-`prompt_result` is emitted when a prompt was accepted immediately but later resolves as local-only:
+The acknowledgement is followed by exactly one correlated terminal frame:
 
 ```json
-{ "type": "prompt_result", "id": "req_1", "agentInvoked": false }
+{
+  "type": "operation_completed",
+  "operationId": "op_123",
+  "requestId": "req_1",
+  "command": "prompt",
+  "agentInvoked": false
+}
 ```
 
-Local-only slash commands may emit `command_output` frames before completing via `data.agentInvoked: false` or a later `prompt_result`. They do not emit `agent_end`.
+Failures and cancellation use the same correlation key:
+
+```json
+{ "type": "operation_failed", "operationId": "op_123", "requestId": "req_1", "command": "prompt", "error": "No model configured", "code": "prompt_scheduling_failed" }
+{ "type": "operation_aborted", "operationId": "op_123", "requestId": "req_1", "command": "prompt", "reason": "user" }
+```
+
+Local-only slash commands may emit `command_output` and the legacy
+`prompt_result` hint before their operation completes; they do not need to emit
+`agent_end`. Older servers may omit `operationId`, in which case current clients
+fall back to the legacy terminal `agent_end`/`prompt_result` behavior.
 
 ### `get_state` payload
 
@@ -514,19 +537,22 @@ Extension runner errors are emitted separately as:
 
 This is the most important operational behavior.
 
-### Immediate ack vs completion
+### Acceptance vs completion
 
-`prompt` and `abort_and_prompt` are **acknowledged immediately**:
+Once `prompt` or `abort_and_prompt` accepts asynchronous work, its single
+response carries an operation ID:
 
 ```json
-{ "id": "req_1", "type": "response", "command": "prompt", "success": true }
+{ "id": "req_1", "type": "response", "command": "prompt", "success": true, "data": { "operationId": "op_123" } }
 ```
 
 That means:
 
 - command acceptance != run completion
-- agent turns complete via `agent_end`
-- local-only prompts complete via `data.agentInvoked: false` on the response or via a later `prompt_result`
+- all accepted prompt-like operations settle through one correlated
+  `operation_completed`, `operation_failed`, or `operation_aborted`
+- `agent_end` continues to describe the session stream but does not settle an
+  operation by itself
 
 ### While streaming
 

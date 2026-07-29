@@ -22,7 +22,6 @@ from omp_rpc import (
 )
 from omp_rpc.client import _RpcFrameDecoder
 
-
 FAKE_SERVER = textwrap.dedent(
     """
     import json
@@ -879,6 +878,74 @@ FORWARD_COMPAT_SERVER = textwrap.dedent(
     """
 )
 
+OPERATION_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    print(json.dumps({"type": "ready"}), flush=True)
+    sequence = 0
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        if command["type"] != "prompt":
+            continue
+        sequence += 1
+        operation_id = f"operation-{sequence}"
+        request_id = command.get("id")
+        print(
+            json.dumps(
+                {
+                    "id": request_id,
+                    "type": "response",
+                    "command": "prompt",
+                    "success": True,
+                    "data": {"operationId": operation_id},
+                }
+            ),
+            flush=True,
+        )
+        if command["message"] == "local":
+            terminal = {
+                "type": "operation_completed",
+                "operationId": operation_id,
+                "requestId": request_id,
+                "command": "prompt",
+                "agentInvoked": False,
+            }
+        elif command["message"] == "fail":
+            terminal = {
+                "type": "operation_failed",
+                "operationId": operation_id,
+                "requestId": request_id,
+                "command": "prompt",
+                "error": "fixture scheduling failure",
+                "code": "prompt_scheduling_failed",
+            }
+        else:
+            print(json.dumps({"type": "agent_start"}), flush=True)
+            print(
+                json.dumps(
+                    {"type": "agent_end", "messages": [], "isTerminal": False}
+                ),
+                flush=True,
+            )
+            print(
+                json.dumps(
+                    {"type": "agent_end", "messages": [], "isTerminal": True}
+                ),
+                flush=True,
+            )
+            terminal = {
+                "type": "operation_completed",
+                "operationId": operation_id,
+                "requestId": request_id,
+                "command": "prompt",
+                "agentInvoked": True,
+            }
+        print(json.dumps(terminal), flush=True)
+    """
+)
+
 
 class RpcClientTests(unittest.TestCase):
     def make_client(self, server: str = FAKE_SERVER, **kwargs: object) -> RpcClient:
@@ -987,6 +1054,40 @@ class RpcClientTests(unittest.TestCase):
 
             self.assertFalse(result.enabled)
             self.assertTrue(result.active)
+
+    def test_prompt_operations_settle_without_guessing_from_agent_end(self) -> None:
+        terminal_types: list[str] = []
+        with self.make_client(OPERATION_SERVER) as client:
+            client.on_operation_terminal(
+                lambda event: terminal_types.append(event.type)
+            )
+
+            local = client.prompt_and_wait("local", timeout=2.0)
+            normal = client.prompt_and_wait("normal", timeout=2.0)
+
+        self.assertEqual(local.events, ())
+        self.assertEqual(
+            [event.type for event in normal.events],
+            ["agent_start", "agent_end", "agent_end"],
+        )
+        self.assertEqual(terminal_types, ["operation_completed", "operation_completed"])
+
+    def test_prompt_operation_failure_is_correlated(self) -> None:
+        with (
+            self.make_client(OPERATION_SERVER) as client,
+            self.assertRaisesRegex(
+                RpcCommandError, "prompt: fixture scheduling failure"
+            ) as raised,
+        ):
+            client.prompt_and_wait("fail", timeout=2.0)
+
+        self.assertEqual(raised.exception.code, "prompt_scheduling_failed")
+
+    def test_wait_for_idle_tracks_local_prompt_operation(self) -> None:
+        with self.make_client(OPERATION_SERVER) as client:
+            operation_id = client.prompt("local")
+            self.assertIsNotNone(operation_id)
+            client.wait_for_idle(timeout=2.0)
 
     def test_prompt_and_wait_returns_assistant_text(self) -> None:
         with self.make_client() as client:

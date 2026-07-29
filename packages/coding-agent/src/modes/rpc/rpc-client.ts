@@ -40,6 +40,8 @@ import type {
 	RpcHostUriRequest,
 	RpcHostUriResult,
 	RpcHostUriSchemeDefinition,
+	RpcOperationAccepted,
+	RpcOperationTerminalFrame,
 	RpcPromptResultFrame,
 	RpcResponse,
 	RpcSessionInfoUpdateFrame,
@@ -87,6 +89,7 @@ export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"
 export type RpcAvailableCommandsUpdateListener = (commands: RpcAvailableSlashCommand[]) => void;
 export type RpcRawFrameListener = (frame: Readonly<Record<string, unknown>>) => void;
 export type RpcPromptResultListener = (frame: RpcPromptResultFrame) => void;
+export type RpcOperationTerminalListener = (frame: RpcOperationTerminalFrame) => void;
 export type RpcCommandOutputListener = (frame: RpcCommandOutputFrame) => void;
 export type RpcSessionInfoUpdateListener = (frame: RpcSessionInfoUpdateFrame) => void;
 export type RpcConfigUpdateListener = (frame: RpcConfigUpdateFrame) => void;
@@ -235,6 +238,26 @@ function isRpcPromptResultFrame(value: unknown): value is RpcPromptResultFrame {
 	);
 }
 
+function isRpcOperationTerminalFrame(value: unknown): value is RpcOperationTerminalFrame {
+	if (!isRecord(value)) return false;
+	if (value.type !== "operation_completed" && value.type !== "operation_failed" && value.type !== "operation_aborted")
+		return false;
+	if (typeof value.operationId !== "string" || typeof value.command !== "string") return false;
+	if (value.requestId !== undefined && typeof value.requestId !== "string") return false;
+	if (value.type === "operation_completed") return typeof value.agentInvoked === "boolean";
+	if (value.type === "operation_failed")
+		return typeof value.error === "string" && (value.code === undefined || typeof value.code === "string");
+	return typeof value.reason === "string";
+}
+
+function parseRpcOperationAccepted(value: unknown): RpcOperationAccepted | undefined {
+	if (!isRecord(value)) return undefined;
+	const operationId = typeof value.operationId === "string" ? value.operationId : undefined;
+	const agentInvoked = typeof value.agentInvoked === "boolean" ? value.agentInvoked : undefined;
+	if (operationId === undefined && agentInvoked === undefined) return undefined;
+	return { operationId, agentInvoked };
+}
+
 function isRpcCommandOutputFrame(value: unknown): value is RpcCommandOutputFrame {
 	if (!isRecord(value)) return false;
 	return value.type === "command_output" && typeof value.text === "string";
@@ -349,6 +372,10 @@ export class RpcClient {
 	#availableCommandsUpdateListeners = new Set<RpcAvailableCommandsUpdateListener>();
 	#rawFrameListeners = new Set<RpcRawFrameListener>();
 	#promptResultListeners = new Set<RpcPromptResultListener>();
+	#operationTerminalListeners = new Set<RpcOperationTerminalListener>();
+	#activeOperationIds = new Set<string>();
+	#settledOperationIds = new Set<string>();
+	#operationLifecycleObserved = false;
 	#commandOutputListeners = new Set<RpcCommandOutputListener>();
 	#sessionInfoUpdateListeners = new Set<RpcSessionInfoUpdateListener>();
 	#configUpdateListeners = new Set<RpcConfigUpdateListener>();
@@ -386,6 +413,9 @@ export class RpcClient {
 		// short-circuit the new stdout reader (issue #4079).
 		this.#abortController = new AbortController();
 		this.#protocolVersion = 1;
+		this.#activeOperationIds.clear();
+		this.#settledOperationIds.clear();
+		this.#operationLifecycleObserved = false;
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
@@ -652,6 +682,12 @@ export class RpcClient {
 		return () => this.#promptResultListeners.delete(listener);
 	}
 
+	/** Subscribe to exactly-once terminal outcomes for accepted asynchronous operations. */
+	onOperationTerminal(listener: RpcOperationTerminalListener): () => void {
+		this.#operationTerminalListeners.add(listener);
+		return () => this.#operationTerminalListeners.delete(listener);
+	}
+
 	/** Subscribe to text produced by extension commands. */
 	onCommandOutput(listener: RpcCommandOutputListener): () => void {
 		this.#commandOutputListeners.add(listener);
@@ -730,8 +766,11 @@ export class RpcClient {
 	 * Returns immediately after sending; use onEvent() to receive streaming events.
 	 * Use waitForIdle() to wait for completion.
 	 */
-	async prompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "prompt", message, images });
+	async prompt(message: string, images?: ImageContent[]): Promise<RpcOperationAccepted | undefined> {
+		const response = await this.#send({ type: "prompt", message, images });
+		const accepted = response.success && "data" in response ? parseRpcOperationAccepted(response.data) : undefined;
+		this.#registerAcceptedOperation(accepted);
+		return accepted;
 	}
 
 	/**
@@ -758,8 +797,11 @@ export class RpcClient {
 	/**
 	 * Abort current operation and immediately start a new turn with the given message.
 	 */
-	async abortAndPrompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "abort_and_prompt", message, images });
+	async abortAndPrompt(message: string, images?: ImageContent[]): Promise<RpcOperationAccepted | undefined> {
+		const response = await this.#send({ type: "abort_and_prompt", message, images });
+		const accepted = response.success && "data" in response ? parseRpcOperationAccepted(response.data) : undefined;
+		this.#registerAcceptedOperation(accepted);
+		return accepted;
 	}
 
 	/**
@@ -1164,10 +1206,34 @@ export class RpcClient {
 	// =========================================================================
 
 	/**
-	 * Wait for agent to become idle (no streaming).
-	 * Resolves when agent_end event is received.
+	 * Wait for the client to become idle.
+	 * Uses correlated operation terminals when supported, otherwise agent_end.
 	 */
 	waitForIdle(timeout = 60000): Promise<void> {
+		if (this.#operationLifecycleObserved && this.#activeOperationIds.size === 0) {
+			return Promise.resolve();
+		}
+		if (this.#activeOperationIds.size > 0) {
+			const { promise, resolve, reject } = Promise.withResolvers<void>();
+			let settled = false;
+			const unsubscribe = this.onOperationTerminal(() => {
+				if (this.#activeOperationIds.size > 0) return;
+				settled = true;
+				unsubscribe();
+				clearTimeout(timeoutId);
+				resolve();
+			});
+			const timeoutId = this.#startTimeout(timeout, () => {
+				if (settled) return;
+				settled = true;
+				unsubscribe();
+				reject(
+					new Error(`Timeout waiting for RPC operations to settle. Stderr: ${this.#process?.peekStderr() ?? ""}`),
+				);
+			});
+			return promise;
+		}
+
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		let settled = false;
 		const unsubscribe = this.onEvent(event => {
@@ -1218,9 +1284,50 @@ export class RpcClient {
 	 * Send prompt and wait for completion, returning all events.
 	 */
 	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentEvent[]> {
-		const eventsPromise = this.collectEvents(timeout);
-		await this.prompt(message, images);
-		return eventsPromise;
+		const events: AgentEvent[] = [];
+		const operationFrames = new Map<string, RpcOperationTerminalFrame>();
+		const terminalAgentEnd = Promise.withResolvers<void>();
+		let operationChanged = Promise.withResolvers<void>();
+		const unsubscribeEvent = this.onEvent(event => {
+			events.push(event);
+			if (isTerminalAgentEnd(event)) terminalAgentEnd.resolve();
+		});
+		const unsubscribeOperation = this.onOperationTerminal(frame => {
+			operationFrames.set(frame.operationId, frame);
+			operationChanged.resolve();
+		});
+		const timeoutSignal = Promise.withResolvers<never>();
+		const timeoutId = this.#startTimeout(timeout, () =>
+			timeoutSignal.reject(
+				new Error(`Timeout waiting for prompt operation. Stderr: ${this.#process?.peekStderr() ?? ""}`),
+			),
+		);
+
+		try {
+			const accepted = await this.prompt(message, images);
+			if (!accepted?.operationId) {
+				await Promise.race([terminalAgentEnd.promise, timeoutSignal.promise]);
+				return events;
+			}
+
+			while (!operationFrames.has(accepted.operationId)) {
+				await Promise.race([operationChanged.promise, timeoutSignal.promise]);
+				operationChanged = Promise.withResolvers<void>();
+			}
+			const terminal = operationFrames.get(accepted.operationId);
+			if (!terminal) throw new Error(`Missing terminal result for operation ${accepted.operationId}`);
+			if (terminal.type === "operation_failed") {
+				throw new RpcCommandError(terminal.error, terminal.command, terminal.code);
+			}
+			if (terminal.type === "operation_aborted") {
+				throw new RpcCommandError(terminal.reason, terminal.command, "operation_aborted");
+			}
+			return events;
+		} finally {
+			clearTimeout(timeoutId);
+			unsubscribeEvent();
+			unsubscribeOperation();
+		}
 	}
 
 	// =========================================================================
@@ -1231,6 +1338,23 @@ export class RpcClient {
 		if (!isRecord(data)) return;
 		for (const listener of this.#rawFrameListeners) {
 			listener(structuredClone(data));
+		}
+	}
+
+	#registerAcceptedOperation(accepted: RpcOperationAccepted | undefined): void {
+		const operationId = accepted?.operationId;
+		if (!operationId || this.#settledOperationIds.has(operationId)) return;
+		this.#operationLifecycleObserved = true;
+		this.#activeOperationIds.add(operationId);
+	}
+
+	#rememberSettledOperation(operationId: string): void {
+		this.#operationLifecycleObserved = true;
+		this.#activeOperationIds.delete(operationId);
+		this.#settledOperationIds.add(operationId);
+		if (this.#settledOperationIds.size > 256) {
+			const oldest = this.#settledOperationIds.values().next().value;
+			if (typeof oldest === "string") this.#settledOperationIds.delete(oldest);
 		}
 	}
 
@@ -1305,6 +1429,14 @@ export class RpcClient {
 
 		if (isRpcPromptResultFrame(data)) {
 			for (const listener of this.#promptResultListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcOperationTerminalFrame(data)) {
+			this.#rememberSettledOperation(data.operationId);
+			for (const listener of this.#operationTerminalListeners) {
 				listener(data);
 			}
 			return;

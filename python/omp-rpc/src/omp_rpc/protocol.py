@@ -19,6 +19,7 @@ StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
 RpcCommandSchedulingClass: TypeAlias = Literal["serial", "concurrent", "control"]
+RpcOperationCommand: TypeAlias = Literal["prompt", "abort_and_prompt"]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
 WidgetPlacement: TypeAlias = Literal["aboveEditor", "belowEditor"]
@@ -931,6 +932,39 @@ class ReadyEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class OperationCompletedEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    agent_invoked: bool
+    request_id: str | None = None
+    type: Literal["operation_completed"] = "operation_completed"
+
+
+@dataclass(slots=True, frozen=True)
+class OperationFailedEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    error: str
+    request_id: str | None = None
+    code: str | None = None
+    type: Literal["operation_failed"] = "operation_failed"
+
+
+@dataclass(slots=True, frozen=True)
+class OperationAbortedEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    reason: str
+    request_id: str | None = None
+    type: Literal["operation_aborted"] = "operation_aborted"
+
+
+RpcOperationEvent: TypeAlias = (
+    OperationCompletedEvent | OperationFailedEvent | OperationAbortedEvent
+)
+
+
+@dataclass(slots=True, frozen=True)
 class MessagesPage:
     messages: tuple[AgentMessage, ...]
     total_messages: int
@@ -1153,6 +1187,7 @@ RpcAgentEvent: TypeAlias = (
 
 RpcNotification: TypeAlias = (
     ReadyEvent
+    | RpcOperationEvent
     | ExtensionUiRequest
     | ExtensionError
     | RpcAgentEvent
@@ -1690,6 +1725,45 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         return parse_extension_ui_request(payload)
     if event_type == "extension_error":
         return parse_extension_error(payload)
+    if event_type in {
+        "operation_completed",
+        "operation_failed",
+        "operation_aborted",
+    }:
+        operation_id = _require_str(payload, "operationId")
+        command = cast(
+            RpcOperationCommand,
+            _require_literal(
+                payload.get("command"),
+                frozenset({"prompt", "abort_and_prompt"}),
+                field=f"{event_type}.command",
+            ),
+        )
+        request_id = _optional_str(payload, "requestId")
+        if event_type == "operation_completed":
+            agent_invoked = _optional_bool(payload, "agentInvoked")
+            if agent_invoked is None:
+                raise ValueError("operation_completed.agentInvoked must be a boolean")
+            return OperationCompletedEvent(
+                operation_id=operation_id,
+                request_id=request_id,
+                command=command,
+                agent_invoked=agent_invoked,
+            )
+        if event_type == "operation_failed":
+            return OperationFailedEvent(
+                operation_id=operation_id,
+                request_id=request_id,
+                command=command,
+                error=_require_str(payload, "error"),
+                code=_optional_str(payload, "code"),
+            )
+        return OperationAbortedEvent(
+            operation_id=operation_id,
+            request_id=request_id,
+            command=command,
+            reason=_require_str(payload, "reason"),
+        )
     if event_type == "agent_start":
         return AgentStartEvent()
     if event_type == "agent_end":
