@@ -97,6 +97,9 @@
 ### Fixed
 
 - Fixed the Python RPC client dropping current context, compaction, OAuth URL, and terminal-settlement fields, and made additive notification variants observable without stopping the stdout reader.
+### Fixed
+
+- Fixed the TypeScript RPC client silently dropping prompt results, extension output and errors, session/config updates, host URI requests, and unknown future frames.
 
 ## [17.1.8] - 2026-07-28
 

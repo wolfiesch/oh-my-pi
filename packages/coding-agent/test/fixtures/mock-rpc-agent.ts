@@ -66,12 +66,54 @@ function writeFrame(frame: Record<string, unknown>): void {
 	}
 }
 
+if (Bun.env.MOCK_RPC_CLIENT_FRAMES === "1") {
+	writeFrame({ type: "command_output", text: "extension output" });
+	writeFrame({ type: "session_info_update", title: "RPC test", sessionId: "session-1" });
+	writeFrame({ type: "config_update", thinkingLevel: "high" });
+	writeFrame({
+		type: "extension_error",
+		extensionPath: "/tmp/example-extension.ts",
+		event: "session_start",
+		error: "fixture failure",
+	});
+	writeFrame({
+		type: "extension_ui_request",
+		id: "ui-confirm-1",
+		method: "confirm",
+		title: "Continue?",
+		message: "Proceed with the fixture?",
+	});
+	writeFrame({
+		type: "host_uri_request",
+		id: "host-uri-1",
+		operation: "read",
+		url: "fixture://resource/1",
+	});
+	if (Bun.env.MOCK_RPC_HOST_URI_CANCEL === "1") {
+		setTimeout(() => {
+			writeFrame({
+				type: "host_uri_cancel",
+				id: "host-uri-cancel-1",
+				targetId: "host-uri-1",
+			});
+		}, 25);
+	}
+	writeFrame({ type: "future_server_frame", value: 1 });
+}
+
+const captureFile = Bun.env.MOCK_RPC_CAPTURE_FILE;
+let captureText = "";
+
 // Bun's `console` is an AsyncIterable over stdin lines.
 for await (const raw of console) {
 	if (!raw) continue;
 	try {
 		const frame = JSON.parse(raw) as Record<string, unknown>;
 		if (frame && typeof frame === "object" && typeof frame.type === "string") {
+			if (captureFile) {
+				captureText += `${JSON.stringify(frame)}\n`;
+				await Bun.write(captureFile, captureText);
+			}
 			if (Bun.env.MOCK_RPC_EXIT_ON_COMMAND) {
 				process.stderr.write(Bun.env.MOCK_RPC_EXIT_STDERR ?? "");
 				process.exit(Number(Bun.env.MOCK_RPC_EXIT_ON_COMMAND));
@@ -172,6 +214,31 @@ for await (const raw of console) {
 				continue;
 			}
 
+			if (Bun.env.MOCK_RPC_CLIENT_FRAMES === "1" && frame.type === "set_todos") {
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: { todoPhases: frame.phases },
+				});
+				continue;
+			}
+			if (Bun.env.MOCK_RPC_CLIENT_FRAMES === "1" && frame.type === "set_host_uri_schemes") {
+				const schemes = Array.isArray(frame.schemes)
+					? frame.schemes
+							.map(scheme => (scheme && typeof scheme === "object" ? Reflect.get(scheme, "scheme") : undefined))
+							.filter((scheme): scheme is string => typeof scheme === "string")
+					: [];
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: { schemes },
+				});
+				continue;
+			}
 			writeFrame({
 				id,
 				type: "response",
@@ -179,6 +246,12 @@ for await (const raw of console) {
 				success: true,
 				data: supportsProtocolV2 ? { payload: "😀".repeat(400_000) } : {},
 			});
+			if (Bun.env.MOCK_RPC_CLIENT_FRAMES === "1" && frame.type === "prompt") {
+				writeFrame({ type: "prompt_result", id, agentInvoked: true });
+				writeFrame({ type: "agent_end", messages: [], isTerminal: false });
+				await Bun.sleep(75);
+				writeFrame({ type: "agent_end", messages: [], isTerminal: true });
+			}
 		}
 	} catch {
 		// ignore parse errors — the test harness sends well-formed frames.
