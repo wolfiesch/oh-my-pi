@@ -12,6 +12,7 @@ import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type { TodoPhase } from "../../tools/todo";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
 import {
 	RPC_MESSAGES_PAGE_BUSY_ERROR,
@@ -24,6 +25,9 @@ import type {
 	RpcAvailableSlashCommand,
 	RpcCapabilityManifest,
 	RpcCommand,
+	RpcCommandOutputFrame,
+	RpcConfigUpdateFrame,
+	RpcExtensionErrorFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcHandoffResult,
@@ -32,7 +36,13 @@ import type {
 	RpcHostToolDefinition,
 	RpcHostToolResult,
 	RpcHostToolUpdate,
+	RpcHostUriCancelRequest,
+	RpcHostUriRequest,
+	RpcHostUriResult,
+	RpcHostUriSchemeDefinition,
+	RpcPromptResultFrame,
 	RpcResponse,
+	RpcSessionInfoUpdateFrame,
 	RpcSessionState,
 	RpcSubagentEventFrame,
 	RpcSubagentLifecycleFrame,
@@ -75,6 +85,29 @@ export type RpcSubagentLifecycleListener = (payload: RpcSubagentLifecycleFrame["
 export type RpcSubagentProgressListener = (payload: RpcSubagentProgressFrame["payload"]) => void;
 export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"]) => void;
 export type RpcAvailableCommandsUpdateListener = (commands: RpcAvailableSlashCommand[]) => void;
+export type RpcRawFrameListener = (frame: Readonly<Record<string, unknown>>) => void;
+export type RpcPromptResultListener = (frame: RpcPromptResultFrame) => void;
+export type RpcCommandOutputListener = (frame: RpcCommandOutputFrame) => void;
+export type RpcSessionInfoUpdateListener = (frame: RpcSessionInfoUpdateFrame) => void;
+export type RpcConfigUpdateListener = (frame: RpcConfigUpdateFrame) => void;
+export type RpcExtensionErrorListener = (frame: RpcExtensionErrorFrame) => void;
+export type RpcExtensionUIRequestListener = (request: RpcExtensionUIRequest) => void;
+
+export interface RpcClientHostUriContext {
+	signal: AbortSignal;
+}
+
+export interface RpcClientHostUriReadResult {
+	content: string;
+	contentType?: "text/markdown" | "application/json" | "text/plain";
+	notes?: string[];
+	immutable?: boolean;
+}
+
+export type RpcClientHostUriHandler = (
+	request: RpcHostUriRequest,
+	context: RpcClientHostUriContext,
+) => string | RpcClientHostUriReadResult | void | Promise<string | RpcClientHostUriReadResult | void>;
 
 export interface RpcClientToolContext<TDetails = unknown> {
 	toolCallId: string;
@@ -169,6 +202,10 @@ function isAgentSessionEvent(value: unknown): value is AgentSessionEvent {
 	return sessionEventTypes.has(type as AgentSessionEvent["type"]);
 }
 
+function isTerminalAgentEnd(event: AgentEvent): boolean {
+	return event.type === "agent_end" && Reflect.get(event, "isTerminal") !== false;
+}
+
 function isRpcSubagentLifecycleFrame(value: unknown): value is RpcSubagentLifecycleFrame {
 	if (!isRecord(value)) return false;
 	return value.type === "subagent_lifecycle" && isRecord(value.payload);
@@ -189,6 +226,48 @@ function isRpcAvailableCommandsUpdateFrame(value: unknown): value is RpcAvailabl
 	return value.type === "available_commands_update" && Array.isArray(value.commands);
 }
 
+function isRpcPromptResultFrame(value: unknown): value is RpcPromptResultFrame {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "prompt_result" &&
+		(value.id === undefined || typeof value.id === "string") &&
+		typeof value.agentInvoked === "boolean"
+	);
+}
+
+function isRpcCommandOutputFrame(value: unknown): value is RpcCommandOutputFrame {
+	if (!isRecord(value)) return false;
+	return value.type === "command_output" && typeof value.text === "string";
+}
+
+function isRpcSessionInfoUpdateFrame(value: unknown): value is RpcSessionInfoUpdateFrame {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "session_info_update" &&
+		(value.title === undefined || typeof value.title === "string") &&
+		typeof value.sessionId === "string"
+	);
+}
+
+function isRpcConfigUpdateFrame(value: unknown): value is RpcConfigUpdateFrame {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "config_update" &&
+		(value.model === undefined || isRecord(value.model)) &&
+		(value.thinkingLevel === undefined || typeof value.thinkingLevel === "string")
+	);
+}
+
+function isRpcExtensionErrorFrame(value: unknown): value is RpcExtensionErrorFrame {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "extension_error" &&
+		typeof value.extensionPath === "string" &&
+		typeof value.event === "string" &&
+		typeof value.error === "string"
+	);
+}
+
 function isRpcHostToolCallRequest(value: unknown): value is RpcHostToolCallRequest {
 	if (!isRecord(value)) return false;
 	return (
@@ -203,6 +282,22 @@ function isRpcHostToolCallRequest(value: unknown): value is RpcHostToolCallReque
 function isRpcHostToolCancelRequest(value: unknown): value is RpcHostToolCancelRequest {
 	if (!isRecord(value)) return false;
 	return value.type === "host_tool_cancel" && typeof value.id === "string" && typeof value.targetId === "string";
+}
+
+function isRpcHostUriRequest(value: unknown): value is RpcHostUriRequest {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "host_uri_request" &&
+		typeof value.id === "string" &&
+		(value.operation === "read" || value.operation === "write") &&
+		typeof value.url === "string" &&
+		(value.content === undefined || typeof value.content === "string")
+	);
+}
+
+function isRpcHostUriCancelRequest(value: unknown): value is RpcHostUriCancelRequest {
+	if (!isRecord(value)) return false;
+	return value.type === "host_uri_cancel" && typeof value.id === "string" && typeof value.targetId === "string";
 }
 
 function isRpcExtensionUiRequest(value: unknown): value is RpcExtensionUIRequest {
@@ -252,13 +347,21 @@ export class RpcClient {
 	#subagentProgressListeners = new Set<RpcSubagentProgressListener>();
 	#subagentEventListeners = new Set<RpcSubagentEventListener>();
 	#availableCommandsUpdateListeners = new Set<RpcAvailableCommandsUpdateListener>();
+	#rawFrameListeners = new Set<RpcRawFrameListener>();
+	#promptResultListeners = new Set<RpcPromptResultListener>();
+	#commandOutputListeners = new Set<RpcCommandOutputListener>();
+	#sessionInfoUpdateListeners = new Set<RpcSessionInfoUpdateListener>();
+	#configUpdateListeners = new Set<RpcConfigUpdateListener>();
+	#extensionErrorListeners = new Set<RpcExtensionErrorListener>();
 	#pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
 	#customTools: RpcClientCustomTool[] = [];
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
+	#pendingHostUriRequests = new Map<string, { controller: AbortController }>();
+	#hostUriHandler: RpcClientHostUriHandler | undefined;
 	#requestId = 0;
 	#protocolVersion: RpcProtocolVersion = 1;
-	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
+	#extensionUiListeners = new Set<RpcExtensionUIRequestListener>();
 	#abortController = new AbortController();
 
 	constructor(private options: RpcClientOptions = {}) {
@@ -323,6 +426,8 @@ export class RpcClient {
 			this.#pendingRequests.clear();
 			for (const pendingCall of this.#pendingHostToolCalls.values()) pendingCall.controller.abort(error);
 			this.#pendingHostToolCalls.clear();
+			for (const pendingRequest of this.#pendingHostUriRequests.values()) pendingRequest.controller.abort(error);
+			this.#pendingHostUriRequests.clear();
 
 			try {
 				child.kill();
@@ -338,6 +443,7 @@ export class RpcClient {
 		void (async () => {
 			for await (const line of lines) {
 				if (!readySettled && isRecord(line) && line.type === "ready") {
+					this.#emitRawFrame(line);
 					protocolV2Supported = supportsRpcProtocolV2(line);
 					readySettled = true;
 					readyResolve();
@@ -450,6 +556,10 @@ export class RpcClient {
 			pendingCall.controller.abort(error);
 		}
 		this.#pendingHostToolCalls.clear();
+		for (const pendingRequest of this.#pendingHostUriRequests.values()) {
+			pendingRequest.controller.abort(error);
+		}
+		this.#pendingHostUriRequests.clear();
 		return this.#waitForExit(child);
 	}
 
@@ -528,6 +638,68 @@ export class RpcClient {
 	onAvailableCommandsUpdate(listener: RpcAvailableCommandsUpdateListener): () => void {
 		this.#availableCommandsUpdateListeners.add(listener);
 		return () => this.#availableCommandsUpdateListeners.delete(listener);
+	}
+
+	/** Subscribe to every decoded JSON frame, including unknown future frames. */
+	onRawFrame(listener: RpcRawFrameListener): () => void {
+		this.#rawFrameListeners.add(listener);
+		return () => this.#rawFrameListeners.delete(listener);
+	}
+
+	/** Subscribe to prompt scheduling outcomes emitted after acknowledgement. */
+	onPromptResult(listener: RpcPromptResultListener): () => void {
+		this.#promptResultListeners.add(listener);
+		return () => this.#promptResultListeners.delete(listener);
+	}
+
+	/** Subscribe to text produced by extension commands. */
+	onCommandOutput(listener: RpcCommandOutputListener): () => void {
+		this.#commandOutputListeners.add(listener);
+		return () => this.#commandOutputListeners.delete(listener);
+	}
+
+	/** Subscribe to active session identity changes. */
+	onSessionInfoUpdate(listener: RpcSessionInfoUpdateListener): () => void {
+		this.#sessionInfoUpdateListeners.add(listener);
+		return () => this.#sessionInfoUpdateListeners.delete(listener);
+	}
+
+	/** Subscribe to active model and thinking-level changes. */
+	onConfigUpdate(listener: RpcConfigUpdateListener): () => void {
+		this.#configUpdateListeners.add(listener);
+		return () => this.#configUpdateListeners.delete(listener);
+	}
+
+	/** Subscribe to extension handler failures. */
+	onExtensionError(listener: RpcExtensionErrorListener): () => void {
+		this.#extensionErrorListeners.add(listener);
+		return () => this.#extensionErrorListeners.delete(listener);
+	}
+
+	/** Subscribe to extension UI requests and passive UI updates. */
+	onExtensionUiRequest(listener: RpcExtensionUIRequestListener): () => void {
+		this.#extensionUiListeners.add(listener);
+		return () => this.#extensionUiListeners.delete(listener);
+	}
+
+	/** Respond to a confirmation request from an extension. */
+	sendUiConfirmation(id: string, confirmed: boolean): void {
+		this.#writeFrame({ type: "extension_ui_response", id, confirmed });
+	}
+
+	/** Respond to a select, input, or editor request from an extension. */
+	sendUiValue(id: string, value: string): void {
+		this.#writeFrame({ type: "extension_ui_response", id, value });
+	}
+
+	/** Cancel an outstanding extension UI request. */
+	cancelUiRequest(id: string, timedOut = false): void {
+		this.#writeFrame({
+			type: "extension_ui_response",
+			id,
+			cancelled: true,
+			...(timedOut ? { timedOut: true } : {}),
+		});
 	}
 
 	/**
@@ -623,6 +795,26 @@ export class RpcClient {
 	async setFastMode(enabled: boolean): Promise<{ enabled: boolean; active: boolean }> {
 		const response = await this.#send({ type: "set_fast_mode", enabled });
 		return this.#getData(response);
+	}
+
+	/** Replace the active session's todo phases. */
+	async setTodos(phases: TodoPhase[]): Promise<TodoPhase[]> {
+		const response = await this.#send({ type: "set_todos", phases });
+		return this.#getData<{ todoPhases: TodoPhase[] }>(response).todoPhases;
+	}
+
+	/** Replace the URI schemes served by the embedding host. */
+	async setHostUriSchemes(schemes: RpcHostUriSchemeDefinition[]): Promise<string[]> {
+		const response = await this.#send({ type: "set_host_uri_schemes", schemes });
+		return this.#getData<{ schemes: string[] }>(response).schemes;
+	}
+
+	/** Register the handler for requests targeting host-owned URI schemes. */
+	registerHostUriHandler(handler: RpcClientHostUriHandler): () => void {
+		this.#hostUriHandler = handler;
+		return () => {
+			if (this.#hostUriHandler === handler) this.#hostUriHandler = undefined;
+		};
 	}
 
 	/**
@@ -725,6 +917,14 @@ export class RpcClient {
 	}
 
 	/**
+	 * Choose whether new user input interrupts immediately or waits for the
+	 * current turn to settle.
+	 */
+	async setInterruptMode(mode: "immediate" | "wait"): Promise<void> {
+		await this.#send({ type: "set_interrupt_mode", mode });
+	}
+
+	/**
 	 * Compact session context.
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
@@ -824,6 +1024,11 @@ export class RpcClient {
 	async getLastAssistantText(): Promise<string | null> {
 		const response = await this.#send({ type: "get_last_assistant_text" });
 		return this.#getData<{ text: string | null }>(response).text;
+	}
+
+	/** Set the active session's display name. */
+	async setSessionName(name: string): Promise<void> {
+		await this.#send({ type: "set_session_name", name });
 	}
 
 	/**
@@ -966,7 +1171,7 @@ export class RpcClient {
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		let settled = false;
 		const unsubscribe = this.onEvent(event => {
-			if (event.type === "agent_end") {
+			if (isTerminalAgentEnd(event)) {
 				settled = true;
 				unsubscribe();
 				clearTimeout(timeoutId);
@@ -992,7 +1197,7 @@ export class RpcClient {
 		let settled = false;
 		const unsubscribe = this.onEvent(event => {
 			events.push(event);
-			if (event.type === "agent_end") {
+			if (isTerminalAgentEnd(event)) {
 				settled = true;
 				unsubscribe();
 				clearTimeout(timeoutId);
@@ -1022,7 +1227,16 @@ export class RpcClient {
 	// Internal
 	// =========================================================================
 
+	#emitRawFrame(data: unknown): void {
+		if (!isRecord(data)) return;
+		for (const listener of this.#rawFrameListeners) {
+			listener(structuredClone(data));
+		}
+	}
+
 	#handleLine(data: unknown): void {
+		this.#emitRawFrame(data);
+
 		// Check if it's a response to a pending request
 		if (isRpcResponse(data)) {
 			const id = data.id;
@@ -1039,6 +1253,11 @@ export class RpcClient {
 			return;
 		}
 
+		if (isRpcHostUriRequest(data)) {
+			void this.#handleHostUriRequest(data);
+			return;
+		}
+
 		if (isRpcExtensionUiRequest(data)) {
 			for (const listener of this.#extensionUiListeners) {
 				listener(data);
@@ -1048,6 +1267,11 @@ export class RpcClient {
 
 		if (isRpcHostToolCancelRequest(data)) {
 			this.#pendingHostToolCalls.get(data.targetId)?.controller.abort();
+			return;
+		}
+
+		if (isRpcHostUriCancelRequest(data)) {
+			this.#pendingHostUriRequests.get(data.targetId)?.controller.abort();
 			return;
 		}
 
@@ -1075,6 +1299,41 @@ export class RpcClient {
 		if (isRpcAvailableCommandsUpdateFrame(data)) {
 			for (const listener of this.#availableCommandsUpdateListeners) {
 				listener(data.commands);
+			}
+			return;
+		}
+
+		if (isRpcPromptResultFrame(data)) {
+			for (const listener of this.#promptResultListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcCommandOutputFrame(data)) {
+			for (const listener of this.#commandOutputListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcSessionInfoUpdateFrame(data)) {
+			for (const listener of this.#sessionInfoUpdateListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcConfigUpdateFrame(data)) {
+			for (const listener of this.#configUpdateListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcExtensionErrorFrame(data)) {
+			for (const listener of this.#extensionErrorListeners) {
+				listener(data);
 			}
 			return;
 		}
@@ -1190,8 +1449,74 @@ export class RpcClient {
 		}
 	}
 
+	async #handleHostUriRequest(request: RpcHostUriRequest): Promise<void> {
+		const handler = this.#hostUriHandler;
+		if (!handler) {
+			this.#writeFrame({
+				type: "host_uri_result",
+				id: request.id,
+				isError: true,
+				error: "No host URI handler is registered",
+			} satisfies RpcHostUriResult);
+			return;
+		}
+
+		const controller = new AbortController();
+		this.#pendingHostUriRequests.set(request.id, { controller });
+		try {
+			const result = await handler(request, { signal: controller.signal });
+			if (controller.signal.aborted) return;
+			if (request.operation === "write") {
+				this.#writeFrame({ type: "host_uri_result", id: request.id } satisfies RpcHostUriResult);
+				return;
+			}
+			if (typeof result === "string") {
+				this.#writeFrame({ type: "host_uri_result", id: request.id, content: result } satisfies RpcHostUriResult);
+				return;
+			}
+			if (!isRecord(result) || typeof result.content !== "string") {
+				throw new Error("Host URI read handlers must return a string or an object with string content");
+			}
+			if (
+				result.contentType !== undefined &&
+				result.contentType !== "text/markdown" &&
+				result.contentType !== "application/json" &&
+				result.contentType !== "text/plain"
+			) {
+				throw new Error(`Unsupported host URI content type: ${String(result.contentType)}`);
+			}
+			if (
+				result.notes !== undefined &&
+				(!Array.isArray(result.notes) || !result.notes.every(note => typeof note === "string"))
+			) {
+				throw new Error("Host URI result notes must be an array of strings");
+			}
+			if (result.immutable !== undefined && typeof result.immutable !== "boolean") {
+				throw new Error("Host URI result immutable must be a boolean");
+			}
+			this.#writeFrame({
+				type: "host_uri_result",
+				id: request.id,
+				content: result.content,
+				...(result.contentType === undefined ? {} : { contentType: result.contentType }),
+				...(result.notes === undefined ? {} : { notes: result.notes }),
+				...(result.immutable === undefined ? {} : { immutable: result.immutable }),
+			} satisfies RpcHostUriResult);
+		} catch (error) {
+			if (controller.signal.aborted) return;
+			this.#writeFrame({
+				type: "host_uri_result",
+				id: request.id,
+				isError: true,
+				error: error instanceof Error ? error.message : String(error),
+			} satisfies RpcHostUriResult);
+		} finally {
+			this.#pendingHostUriRequests.delete(request.id);
+		}
+	}
+
 	#writeFrame(
-		frame: RpcCommand | RpcExtensionUIResponse | RpcHostToolResult | RpcHostToolUpdate,
+		frame: RpcCommand | RpcExtensionUIResponse | RpcHostToolResult | RpcHostToolUpdate | RpcHostUriResult,
 		onError?: (error: Error) => void,
 	): void {
 		if (!this.#process?.stdin) {
