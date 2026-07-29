@@ -28,12 +28,13 @@ const makeDeps = (
 		output: obj => {
 			outputs.push(obj as OutputFrame);
 		},
-		errorResponse: (id, command, message) => ({
+		errorResponse: (id, command, message, code) => ({
 			id,
 			type: "response",
 			command,
 			success: false,
 			error: message,
+			...(code ? { code } : {}),
 		}),
 		pendingExtensionRequests: options?.pendingExtensionRequests ?? new Map<string, PendingExtensionRequest>(),
 		onHostToolResult: () => {},
@@ -106,24 +107,28 @@ describe("dispatchRpcInputFrame", () => {
 		await flushMicrotasks();
 		expect(outputs).toHaveLength(0);
 
-		// Now dispatch abort_bash. It must run serially (not backgrounded)
-		// and resolve after handleCommand completes.
+		// Now dispatch abort_bash. It is a control command, so it runs in the
+		// background and can cancel the in-flight bash.
 		const abortAwait = dispatchRpcInputFrame({ id: "a1", type: "abort_bash" }, deps);
-		expect(abortAwait).toBeInstanceOf(Promise);
-		await abortAwait;
+		expect(abortAwait).toBeUndefined();
+		await flushMicrotasks();
 
 		expect(abortBashCalled).toBe(true);
-		expect(outputs[0]).toEqual({
+		expect(outputs).toContainEqual({
 			id: "a1",
 			type: "response",
 			command: "abort_bash",
 			success: true,
 		});
 
-		// The background bash response arrives after abort_bash.
+		// Both background responses arrive; their relative order is unspecified.
 		await flushMicrotasks();
 		expect(outputs).toHaveLength(2);
-		const bashFrame = outputs[1] as RpcResponse;
+		const bashFrame = outputs.find(
+			(frame): frame is Extract<RpcResponse, { command: "bash" }> => "command" in frame && frame.command === "bash",
+		);
+		expect(bashFrame).toBeDefined();
+		if (!bashFrame) throw new Error("missing bash response");
 		expect(bashFrame.command).toBe("bash");
 		expect(bashFrame.success).toBe(true);
 		if (bashFrame.command === "bash" && bashFrame.success) {
@@ -132,15 +137,15 @@ describe("dispatchRpcInputFrame", () => {
 		}
 	});
 
-	test("non-bash commands are dispatched serially (ordering preserved)", async () => {
+	test("serial commands preserve ordering", async () => {
 		const started: string[] = [];
 		const finished: string[] = [];
 		const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 			started.push(command.type);
 			await Bun.sleep(5);
 			finished.push(command.type);
-			if (command.type === "abort_retry") {
-				return { id: command.id, type: "response", command: "abort_retry", success: true };
+			if (command.type === "set_auto_compaction") {
+				return { id: command.id, type: "response", command: "set_auto_compaction", success: true };
 			}
 			if (command.type === "set_auto_retry") {
 				return { id: command.id, type: "response", command: "set_auto_retry", success: true };
@@ -150,19 +155,19 @@ describe("dispatchRpcInputFrame", () => {
 
 		const { deps, outputs } = makeDeps(handleCommand);
 
-		const first = dispatchRpcInputFrame({ id: "c1", type: "abort_retry" }, deps);
+		const first = dispatchRpcInputFrame({ id: "c1", type: "set_auto_compaction", enabled: true }, deps);
 		expect(first).toBeInstanceOf(Promise);
 		// The input loop awaits each command's promise before pulling the next
 		// frame; simulate that contract by awaiting before the next dispatch.
 		await first;
 		expect(outputs).toHaveLength(1);
-		expect(started).toEqual(["abort_retry"]);
-		expect(finished).toEqual(["abort_retry"]);
+		expect(started).toEqual(["set_auto_compaction"]);
+		expect(finished).toEqual(["set_auto_compaction"]);
 
 		const second = dispatchRpcInputFrame({ id: "c2", type: "set_auto_retry", enabled: true }, deps);
 		await second;
 		expect(outputs).toHaveLength(2);
-		expect(started).toEqual(["abort_retry", "set_auto_retry"]);
+		expect(started).toEqual(["set_auto_compaction", "set_auto_retry"]);
 	});
 
 	test("bash handler errors surface as an error response on the background frame", async () => {
@@ -278,7 +283,7 @@ describe("RpcInputDispatcher", () => {
 		]);
 	});
 
-	test("malformed frames emit a parse error without ending the input reader", () => {
+	test("malformed frames emit a correlated validation error without ending the input reader", () => {
 		const { deps, outputs } = makeDeps(async command => ({
 			id: command.id,
 			type: "response",
@@ -288,15 +293,17 @@ describe("RpcInputDispatcher", () => {
 		}));
 		const dispatcher = new RpcInputDispatcher({ deps });
 
-		dispatcher.dispatch(null);
+		dispatcher.dispatch({ id: "invalid-1", type: "set_model", provider: "anthropic" });
 
 		expect(outputs).toEqual([
-			expect.objectContaining({
+			{
+				id: "invalid-1",
 				type: "response",
-				command: "parse",
+				command: "set_model",
 				success: false,
-				error: expect.stringContaining("Failed to parse command:"),
-			}),
+				error: 'RPC command field "modelId" is required',
+				code: "invalid_request",
+			},
 		]);
 	});
 
@@ -305,9 +312,9 @@ describe("RpcInputDispatcher", () => {
 		const started: string[] = [];
 		const { deps, outputs } = makeDeps(async command => {
 			started.push(command.type);
-			if (command.type === "abort_retry") {
+			if (command.type === "set_auto_compaction") {
 				await releaseFirst.promise;
-				return { id: command.id, type: "response", command: "abort_retry", success: true };
+				return { id: command.id, type: "response", command: "set_auto_compaction", success: true };
 			}
 			if (command.type === "get_state") {
 				return {
@@ -337,17 +344,17 @@ describe("RpcInputDispatcher", () => {
 		});
 		const dispatcher = new RpcInputDispatcher({ deps });
 
-		dispatcher.dispatch({ id: "first", type: "abort_retry" });
+		dispatcher.dispatch({ id: "first", type: "set_auto_compaction", enabled: true });
 		dispatcher.dispatch({ id: "second", type: "get_state" });
 		await flushMicrotasks();
 
-		expect(started).toEqual(["abort_retry"]);
+		expect(started).toEqual(["set_auto_compaction"]);
 		expect(outputs).toHaveLength(0);
 
 		releaseFirst.resolve();
 		await dispatcher.drain();
 
-		expect(started).toEqual(["abort_retry", "get_state"]);
+		expect(started).toEqual(["set_auto_compaction", "get_state"]);
 		expect((outputs[0] as RpcResponse).id).toBe("first");
 		expect((outputs[1] as RpcResponse).id).toBe("second");
 		expect((outputs[1] as RpcResponse).command).toBe("get_state");
@@ -357,7 +364,7 @@ describe("RpcInputDispatcher", () => {
 		const started: string[] = [];
 		const { deps, outputs } = makeDeps(async command => {
 			started.push(command.type);
-			if (command.type === "abort_retry") throw new Error("retry controller exploded");
+			if (command.type === "set_auto_compaction") throw new Error("compaction controller exploded");
 			if (command.type === "set_auto_retry") {
 				return { id: command.id, type: "response", command: "set_auto_retry", success: true };
 			}
@@ -365,18 +372,18 @@ describe("RpcInputDispatcher", () => {
 		});
 		const dispatcher = new RpcInputDispatcher({ deps });
 
-		dispatcher.dispatch({ id: "bad", type: "abort_retry" });
+		dispatcher.dispatch({ id: "bad", type: "set_auto_compaction", enabled: false });
 		dispatcher.dispatch({ id: "next", type: "set_auto_retry", enabled: true });
 		await dispatcher.drain();
 
-		expect(started).toEqual(["abort_retry", "set_auto_retry"]);
+		expect(started).toEqual(["set_auto_compaction", "set_auto_retry"]);
 		expect(outputs).toEqual([
 			{
 				id: "bad",
 				type: "response",
-				command: "abort_retry",
+				command: "set_auto_compaction",
 				success: false,
-				error: "retry controller exploded",
+				error: "compaction controller exploded",
 			},
 			{
 				id: "next",
@@ -385,6 +392,42 @@ describe("RpcInputDispatcher", () => {
 				success: true,
 			},
 		]);
+	});
+
+	test("control commands overtake a blocked serial command", async () => {
+		const releaseSerial = Promise.withResolvers<void>();
+		const started: string[] = [];
+		const { deps, outputs } = makeDeps(async command => {
+			started.push(command.type);
+			if (command.type === "set_auto_retry") {
+				await releaseSerial.promise;
+				return { id: command.id, type: "response", command: "set_auto_retry", success: true };
+			}
+			if (command.type === "abort_retry") {
+				return { id: command.id, type: "response", command: "abort_retry", success: true };
+			}
+			throw new Error(`unexpected command type: ${command.type}`);
+		});
+		const dispatcher = new RpcInputDispatcher({ deps });
+
+		dispatcher.dispatch({ id: "serial", type: "set_auto_retry", enabled: true });
+		await flushMicrotasks();
+		dispatcher.dispatch({ id: "control", type: "abort_retry" });
+		await flushMicrotasks();
+
+		expect(started).toEqual(["set_auto_retry", "abort_retry"]);
+		expect(outputs).toEqual([
+			{
+				id: "control",
+				type: "response",
+				command: "abort_retry",
+				success: true,
+			},
+		]);
+
+		releaseSerial.resolve();
+		await dispatcher.drain();
+		expect((outputs[1] as RpcResponse).id).toBe("serial");
 	});
 
 	test("drain after EOF rejects active and queued host tool requests without emitting new calls", async () => {

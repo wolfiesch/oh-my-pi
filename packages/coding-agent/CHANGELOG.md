@@ -93,6 +93,7 @@
 ### Removed
 
 - Removed the dangling `MCPManager.setOnNotification` single-slot setter, which had no callers in the runtime. Replaced by `MCPManager.addNotificationListener` — multi-listener, per-listener error isolation, returns an unsubscribe function.
+- Added a runtime-validated RPC command registry and capability manifest, including explicit serial, concurrent, and control scheduling metadata in the ready frame and TypeScript/Python client APIs.
 
 ## [17.1.8] - 2026-07-28
 

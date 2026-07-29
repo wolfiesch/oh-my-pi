@@ -41,9 +41,23 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "protocolVersion": 1,
   "supportedProtocolVersions": [1, 2],
   "maxFrameBytes": 1048576,
-  "maxReassembledFrameBytes": 67108864
+  "maxReassembledFrameBytes": 67108864,
+  "capabilities": {
+    "applicationApiVersion": 1,
+    "commands": [
+      { "name": "get_capabilities", "version": 1, "scheduling": "serial" },
+      { "name": "abort", "version": 1, "scheduling": "control" }
+    ],
+    "events": ["ready", "agent_start", "agent_end"],
+    "extensionUiMethods": ["select", "confirm", "input"],
+    "hostProtocols": ["tools", "uris"]
+  }
 }
 ```
+
+The example capability arrays are abbreviated. The actual ready frame contains
+the complete manifest. Hosts can refresh it at runtime with
+`{ id?, type: "get_capabilities" }`.
 
 Clients that support protocol v2 SHOULD immediately send:
 
@@ -98,15 +112,22 @@ All commands accept optional `id?: string`.
 
 Important edge behavior from runtime:
 
-- Unknown command responses are emitted with `id: undefined` (even if the request had an `id`).
-- Parse/handler exceptions in the input loop emit `command: "parse"` with `id: undefined`.
+- Runtime validation rejects unknown commands and malformed fields before a
+  handler runs. Error responses preserve a valid request `id` and use
+  `code: "unsupported_command"` or `code: "invalid_request"`.
+- Each command has an advertised scheduling class. `serial` commands preserve
+  input order, `concurrent` commands run independently, and `control` commands
+  can overtake blocked serial work so abort and steering remain responsive.
 - `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails.
 - `prompt` success responses may include `data.agentInvoked`. `false` means the prompt completed locally without an agent turn; `true` means the prompt produced agent lifecycle events; omitted means the host must rely on session events for completion.
 - `abort_and_prompt` does not currently emit `data.agentInvoked` or `prompt_result`; hosts should treat it as the legacy abort-then-schedule path and rely on session events or same-id scheduling errors.
 
 ## Command Schema (canonical)
 
-`RpcCommand` is defined in `src/modes/rpc/rpc-types.ts`:
+`RpcCommand` is defined in `src/modes/rpc/rpc-types.ts`. Runtime field
+validation, examples, versions, and scheduling are defined exhaustively in
+`src/modes/rpc/rpc-command-registry.ts`; the type checker rejects a registry
+that omits a command:
 
 ### Prompting
 
@@ -120,6 +141,7 @@ Important edge behavior from runtime:
 ### Protocol
 
 - `{ id?, type: "negotiate_protocol", protocolVersion: 2 }`
+- `{ id?, type: "get_capabilities" }`
 
 ### State
 
@@ -165,12 +187,11 @@ Important edge behavior from runtime:
 - `{ id?, type: "bash", command: string }`
 - `{ id?, type: "abort_bash" }`
 
-`bash` is dispatched concurrently: the RPC server continues reading commands
-while the shell command runs, so `abort_bash` (or any other command) sent
-during a long-running `bash` is handled without waiting for it to finish on
-its own. The `bash` response is emitted when the command completes; hosts
-correlate it via `id`. Ordering across concurrent commands is not guaranteed
-— clients MUST match responses on `id`, not on emission order.
+`bash` is dispatched concurrently. Control commands such as `abort_bash`,
+`abort_retry`, `abort`, `steer`, and `follow_up` can also overtake blocked
+serial work. The server therefore continues reading commands while long-running
+work is active. Ordering across concurrent/control responses is not guaranteed;
+clients MUST correlate responses by `id`, not emission order.
 
 ### Session
 

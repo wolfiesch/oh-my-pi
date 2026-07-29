@@ -43,6 +43,7 @@ from .protocol import (
     ModelCycleResult,
     ModelInfo,
     ReadyEvent,
+    RpcCapabilityManifest,
     RetryFallbackAppliedEvent,
     RetryFallbackSucceededEvent,
     RpcAgentEvent,
@@ -76,6 +77,7 @@ from .protocol import (
     parse_model_cycle_result,
     parse_model_info,
     parse_notification,
+    parse_rpc_capability_manifest,
     parse_session_state,
     parse_session_stats,
     parse_thinking_level_cycle_result,
@@ -920,6 +922,9 @@ class RpcClient:
 
     def set_fast_mode(self, enabled: bool) -> FastModeResult:
         return parse_fast_mode_result(self._request("set_fast_mode", enabled=enabled))
+
+    def get_capabilities(self) -> RpcCapabilityManifest:
+        return parse_rpc_capability_manifest(self._request("get_capabilities"))
 
     def set_model(self, provider: str, model_id: str) -> ModelInfo:
         payload = self._request("set_model", provider=provider, modelId=model_id)

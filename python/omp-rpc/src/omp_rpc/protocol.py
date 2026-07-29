@@ -18,6 +18,7 @@ ThinkingLevel: TypeAlias = Literal[
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
+RpcCommandSchedulingClass: TypeAlias = Literal["serial", "concurrent", "control"]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
 WidgetPlacement: TypeAlias = Literal["aboveEditor", "belowEditor"]
@@ -59,6 +60,9 @@ _EFFORT_VALUES: Final[frozenset[str]] = frozenset(
 _THINKING_LEVEL_VALUES: Final[frozenset[str]] = _EFFORT_VALUES | frozenset({"off"})
 _STEERING_MODE_VALUES: Final[frozenset[str]] = frozenset({"all", "one-at-a-time"})
 _INTERRUPT_MODE_VALUES: Final[frozenset[str]] = frozenset({"immediate", "wait"})
+_RPC_COMMAND_SCHEDULING_VALUES: Final[frozenset[str]] = frozenset(
+    {"serial", "concurrent", "control"}
+)
 _STOP_REASON_VALUES: Final[frozenset[str]] = frozenset(
     {"stop", "length", "toolUse", "error", "aborted"}
 )
@@ -879,11 +883,28 @@ class SessionStats:
 
 
 @dataclass(slots=True, frozen=True)
+class RpcCommandCapability:
+    name: str
+    version: int
+    scheduling: RpcCommandSchedulingClass
+
+
+@dataclass(slots=True, frozen=True)
+class RpcCapabilityManifest:
+    application_api_version: int
+    commands: tuple[RpcCommandCapability, ...]
+    events: tuple[str, ...]
+    extension_ui_methods: tuple[str, ...]
+    host_protocols: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
 class ReadyEvent:
     protocol_version: int | None = None
     supported_protocol_versions: tuple[int, ...] | None = None
     max_frame_bytes: int | None = None
     max_reassembled_frame_bytes: int | None = None
+    capabilities: RpcCapabilityManifest | None = None
     type: Literal["ready"] = "ready"
 
 
@@ -1396,6 +1417,59 @@ def parse_fast_mode_result(payload: JsonObject) -> FastModeResult:
     )
 
 
+def parse_rpc_capability_manifest(payload: JsonObject) -> RpcCapabilityManifest:
+    raw_api_version = payload.get("applicationApiVersion")
+    if not isinstance(raw_api_version, int) or isinstance(raw_api_version, bool):
+        raise ValueError("capabilities.applicationApiVersion must be an integer")
+
+    raw_commands = payload.get("commands")
+    if not isinstance(raw_commands, list):
+        raise ValueError("capabilities.commands must be a list")
+    commands: list[RpcCommandCapability] = []
+    for index, raw_command in enumerate(raw_commands):
+        command = _clone_json_object(
+            raw_command, field=f"capabilities.commands[{index}]"
+        )
+        version = command.get("version")
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise ValueError(
+                f"capabilities.commands[{index}].version must be an integer"
+            )
+        commands.append(
+            RpcCommandCapability(
+                name=_require_str(command, "name"),
+                version=version,
+                scheduling=cast(
+                    RpcCommandSchedulingClass,
+                    _require_literal(
+                        command.get("scheduling"),
+                        _RPC_COMMAND_SCHEDULING_VALUES,
+                        field=f"capabilities.commands[{index}].scheduling",
+                    ),
+                ),
+            )
+        )
+
+    def string_list(field: str) -> tuple[str, ...]:
+        value = payload.get(field)
+        if not isinstance(value, list):
+            raise ValueError(f"capabilities.{field} must be a list")
+        result: list[str] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, str):
+                raise ValueError(f"capabilities.{field}[{index}] must be a string")
+            result.append(item)
+        return tuple(result)
+
+    return RpcCapabilityManifest(
+        application_api_version=raw_api_version,
+        commands=tuple(commands),
+        events=string_list("events"),
+        extension_ui_methods=string_list("extensionUiMethods"),
+        host_protocols=string_list("hostProtocols"),
+    )
+
+
 def parse_compaction_result(payload: JsonObject) -> CompactionResult:
     return CompactionResult(
         summary=str(payload.get("summary", "")),
@@ -1550,6 +1624,14 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             ):
                 raise ValueError("ready.supportedProtocolVersions must be integers")
             supported_versions = tuple(raw_versions)
+        raw_capabilities = payload.get("capabilities")
+        capabilities = (
+            parse_rpc_capability_manifest(
+                _clone_json_object(raw_capabilities, field="ready.capabilities")
+            )
+            if raw_capabilities is not None
+            else None
+        )
         return ReadyEvent(
             protocol_version=_optional_int(payload, "protocolVersion"),
             supported_protocol_versions=supported_versions,
@@ -1557,6 +1639,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             max_reassembled_frame_bytes=_optional_int(
                 payload, "maxReassembledFrameBytes"
             ),
+            capabilities=capabilities,
         )
     if event_type == "extension_ui_request":
         return parse_extension_ui_request(payload)

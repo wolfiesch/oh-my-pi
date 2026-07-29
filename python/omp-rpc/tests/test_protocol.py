@@ -5,6 +5,7 @@ import unittest
 from omp_rpc import (
     AgentEndEvent,
     ExtensionUiRequest,
+    ReadyEvent,
     SessionState,
     TodoReminderEvent,
     assistant_text,
@@ -15,6 +16,34 @@ from omp_rpc import (
 
 
 class ProtocolParsingTests(unittest.TestCase):
+    def test_parse_ready_capability_manifest(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "ready",
+                "protocolVersion": 1,
+                "capabilities": {
+                    "applicationApiVersion": 1,
+                    "commands": [
+                        {
+                            "name": "abort",
+                            "version": 1,
+                            "scheduling": "control",
+                        }
+                    ],
+                    "events": ["ready", "agent_end"],
+                    "extensionUiMethods": ["confirm"],
+                    "hostProtocols": ["tools", "uris"],
+                },
+            }
+        )
+
+        self.assertIsInstance(notification, ReadyEvent)
+        self.assertIsNotNone(notification.capabilities)
+        assert notification.capabilities is not None
+        self.assertEqual(notification.capabilities.application_api_version, 1)
+        self.assertEqual(notification.capabilities.commands[0].name, "abort")
+        self.assertEqual(notification.capabilities.commands[0].scheduling, "control")
+
     def test_parse_session_state(self) -> None:
         state = parse_session_state(
             {
