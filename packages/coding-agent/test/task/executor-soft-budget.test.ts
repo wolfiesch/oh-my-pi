@@ -11,7 +11,11 @@ import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { resolveSoftRequestBudget, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import {
+	createSubagentSettings,
+	resolveSoftRequestBudget,
+	runSubprocess,
+} from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -383,5 +387,75 @@ describe("resolveSoftRequestBudget", () => {
 		expect(resolveSoftRequestBudget("scout", 0)).toBe(0);
 		expect(resolveSoftRequestBudget("scout", -5)).toBe(0);
 		expect(resolveSoftRequestBudget("scout", 20.9)).toBe(20);
+	});
+});
+
+describe("createSubagentSettings child context budget", () => {
+	it("leaves inherited compaction settings unchanged when the budget is disabled", () => {
+		expect(
+			createSubagentSettings(
+				Settings.isolated({
+					"task.childContextBudgetTokens": 0,
+					"compaction.thresholdTokens": 25_000,
+				}),
+			).get("compaction.thresholdTokens"),
+		).toBe(25_000);
+		expect(
+			createSubagentSettings(
+				Settings.isolated({
+					"task.childContextBudgetTokens": -1,
+					"compaction.thresholdTokens": 25_000,
+				}),
+			).get("compaction.thresholdTokens"),
+		).toBe(25_000);
+	});
+
+	it("rejects non-finite budgets without changing inherited context policy", () => {
+		for (const budget of [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NaN]) {
+			const settings = createSubagentSettings(
+				Settings.isolated({
+					"task.childContextBudgetTokens": budget,
+					"compaction.thresholdTokens": 25_000,
+					"contextPromotion.enabled": true,
+				}),
+			);
+			expect(settings.get("compaction.thresholdTokens")).toBe(25_000);
+			expect(settings.get("task.childContextBudgetTokens")).toBe(0);
+			expect(settings.get("contextPromotion.enabled")).toBe(true);
+		}
+	});
+
+	it("truncates a positive budget without replacing the inherited threshold policy", () => {
+		const settings = createSubagentSettings(
+			Settings.isolated({
+				"task.childContextBudgetTokens": 64_000.9,
+				"compaction.thresholdTokens": -1,
+				"compaction.thresholdPercent": 10,
+			}),
+		);
+		expect(settings.get("task.childContextBudgetTokens")).toBe(64_000);
+		expect(settings.get("compaction.thresholdTokens")).toBe(-1);
+		expect(settings.get("compaction.thresholdPercent")).toBe(10);
+	});
+
+	it("preserves an inherited positive threshold that is stricter than the child budget", () => {
+		const settings = createSubagentSettings(
+			Settings.isolated({
+				"task.childContextBudgetTokens": 100_000,
+				"compaction.thresholdTokens": 25_000,
+			}),
+		);
+		expect(settings.get("compaction.thresholdTokens")).toBe(25_000);
+	});
+
+	it("preserves an inherited fixed threshold when the child budget is stricter", () => {
+		const settings = createSubagentSettings(
+			Settings.isolated({
+				"task.childContextBudgetTokens": 64_000,
+				"compaction.thresholdTokens": 100_000,
+			}),
+		);
+		expect(settings.get("task.childContextBudgetTokens")).toBe(64_000);
+		expect(settings.get("compaction.thresholdTokens")).toBe(100_000);
 	});
 });

@@ -93,7 +93,7 @@ async function createPersistedSession(cwd: string, restrictToolNames?: boolean):
 	return sessionFile;
 }
 
-function createFactory(cwd: string, eventBus?: EventBus) {
+function createFactory(cwd: string, settings = Settings.isolated(), eventBus?: EventBus) {
 	const parentSession = {
 		sessionManager: {
 			getCwd: () => cwd,
@@ -107,7 +107,7 @@ function createFactory(cwd: string, eventBus?: EventBus) {
 		session: parentSession,
 		authStorage: {} as never,
 		modelRegistry: { authStorage: {} } as ModelRegistry,
-		settings: Settings.isolated(),
+		settings,
 		enableLsp: true,
 		eventBus,
 	});
@@ -207,7 +207,7 @@ describe("persisted subagent revival", () => {
 			sessionFile,
 			status: "parked",
 		});
-		const reviver = await createFactory(cwd, eventBus)(ref);
+		const reviver = await createFactory(cwd, undefined, eventBus)(ref);
 		if (!reviver) throw new Error("Expected a persisted reviver");
 		await reviver(ref);
 
@@ -238,5 +238,27 @@ describe("persisted subagent revival", () => {
 		rpcRegistry.dispose();
 		AgentLifecycleManager.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
+	});
+
+	it("keeps the child context budget on a cold-revived session", async () => {
+		const cwd = makeTempDir("@pi-budgeted-revive-");
+		const sessionFile = await createPersistedSession(cwd);
+		let capturedOptions: CreateAgentSessionOptions | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			capturedOptions = options;
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+
+		const ref = createRef(sessionFile);
+		const settings = Settings.isolated({
+			"task.childContextBudgetTokens": 64_000,
+			"compaction.thresholdTokens": 100_000,
+		});
+		const reviver = await createFactory(cwd, settings)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		expect(capturedOptions?.settings?.get("task.childContextBudgetTokens")).toBe(64_000);
+		expect(capturedOptions?.settings?.get("compaction.thresholdTokens")).toBe(100_000);
 	});
 });

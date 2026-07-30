@@ -4626,6 +4626,25 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.childContextBudgetTokens": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Child Context Budget",
+			description:
+				"Maximum inherited context tokens for a subagent session (0 disables). When set, the child session's compaction threshold is clamped to this budget so oversized inherited context triggers maintenance before it repeatedly inflates first-token latency.",
+			options: [
+				{ value: "0", label: "Disabled", description: "Default" },
+				{ value: "50000", label: "50K tokens" },
+				{ value: "100000", label: "100K tokens" },
+				{ value: "150000", label: "150K tokens" },
+				{ value: "200000", label: "200K tokens" },
+			],
+		},
+	},
+
 	"task.agentIdleTtlMs": {
 		type: "number",
 		default: 420_000,

@@ -844,8 +844,19 @@ export function createSubagentSettings(
 	snapshot["tier.openai"] = subagentTiers.openai ?? "none";
 	snapshot["tier.anthropic"] = subagentTiers.anthropic ?? "none";
 	snapshot["tier.google"] = subagentTiers.google ?? "none";
-	return Settings.isolated({
+	const mergedSettings: Partial<Record<SettingPath, unknown>> = {
 		...snapshot,
+		...overrides,
+	};
+	const configuredChildContextBudget = Number(mergedSettings["task.childContextBudgetTokens"] ?? 0);
+	const childContextBudgetTokens = Number.isFinite(configuredChildContextBudget)
+		? Math.max(0, Math.trunc(configuredChildContextBudget))
+		: 0;
+	// Preserve the inherited fixed/percentage policy. Session maintenance knows
+	// the resolved model window and applies the child ceiling only when stricter.
+	mergedSettings["task.childContextBudgetTokens"] = childContextBudgetTokens;
+	return Settings.isolated({
+		...mergedSettings,
 		// Async jobs and bash auto-backgrounding are inherited from the parent:
 		// background jobs are owner-routed to the subagent's own session, and
 		// the run driver's quiescence barrier + teardown reap guarantee no
@@ -856,7 +867,6 @@ export function createSubagentSettings(
 		// the parent task approval is the authorization boundary. Use yolo mode
 		// to preserve unattended subagent execution. User `tools.approval` policies still apply.
 		"tools.approvalMode": "yolo",
-		...overrides,
 	});
 }
 

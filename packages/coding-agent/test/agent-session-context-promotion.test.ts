@@ -8,6 +8,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { createSubagentSettings } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 describe("AgentSession context promotion", () => {
@@ -22,13 +23,11 @@ describe("AgentSession context promotion", () => {
 		// tests here (tests only read models and add benign extra runtime keys),
 		// so build them once instead of paying ~950ms across the 9 cases.
 		//
-		// The bundled catalog no longer ships a codex model whose configured
-		// promotion target has a strictly larger window (gpt-5.5's bundled target
-		// gpt-5.4 is a same-window no-op the runtime rejects), so pin
-		// gpt-5.5 (272k) -> gpt-5.6-sol (372k) via modelOverrides — the same
-		// mechanism users configure promotion pairs with. gpt-5.4-mini is pinned
-		// text-only so the snapcompact-fallback case has a codex model on which
-		// snapcompact (vision-based) cannot run.
+		// The bundled catalog no longer ships a Codex promotion pair with
+		// increasing windows, so pin gpt-5.6-luna (272k) -> gpt-5.6-terra (372k)
+		// via modelOverrides — the same mechanism users configure promotion pairs
+		// with. Luna's override is text-only, ensuring snapcompact (vision-based)
+		// cannot run.
 		tempDir = TempDir.createSync("@pi-context-promotion-");
 		const modelsConfigPath = path.join(tempDir.path(), "models.json");
 		await Bun.write(
@@ -37,8 +36,11 @@ describe("AgentSession context promotion", () => {
 				providers: {
 					"openai-codex": {
 						modelOverrides: {
-							"gpt-5.5": { contextPromotionTarget: "openai-codex/gpt-5.6-sol" },
-							"gpt-5.4-mini": { input: ["text"] },
+							"gpt-5.6-luna": {
+								contextWindow: 272_000,
+								contextPromotionTarget: "openai-codex/gpt-5.6-terra",
+								input: ["text"],
+							},
 						},
 					},
 				},
@@ -156,8 +158,8 @@ describe("AgentSession context promotion", () => {
 	}
 
 	it("promotes to a larger-context model on overflow and clears codex websocket session state", async () => {
-		const smallModel = modelRegistry.find("openai-codex", "gpt-5.5");
-		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-sol");
+		const smallModel = modelRegistry.find("openai-codex", "gpt-5.6-luna");
+		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-terra");
 		if (!smallModel || !largeModel) {
 			throw new Error("Expected small and large codex models to exist");
 		}
@@ -200,9 +202,246 @@ describe("AgentSession context promotion", () => {
 		expect(session.providerSessionState.size).toBe(0);
 	});
 
+	it("compacts an oversized child prompt instead of promoting past its context budget", async () => {
+		const smallModel = modelRegistry.find("openai-codex", "gpt-5.6-luna");
+		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-terra");
+		if (!smallModel || !largeModel) {
+			throw new Error("Expected small and large codex models to exist");
+		}
+
+		const settings = createSubagentSettings(
+			Settings.isolated({
+				"task.childContextBudgetTokens": 50,
+				"compaction.enabled": true,
+				"compaction.autoContinue": false,
+				"compaction.strategy": "context-full",
+				"compaction.keepRecentTokens": 1,
+				"contextPromotion.enabled": true,
+			}),
+		);
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendMessage(createUserMessage("old child context ".repeat(120)));
+		sessionManager.appendMessage(createAssistantMessage(smallModel, "old response"));
+
+		const agent = new Agent({
+			initialState: {
+				model: smallModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: sessionManager.buildSessionContext().messages,
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			agentKind: "sub",
+		});
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "budgeted child summary",
+			shortSummary: undefined,
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+		}));
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			expect(sessionManager.getEntries().some(entry => entry.type === "compaction")).toBe(true);
+		});
+
+		await session.prompt("pending child prompt ".repeat(120));
+
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(session.model?.id).toBe(smallModel.id);
+		expect(session.model?.id).not.toBe(largeModel.id);
+	});
+
+	it("preserves percentage-threshold promotion while a child remains below its looser budget", async () => {
+		const smallModel = modelRegistry.find("openai-codex", "gpt-5.6-luna");
+		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-terra");
+		if (!smallModel || !largeModel) {
+			throw new Error("Expected small and large codex models to exist");
+		}
+
+		const settings = createSubagentSettings(
+			Settings.isolated({
+				"task.childContextBudgetTokens": 100_000,
+				"compaction.thresholdTokens": -1,
+				"compaction.thresholdPercent": 1,
+				"compaction.enabled": true,
+				"compaction.strategy": "context-full",
+				"contextPromotion.enabled": true,
+			}),
+		);
+		const agent = new Agent({
+			initialState: {
+				model: smallModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			agentKind: "sub",
+		});
+		const compactSpy = vi.spyOn(compactionModule, "compact");
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+
+		await session.prompt("pending child prompt ".repeat(2_000));
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(compactSpy).not.toHaveBeenCalled();
+		expect(session.model?.provider).toBe(largeModel.provider);
+		expect(session.model?.id).toBe(largeModel.id);
+	});
+
+	it("does not compact or promote when pruning brings a child below its ceiling", async () => {
+		const smallModel = modelRegistry.find("openai-codex", "gpt-5.6-luna");
+		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-terra");
+		if (!smallModel || !largeModel) {
+			throw new Error("Expected small and large codex models to exist");
+		}
+
+		const settings = createSubagentSettings(
+			Settings.isolated({
+				"task.childContextBudgetTokens": 100_000,
+				"compaction.thresholdTokens": 150_000,
+				"compaction.enabled": true,
+				"compaction.strategy": "context-full",
+				"compaction.dropUseless": true,
+				"compaction.keepRecentTokens": 1,
+				"contextPromotion.enabled": true,
+			}),
+		);
+		const sessionManager = SessionManager.inMemory();
+		const now = Date.now();
+		sessionManager.appendMessage(createUserMessage("Investigate everything."));
+		const largeCallId = "call-large-useless";
+		sessionManager.appendMessage({
+			...createAssistantMessage(smallModel),
+			content: [{ type: "toolCall", id: largeCallId, name: "grep", arguments: { pattern: "TODO" } }],
+			stopReason: "toolUse",
+			timestamp: now - 20,
+		});
+		sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: largeCallId,
+			toolName: "grep",
+			content: [{ type: "text", text: "match line\n".repeat(20_000) }],
+			isError: false,
+			useless: true,
+			timestamp: now - 19,
+		});
+		for (let index = 0; index < 4; index++) {
+			const callId = `call-small-${index}`;
+			sessionManager.appendMessage({
+				...createAssistantMessage(smallModel),
+				content: [{ type: "toolCall", id: callId, name: "read", arguments: { path: `note-${index}.md` } }],
+				stopReason: "toolUse",
+				timestamp: now - 18 + index * 2,
+			});
+			sessionManager.appendMessage({
+				role: "toolResult",
+				toolCallId: callId,
+				toolName: "read",
+				content: [{ type: "text", text: `tiny note ${index}` }],
+				isError: false,
+				timestamp: now - 17 + index * 2,
+			});
+		}
+
+		const agent = new Agent({
+			initialState: {
+				model: smallModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: sessionManager.buildSessionContext().messages,
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			agentKind: "sub",
+		});
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "unexpected child compaction",
+			shortSummary: undefined,
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+		}));
+		const finalAssistant = {
+			...createAssistantMessage(smallModel, "continuing"),
+			usage: {
+				input: 120_000,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 120_001,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		};
+
+		session.agent.emitExternalEvent({ type: "message_end", message: finalAssistant });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [finalAssistant] });
+		await settle();
+
+		expect(compactSpy).not.toHaveBeenCalled();
+		expect(session.model?.provider).toBe(smallModel.provider);
+		expect(session.model?.id).toBe(smallModel.id);
+		expect(session.model?.id).not.toBe(largeModel.id);
+	});
+
+	it("preserves overflow promotion for a budgeted child when compaction is disabled", async () => {
+		const smallModel = modelRegistry.find("openai-codex", "gpt-5.6-luna");
+		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-terra");
+		if (!smallModel || !largeModel) {
+			throw new Error("Expected small and large codex models to exist");
+		}
+
+		const settings = createSubagentSettings(
+			Settings.isolated({
+				"task.childContextBudgetTokens": 50,
+				"compaction.enabled": false,
+				"contextPromotion.enabled": true,
+			}),
+		);
+		const agent = new Agent({
+			initialState: {
+				model: smallModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			agentKind: "sub",
+		});
+
+		const overflowMessage = createOverflowMessage(smallModel);
+		session.agent.emitExternalEvent({ type: "message_end", message: overflowMessage });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [overflowMessage] });
+
+		await waitFor(() => session.model?.id === largeModel.id);
+
+		expect(session.model?.provider).toBe(largeModel.provider);
+		expect(session.model?.id).toBe(largeModel.id);
+	});
+
 	it("promotes on 413 payload-too-large overflow errors", async () => {
-		const smallModel = modelRegistry.find("openai-codex", "gpt-5.5");
-		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-sol");
+		const smallModel = modelRegistry.find("openai-codex", "gpt-5.6-luna");
+		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-terra");
 		if (!smallModel || !largeModel) {
 			throw new Error("Expected small and large codex models to exist");
 		}
@@ -241,7 +480,7 @@ describe("AgentSession context promotion", () => {
 		expect(session.model?.id).toBe(largeModel.id);
 	});
 	it("clears codex provider session state on manual setModel switch away from codex", async () => {
-		const codexModel = modelRegistry.find("openai-codex", "gpt-5.4");
+		const codexModel = modelRegistry.find("openai-codex", "gpt-5.6-luna");
 		const nonCodexModel = modelRegistry.getAll().find(model => model.api !== "openai-codex-responses");
 		if (!codexModel || !nonCodexModel) {
 			throw new Error("Expected codex and non-codex models to exist");
@@ -278,7 +517,7 @@ describe("AgentSession context promotion", () => {
 	});
 
 	it("clears codex provider session state on manual temporary switch into codex", async () => {
-		const codexModel = modelRegistry.find("openai-codex", "gpt-5.4");
+		const codexModel = modelRegistry.find("openai-codex", "gpt-5.6-luna");
 		const nonCodexModel = modelRegistry.getAll().find(model => model.api !== "openai-codex-responses");
 		if (!codexModel || !nonCodexModel) {
 			throw new Error("Expected codex and non-codex models to exist");
@@ -315,7 +554,7 @@ describe("AgentSession context promotion", () => {
 	});
 
 	it("clears codex provider session state when branching rewrites history", async () => {
-		const codexModel = modelRegistry.find("openai-codex", "gpt-5.4");
+		const codexModel = modelRegistry.find("openai-codex", "gpt-5.6-luna");
 		if (!codexModel) {
 			throw new Error("Expected codex model to exist");
 		}
@@ -356,7 +595,7 @@ describe("AgentSession context promotion", () => {
 	});
 
 	it("clears codex provider session state when tree navigation rewrites history", async () => {
-		const codexModel = modelRegistry.find("openai-codex", "gpt-5.4");
+		const codexModel = modelRegistry.find("openai-codex", "gpt-5.6-luna");
 		if (!codexModel) {
 			throw new Error("Expected codex model to exist");
 		}
@@ -397,7 +636,7 @@ describe("AgentSession context promotion", () => {
 	});
 
 	it("does not promote when promotion is disabled", async () => {
-		const smallModel = modelRegistry.find("openai-codex", "gpt-5.5");
+		const smallModel = modelRegistry.find("openai-codex", "gpt-5.6-luna");
 		if (!smallModel) {
 			throw new Error("Expected small codex model to exist");
 		}
@@ -441,7 +680,7 @@ describe("AgentSession context promotion", () => {
 	});
 
 	it("does not promote by default", async () => {
-		const smallModel = modelRegistry.find("openai-codex", "gpt-5.5");
+		const smallModel = modelRegistry.find("openai-codex", "gpt-5.6-luna");
 		if (!smallModel) {
 			throw new Error("Expected small codex model to exist");
 		}
@@ -473,7 +712,7 @@ describe("AgentSession context promotion", () => {
 	});
 
 	it("falls back to LLM compaction when snapcompact cannot run during overflow recovery", async () => {
-		const model = modelRegistry.find("openai-codex", "gpt-5.4-mini");
+		const model = modelRegistry.find("openai-codex", "gpt-5.6-luna");
 		if (!model) {
 			throw new Error("Expected codex model to exist");
 		}
@@ -534,8 +773,8 @@ describe("AgentSession context promotion", () => {
 	});
 
 	it("promotes to a larger-context model on response.incomplete (length stop)", async () => {
-		const smallModel = modelRegistry.find("openai-codex", "gpt-5.5");
-		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-sol");
+		const smallModel = modelRegistry.find("openai-codex", "gpt-5.6-luna");
+		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-terra");
 		if (!smallModel || !largeModel) {
 			throw new Error("Expected small and large codex models to exist");
 		}
@@ -575,8 +814,8 @@ describe("AgentSession context promotion", () => {
 		// Switching from a small-context model to a larger one and then receiving a
 		// stale length-stop event for the previous model must NOT trigger promotion
 		// or compaction on the new model — same guard as the overflow path.
-		const smallModel = modelRegistry.find("openai-codex", "gpt-5.5");
-		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-sol");
+		const smallModel = modelRegistry.find("openai-codex", "gpt-5.6-luna");
+		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-terra");
 		if (!smallModel || !largeModel) {
 			throw new Error("Expected small and large codex models to exist");
 		}
