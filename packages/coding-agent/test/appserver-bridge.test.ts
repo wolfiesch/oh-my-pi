@@ -2,16 +2,16 @@ import { describe, expect, test } from "bun:test";
 import {
 	decodeOmpAuthorityBridgeServerFrame,
 	encodeOmpAuthorityBridgeFrame,
-	OMP_AUTHORITY_BRIDGE_PROTOCOL,
 	OMP_AUTHORITY_BRIDGE_METHODS,
+	OMP_AUTHORITY_BRIDGE_PROTOCOL,
 	type OmpAuthorityBridgeMethod,
 } from "../../appserver/src/omp-authority-bridge-contract";
-import { isSubcommand } from "../src/cli-commands";
 import {
 	type BridgeSessionRecord,
 	type OmpAuthorityBridgeAuthority,
 	runOmpAuthorityBridge,
 } from "../src/cli/appserver-bridge-cli";
+import { isSubcommand } from "../src/cli-commands";
 
 class AsyncQueue implements AsyncIterable<string> {
 	readonly #values: string[] = [];
@@ -54,14 +54,56 @@ function fixture(): BridgeSessionRecord {
 		entries: [],
 	};
 }
-function authority(overrides: Partial<Pick<OmpAuthorityBridgeAuthority, "flush" | "quiesce">> = {}): OmpAuthorityBridgeAuthority {
+function authority(
+	overrides: Partial<Pick<OmpAuthorityBridgeAuthority, "flush" | "quiesce">> = {},
+): OmpAuthorityBridgeAuthority {
 	const item = fixture();
+	let current: BridgeSessionRecord | undefined = item;
+	const operation = async (args: Record<string, unknown>): Promise<unknown> => structuredClone(args);
+	const terminal = async (): Promise<void> => undefined;
 	return {
-		create: async () => item,
-		fork: async () => item,
-		list: async () => [item],
+		create: async () => (current = item),
+		fork: async () => (current = item),
+		list: async () => (current ? [current] : []),
+		archive: async (session, archivedAt) => {
+			current = { ...session, archivedAt };
+		},
+		restore: async session => {
+			const { archivedAt: _archivedAt, ...restored } = session;
+			current = restored;
+		},
+		delete: async session => {
+			if (current?.sessionId === session.sessionId) current = undefined;
+		},
+		load: async session => ({ ...session, entriesLoaded: true }),
+		page: async session => ({ entries: session.entries, hasMore: false, generation: "test" }),
+		rootForProject: async () => item.cwd,
+		rootForSession: async () => item.cwd,
+		lockCheck: async () => undefined,
+		lockStatus: async () => "missing",
+		operations: {
+			filesRead: operation,
+			filesList: operation,
+			filesDiff: operation,
+			filesWrite: operation,
+			filesPatch: operation,
+			reviewRead: operation,
+			reviewApply: operation,
+			bashRun: operation,
+			termOpen: operation,
+			catalogGet: operation,
+			settingsRead: operation,
+			brokerStatus: operation,
+			settingsWrite: operation,
+			configWrite: operation,
+			terminalInput: terminal,
+			terminalResize: terminal,
+			terminalClose: terminal,
+		},
+		usageRead: async () => ({ generatedAt: 0, reports: [], accountsWithoutUsage: [], capacity: {} }),
 		flush: overrides.flush ?? (async () => {}),
 		quiesce: overrides.quiesce ?? (async () => {}),
+		shutdown: async () => undefined,
 	};
 }
 function request(id: string, method: OmpAuthorityBridgeMethod, params: Record<string, unknown> = {}): string {
@@ -81,17 +123,25 @@ describe("OMP authority bridge lifecycle", () => {
 		const calls: string[] = [];
 		const running = runOmpAuthorityBridge({
 			authority: authority({
-				flush: async () => { calls.push("flush"); },
-				quiesce: async options => { calls.push(`quiesce:${options.interrupt}`); },
+				flush: async () => {
+					calls.push("flush");
+				},
+				quiesce: async options => {
+					calls.push(`quiesce:${options.interrupt}`);
+				},
 			}),
 			input,
-			write: line => { output.push(line); },
+			write: line => {
+				output.push(line);
+			},
 			identity,
 			generation: "gen_test_0001",
 		});
 		input.push(request("health", "host.info"));
 		input.push(request("flush", "authority.flush", { generation: "gen_test_0001", timeoutMs: 1000 }));
-		input.push(request("quiesce", "authority.quiesce", { generation: "gen_test_0001", timeoutMs: 1000, interrupt: true }));
+		input.push(
+			request("quiesce", "authority.quiesce", { generation: "gen_test_0001", timeoutMs: 1000, interrupt: true }),
+		);
 		input.push(request("mutate", "session.create", { cwd: "/tmp/project" }));
 		input.push(request("list", "session.list"));
 		input.push(request("flush-after", "authority.flush"));
@@ -99,14 +149,38 @@ describe("OMP authority bridge lifecycle", () => {
 		await running;
 		const frames = output.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)));
 		expect(frames[0]).toMatchObject({ type: "ready", methods: OMP_AUTHORITY_BRIDGE_METHODS });
-		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "health", ok: true,
-			result: { transcriptImageRoot: expect.any(String) } }));
-		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "flush", ok: true,
-			result: { schemaVersion: 1, generation: "gen_test_0001", durable: true } }));
-		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "quiesce", ok: true,
-			result: { schemaVersion: 1, generation: "gen_test_0001", durable: true, quiesced: true } }));
-		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "mutate", ok: false,
-			error: { code: "QUIESCED", message: "authority is quiesced" } }));
+		expect(frames).toContainEqual(
+			expect.objectContaining({
+				type: "response",
+				id: "health",
+				ok: true,
+				result: { transcriptImageRoot: expect.any(String) },
+			}),
+		);
+		expect(frames).toContainEqual(
+			expect.objectContaining({
+				type: "response",
+				id: "flush",
+				ok: true,
+				result: { schemaVersion: 1, generation: "gen_test_0001", durable: true },
+			}),
+		);
+		expect(frames).toContainEqual(
+			expect.objectContaining({
+				type: "response",
+				id: "quiesce",
+				ok: true,
+				result: { schemaVersion: 1, generation: "gen_test_0001", durable: true, quiesced: true },
+			}),
+		);
+		expect(frames).toContainEqual(
+			expect.objectContaining({
+				type: "response",
+				id: "mutate",
+				ok: false,
+				error: { code: "QUIESCED", message: "authority is quiesced" },
+			}),
+		);
 		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "list", ok: true }));
 		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "flush-after", ok: true }));
 		expect(calls).toEqual(["flush", "quiesce:true", "flush"]);
@@ -117,9 +191,15 @@ describe("OMP authority bridge lifecycle", () => {
 		const input = new AsyncQueue();
 		const output: string[] = [];
 		const running = runOmpAuthorityBridge({
-			authority: authority({ flush: async () => { flushed = true; } }),
+			authority: authority({
+				flush: async () => {
+					flushed = true;
+				},
+			}),
 			input,
-			write: line => { output.push(line); },
+			write: line => {
+				output.push(line);
+			},
 			identity,
 			generation: "gen_current",
 		});
@@ -127,9 +207,14 @@ describe("OMP authority bridge lifecycle", () => {
 		input.close();
 		await running;
 		expect(flushed).toBe(false);
-		expect(output.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line))))
-			.toContainEqual(expect.objectContaining({ type: "response", id: "flush", ok: false,
-				error: { code: "STALE_GENERATION", message: "runtime generation is stale" } }));
+		expect(output.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)))).toContainEqual(
+			expect.objectContaining({
+				type: "response",
+				id: "flush",
+				ok: false,
+				error: { code: "STALE_GENERATION", message: "runtime generation is stale" },
+			}),
+		);
 	});
 
 	test("rolls the mutation fence back if quiesce fails", async () => {
@@ -152,15 +237,23 @@ describe("OMP authority bridge lifecycle", () => {
 		input.push(request("quiesce", "authority.quiesce", { timeoutMs: 5 }));
 		await running;
 		const frames = output.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)));
-		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "quiesce", ok: false,
-			error: { code: "TIMEOUT", message: "operation timed out" } }));
+		expect(frames).toContainEqual(
+			expect.objectContaining({
+				type: "response",
+				id: "quiesce",
+				ok: false,
+				error: { code: "TIMEOUT", message: "operation timed out" },
+			}),
+		);
 		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "create", ok: true }));
 	});
 
 	test("rejects unknown frame fields before invoking authority", async () => {
 		const input = new AsyncQueue();
 		const running = runOmpAuthorityBridge({ authority: authority(), input, write: () => {}, identity });
-		input.push(`${JSON.stringify({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "request", id: "bad", method: "host.info", params: {}, extra: true })}\n`);
+		input.push(
+			`${JSON.stringify({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "request", id: "bad", method: "host.info", params: {}, extra: true })}\n`,
+		);
 		input.close();
 		await expect(running).rejects.toThrow("unknown or missing fields");
 	});

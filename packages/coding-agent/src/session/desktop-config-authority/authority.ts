@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
+
 interface CatalogItem {
 	id: string;
 	kind: string;
@@ -31,14 +32,15 @@ function hostId(value: string): string {
 	if (!value) throw new Error("host id is invalid");
 	return value;
 }
-import type { ModelRegistry } from "../../config/model-registry.ts";
-import { getKnownRoleIds, getRoleInfo } from "../../config/model-roles.ts";
-import type { SettingsDesktopSnapshot } from "../../config/settings.ts";
-import { SETTINGS_SCHEMA, type SettingPath } from "../../config/settings-schema.ts";
-import type { AgentRegistry } from "../../registry/agent-registry.ts";
-import { BUILTIN_SLASH_COMMAND_DEFS } from "../../slash-commands/builtin-registry.ts";
-import { loadBundledAgents } from "../../task/agents.ts";
-import { BUILTIN_TOOLS, HIDDEN_TOOLS } from "../../tools/index.ts";
+
+import type { ModelRegistry } from "../../config/model-registry";
+import { getKnownRoleIds, getRoleInfo } from "../../config/model-roles";
+import type { SettingsDesktopSnapshot } from "../../config/settings";
+import { SETTINGS_SCHEMA, type SettingPath } from "../../config/settings-schema";
+import type { AgentRegistry } from "../../registry/agent-registry";
+import { BUILTIN_SLASH_COMMAND_DEFS } from "../../slash-commands/builtin-registry";
+import { loadBundledAgents } from "../../task/agents";
+import { BUILTIN_TOOLS, HIDDEN_TOOLS } from "../../tools";
 
 const MAX_ITEMS = 1000;
 const MAX_PATHS = 256;
@@ -395,23 +397,23 @@ function itemFromUnknown(
 	const id = pathSafe(text(source.id, 256) ?? text(source.name, 256) ?? text(fallbackId, 256) ?? "item");
 	const name = pathSafe(text(source.name, 256) ?? text(source.displayName, 256) ?? id);
 	if (!id || !name) return undefined;
-	const item: CatalogItem = { id: catalogId(id), kind: fallbackKind, name };
+	let item: CatalogItem = { id: catalogId(id), kind: fallbackKind, name };
 	const description = text(source.description, 4096);
-	if (description) item.description = description;
+	if (description) item = { ...item, description };
 	const capabilities = Array.isArray(source.capabilities)
 		? source.capabilities
 				.flatMap(capability => [text(capability, 256)])
 				.filter((capability): capability is string => capability !== undefined)
 				.slice(0, 128)
 		: undefined;
-	if (capabilities?.length) item.capabilities = capabilities;
+	if (capabilities?.length) item = { ...item, capabilities };
 	const metadata: Record<string, unknown> = {};
 	for (const [key, child] of Object.entries(source)) {
 		if (["id", "kind", "name", "displayName", "description", "capabilities"].includes(key)) continue;
 		const clean = safeMetadata(child, 1, { nodes: 0 }, key);
 		if (clean !== undefined) metadata[text(key, 256) ?? "<redacted-key>"] = clean;
 	}
-	if (Object.keys(metadata).length) item.metadata = metadata;
+	if (Object.keys(metadata).length) item = { ...item, metadata };
 	return item;
 }
 function unsupportedItem(kind: CatalogItem["kind"], id: string, reason: string): CatalogItem {

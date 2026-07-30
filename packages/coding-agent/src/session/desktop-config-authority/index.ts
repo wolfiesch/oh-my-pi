@@ -8,4 +8,4 @@ export {
 	type OperationContextLike,
 	type SettingsReadArgs,
 	type SettingsWriteArgs,
-} from "./authority.ts";
+} from "./authority";

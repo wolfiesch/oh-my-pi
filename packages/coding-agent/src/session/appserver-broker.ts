@@ -3,6 +3,7 @@ export interface BrokerStatusResult {
 	endpoint?: string;
 	generation: number;
 }
+
 import { AuthBrokerClient } from "@oh-my-pi/pi-ai/auth-broker";
 import { resolveAuthBrokerConfig } from "./auth-broker-config";
 import type { AuthStorage } from "./auth-storage";

@@ -234,16 +234,19 @@ export function decodeOmpAuthorityBridgeServerFrame(value: unknown): OmpAuthorit
 	};
 }
 
-export function encodeOmpAuthorityBridgeFrame(frame: OmpAuthorityBridgeClientFrame | OmpAuthorityBridgeServerFrame): string {
+export function encodeOmpAuthorityBridgeFrame(
+	frame: OmpAuthorityBridgeClientFrame | OmpAuthorityBridgeServerFrame,
+): string {
 	const text = `${JSON.stringify(frame)}\n`;
 	if (Buffer.byteLength(text, "utf8") > OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES)
 		throw new Error("bridge frame exceeds the line limit");
 	return text;
 }
 
-export function parseOmpAuthorityBridgeLine(line: string, side: "client" | "server"):
-	| OmpAuthorityBridgeClientFrame
-	| OmpAuthorityBridgeServerFrame {
+export function parseOmpAuthorityBridgeLine(
+	line: string,
+	side: "client" | "server",
+): OmpAuthorityBridgeClientFrame | OmpAuthorityBridgeServerFrame {
 	if (Buffer.byteLength(line, "utf8") > OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES)
 		throw new Error("bridge frame exceeds the line limit");
 	let value: unknown;

@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { acquireSessionLock, type SessionLockHandle } from "./session-lock";
+
 type SessionId = string;
 
 function sessionId(value: unknown, label: string): SessionId {

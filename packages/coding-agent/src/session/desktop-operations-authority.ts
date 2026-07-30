@@ -139,10 +139,17 @@ interface TerminalHandle {
 }
 function withinRoot(root: string, candidate: string): boolean {
 	const rel = relative(root, candidate);
-	return rel === "" || (!rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) && rel !== ".." && !isAbsolute(rel));
+	return (
+		rel === "" ||
+		(!rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) && rel !== ".." && !isAbsolute(rel))
+	);
 }
 
-async function secureTarget(root: string, relativePath: string, allowMissing = false): Promise<{ root: string; target: string }> {
+async function secureTarget(
+	root: string,
+	relativePath: string,
+	allowMissing = false,
+): Promise<{ root: string; target: string }> {
 	const canonicalRoot = await fs.realpath(root);
 	const target = resolve(canonicalRoot, relativePath);
 	if (!withinRoot(canonicalRoot, target)) throw new Error("UNSAFE_PATH");
@@ -151,7 +158,8 @@ async function secureTarget(root: string, relativePath: string, allowMissing = f
 		if (!withinRoot(canonicalRoot, canonical)) throw new Error("UNSAFE_PATH");
 		return { root: canonicalRoot, target: canonical };
 	} catch (error) {
-		if (!allowMissing || !(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+		if (!allowMissing || !(error && typeof error === "object" && "code" in error && error.code === "ENOENT"))
+			throw error;
 		const parent = await fs.realpath(dirname(target));
 		if (!withinRoot(canonicalRoot, parent)) throw new Error("UNSAFE_PATH");
 		return { root: canonicalRoot, target: resolve(parent, basename(target)) };
@@ -179,17 +187,25 @@ async function secureListDirectory(
 	const values = await fs.readdir(target, { withFileTypes: true });
 	if (values.length > maxEntries) throw new Error("BOUNDS");
 	return {
-		entries: await Promise.all(values.map(async entry => {
-			const child = resolve(target, entry.name);
-			const rel = relative(canonicalRoot, child).split("\\").join("/");
-			const info = await fs.lstat(child);
-			return {
-				name: entry.name,
-				path: rel,
-				kind: info.isSymbolicLink() ? "symlink" : info.isFile() ? "file" : info.isDirectory() ? "directory" : "other",
-				...(info.isFile() ? { size: info.size } : {}),
-			};
-		})),
+		entries: await Promise.all(
+			values.map(async entry => {
+				const child = resolve(target, entry.name);
+				const rel = relative(canonicalRoot, child).split("\\").join("/");
+				const info = await fs.lstat(child);
+				return {
+					name: entry.name,
+					path: rel,
+					kind: info.isSymbolicLink()
+						? "symlink"
+						: info.isFile()
+							? "file"
+							: info.isDirectory()
+								? "directory"
+								: "other",
+					...(info.isFile() ? { size: info.size } : {}),
+				};
+			}),
+		),
 	};
 }
 
