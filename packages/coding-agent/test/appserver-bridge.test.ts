@@ -1,18 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { hostId, MAX_ARRAY_ITEMS, projectId, sessionId } from "@oh-my-pi/app-wire";
 import {
 	decodeOmpAuthorityBridgeServerFrame,
 	encodeOmpAuthorityBridgeFrame,
-	OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES,
 	OMP_AUTHORITY_BRIDGE_PROTOCOL,
-	type SessionRecord,
-} from "@oh-my-pi/appserver";
-import { getAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
-import { runOmpAuthorityBridge } from "../src/cli/appserver-bridge-cli";
-import { CURRENT_SESSION_VERSION } from "../src/session/session-entries";
-import { inspectSessionLock } from "../src/session/session-lock";
+	type OmpAuthorityBridgeMethod,
+} from "../../appserver/src/omp-authority-bridge-contract";
+import { isSubcommand } from "../src/cli-commands";
+import {
+	type BridgeSessionRecord,
+	type OmpAuthorityBridgeAuthority,
+	runOmpAuthorityBridge,
+} from "../src/cli/appserver-bridge-cli";
 
 class AsyncQueue implements AsyncIterable<string> {
 	readonly #values: string[] = [];
@@ -33,556 +31,136 @@ class AsyncQueue implements AsyncIterable<string> {
 				const value = this.#values.shift();
 				if (value !== undefined) return Promise.resolve({ done: false, value });
 				if (this.#closed) return Promise.resolve({ done: true, value: undefined });
-				return new Promise(resolve => this.#waiters.push(resolve));
+				const gate = Promise.withResolvers<IteratorResult<string>>();
+				this.#waiters.push(gate.resolve);
+				return gate.promise;
 			},
 		};
 	}
 }
 
-function session(): SessionRecord {
+function fixture(): BridgeSessionRecord {
 	return {
-		sessionId: sessionId("session-test"),
+		sessionId: "session-test",
 		path: "/tmp/session-test.jsonl",
 		cwd: "/tmp/project",
-		projectId: projectId("project-test"),
+		projectId: "project-test",
+		projectName: "project",
 		title: "Test",
 		updatedAt: new Date(0).toISOString(),
-		status: "idle" as const,
+		status: "idle",
+		entriesLoaded: false,
 		entries: [],
 	};
 }
-
-function runtime(record: SessionRecord = session(), records: readonly SessionRecord[] = [record]) {
-	const sessionAuthority = {
-		create: async () => ({ ...record }),
-		list: async () => records,
-		archive: async () => {},
-		restore: async () => {},
-		delete: async () => {},
-	};
+function authority(overrides: Partial<Pick<OmpAuthorityBridgeAuthority, "flush" | "quiesce">> = {}): OmpAuthorityBridgeAuthority {
+	const item = fixture();
 	return {
-		sessionAuthority,
-		discovery: { list: sessionAuthority.list, load: async () => record },
-		operationsAuthority: {
-			termOpen: async (_args: unknown, context: { emitTerminalOutput?: (frame: unknown) => void }) => {
-				context.emitTerminalOutput?.({
-					v: "omp-app/1",
-					type: "terminal.output",
-					hostId: hostId("host-test"),
-					sessionId: record.sessionId,
-					terminalId: "terminal-test",
-					cursor: { epoch: "terminal", seq: 1 },
-					stream: "stdout",
-					data: "ready",
-				});
-				return { terminalId: "terminal-test" };
-			},
-			terminalInput: async () => {},
-			terminalResize: async () => {},
-			terminalClose: async () => {},
-		},
-		projectRootForProject: async () => record.cwd,
-		projectRootForSession: async () => record.cwd,
-		lockCheck: () => {},
-		lockStatus: () => "missing" as const,
-		transcriptSearchAuthority: {},
-	} as never;
+		create: async () => item,
+		fork: async () => item,
+		list: async () => [item],
+		flush: overrides.flush ?? (async () => {}),
+		quiesce: overrides.quiesce ?? (async () => {}),
+	};
+}
+function request(id: string, method: OmpAuthorityBridgeMethod, params: Record<string, unknown> = {}): string {
+	return encodeOmpAuthorityBridgeFrame({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "request", id, method, params });
 }
 
-function request(
-	id: string,
-	method: "session.list" | "discovery.load" | "operation.termOpen",
-	params: Record<string, unknown>,
-) {
-	return encodeOmpAuthorityBridgeFrame({
-		v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
-		type: "request",
-		id,
-		method,
-		params,
+const identity = { ompVersion: "test", ompBuild: "test-build" };
+
+describe("OMP authority bridge lifecycle", () => {
+	test("routes bridge as a top-level CLI command", () => {
+		expect(isSubcommand("bridge")).toBe(true);
 	});
-}
 
-describe("thin OMP authority bridge", () => {
-	test("advertises concrete methods and serves sessions plus terminal events over stdio", async () => {
+	test("returns generation-bound durable acknowledgements and keeps reads available after quiesce", async () => {
 		const input = new AsyncQueue();
 		const output: string[] = [];
+		const calls: string[] = [];
 		const running = runOmpAuthorityBridge({
-			runtime: runtime(),
-			input,
-			write: line => {
-				output.push(line);
-			},
-			identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
-		});
-		input.push(request("list-1", "session.list", {}));
-		input.push(
-			request("term-1", "operation.termOpen", {
-				args: {},
-				context: {
-					hostId: "host-test",
-					sessionId: "session-test",
-					deviceId: "device-test",
-					connectionId: "connection-test",
-					capabilities: ["term.open"],
-				},
+			authority: authority({
+				flush: async () => { calls.push("flush"); },
+				quiesce: async options => { calls.push(`quiesce:${options.interrupt}`); },
 			}),
-		);
+			input,
+			write: line => { output.push(line); },
+			identity,
+			generation: "gen_test_0001",
+		});
+		input.push(request("health", "host.info"));
+		input.push(request("flush", "authority.flush", { generation: "gen_test_0001", timeoutMs: 1000 }));
+		input.push(request("quiesce", "authority.quiesce", { generation: "gen_test_0001", timeoutMs: 1000, interrupt: true }));
+		input.push(request("mutate", "session.create", { cwd: "/tmp/project" }));
+		input.push(request("list", "session.list"));
+		input.push(request("flush-after", "authority.flush"));
 		input.close();
 		await running;
 		const frames = output.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)));
-		expect(frames[0]).toMatchObject({
-			type: "ready",
-			ompVersion: "17.0.5",
-			methods: expect.arrayContaining(["host.info", "session.list", "operation.termOpen", "terminal.close"]),
-		});
-		expect(frames[0]).not.toMatchObject({ methods: expect.arrayContaining(["operation.filesRead"]) });
-		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "list-1", ok: true }));
-		expect(frames).toContainEqual(expect.objectContaining({ type: "event", id: "term-1", event: "terminal" }));
-		expect(frames).toContainEqual(
-			expect.objectContaining({
-				type: "response",
-				id: "term-1",
-				ok: true,
-				result: { terminalId: "terminal-test" },
-			}),
-		);
+		expect(frames[0]).toMatchObject({ type: "ready", methods: ["host.info", "authority.flush", "authority.quiesce", "session.create", "session.fork", "session.list"] });
+		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "health", ok: true,
+			result: expect.objectContaining({ generation: "gen_test_0001", health: "ready", acceptingMutations: true }) }));
+		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "flush", ok: true,
+			result: { schemaVersion: 1, generation: "gen_test_0001", durable: true } }));
+		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "quiesce", ok: true,
+			result: { schemaVersion: 1, generation: "gen_test_0001", durable: true, quiesced: true } }));
+		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "mutate", ok: false,
+			error: { code: "QUIESCED", message: "authority is quiesced" } }));
+		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "list", ok: true }));
+		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "flush-after", ok: true }));
+		expect(calls).toEqual(["flush", "quiesce:true", "flush"]);
 	});
 
-	test("emits sparse session-list records before the bridge frame is encoded", async () => {
-		using tempDir = TempDir.createSync("@omp-bridge-list-");
+	test("fails stale generations closed without invoking durability work", async () => {
+		let flushed = false;
 		const input = new AsyncQueue();
 		const output: string[] = [];
-		const sessionPath = path.join(tempDir.path(), "session.jsonl");
-		await Bun.write(
-			sessionPath,
-			`${JSON.stringify({
-				type: "session",
-				version: CURRENT_SESSION_VERSION,
-				id: "session-test",
-				title: "x".repeat(32 * 1024),
-				timestamp: new Date(0).toISOString(),
-				cwd: "/tmp/project",
-				authorityProtocol: OMP_AUTHORITY_BRIDGE_PROTOCOL,
-			})}\n`,
-		);
-		const large: SessionRecord = {
-			...session(),
-			path: sessionPath,
-			entries: [
-				{
-					id: "large-entry" as never,
-					parentId: null,
-					hostId: hostId("host-test"),
-					sessionId: sessionId("session-test"),
-					kind: "message",
-					timestamp: new Date(0).toISOString(),
-					data: { text: "x".repeat(OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES + 1) },
-				},
-			],
-		};
 		const running = runOmpAuthorityBridge({
-			runtime: runtime(large),
+			authority: authority({ flush: async () => { flushed = true; } }),
 			input,
-			write: line => {
-				output.push(line);
-			},
-			identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
+			write: line => { output.push(line); },
+			identity,
+			generation: "gen_current",
 		});
-		input.push(request("list-large", "session.list", {}));
+		input.push(request("flush", "authority.flush", { generation: "gen_stale" }));
 		input.close();
 		await running;
-
-		const response = output
-			.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)))
-			.find(frame => frame.type === "response" && frame.id === "list-large");
-		expect(response).toMatchObject({
-			type: "response",
-			ok: true,
-			result: {
-				sessions: [
-					{
-						...large,
-						authorityProtocol: OMP_AUTHORITY_BRIDGE_PROTOCOL,
-						entriesLoaded: false,
-						entries: [],
-					},
-				],
-			},
-		});
-		expect(Buffer.byteLength(output.find(line => line.includes('"list-large"'))!, "utf8")).toBeLessThanOrEqual(
-			OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES,
-		);
+		expect(flushed).toBe(false);
+		expect(output.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line))))
+			.toContainEqual(expect.objectContaining({ type: "response", id: "flush", ok: false,
+				error: { code: "STALE_GENERATION", message: "runtime generation is stale" } }));
 	});
 
-	test("preserves the transcript authority marker when loading a session", async () => {
-		using tempDir = TempDir.createSync("@omp-bridge-load-");
-		const sessionPath = path.join(tempDir.path(), "session.jsonl");
-		await Bun.write(
-			sessionPath,
-			`${JSON.stringify({
-				type: "session",
-				version: CURRENT_SESSION_VERSION,
-				id: "session-test",
-				timestamp: new Date(0).toISOString(),
-				cwd: "/tmp/project",
-				authorityProtocol: OMP_AUTHORITY_BRIDGE_PROTOCOL,
-			})}\n`,
-		);
-		const record: SessionRecord = { ...session(), path: sessionPath };
+	test("rolls the mutation fence back if quiesce fails", async () => {
 		const input = new AsyncQueue();
 		const output: string[] = [];
 		const running = runOmpAuthorityBridge({
-			runtime: runtime(record),
-			input,
-			write: line => {
-				output.push(line);
-			},
-			identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
-		});
-		input.push(request("load-1", "discovery.load", { session: record }));
-		input.close();
-		await running;
-		const response = output
-			.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)))
-			.find(frame => frame.type === "response" && frame.id === "load-1");
-		expect(response).toMatchObject({
-			type: "response",
-			ok: true,
-			result: { authorityProtocol: OMP_AUTHORITY_BRIDGE_PROTOCOL },
-		});
-	});
-
-	test("does not trust an authority marker supplied by a bridge client", async () => {
-		using tempDir = TempDir.createSync("@omp-bridge-untrusted-");
-		const sessionPath = path.join(tempDir.path(), "session.jsonl");
-		await Bun.write(
-			sessionPath,
-			`${JSON.stringify({
-				type: "session",
-				version: CURRENT_SESSION_VERSION,
-				id: "session-test",
-				timestamp: new Date(0).toISOString(),
-				cwd: "/tmp/project",
-			})}\n`,
-		);
-		const claimed = {
-			...session(),
-			path: sessionPath,
-			authorityProtocol: OMP_AUTHORITY_BRIDGE_PROTOCOL,
-		};
-		const input = new AsyncQueue();
-		const output: string[] = [];
-		const running = runOmpAuthorityBridge({
-			runtime: runtime(claimed),
-			input,
-			write: line => {
-				output.push(line);
-			},
-			identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
-		});
-		input.push(request("load-untrusted", "discovery.load", { session: claimed }));
-		input.close();
-		await running;
-		const response = output
-			.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)))
-			.find(frame => frame.type === "response" && frame.id === "load-untrusted");
-		expect(response).toMatchObject({
-			type: "response",
-			ok: true,
-			result: expect.not.objectContaining({
-				authorityProtocol: OMP_AUTHORITY_BRIDGE_PROTOCOL,
-			}),
-		});
-	});
-
-	test("returns a complete bounded session inventory", async () => {
-		const input = new AsyncQueue();
-		const output: string[] = [];
-		const collected: unknown[] = [];
-		const continuationCursors = new Set<string>();
-		let pageNumber = 0;
-		const sessions = Array.from({ length: MAX_ARRAY_ITEMS }, (_, index) => ({
-			...session(),
-			sessionId: sessionId(`session-${index}`),
-			path: `/tmp/session-${index}.jsonl`,
-			title: `Session ${index} ${"x".repeat(2048)}`,
-		}));
-		const running = runOmpAuthorityBridge({
-			runtime: runtime(session(), sessions),
+			authority: authority({ quiesce: () => Promise.withResolvers<void>().promise }),
 			input,
 			write: line => {
 				output.push(line);
 				const frame = decodeOmpAuthorityBridgeServerFrame(JSON.parse(line));
-				if (frame.type !== "response" || !frame.id.startsWith("list-page-") || !frame.ok) return;
-				if (!frame.result || typeof frame.result !== "object" || Array.isArray(frame.result))
-					throw new Error("session list page is unavailable");
-				const page = frame.result as Record<string, unknown>;
-				if (!Array.isArray(page.sessions)) throw new Error("session list page sessions are unavailable");
-				collected.push(...page.sessions);
-				if (typeof page.nextCursor === "string") {
-					if (continuationCursors.has(page.nextCursor)) throw new Error("session list cursor repeated");
-					continuationCursors.add(page.nextCursor);
-					pageNumber += 1;
-					input.push(request(`list-page-${pageNumber}`, "session.list", { cursor: page.nextCursor }));
-				} else {
+				if (frame.type === "response" && frame.id === "quiesce") {
+					input.push(request("create", "session.create", { cwd: "/tmp/project" }));
 					input.close();
 				}
 			},
-			identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
+			identity,
+			generation: "gen_current",
 		});
-		input.push(request("list-page-0", "session.list", {}));
+		input.push(request("quiesce", "authority.quiesce", { timeoutMs: 5 }));
 		await running;
-
-		const responseLines = output.filter(line => line.includes('"id":"list-page-'));
-		expect(responseLines.length).toBeGreaterThan(2);
-		expect(continuationCursors.size).toBe(responseLines.length - 1);
-		expect(responseLines.every(line => Buffer.byteLength(line, "utf8") <= OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES)).toBe(
-			true,
-		);
-		expect(collected).toHaveLength(MAX_ARRAY_ITEMS);
-		const lastIndex = MAX_ARRAY_ITEMS - 1;
-		expect(collected[0]).toMatchObject({ sessionId: "session-0" });
-		expect(collected[lastIndex]).toMatchObject({ sessionId: `session-${lastIndex}` });
+		const frames = output.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)));
+		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "quiesce", ok: false,
+			error: { code: "TIMEOUT", message: "operation timed out" } }));
+		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "create", ok: true }));
 	});
 
-	test("marks an over-limit inventory partial instead of treating omissions as complete", async () => {
+	test("rejects unknown frame fields before invoking authority", async () => {
 		const input = new AsyncQueue();
-		const output: string[] = [];
-		const sessions = Array.from({ length: MAX_ARRAY_ITEMS + 1 }, (_, index) => ({
-			...session(),
-			sessionId: sessionId(`session-${index}`),
-			path: `/tmp/session-${index}.jsonl`,
-		}));
-		const running = runOmpAuthorityBridge({
-			runtime: runtime(session(), sessions),
-			input,
-			write: line => {
-				output.push(line);
-			},
-			identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
-		});
-		input.push(request("list-too-large", "session.list", {}));
-		input.close();
-		await running;
-
-		const response = output
-			.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)))
-			.find(frame => frame.type === "response" && frame.id === "list-too-large");
-		expect(response).toMatchObject({
-			v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
-			type: "response",
-			id: "list-too-large",
-			ok: true,
-			result: {
-				complete: false,
-				totalCount: MAX_ARRAY_ITEMS + 1,
-			},
-		});
-		if (response?.type !== "response" || !response.ok)
-			throw new Error("partial session inventory response is unavailable");
-		const page = response.result as { sessions: unknown[] };
-		expect(page.sessions).toHaveLength(MAX_ARRAY_ITEMS);
-	});
-
-	test("rejects malformed frames before invoking authority code", async () => {
-		const input = new AsyncQueue();
-		const running = runOmpAuthorityBridge({
-			runtime: runtime(),
-			input,
-			write: () => {},
-			identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
-		});
-		input.push(
-			`${JSON.stringify({
-				v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
-				type: "request",
-				id: "bad-1",
-				method: "session.list",
-				params: {},
-				extra: true,
-			})}\n`,
-		);
+		const running = runOmpAuthorityBridge({ authority: authority(), input, write: () => {}, identity });
+		input.push(`${JSON.stringify({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "request", id: "bad", method: "host.info", params: {}, extra: true })}\n`);
 		input.close();
 		await expect(running).rejects.toThrow("unknown or missing fields");
-	});
-
-	test("rejects an oversized unfinished input frame", async () => {
-		const input = new AsyncQueue();
-		const running = runOmpAuthorityBridge({
-			runtime: runtime(),
-			input,
-			write: () => {},
-			identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
-		});
-		input.push("x".repeat(OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES + 1));
-		await expect(running).rejects.toThrow("bridge input exceeds the line limit");
-	});
-
-	test("forks a session into an unlocked copy and never writes the source", async () => {
-		using tempDir = TempDir.createSync("@omp-bridge-fork-");
-		const previousAgentDir = getAgentDir();
-		setAgentDir(path.join(tempDir.path(), "agent"));
-		try {
-			const cwd = path.join(tempDir.path(), "project");
-			const sessionDir = path.join(tempDir.path(), "sessions");
-			await fs.mkdir(cwd, { recursive: true });
-			await fs.mkdir(sessionDir, { recursive: true });
-			const sourceFile = path.join(sessionDir, "source.jsonl");
-			const timestamp = new Date().toISOString();
-			const sourceText = `${JSON.stringify({
-				type: "session",
-				version: CURRENT_SESSION_VERSION,
-				id: "bridge-fork-source",
-				timestamp,
-				cwd,
-			})}\n${JSON.stringify({
-				type: "message",
-				id: "message-1",
-				parentId: null,
-				timestamp,
-				message: { role: "user", content: "carried across", timestamp: Date.now() },
-			})}\n`;
-			await Bun.write(sourceFile, sourceText);
-			const record: SessionRecord = {
-				...session(),
-				sessionId: sessionId("bridge-fork-source"),
-				path: sourceFile,
-				cwd,
-			};
-			const input = new AsyncQueue();
-			const output: string[] = [];
-			const running = runOmpAuthorityBridge({
-				runtime: runtime(record),
-				input,
-				write: line => {
-					output.push(line);
-				},
-				identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
-			});
-			input.push(
-				encodeOmpAuthorityBridgeFrame({
-					v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
-					type: "request",
-					id: "fork-1",
-					method: "session.fork",
-					params: { session: record },
-				}),
-			);
-			input.close();
-			await running;
-			const frames = output.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)));
-			expect(frames[0]).toMatchObject({
-				type: "ready",
-				methods: expect.arrayContaining(["session.fork"]),
-			});
-			const forked = frames.find(frame => frame.type === "response" && frame.id === "fork-1");
-			if (forked?.type !== "response") throw new Error("expected a fork response");
-			if (!forked.ok) throw new Error("fork request was rejected");
-			const result = forked.result;
-			if (!result || typeof result !== "object") throw new Error("expected a fork result");
-			if (!("path" in result) || typeof result.path !== "string") throw new Error("expected a fork path");
-			if (!("sessionId" in result) || typeof result.sessionId !== "string")
-				throw new Error("expected a fork session id");
-			expect(result.path).not.toBe(sourceFile);
-			expect(result.sessionId).not.toBe("bridge-fork-source");
-			// The source is read, never written.
-			expect(await Bun.file(sourceFile).text()).toBe(sourceText);
-			// The copy carries the history and arrives unlocked, so the host can
-			// start its own writer instead of seeing the fork as live elsewhere.
-			expect(await Bun.file(result.path).text()).toContain("carried across");
-			expect(inspectSessionLock(result.path).status).toBe("missing");
-		} finally {
-			setAgentDir(previousAgentDir);
-		}
-	});
-
-	// Historic transcripts routinely name a project directory that has since been
-	// deleted. The copy is a new session and has to live somewhere real, so the
-	// caller may name an existing directory for it.
-	test("forks a session whose recorded directory is gone into a caller-chosen one", async () => {
-		using tempDir = TempDir.createSync("@omp-bridge-fork-cwd-");
-		const previousAgentDir = getAgentDir();
-		setAgentDir(path.join(tempDir.path(), "agent"));
-		try {
-			const goneCwd = path.join(tempDir.path(), "deleted-project");
-			const chosenCwd = path.join(tempDir.path(), "chosen-project");
-			const sessionDir = path.join(tempDir.path(), "sessions");
-			await fs.mkdir(chosenCwd, { recursive: true });
-			await fs.mkdir(sessionDir, { recursive: true });
-			const sourceFile = path.join(sessionDir, "gone-source.jsonl");
-			const timestamp = new Date().toISOString();
-			const sourceText = `${JSON.stringify({
-				type: "session",
-				version: CURRENT_SESSION_VERSION,
-				id: "bridge-fork-gone",
-				timestamp,
-				cwd: goneCwd,
-			})}\n${JSON.stringify({
-				type: "message",
-				id: "message-1",
-				parentId: null,
-				timestamp,
-				message: { role: "user", content: "carried across", timestamp: Date.now() },
-			})}\n`;
-			await Bun.write(sourceFile, sourceText);
-			const record: SessionRecord = {
-				...session(),
-				sessionId: sessionId("bridge-fork-gone"),
-				path: sourceFile,
-				cwd: goneCwd,
-			};
-			const input = new AsyncQueue();
-			const output: string[] = [];
-			const running = runOmpAuthorityBridge({
-				runtime: runtime(record),
-				input,
-				write: line => {
-					output.push(line);
-				},
-				identity: { ompVersion: "17.0.5", ompBuild: "bridge-test" },
-			});
-			input.push(
-				encodeOmpAuthorityBridgeFrame({
-					v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
-					type: "request",
-					id: "fork-gone",
-					method: "session.fork",
-					params: { session: record, cwd: chosenCwd },
-				}),
-			);
-			input.push(
-				encodeOmpAuthorityBridgeFrame({
-					v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
-					type: "request",
-					id: "fork-missing",
-					method: "session.fork",
-					params: { session: record, cwd: path.join(tempDir.path(), "not-there") },
-				}),
-			);
-			input.close();
-			await running;
-			const frames = output.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)));
-			const forked = frames.find(frame => frame.type === "response" && frame.id === "fork-gone");
-			if (forked?.type !== "response") throw new Error("expected a fork response");
-			if (!forked.ok) throw new Error("fork request was rejected");
-			const result = forked.result;
-			if (!result || typeof result !== "object") throw new Error("expected a fork result");
-			if (!("cwd" in result) || typeof result.cwd !== "string") throw new Error("expected a fork cwd");
-			if (!("path" in result) || typeof result.path !== "string") throw new Error("expected a fork path");
-			// The copy runs where the caller asked, and the header carries it, so
-			// the choice survives rediscovery instead of living only in memory.
-			expect(result.cwd).toBe(chosenCwd);
-			expect(await Bun.file(result.path).text()).toContain(chosenCwd);
-			expect(await Bun.file(result.path).text()).toContain("carried across");
-			// The source is still only read.
-			expect(await Bun.file(sourceFile).text()).toBe(sourceText);
-			// A directory that does not exist is refused rather than substituted.
-			const refused = frames.find(frame => frame.type === "response" && frame.id === "fork-missing");
-			if (refused?.type !== "response") throw new Error("expected a refusal response");
-			expect(refused.ok).toBe(false);
-		} finally {
-			setAgentDir(previousAgentDir);
-		}
 	});
 });

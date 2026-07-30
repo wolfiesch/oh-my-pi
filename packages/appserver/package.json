@@ -3,12 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Thin OMP authority adapter for the T4-owned host service",
+  "description": "Shared OMP authority bridge protocol and T4 host adapter",
   "license": "MIT",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "files": ["src", "README.md"],
-  "exports": { ".": { "types": "./src/index.ts", "import": "./src/index.ts" } },
+  "exports": {
+    ".": { "types": "./src/index.ts", "import": "./src/index.ts" },
+    "./*": { "types": "./src/*.ts", "import": "./src/*.ts" }
+  },
   "scripts": {
     "build": "bunx tsc -p tsconfig.json --noEmit",
     "check": "bun run build",

@@ -6,3 +6,4 @@
  * comes from the checksum-pinned T4 artifact under vendor/t4-host.
  */
 export * from "@t4-code/host-service";
+export * from "./omp-authority-bridge-contract";
