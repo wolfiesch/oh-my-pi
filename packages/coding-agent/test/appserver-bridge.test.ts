@@ -3,6 +3,7 @@ import {
 	decodeOmpAuthorityBridgeServerFrame,
 	encodeOmpAuthorityBridgeFrame,
 	OMP_AUTHORITY_BRIDGE_PROTOCOL,
+	OMP_AUTHORITY_BRIDGE_METHODS,
 	type OmpAuthorityBridgeMethod,
 } from "../../appserver/src/omp-authority-bridge-contract";
 import { isSubcommand } from "../src/cli-commands";
@@ -97,9 +98,9 @@ describe("OMP authority bridge lifecycle", () => {
 		input.close();
 		await running;
 		const frames = output.map(line => decodeOmpAuthorityBridgeServerFrame(JSON.parse(line)));
-		expect(frames[0]).toMatchObject({ type: "ready", methods: ["host.info", "authority.flush", "authority.quiesce", "session.create", "session.fork", "session.list"] });
+		expect(frames[0]).toMatchObject({ type: "ready", methods: OMP_AUTHORITY_BRIDGE_METHODS });
 		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "health", ok: true,
-			result: expect.objectContaining({ generation: "gen_test_0001", health: "ready", acceptingMutations: true }) }));
+			result: { transcriptImageRoot: expect.any(String) } }));
 		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "flush", ok: true,
 			result: { schemaVersion: 1, generation: "gen_test_0001", durable: true } }));
 		expect(frames).toContainEqual(expect.objectContaining({ type: "response", id: "quiesce", ok: true,

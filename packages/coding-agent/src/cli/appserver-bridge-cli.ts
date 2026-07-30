@@ -1,57 +1,63 @@
-import { createHash, randomUUID } from "node:crypto";
-import * as fs from "node:fs";
-import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import {
 	decodeOmpAuthorityBridgeClientFrame,
 	decodeOmpAuthorityBridgeServerFrame,
 	encodeOmpAuthorityBridgeFrame,
 	OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES,
 	OMP_AUTHORITY_BRIDGE_PROTOCOL,
+	OMP_AUTHORITY_BRIDGE_METHODS,
 	type OmpAuthorityBridgeClientFrame,
 	type OmpAuthorityBridgeMethod,
 } from "../../../appserver/src/omp-authority-bridge-contract";
 import { getBlobsDir, VERSION } from "@oh-my-pi/pi-utils/dirs";
-import type { SessionInfo } from "../session/session-listing";
-import { SessionManager } from "../session/session-manager";
+import {
+	createDefaultOmpAuthorityBridgeAuthority,
+	type BridgeOperationContext,
+	type BridgeSessionRecord,
+	type OmpAuthorityBridgeAuthority,
+} from "../session/appserver-bridge-authority";
+export type { BridgeSessionRecord, OmpAuthorityBridgeAuthority } from "../session/appserver-bridge-authority";
 
 const MAX_SESSION_RECORDS = 1_000;
 const MAX_SESSION_LIST_SNAPSHOTS = 4;
 const SESSION_LIST_SNAPSHOT_TTL_MS = 30_000;
 const DEFAULT_LIFECYCLE_TIMEOUT_MS = 10_000;
 const MAX_LIFECYCLE_TIMEOUT_MS = 30_000;
-const METHODS = [
-	"host.info",
-	"authority.flush",
-	"authority.quiesce",
-	"session.create",
-	"session.fork",
-	"session.list",
-] as const satisfies readonly OmpAuthorityBridgeMethod[];
+const METHODS = OMP_AUTHORITY_BRIDGE_METHODS;
 const MUTATING_METHODS: Partial<Record<OmpAuthorityBridgeMethod, true>> = {
 	"session.create": true,
 	"session.fork": true,
+	"session.archive": true,
+	"session.restore": true,
+	"session.delete": true,
+	"operation.filesWrite": true,
+	"operation.filesPatch": true,
+	"operation.reviewApply": true,
+	"operation.bashRun": true,
+	"operation.termOpen": true,
+	"operation.settingsWrite": true,
+	"operation.configWrite": true,
+	"terminal.input": true,
+	"terminal.resize": true,
+	"terminal.close": true,
 };
+const OPERATION_METHODS = {
+	"operation.filesRead": "filesRead",
+	"operation.filesList": "filesList",
+	"operation.filesDiff": "filesDiff",
+	"operation.filesWrite": "filesWrite",
+	"operation.filesPatch": "filesPatch",
+	"operation.reviewRead": "reviewRead",
+	"operation.reviewApply": "reviewApply",
+	"operation.bashRun": "bashRun",
+	"operation.termOpen": "termOpen",
+	"operation.catalogGet": "catalogGet",
+	"operation.settingsRead": "settingsRead",
+	"operation.brokerStatus": "brokerStatus",
+	"operation.settingsWrite": "settingsWrite",
+	"operation.configWrite": "configWrite",
+} as const;
 
-export interface BridgeSessionRecord {
-	readonly sessionId: string;
-	readonly path: string;
-	readonly cwd: string;
-	readonly projectId: string;
-	readonly projectName?: string;
-	readonly title: string;
-	readonly updatedAt: string;
-	readonly status: "idle";
-	readonly entriesLoaded: false;
-	readonly entries: readonly [];
-}
-
-export interface OmpAuthorityBridgeAuthority {
-	create(cwd: string, title: string | undefined, signal: AbortSignal): Promise<BridgeSessionRecord>;
-	fork(source: BridgeSessionRecord, cwd: string | undefined, signal: AbortSignal): Promise<BridgeSessionRecord>;
-	list(signal: AbortSignal): Promise<readonly BridgeSessionRecord[]>;
-	flush(): Promise<void>;
-	quiesce(options: { readonly interrupt: boolean }): Promise<void>;
-}
 
 interface SessionListSnapshot {
 	readonly references: readonly BridgeSessionRecord[];
@@ -102,28 +108,6 @@ function requiredString(value: unknown, label: string): string {
 function optionalString(value: unknown, label: string): string | undefined {
 	return value === undefined ? undefined : requiredString(value, label);
 }
-function projectName(cwd: string): string {
-	return path.basename(cwd) || path.parse(cwd).root || "Project";
-}
-function stableProjectId(cwd: string): string {
-	let canonical = path.resolve(cwd);
-	try { canonical = fs.realpathSync.native(canonical); } catch {}
-	return `project-${createHash("sha256").update(canonical).digest("hex").slice(0, 24)}`;
-}
-function sessionRecord(info: SessionInfo): BridgeSessionRecord {
-	return {
-		sessionId: info.id,
-		path: info.path,
-		cwd: info.cwd,
-		projectId: stableProjectId(info.cwd),
-		projectName: projectName(info.cwd),
-		title: info.title || "Untitled",
-		updatedAt: info.modified.toISOString(),
-		status: "idle",
-		entriesLoaded: false,
-		entries: [],
-	};
-}
 function requestedSession(value: unknown): BridgeSessionRecord {
 	const item = record(value, "session");
 	return {
@@ -139,66 +123,36 @@ function requestedSession(value: unknown): BridgeSessionRecord {
 		entries: [],
 	};
 }
-
-async function syncFileAndParent(filePath: string): Promise<void> {
-	const file = await fs.promises.open(filePath, "r");
-	try { await file.sync(); } finally { await file.close(); }
-	const directory = await fs.promises.open(path.dirname(filePath), "r");
-	try { await directory.sync(); } finally { await directory.close(); }
-}
-
-export function createDefaultOmpAuthorityBridgeAuthority(): OmpAuthorityBridgeAuthority {
-	const dirtyPaths = new Set<string>();
-	const persist = async (manager: SessionManager): Promise<BridgeSessionRecord> => {
-		await manager.ensureOnDisk();
-		const sessionPath = manager.getSessionFile();
-		if (!sessionPath) throw new Error("session file was not created");
-		dirtyPaths.add(sessionPath);
-		return {
-			sessionId: manager.getSessionId(),
-			path: sessionPath,
-			cwd: manager.getCwd(),
-			projectId: stableProjectId(manager.getCwd()),
-			projectName: projectName(manager.getCwd()),
-			title: manager.getSessionName() || "Untitled",
-			updatedAt: new Date().toISOString(),
-			status: "idle",
-			entriesLoaded: false,
-			entries: [],
-		};
-	};
-	const flush = async (): Promise<void> => {
-		for (const filePath of [...dirtyPaths]) {
-			await syncFileAndParent(filePath);
-			dirtyPaths.delete(filePath);
-		}
-	};
+function operationContext(
+	value: unknown,
+	abortSignal: AbortSignal,
+	emitTerminalOutput: (frame: unknown) => void,
+): BridgeOperationContext {
+	const item = record(value, "operation context");
+	exact(item, [
+		"hostId",
+		...(item.sessionId === undefined ? [] : ["sessionId"]),
+		"deviceId",
+		"connectionId",
+		"capabilities",
+		...(item.currentRevision === undefined ? [] : ["currentRevision"]),
+		...(item.expectedRevision === undefined ? [] : ["expectedRevision"]),
+	], "operation context");
+	if (!Array.isArray(item.capabilities) || item.capabilities.some(capability => typeof capability !== "string"))
+		throw new Error("operation context capabilities are invalid");
 	return {
-		async create(cwd, title, signal) {
-			if (signal.aborted) throw Object.assign(new Error("operation was cancelled"), { code: "ABORTED" });
-			const manager = SessionManager.create(cwd);
-			try {
-				if (title !== undefined) await manager.setSessionName(title, "user");
-				return await persist(manager);
-			} finally {
-				await manager.close();
-			}
-		},
-		async fork(source, cwd, signal) {
-			if (signal.aborted) throw Object.assign(new Error("operation was cancelled"), { code: "ABORTED" });
-			const available = (await SessionManager.listAll()).find(candidate => candidate.id === source.sessionId);
-			if (!available) throw Object.assign(new Error("unknown session"), { code: "NOT_FOUND" });
-			const manager = await SessionManager.forkFrom(available.path, cwd ?? available.cwd);
-			try { return await persist(manager); } finally { await manager.close(); }
-		},
-		async list(signal) {
-			if (signal.aborted) throw Object.assign(new Error("operation was cancelled"), { code: "ABORTED" });
-			return (await SessionManager.listAll()).map(sessionRecord);
-		},
-		flush,
-		async quiesce() { await flush(); },
+		hostId: requiredString(item.hostId, "operation host id"),
+		...(item.sessionId === undefined ? {} : { sessionId: requiredString(item.sessionId, "operation session id") }),
+		deviceId: requiredString(item.deviceId, "operation device id"),
+		connectionId: requiredString(item.connectionId, "operation connection id"),
+		capabilities: new Set(item.capabilities as string[]),
+		...(item.currentRevision === undefined ? {} : { currentRevision: requiredString(item.currentRevision, "current revision") }),
+		...(item.expectedRevision === undefined ? {} : { expectedRevision: requiredString(item.expectedRevision, "expected revision") }),
+		abortSignal,
+		emitTerminalOutput,
 	};
 }
+
 
 function sessionListPage(
 	id: string,
@@ -340,13 +294,14 @@ async function dispatch(
 	frame: Extract<OmpAuthorityBridgeClientFrame, { type: "request" }>,
 	signal: AbortSignal,
 	snapshots: Map<string, SessionListSnapshot>,
+	emitTerminalOutput: (frame: unknown) => void,
 	state: BridgeState,
 ): Promise<unknown> {
 	const params = frame.params;
 	switch (frame.method) {
 		case "host.info":
 			exact(params, [], "host.info params");
-			return { transcriptImageRoot: getBlobsDir(), generation: state.generation, health: "ready", acceptingMutations: !state.quiesced };
+			return { transcriptImageRoot: getBlobsDir() };
 		case "authority.flush": {
 			const policy = lifecycleParams(params, state.generation);
 			const pending = [...state.requests.entries()]
@@ -383,13 +338,69 @@ async function dispatch(
 		}
 		case "session.list":
 			return listSessionPage(authority, frame.id, params, snapshots, signal);
-		default:
-			throw Object.assign(new Error("unsupported"), { code: "UNSUPPORTED" });
+		case "session.archive":
+			exact(params, ["session", "archivedAt"], "session.archive params");
+			await authority.archive(requestedSession(params.session), requiredString(params.archivedAt, "archive time"), signal);
+			return null;
+		case "session.restore":
+			exact(params, ["session"], "session.restore params");
+			await authority.restore(requestedSession(params.session), signal);
+			return null;
+		case "session.delete":
+			exact(params, ["session"], "session.delete params");
+			await authority.delete(requestedSession(params.session), signal);
+			return null;
+		case "discovery.load":
+			exact(params, ["session"], "discovery.load params");
+			return authority.load(requestedSession(params.session), signal);
+		case "discovery.page":
+			exact(params, ["session", "args"], "discovery.page params");
+			return authority.page(requestedSession(params.session), record(params.args, "transcript page args"), signal);
+		case "project.rootForProject":
+			exact(params, ["projectId"], "project.rootForProject params");
+			return authority.rootForProject(requiredString(params.projectId, "project id"), signal);
+		case "project.rootForSession":
+			exact(params, ["sessionId"], "project.rootForSession params");
+			return authority.rootForSession(requiredString(params.sessionId, "session id"), signal);
+		case "lock.check":
+			exact(params, ["session"], "lock.check params");
+			await authority.lockCheck(requestedSession(params.session), signal);
+			return null;
+		case "lock.status":
+			exact(params, ["session"], "lock.status params");
+			return authority.lockStatus(requestedSession(params.session), signal);
+		case "usage.read":
+			exact(params, [], "usage.read params");
+			return authority.usageRead(signal);
+		case "terminal.input":
+		case "terminal.resize":
+		case "terminal.close": {
+			exact(params, ["frame", "context"], `${frame.method} params`);
+			const property = frame.method === "terminal.input"
+				? "terminalInput"
+				: frame.method === "terminal.resize"
+					? "terminalResize"
+					: "terminalClose";
+			await authority.operations[property](
+				record(params.frame, "terminal frame"),
+				operationContext(params.context, signal, emitTerminalOutput),
+			);
+			return null;
+		}
+		default: {
+			const property = OPERATION_METHODS[frame.method as keyof typeof OPERATION_METHODS];
+			if (!property) throw Object.assign(new Error("unsupported"), { code: "UNSUPPORTED" });
+			exact(params, ["args", "context"], `${frame.method} params`);
+			return authority.operations[property](
+				record(params.args, "operation args"),
+				operationContext(params.context, signal, emitTerminalOutput),
+			);
+		}
 	}
 }
 
 export async function runOmpAuthorityBridge(options: OmpAuthorityBridgeRunnerOptions = {}): Promise<void> {
-	const authority = options.authority ?? createDefaultOmpAuthorityBridgeAuthority();
+	const authority = options.authority ?? await createDefaultOmpAuthorityBridgeAuthority();
 	const input = options.input ?? process.stdin as unknown as AsyncIterable<Uint8Array>;
 	const output = options.write ?? (line => new Promise<void>((resolve, reject) => {
 		process.stdout.write(line, error => error ? reject(error) : resolve());
@@ -428,7 +439,10 @@ export async function runOmpAuthorityBridge(options: OmpAuthorityBridgeRunnerOpt
 		const controller = new AbortController();
 		const active: ActiveRequest = { controller, method: frame.method, promise: Promise.resolve() };
 		state.requests.set(frame.id, active);
-		active.promise = dispatch(authority, frame, controller.signal, snapshots, state)
+		active.promise = dispatch(authority, frame, controller.signal, snapshots, payload => {
+			if (!controller.signal.aborted)
+				void write({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "event", id: frame.id, event: "terminal", payload });
+		}, state)
 			.then(
 				result => write({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "response", id: frame.id, ok: true, result: result ?? null }),
 				error => write({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "response", id: frame.id, ok: false, error: safeError(error) }),
@@ -438,5 +452,6 @@ export async function runOmpAuthorityBridge(options: OmpAuthorityBridgeRunnerOpt
 	}
 	for (const request of state.requests.values()) request.controller.abort();
 	await Promise.allSettled([...state.requests.values()].map(request => request.promise));
+	await authority.shutdown?.();
 	await writeTail;
 }

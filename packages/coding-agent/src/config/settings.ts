@@ -60,6 +60,19 @@ export * from "./settings-schema";
 export interface RawSettings {
 	[key: string]: unknown;
 }
+export interface SettingsLayerValue {
+	present: boolean;
+	value?: unknown;
+}
+export interface SettingsDesktopSnapshot {
+	path: SettingPath;
+	global: SettingsLayerValue;
+	project: SettingsLayerValue;
+	configOverlay: SettingsLayerValue;
+	override: SettingsLayerValue;
+	effective: unknown;
+	source: "override" | "configOverlay" | "project" | "global" | "default";
+}
 
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
@@ -112,6 +125,15 @@ function setByPath(obj: RawSettings, segments: string[], value: unknown): void {
 		current = current[segment] as RawSettings;
 	}
 	current[segments[segments.length - 1]] = value;
+}
+function deleteByPath(obj: RawSettings, segments: readonly string[]): void {
+	let current = obj;
+	for (let i = 0; i < segments.length - 1; i++) {
+		const child = current[segments[i]];
+		if (!child || typeof child !== "object" || Array.isArray(child)) return;
+		current = child as RawSettings;
+	}
+	delete current[segments[segments.length - 1]];
 }
 
 export function normalizeProviderMaxInFlightRequests(value: unknown): Record<string, number> {
@@ -447,6 +469,56 @@ export class Settings {
 	// ─────────────────────────────────────────────────────────────────────────
 	// Core API
 	// ─────────────────────────────────────────────────────────────────────────
+
+	getDesktopSnapshot(path: SettingPath): SettingsDesktopSnapshot {
+		const segments = SETTING_PATH_SEGMENTS[path];
+		const layer = (raw: RawSettings): SettingsLayerValue => {
+			const value = getByPath(raw, segments);
+			return value === undefined ? { present: false } : { present: true, value: structuredClone(value) };
+		};
+		const global = layer(this.#global);
+		const project = layer(this.#project);
+		const configOverlay = layer(this.#configOverlay);
+		const override = layer(this.#overrides);
+		let source: SettingsDesktopSnapshot["source"] = "default";
+		if (override.present) source = "override";
+		else if (configOverlay.present) source = "configOverlay";
+		else if (project.present) source = "project";
+		else if (global.present) source = "global";
+		return { path, global, project, configOverlay, override, effective: structuredClone(this.get(path)), source };
+	}
+
+	clearGlobal(path: SettingPath): void {
+		const prev = this.get(path);
+		deleteByPath(this.#global, SETTING_PATH_SEGMENTS[path]);
+		this.#modified.add(path);
+		this.#rebuildMerged();
+		this.#queueSave();
+		const next = this.get(path);
+		const hook = SETTING_HOOKS[path];
+		if (hook) hook(next, prev);
+		this.#fireEffectiveSettingChanged(path, next, prev);
+	}
+
+	restoreDesktopSnapshot(snapshot: SettingsDesktopSnapshot): void {
+		const segments = SETTING_PATH_SEGMENTS[snapshot.path];
+		const previous = this.get(snapshot.path);
+		const restore = (target: RawSettings, layer: SettingsLayerValue): void => {
+			if (layer.present) setByPath(target, [...segments], structuredClone(layer.value));
+			else deleteByPath(target, segments);
+		};
+		restore(this.#global, snapshot.global);
+		restore(this.#project, snapshot.project);
+		restore(this.#configOverlay, snapshot.configOverlay);
+		restore(this.#overrides, snapshot.override);
+		this.#modified.add(snapshot.path);
+		this.#rebuildMerged();
+		this.#queueSave();
+		const next = this.get(snapshot.path);
+		const hook = SETTING_HOOKS[snapshot.path];
+		if (hook) hook(next, previous);
+		this.#fireEffectiveSettingChanged(snapshot.path, next, previous);
+	}
 
 	/**
 	 * Get a setting value (sync).
