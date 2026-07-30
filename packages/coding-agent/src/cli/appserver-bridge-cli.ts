@@ -1,21 +1,23 @@
 import { randomUUID } from "node:crypto";
+import { sessionId } from "@oh-my-pi/app-wire";
+import { getBlobsDir, VERSION } from "@oh-my-pi/pi-utils/dirs";
 import {
 	decodeOmpAuthorityBridgeClientFrame,
 	decodeOmpAuthorityBridgeServerFrame,
 	encodeOmpAuthorityBridgeFrame,
 	OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES,
-	OMP_AUTHORITY_BRIDGE_PROTOCOL,
 	OMP_AUTHORITY_BRIDGE_METHODS,
+	OMP_AUTHORITY_BRIDGE_PROTOCOL,
 	type OmpAuthorityBridgeClientFrame,
 	type OmpAuthorityBridgeMethod,
 } from "../../../appserver/src/omp-authority-bridge-contract";
-import { getBlobsDir, VERSION } from "@oh-my-pi/pi-utils/dirs";
 import {
-	createDefaultOmpAuthorityBridgeAuthority,
 	type BridgeOperationContext,
 	type BridgeSessionRecord,
+	createDefaultOmpAuthorityBridgeAuthority,
 	type OmpAuthorityBridgeAuthority,
 } from "../session/appserver-bridge-authority";
+
 export type { BridgeSessionRecord, OmpAuthorityBridgeAuthority } from "../session/appserver-bridge-authority";
 
 const MAX_SESSION_RECORDS = 1_000;
@@ -57,7 +59,6 @@ const OPERATION_METHODS = {
 	"operation.settingsWrite": "settingsWrite",
 	"operation.configWrite": "configWrite",
 } as const;
-
 
 interface SessionListSnapshot {
 	readonly references: readonly BridgeSessionRecord[];
@@ -111,11 +112,13 @@ function optionalString(value: unknown, label: string): string | undefined {
 function requestedSession(value: unknown): BridgeSessionRecord {
 	const item = record(value, "session");
 	return {
-		sessionId: requiredString(item.sessionId, "session id"),
+		sessionId: sessionId(requiredString(item.sessionId, "session id"), "sessionId"),
 		path: requiredString(item.path, "session path"),
 		cwd: requiredString(item.cwd, "session cwd"),
 		projectId: requiredString(item.projectId, "session project id"),
-		...(item.projectName === undefined ? {} : { projectName: requiredString(item.projectName, "session project name") }),
+		...(item.projectName === undefined
+			? {}
+			: { projectName: requiredString(item.projectName, "session project name") }),
 		title: requiredString(item.title, "session title"),
 		updatedAt: requiredString(item.updatedAt, "session update time"),
 		status: "idle",
@@ -129,15 +132,19 @@ function operationContext(
 	emitTerminalOutput: (frame: unknown) => void,
 ): BridgeOperationContext {
 	const item = record(value, "operation context");
-	exact(item, [
-		"hostId",
-		...(item.sessionId === undefined ? [] : ["sessionId"]),
-		"deviceId",
-		"connectionId",
-		"capabilities",
-		...(item.currentRevision === undefined ? [] : ["currentRevision"]),
-		...(item.expectedRevision === undefined ? [] : ["expectedRevision"]),
-	], "operation context");
+	exact(
+		item,
+		[
+			"hostId",
+			...(item.sessionId === undefined ? [] : ["sessionId"]),
+			"deviceId",
+			"connectionId",
+			"capabilities",
+			...(item.currentRevision === undefined ? [] : ["currentRevision"]),
+			...(item.expectedRevision === undefined ? [] : ["expectedRevision"]),
+		],
+		"operation context",
+	);
 	if (!Array.isArray(item.capabilities) || item.capabilities.some(capability => typeof capability !== "string"))
 		throw new Error("operation context capabilities are invalid");
 	return {
@@ -146,13 +153,16 @@ function operationContext(
 		deviceId: requiredString(item.deviceId, "operation device id"),
 		connectionId: requiredString(item.connectionId, "operation connection id"),
 		capabilities: new Set(item.capabilities as string[]),
-		...(item.currentRevision === undefined ? {} : { currentRevision: requiredString(item.currentRevision, "current revision") }),
-		...(item.expectedRevision === undefined ? {} : { expectedRevision: requiredString(item.expectedRevision, "expected revision") }),
+		...(item.currentRevision === undefined
+			? {}
+			: { currentRevision: requiredString(item.currentRevision, "current revision") }),
+		...(item.expectedRevision === undefined
+			? {}
+			: { expectedRevision: requiredString(item.expectedRevision, "expected revision") }),
 		abortSignal,
 		emitTerminalOutput,
 	};
 }
-
 
 function sessionListPage(
 	id: string,
@@ -171,13 +181,17 @@ function sessionListPage(
 			totalCount: snapshot.totalCount,
 		};
 		try {
-			decodeOmpAuthorityBridgeServerFrame(JSON.parse(encodeOmpAuthorityBridgeFrame({
-				v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
-				type: "response",
-				id,
-				ok: true,
-				result,
-			})));
+			decodeOmpAuthorityBridgeServerFrame(
+				JSON.parse(
+					encodeOmpAuthorityBridgeFrame({
+						v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+						type: "response",
+						id,
+						ok: true,
+						result,
+					}),
+				),
+			);
 			lower = end;
 		} catch {
 			upper = end - 1;
@@ -192,7 +206,11 @@ function sessionListPage(
 		totalCount: snapshot.totalCount,
 	};
 	if (result.nextCursor)
-		snapshots.set(result.nextCursor, { ...snapshot, offset: lower, expiresAt: Date.now() + SESSION_LIST_SNAPSHOT_TTL_MS });
+		snapshots.set(result.nextCursor, {
+			...snapshot,
+			offset: lower,
+			expiresAt: Date.now() + SESSION_LIST_SNAPSHOT_TTL_MS,
+		});
 	return result;
 }
 
@@ -217,41 +235,65 @@ async function listSessionPage(
 		throw Object.assign(new Error("too many session inventory snapshots"), { code: "BOUNDS" });
 	const all = await authority.list(signal);
 	const references = all.slice(0, MAX_SESSION_RECORDS);
-	return sessionListPage(id, {
-		references,
-		offset: 0,
-		expiresAt: now + SESSION_LIST_SNAPSHOT_TTL_MS,
-		complete: all.length <= MAX_SESSION_RECORDS,
-		totalCount: all.length,
-	}, snapshots);
+	return sessionListPage(
+		id,
+		{
+			references,
+			offset: 0,
+			expiresAt: now + SESSION_LIST_SNAPSHOT_TTL_MS,
+			complete: all.length <= MAX_SESSION_RECORDS,
+			totalCount: all.length,
+		},
+		snapshots,
+	);
 }
 
-function lifecycleParams(params: Record<string, unknown>, generation: string): { timeoutMs: number; interrupt: boolean } {
-	exact(params, [
-		...(params.generation === undefined ? [] : ["generation"]),
-		...(params.timeoutMs === undefined ? [] : ["timeoutMs"]),
-		...(params.interrupt === undefined ? [] : ["interrupt"]),
-	], "authority lifecycle params");
+function lifecycleParams(
+	params: Record<string, unknown>,
+	generation: string,
+): { timeoutMs: number; interrupt: boolean } {
+	exact(
+		params,
+		[
+			...(params.generation === undefined ? [] : ["generation"]),
+			...(params.timeoutMs === undefined ? [] : ["timeoutMs"]),
+			...(params.interrupt === undefined ? [] : ["interrupt"]),
+		],
+		"authority lifecycle params",
+	);
 	if (params.generation !== undefined && requiredString(params.generation, "runtime generation") !== generation)
 		throw Object.assign(new Error("runtime generation is stale"), { code: "STALE_GENERATION" });
 	const timeoutMs = params.timeoutMs ?? DEFAULT_LIFECYCLE_TIMEOUT_MS;
-	if (!Number.isSafeInteger(timeoutMs) || (timeoutMs as number) < 1 || (timeoutMs as number) > MAX_LIFECYCLE_TIMEOUT_MS)
+	if (
+		!Number.isSafeInteger(timeoutMs) ||
+		(timeoutMs as number) < 1 ||
+		(timeoutMs as number) > MAX_LIFECYCLE_TIMEOUT_MS
+	)
 		throw Object.assign(new Error("lifecycle timeout is invalid"), { code: "BOUNDS" });
-	if (params.interrupt !== undefined && typeof params.interrupt !== "boolean") throw new Error("interrupt policy is invalid");
+	if (params.interrupt !== undefined && typeof params.interrupt !== "boolean")
+		throw new Error("interrupt policy is invalid");
 	return { timeoutMs: timeoutMs as number, interrupt: params.interrupt !== false };
 }
 async function bounded<T>(task: Promise<T>, timeoutMs: number): Promise<T> {
 	const timeout = Promise.withResolvers<never>();
-	const timer = setTimeout(() => timeout.reject(Object.assign(new Error("operation timed out"), { code: "TIMEOUT" })), timeoutMs);
-	try { return await Promise.race([task, timeout.promise]); } finally { clearTimeout(timer); }
+	const timer = setTimeout(
+		() => timeout.reject(Object.assign(new Error("operation timed out"), { code: "TIMEOUT" })),
+		timeoutMs,
+	);
+	try {
+		return await Promise.race([task, timeout.promise]);
+	} finally {
+		clearTimeout(timer);
+	}
 }
 function acknowledgement(generation: string, quiesced: boolean): Record<string, unknown> {
 	return { schemaVersion: 1, generation, durable: true, ...(quiesced ? { quiesced: true } : {}) };
 }
 function safeError(error: unknown): { code: string; message: string } {
-	const raw = error && typeof error === "object" && "code" in error && typeof error.code === "string"
-		? error.code.toUpperCase()
-		: "BRIDGE_FAILED";
+	const raw =
+		error && typeof error === "object" && "code" in error && typeof error.code === "string"
+			? error.code.toUpperCase()
+			: "BRIDGE_FAILED";
 	const known: Record<string, string> = {
 		ABORTED: "operation was cancelled",
 		BOUNDS: "operation exceeds a bridge limit",
@@ -308,7 +350,10 @@ async function dispatch(
 			const pending = [...state.requests.entries()]
 				.filter(([id, request]) => id !== frame.id && MUTATING_METHODS[request.method])
 				.map(([, request]) => request.promise);
-			await bounded(Promise.allSettled(pending).then(() => undefined), policy.timeoutMs);
+			await bounded(
+				Promise.allSettled(pending).then(() => undefined),
+				policy.timeoutMs,
+			);
 			await bounded(authority.flush(), policy.timeoutMs);
 			return acknowledgement(state.generation, false);
 		}
@@ -317,11 +362,16 @@ async function dispatch(
 			const previous = state.quiesced;
 			state.quiesced = true;
 			try {
-				const active = [...state.requests.entries()].filter(([id]) => id !== frame.id).map(([, request]) => request);
+				const active = [...state.requests.entries()]
+					.filter(([id]) => id !== frame.id)
+					.map(([, request]) => request);
 				if (!policy.interrupt && active.length > 0)
 					throw Object.assign(new Error("authority work is active"), { code: "CONFLICT" });
 				if (policy.interrupt) for (const request of active) request.controller.abort();
-				await bounded(Promise.allSettled(active.map(request => request.promise)).then(() => undefined), policy.timeoutMs);
+				await bounded(
+					Promise.allSettled(active.map(request => request.promise)).then(() => undefined),
+					policy.timeoutMs,
+				);
 				await bounded(authority.quiesce({ interrupt: policy.interrupt }), policy.timeoutMs);
 				return acknowledgement(state.generation, true);
 			} catch (error) {
@@ -331,7 +381,11 @@ async function dispatch(
 		}
 		case "session.create": {
 			exact(params, ["cwd", ...(params.title === undefined ? [] : ["title"])], "session.create params");
-			return authority.create(requiredString(params.cwd, "session cwd"), optionalString(params.title, "session title"), signal);
+			return authority.create(
+				requiredString(params.cwd, "session cwd"),
+				optionalString(params.title, "session title"),
+				signal,
+			);
 		}
 		case "session.fork": {
 			exact(params, ["session", ...(params.cwd === undefined ? [] : ["cwd"])], "session.fork params");
@@ -341,7 +395,11 @@ async function dispatch(
 			return listSessionPage(authority, frame.id, params, snapshots, signal);
 		case "session.archive":
 			exact(params, ["session", "archivedAt"], "session.archive params");
-			await authority.archive(requestedSession(params.session), requiredString(params.archivedAt, "archive time"), signal);
+			await authority.archive(
+				requestedSession(params.session),
+				requiredString(params.archivedAt, "archive time"),
+				signal,
+			);
 			return null;
 		case "session.restore":
 			exact(params, ["session"], "session.restore params");
@@ -377,11 +435,12 @@ async function dispatch(
 		case "terminal.resize":
 		case "terminal.close": {
 			exact(params, ["frame", "context"], `${frame.method} params`);
-			const property = frame.method === "terminal.input"
-				? "terminalInput"
-				: frame.method === "terminal.resize"
-					? "terminalResize"
-					: "terminalClose";
+			const property =
+				frame.method === "terminal.input"
+					? "terminalInput"
+					: frame.method === "terminal.resize"
+						? "terminalResize"
+						: "terminalClose";
 			await authority.operations[property](
 				record(params.frame, "terminal frame"),
 				operationContext(params.context, signal, emitTerminalOutput),
@@ -401,11 +460,14 @@ async function dispatch(
 }
 
 export async function runOmpAuthorityBridge(options: OmpAuthorityBridgeRunnerOptions = {}): Promise<void> {
-	const authority = options.authority ?? await createDefaultOmpAuthorityBridgeAuthority();
-	const input = options.input ?? process.stdin as unknown as AsyncIterable<Uint8Array>;
-	const output = options.write ?? (line => new Promise<void>((resolve, reject) => {
-		process.stdout.write(line, error => error ? reject(error) : resolve());
-	}));
+	const authority = options.authority ?? (await createDefaultOmpAuthorityBridgeAuthority());
+	const input = options.input ?? (process.stdin as unknown as AsyncIterable<Uint8Array>);
+	const output =
+		options.write ??
+		(line =>
+			new Promise<void>((resolve, reject) => {
+				process.stdout.write(line, error => (error ? reject(error) : resolve()));
+			}));
 	let writeTail = Promise.resolve();
 	const write = (frame: Parameters<typeof encodeOmpAuthorityBridgeFrame>[0]): Promise<void> => {
 		const line = encodeOmpAuthorityBridgeFrame(frame);
@@ -429,24 +491,63 @@ export async function runOmpAuthorityBridge(options: OmpAuthorityBridgeRunnerOpt
 			continue;
 		}
 		if (!(METHODS as readonly OmpAuthorityBridgeMethod[]).includes(frame.method)) {
-			await write({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "response", id: frame.id, ok: false, error: safeError({ code: "UNSUPPORTED" }) });
+			await write({
+				v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+				type: "response",
+				id: frame.id,
+				ok: false,
+				error: safeError({ code: "UNSUPPORTED" }),
+			});
 			continue;
 		}
 		if (state.requests.has(frame.id)) throw new Error("duplicate bridge request id");
 		if (state.quiesced && MUTATING_METHODS[frame.method]) {
-			await write({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "response", id: frame.id, ok: false, error: safeError({ code: "QUIESCED" }) });
+			await write({
+				v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+				type: "response",
+				id: frame.id,
+				ok: false,
+				error: safeError({ code: "QUIESCED" }),
+			});
 			continue;
 		}
 		const controller = new AbortController();
 		const active: ActiveRequest = { controller, method: frame.method, promise: Promise.resolve() };
 		state.requests.set(frame.id, active);
-		active.promise = dispatch(authority, frame, controller.signal, snapshots, payload => {
-			if (!controller.signal.aborted)
-				void write({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "event", id: frame.id, event: "terminal", payload });
-		}, state)
+		active.promise = dispatch(
+			authority,
+			frame,
+			controller.signal,
+			snapshots,
+			payload => {
+				if (!controller.signal.aborted)
+					void write({
+						v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+						type: "event",
+						id: frame.id,
+						event: "terminal",
+						payload,
+					});
+			},
+			state,
+		)
 			.then(
-				result => write({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "response", id: frame.id, ok: true, result: result ?? null }),
-				error => write({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "response", id: frame.id, ok: false, error: safeError(error) }),
+				result =>
+					write({
+						v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+						type: "response",
+						id: frame.id,
+						ok: true,
+						result: result ?? null,
+					}),
+				error =>
+					write({
+						v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+						type: "response",
+						id: frame.id,
+						ok: false,
+						error: safeError(error),
+					}),
 			)
 			.then(() => undefined)
 			.finally(() => state.requests.delete(frame.id));

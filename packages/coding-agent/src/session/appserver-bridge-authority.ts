@@ -1,28 +1,30 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { type SessionId, sessionId, type UsageReadResult } from "@oh-my-pi/app-wire";
 import { getAgentDir, getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
-import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
-import { Settings } from "../config/settings";
 import { ModelRegistry } from "../config/model-registry";
+import { Settings } from "../config/settings";
 import { discoverAuthStorage, discoverSkills } from "../sdk";
-import { loadEntriesFromFile } from "./session-loader";
-import { AppserverSessionLifecycleStore } from "./appserver-session-lifecycle";
 import { createAppserverBrokerStatus } from "./appserver-broker";
-import { createAppserverUsageAuthority, type UsageReadResult } from "./appserver-usage";
+import { AppserverSessionLifecycleStore } from "./appserver-session-lifecycle";
+import { createAppserverUsageAuthority } from "./appserver-usage";
 import { createDesktopConfigAuthority } from "./desktop-config-authority";
 import {
 	CodingAgentDesktopAuthority,
 	type DesktopReviewApplyRequest,
 	type DesktopReviewReadRequest,
+	type DesktopTerminalRequest,
 	type OperationContextLike,
 } from "./desktop-operations-authority";
+import type { CustomEntry } from "./session-entries";
+import type { SessionInfo } from "./session-listing";
+import { loadEntriesFromFile } from "./session-loader";
 import { acquireSessionLock, inspectSessionLock } from "./session-lock";
 import { SessionManager } from "./session-manager";
-import type { SessionInfo } from "./session-listing";
 
 export interface BridgeSessionRecord {
-	readonly sessionId: string;
+	readonly sessionId: SessionId;
 	readonly path: string;
 	readonly cwd: string;
 	readonly projectId: string;
@@ -74,7 +76,11 @@ export interface OmpAuthorityBridgeAuthority {
 	restore(session: BridgeSessionRecord, signal: AbortSignal): Promise<void>;
 	delete(session: BridgeSessionRecord, signal: AbortSignal): Promise<void>;
 	load(session: BridgeSessionRecord, signal: AbortSignal): Promise<BridgeSessionRecord>;
-	page(session: BridgeSessionRecord, args: Record<string, unknown>, signal: AbortSignal): Promise<Record<string, unknown>>;
+	page(
+		session: BridgeSessionRecord,
+		args: Record<string, unknown>,
+		signal: AbortSignal,
+	): Promise<Record<string, unknown>>;
 	rootForProject(projectId: string, signal: AbortSignal): Promise<string>;
 	rootForSession(sessionId: string, signal: AbortSignal): Promise<string>;
 	lockCheck(session: BridgeSessionRecord, signal: AbortSignal): Promise<void>;
@@ -106,7 +112,7 @@ function checkCancelled(signal: AbortSignal): void {
 }
 function sessionRecord(info: SessionInfo, archivedAt?: string): BridgeSessionRecord {
 	return {
-		sessionId: info.id,
+		sessionId: sessionId(info.id, "sessionId"),
 		path: info.path,
 		cwd: info.cwd,
 		projectId: stableProjectId(info.cwd),
@@ -133,15 +139,22 @@ function durableEntries(entries: readonly Record<string, unknown>[], sessionId: 
 		};
 	});
 }
-function boundedPage(entries: readonly Record<string, unknown>[], args: Record<string, unknown>): Record<string, unknown> {
-	for (const key of Object.keys(args)) if (!["before", "limit", "maxBytes"].includes(key)) throw new Error("invalid transcript page arguments");
+function boundedPage(
+	entries: readonly Record<string, unknown>[],
+	args: Record<string, unknown>,
+): Record<string, unknown> {
+	for (const key of Object.keys(args))
+		if (!["before", "limit", "maxBytes"].includes(key)) throw new Error("invalid transcript page arguments");
 	const limit = args.limit ?? MAX_PAGE_ENTRIES;
 	const maxBytes = args.maxBytes ?? MAX_PAGE_BYTES;
-	if (!Number.isSafeInteger(limit) || (limit as number) < 1 || (limit as number) > MAX_PAGE_ENTRIES) throw Object.assign(new Error("invalid transcript page limit"), { code: "BOUNDS" });
-	if (!Number.isSafeInteger(maxBytes) || (maxBytes as number) < 1024 || (maxBytes as number) > MAX_PAGE_BYTES) throw Object.assign(new Error("invalid transcript page byte limit"), { code: "BOUNDS" });
+	if (!Number.isSafeInteger(limit) || (limit as number) < 1 || (limit as number) > MAX_PAGE_ENTRIES)
+		throw Object.assign(new Error("invalid transcript page limit"), { code: "BOUNDS" });
+	if (!Number.isSafeInteger(maxBytes) || (maxBytes as number) < 1024 || (maxBytes as number) > MAX_PAGE_BYTES)
+		throw Object.assign(new Error("invalid transcript page byte limit"), { code: "BOUNDS" });
 	let end = entries.length;
 	if (args.before !== undefined) {
-		if (typeof args.before !== "string" || !/^entry:\d+$/u.test(args.before)) throw new Error("invalid transcript cursor");
+		if (typeof args.before !== "string" || !/^entry:\d+$/u.test(args.before))
+			throw new Error("invalid transcript cursor");
 		end = Number(args.before.slice(6));
 		if (!Number.isSafeInteger(end) || end < 0 || end > entries.length) throw new Error("stale transcript cursor");
 	}
@@ -151,7 +164,8 @@ function boundedPage(entries: readonly Record<string, unknown>[], args: Record<s
 		const candidate = entries[index];
 		const size = Buffer.byteLength(JSON.stringify(candidate), "utf8");
 		if (selected.length > 0 && bytes + size > (maxBytes as number)) break;
-		if (size > (maxBytes as number)) throw Object.assign(new Error("transcript entry exceeds page limit"), { code: "BOUNDS" });
+		if (size > (maxBytes as number))
+			throw Object.assign(new Error("transcript entry exceeds page limit"), { code: "BOUNDS" });
 		selected.unshift(candidate);
 		bytes += size;
 	}
@@ -160,7 +174,10 @@ function boundedPage(entries: readonly Record<string, unknown>[], args: Record<s
 		entries: selected,
 		...(start > 0 ? { nextCursor: `entry:${start}` } : {}),
 		hasMore: start > 0,
-		generation: createHash("sha256").update(JSON.stringify(entries.map(entry => entry.id))).digest("hex").slice(0, 32),
+		generation: createHash("sha256")
+			.update(JSON.stringify(entries.map(entry => entry.id)))
+			.digest("hex")
+			.slice(0, 32),
 	};
 }
 
@@ -185,12 +202,15 @@ export async function createDefaultOmpAuthorityBridgeAuthority(): Promise<OmpAut
 		const archived = await lifecycle.archivedSessions();
 		const all = await SessionManager.listAll();
 		checkCancelled(signal);
-		const result = all.map(info => sessionRecord(info, archived.get(info.id)));
+		const result = all.map(info => sessionRecord(info, archived.get(sessionId(info.id, "sessionId"))));
 		records.clear();
 		for (const item of result) records.set(item.sessionId, item);
 		return result;
 	};
-	const authoritativeSession = async (session: BridgeSessionRecord, signal: AbortSignal): Promise<BridgeSessionRecord> => {
+	const authoritativeSession = async (
+		session: BridgeSessionRecord,
+		signal: AbortSignal,
+	): Promise<BridgeSessionRecord> => {
 		const current = (await refresh(signal)).find(item => item.sessionId === session.sessionId);
 		if (!current || path.resolve(current.path) !== path.resolve(session.path))
 			throw Object.assign(new Error("session reference changed"), { code: "CONFLICT" });
@@ -208,19 +228,36 @@ export async function createDefaultOmpAuthorityBridgeAuthority(): Promise<OmpAut
 			const record = records.get(sessionId);
 			if (!record) throw Object.assign(new Error("unknown session"), { code: "NOT_FOUND" });
 			const entries = await loadEntriesFromFile(record.path);
-			const found = entries.find(entry => entry.type === "custom" && entry.customType === REVIEW_ENTRY_TYPE && entry.data && typeof entry.data === "object" && (entry.data as Record<string, unknown>).reviewId === request.reviewId);
+			const found = entries.find(
+				(entry): entry is CustomEntry<Record<string, unknown>> & { data: Record<string, unknown> } =>
+					entry.type === "custom" &&
+					entry.customType === REVIEW_ENTRY_TYPE &&
+					entry.data !== null &&
+					typeof entry.data === "object" &&
+					!Array.isArray(entry.data) &&
+					"reviewId" in entry.data &&
+					entry.data.reviewId === request.reviewId,
+			);
 			if (!found) throw Object.assign(new Error("review was not found"), { code: "NOT_FOUND" });
-			return structuredClone((found as Record<string, unknown>).data as Record<string, unknown>);
+			return structuredClone(found.data);
 		},
-		async apply(request: DesktopReviewApplyRequest, context?: OperationContextLike): Promise<Record<string, unknown>> {
+		async apply(
+			request: DesktopReviewApplyRequest,
+			context?: OperationContextLike,
+		): Promise<Record<string, unknown>> {
 			const current = await this.read({ reviewId: request.reviewId }, context);
-			if (request.expectedRevision !== undefined && current.revision !== request.expectedRevision) throw Object.assign(new Error("review revision is stale"), { code: "STALE_REVISION" });
+			if (request.expectedRevision !== undefined && current.revision !== request.expectedRevision)
+				throw Object.assign(new Error("review revision is stale"), { code: "STALE_REVISION" });
 			const sessionId = context?.sessionId;
 			const record = sessionId ? records.get(sessionId) : undefined;
 			if (!record) throw Object.assign(new Error("unknown session"), { code: "NOT_FOUND" });
 			const manager = await SessionManager.open(record.path);
 			dirtyManagers.add(manager);
-			manager.appendCustomEntry(REVIEW_APPLIED_TYPE, { reviewId: request.reviewId, revision: current.revision, appliedAt: new Date().toISOString() });
+			manager.appendCustomEntry(REVIEW_APPLIED_TYPE, {
+				reviewId: request.reviewId,
+				revision: current.revision,
+				appliedAt: new Date().toISOString(),
+			});
 			await manager.flush();
 			dirtyManagers.delete(manager);
 			await manager.close();
@@ -229,7 +266,10 @@ export async function createDefaultOmpAuthorityBridgeAuthority(): Promise<OmpAut
 	};
 	const coding = new CodingAgentDesktopAuthority(
 		{
-			sessionManager: { getSessionId: () => records.keys().next().value ?? "", getCwd: () => records.values().next().value?.cwd ?? process.cwd() },
+			sessionManager: {
+				getSessionId: () => records.keys().next().value ?? "",
+				getCwd: () => records.values().next().value?.cwd ?? process.cwd(),
+			},
 			projectRootForSession: rootFor,
 			reviewStore,
 		},
@@ -240,6 +280,8 @@ export async function createDefaultOmpAuthorityBridgeAuthority(): Promise<OmpAut
 			get: settingPath => settings.get(settingPath),
 			isConfigured: settingPath => settings.isConfigured(settingPath),
 			set: (settingPath, value) => settings.set(settingPath, value as never),
+			setProject: (settingPath, value) => settings.setProject(settingPath, value as never),
+			clearProject: settingPath => settings.clearProject(settingPath),
 			override: (settingPath, value) => settings.override(settingPath, value as never),
 			clearOverride: settingPath => settings.clearOverride(settingPath),
 			flush: () => settings.flush(),
@@ -274,20 +316,44 @@ export async function createDefaultOmpAuthorityBridgeAuthority(): Promise<OmpAut
 				active = false;
 				pending.length = 0;
 				if (terminalId) {
-					try { coding.closeTerminal(terminalId); } catch {}
+					try {
+						coding.closeTerminal(terminalId);
+					} catch {}
 					terminalOwners.delete(terminalId);
 				}
 			};
 			context.abortSignal.addEventListener("abort", onAbort, { once: true });
 			try {
-				const result = await coding.openTerminal({
-					...(args as never),
-					onOutput: (stream, data) => emit({ v: "omp-app/1", type: "terminal.output", hostId: context.hostId, sessionId: context.sessionId, terminalId, cursor: { epoch: "terminal", seq: ++sequence }, stream, data }),
-					onExit: exit => {
-						emit({ v: "omp-app/1", type: "terminal.exit", hostId: context.hostId, sessionId: context.sessionId, terminalId, cursor: { epoch: "terminal", seq: ++sequence }, exitCode: exit.exitCode ?? -1 });
-						if (terminalId) terminalOwners.delete(terminalId);
+				const request = args as DesktopTerminalRequest;
+				const result = await coding.openTerminal(
+					{
+						...request,
+						onOutput: (stream, data) =>
+							emit({
+								v: "omp-app/1",
+								type: "terminal.output",
+								hostId: context.hostId,
+								sessionId: context.sessionId,
+								terminalId,
+								cursor: { epoch: "terminal", seq: ++sequence },
+								stream,
+								data,
+							}),
+						onExit: exit => {
+							emit({
+								v: "omp-app/1",
+								type: "terminal.exit",
+								hostId: context.hostId,
+								sessionId: context.sessionId,
+								terminalId,
+								cursor: { epoch: "terminal", seq: ++sequence },
+								exitCode: exit.exitCode ?? -1,
+							});
+							if (terminalId) terminalOwners.delete(terminalId);
+						},
 					},
-				}, context);
+					context,
+				);
 				terminalId = result.terminalId;
 				terminalOwners.set(terminalId, context.connectionId);
 				for (const payload of pending.splice(0)) context.emitTerminalOutput?.(payload);
@@ -303,24 +369,27 @@ export async function createDefaultOmpAuthorityBridgeAuthority(): Promise<OmpAut
 		configWrite: (args, context) => config.configWrite(args, context),
 		terminalInput: async (frame, context) => {
 			checkCancelled(context.abortSignal);
-			if (terminalOwners.get(String(frame.terminalId)) !== context.connectionId) throw Object.assign(new Error("terminal is not owned by this connection"), { code: "FORBIDDEN" });
+			if (terminalOwners.get(String(frame.terminalId)) !== context.connectionId)
+				throw Object.assign(new Error("terminal is not owned by this connection"), { code: "FORBIDDEN" });
 			coding.inputTerminal(String(frame.terminalId), String(frame.data));
 		},
 		terminalResize: async (frame, context) => {
 			checkCancelled(context.abortSignal);
-			if (terminalOwners.get(String(frame.terminalId)) !== context.connectionId) throw Object.assign(new Error("terminal is not owned by this connection"), { code: "FORBIDDEN" });
+			if (terminalOwners.get(String(frame.terminalId)) !== context.connectionId)
+				throw Object.assign(new Error("terminal is not owned by this connection"), { code: "FORBIDDEN" });
 			coding.resizeTerminal(String(frame.terminalId), Number(frame.cols), Number(frame.rows));
 		},
 		terminalClose: async (frame, context) => {
 			checkCancelled(context.abortSignal);
 			const terminalId = String(frame.terminalId);
-			if (terminalOwners.get(terminalId) !== context.connectionId) throw Object.assign(new Error("terminal is not owned by this connection"), { code: "FORBIDDEN" });
+			if (terminalOwners.get(terminalId) !== context.connectionId)
+				throw Object.assign(new Error("terminal is not owned by this connection"), { code: "FORBIDDEN" });
 			coding.closeTerminal(terminalId);
 			terminalOwners.delete(terminalId);
 		},
 	};
 
-	return {
+	const authority: OmpAuthorityBridgeAuthority = {
 		async create(cwd, title, signal) {
 			checkCancelled(signal);
 			const manager = SessionManager.create(cwd);
@@ -349,7 +418,18 @@ export async function createDefaultOmpAuthorityBridgeAuthority(): Promise<OmpAut
 			try {
 				const file = manager.getSessionFile();
 				if (!file) throw new Error("forked session was not written");
-				const result: BridgeSessionRecord = { sessionId: manager.getSessionId(), path: file, cwd: manager.getCwd(), projectId: stableProjectId(manager.getCwd()), projectName: projectName(manager.getCwd()), title: manager.getSessionName() || "Untitled", updatedAt: new Date().toISOString(), status: "idle", entriesLoaded: false, entries: [] };
+				const result: BridgeSessionRecord = {
+					sessionId: sessionId(manager.getSessionId(), "sessionId"),
+					path: file,
+					cwd: manager.getCwd(),
+					projectId: stableProjectId(manager.getCwd()),
+					projectName: projectName(manager.getCwd()),
+					title: manager.getSessionName() || "Untitled",
+					updatedAt: new Date().toISOString(),
+					status: "idle",
+					entriesLoaded: false,
+					entries: [],
+				};
 				records.set(result.sessionId, result);
 				return result;
 			} finally {
@@ -375,13 +455,14 @@ export async function createDefaultOmpAuthorityBridgeAuthority(): Promise<OmpAut
 		async load(session, signal) {
 			checkCancelled(signal);
 			const current = (await refresh(signal)).find(item => item.sessionId === session.sessionId);
-			if (!current || path.resolve(current.path) !== path.resolve(session.path)) throw Object.assign(new Error("unknown session"), { code: "NOT_FOUND" });
-			const raw = await loadEntriesFromFile(current.path) as unknown as Record<string, unknown>[];
+			if (!current || path.resolve(current.path) !== path.resolve(session.path))
+				throw Object.assign(new Error("unknown session"), { code: "NOT_FOUND" });
+			const raw = (await loadEntriesFromFile(current.path)) as unknown as Record<string, unknown>[];
 			const entries = durableEntries(raw.slice(1), current.sessionId);
 			return { ...current, entriesLoaded: true, entries };
 		},
 		async page(session, args, signal) {
-			const loaded = await this.load(session, signal);
+			const loaded = await authority.load(session, signal);
 			return boundedPage(loaded.entries as Record<string, unknown>[], args);
 		},
 		async rootForProject(projectId, signal) {
@@ -417,12 +498,13 @@ export async function createDefaultOmpAuthorityBridgeAuthority(): Promise<OmpAut
 		async quiesce({ interrupt }) {
 			quiesced = true;
 			if (interrupt) coding.disconnect();
-			await this.flush();
+			await authority.flush();
 			if (!quiesced) throw new Error("authority quiesce failed");
 		},
 		async shutdown() {
 			coding.disconnect();
-			await this.flush();
+			await authority.flush();
 		},
 	};
+	return authority;
 }

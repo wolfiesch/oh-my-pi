@@ -22,7 +22,7 @@ interface Deferred<T> {
 	readonly reject: (reason?: unknown) => void;
 }
 interface BridgeChild {
-	readonly stdin: { write(data: string): number | Promise<number>; end(): void | Promise<void> };
+	readonly stdin: { write(data: string): number | Promise<number>; end(): number | Promise<number> };
 	readonly stdout: ReadableStream<Uint8Array>;
 	readonly exited: Promise<number>;
 }
@@ -32,7 +32,6 @@ interface EventWaiter {
 }
 
 class BridgeClient {
-
 	readonly #pending = new Map<string, Deferred<ResponseFrame>>();
 	readonly events: Record<string, unknown>[] = [];
 	readonly ready = Promise.withResolvers<Record<string, unknown>>();
@@ -62,8 +61,7 @@ class BridgeClient {
 						this.#eventWaiters.splice(index, 1);
 						waiter.resolve(frame);
 					}
-				}
-				else if (frame.type === "response") {
+				} else if (frame.type === "response") {
 					const gate = this.#pending.get(String(frame.id));
 					if (gate) {
 						this.#pending.delete(String(frame.id));
@@ -73,11 +71,16 @@ class BridgeClient {
 			}
 		}
 	}
-	request(method: OmpAuthorityBridgeMethod, params: Record<string, unknown>): { id: string; response: Promise<ResponseFrame> } {
+	request(
+		method: OmpAuthorityBridgeMethod,
+		params: Record<string, unknown>,
+	): { id: string; response: Promise<ResponseFrame> } {
 		const id = `request-${++this.#counter}`;
 		const gate = Promise.withResolvers<ResponseFrame>();
 		this.#pending.set(id, gate);
-		this.child.stdin.write(`${JSON.stringify({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "request", id, method, params })}\n`);
+		this.child.stdin.write(
+			`${JSON.stringify({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "request", id, method, params })}\n`,
+		);
 		return { id, response: gate.promise };
 	}
 	async success(method: OmpAuthorityBridgeMethod, params: Record<string, unknown>): Promise<unknown> {
@@ -134,92 +137,187 @@ describe("OMP authority bridge source CLI", () => {
 		const ready = await client.ready.promise;
 		expect(ready.methods).toEqual(OMP_AUTHORITY_BRIDGE_METHODS);
 
-		const created = await client.success("session.create", { cwd: project, title: "Bridge smoke" }) as Record<string, unknown>;
+		const created = (await client.success("session.create", { cwd: project, title: "Bridge smoke" })) as Record<
+			string,
+			unknown
+		>;
 		const sessionId = String(created.sessionId);
 		const sessionPath = String(created.path);
 		const session = { ...created, entriesLoaded: false, entries: [] };
 		const missingSession = { ...session, sessionId: "missing-session", path: path.join(home, "missing.jsonl") };
-		expect(await client.request("discovery.load", { session: missingSession }).response)
-			.toMatchObject({ ok: false, error: { code: "NOT_FOUND" } });
-		const inventory = await client.success("session.list", {}) as Record<string, unknown>;
+		expect(await client.request("discovery.load", { session: missingSession }).response).toMatchObject({
+			ok: false,
+			error: { code: "NOT_FOUND" },
+		});
+		const inventory = (await client.success("session.list", {})) as Record<string, unknown>;
 		expect((inventory.sessions as unknown[]).length).toBe(1);
-		const forked = await client.success("session.fork", { session, cwd: project }) as Record<string, unknown>;
+		const forked = (await client.success("session.fork", { session, cwd: project })) as Record<string, unknown>;
 		await client.success("session.archive", { session, archivedAt: new Date(0).toISOString() });
 		await client.success("session.restore", { session });
 
 		const manager = await SessionManager.open(sessionPath);
-		manager.appendCustomEntry("desktop-review", { reviewId: "review-smoke", revision: "review-r1", status: "open", findings: [] });
+		manager.appendCustomEntry("desktop-review", {
+			reviewId: "review-smoke",
+			revision: "review-r1",
+			status: "open",
+			findings: [],
+		});
 		await manager.flush();
 		await manager.close();
 
-		const loaded = await client.success("discovery.load", { session }) as Record<string, unknown>;
+		const loaded = (await client.success("discovery.load", { session })) as Record<string, unknown>;
 		expect(loaded.entriesLoaded).toBe(true);
-		expect(await client.request("operation.filesRead", { args: { path: "../escape" }, context: context(sessionId) }).response)
-			.toMatchObject({ ok: false, error: { code: "FORBIDDEN" } });
-		const page = await client.success("discovery.page", { session, args: { limit: 16, maxBytes: 32 * 1024 } }) as Record<string, unknown>;
+		expect(
+			await client.request("operation.filesRead", { args: { path: "../escape" }, context: context(sessionId) })
+				.response,
+		).toMatchObject({ ok: false, error: { code: "FORBIDDEN" } });
+		const page = (await client.success("discovery.page", {
+			session,
+			args: { limit: 16, maxBytes: 32 * 1024 },
+		})) as Record<string, unknown>;
 		expect(Array.isArray(page.entries)).toBe(true);
 		expect(await client.success("project.rootForProject", { projectId: created.projectId })).toBe(project);
 		expect(await client.success("project.rootForSession", { sessionId })).toBe(project);
 		await client.success("lock.check", { session });
 		expect(await client.success("lock.status", { session })).toBe("missing");
 
-		const read = await client.success("operation.filesRead", { args: { path: "note.txt" }, context: context(sessionId) }) as Record<string, unknown>;
+		const read = (await client.success("operation.filesRead", {
+			args: { path: "note.txt" },
+			context: context(sessionId),
+		})) as Record<string, unknown>;
 		expect(read.content).toBe("hello\n");
 		const revision = String(read.revision);
-		const listing = await client.success("operation.filesList", { args: {}, context: context(sessionId) }) as Record<string, unknown>;
+		const listing = (await client.success("operation.filesList", {
+			args: {},
+			context: context(sessionId),
+		})) as Record<string, unknown>;
 		expect((listing.entries as Record<string, unknown>[]).some(entry => entry.path === "note.txt")).toBe(true);
-		const written = await client.success("operation.filesWrite", { args: { path: "note.txt", content: "hello two\n", expectedRevision: revision }, context: context(sessionId, revision) }) as Record<string, unknown>;
+		const written = (await client.success("operation.filesWrite", {
+			args: { path: "note.txt", content: "hello two\n", expectedRevision: revision },
+			context: context(sessionId, revision),
+		})) as Record<string, unknown>;
 		const writtenRevision = String(written.revision);
-		const diff = await client.success("operation.filesDiff", { args: { path: "note.txt", content: "patched\n", fromRevision: writtenRevision }, context: context(sessionId, writtenRevision) }) as Record<string, unknown>;
+		const diff = (await client.success("operation.filesDiff", {
+			args: { path: "note.txt", content: "patched\n", fromRevision: writtenRevision },
+			context: context(sessionId, writtenRevision),
+		})) as Record<string, unknown>;
 		expect(String(diff.diff)).toContain("+patched");
 		const patch = "*** Begin Patch\n*** Update File: note.txt\n@@\n-hello two\n+patched\n*** End Patch\n";
-		await client.success("operation.filesPatch", { args: { path: "note.txt", patch, expectedRevision: writtenRevision }, context: context(sessionId, writtenRevision) });
+		await client.success("operation.filesPatch", {
+			args: { path: "note.txt", patch, expectedRevision: writtenRevision },
+			context: context(sessionId, writtenRevision),
+		});
 
-		const review = await client.success("operation.reviewRead", { args: { reviewId: "review-smoke" }, context: context(sessionId) }) as Record<string, unknown>;
+		const review = (await client.success("operation.reviewRead", {
+			args: { reviewId: "review-smoke" },
+			context: context(sessionId),
+		})) as Record<string, unknown>;
 		expect(review.revision).toBe("review-r1");
-		const applied = await client.success("operation.reviewApply", { args: { reviewId: "review-smoke", expectedRevision: "review-r1" }, context: context(sessionId, "review-r1") }) as Record<string, unknown>;
+		const applied = (await client.success("operation.reviewApply", {
+			args: { reviewId: "review-smoke", expectedRevision: "review-r1" },
+			context: context(sessionId, "review-r1"),
+		})) as Record<string, unknown>;
 		expect(applied.status).toBe("applied");
 
-		expect(await client.request("operation.reviewRead", { args: { reviewId: "missing-review" }, context: context(sessionId) }).response)
-			.toMatchObject({ ok: false, error: { code: "NOT_FOUND" } });
-		const bash = await client.success("operation.bashRun", { args: { command: "printf bridge-bash" }, context: context(sessionId) }) as Record<string, unknown>;
+		expect(
+			await client.request("operation.reviewRead", {
+				args: { reviewId: "missing-review" },
+				context: context(sessionId),
+			}).response,
+		).toMatchObject({ ok: false, error: { code: "NOT_FOUND" } });
+		const bash = (await client.success("operation.bashRun", {
+			args: { command: "printf bridge-bash" },
+			context: context(sessionId),
+		})) as Record<string, unknown>;
 		expect(bash.stdout).toBe("bridge-bash");
-		const cancelled = client.request("operation.bashRun", { args: { command: "sleep 30" }, context: context(sessionId) });
+		const cancelled = client.request("operation.bashRun", {
+			args: { command: "sleep 30" },
+			context: context(sessionId),
+		});
 		client.cancel(cancelled.id);
 		expect(await cancelled.response).toMatchObject({ ok: true, result: { cancelled: true } });
 
-		const terminal = await client.success("operation.termOpen", { args: { shell: "/bin/sh", cols: 80, rows: 24 }, context: context(sessionId) }) as Record<string, unknown>;
+		const terminal = (await client.success("operation.termOpen", {
+			args: { shell: "/bin/sh", cols: 80, rows: 24 },
+			context: context(sessionId),
+		})) as Record<string, unknown>;
 		const terminalId = String(terminal.terminalId);
-		await client.success("terminal.input", { frame: { terminalId, data: "printf 'bridge-term\\n'\n" }, context: context(sessionId) });
+		await client.success("terminal.input", {
+			frame: { terminalId, data: "printf 'bridge-term\\n'\n" },
+			context: context(sessionId),
+		});
 		await client.waitForEvent(event => JSON.stringify(event).includes("bridge-term"));
-		await client.success("terminal.resize", { frame: { terminalId, cols: 100, rows: 30 }, context: context(sessionId) });
+		await client.success("terminal.resize", {
+			frame: { terminalId, cols: 100, rows: 30 },
+			context: context(sessionId),
+		});
 		const wrongTerminalContext = { ...context(sessionId), connectionId: "other-connection" };
-		expect(await client.request("terminal.resize", { frame: { terminalId, cols: 90, rows: 25 }, context: wrongTerminalContext }).response)
-			.toMatchObject({ ok: false, error: { code: "FORBIDDEN" } });
+		expect(
+			await client.request("terminal.resize", {
+				frame: { terminalId, cols: 90, rows: 25 },
+				context: wrongTerminalContext,
+			}).response,
+		).toMatchObject({ ok: false, error: { code: "FORBIDDEN" } });
 		await client.success("terminal.close", { frame: { terminalId }, context: context(sessionId) });
 
-		const catalog = await client.success("operation.catalogGet", { args: { kind: "setting" }, context: context(sessionId) }) as Record<string, unknown>;
+		const catalog = (await client.success("operation.catalogGet", {
+			args: { kind: "setting" },
+			context: context(sessionId),
+		})) as Record<string, unknown>;
 		expect((catalog.items as unknown[]).length).toBeGreaterThan(0);
-		const settings = await client.success("operation.settingsRead", { args: { path: "advisor.enabled" }, context: context(sessionId) }) as Record<string, unknown>;
+		const settings = (await client.success("operation.settingsRead", {
+			args: { path: "advisor.enabled" },
+			context: context(sessionId),
+		})) as Record<string, unknown>;
 		const settingsRevision = String(settings.revision);
-		await client.success("operation.settingsWrite", { args: { path: "advisor.enabled", value: true, expectedRevision: settingsRevision }, context: context(sessionId, settingsRevision) });
-		const settingsAfter = await client.success("operation.settingsRead", { args: {}, context: context(sessionId) }) as Record<string, unknown>;
-		await client.success("operation.configWrite", { args: { path: "prewalk.enabled", value: true, expectedRevision: settingsAfter.revision }, context: context(sessionId, String(settingsAfter.revision)) });
-		expect(await client.success("operation.brokerStatus", { args: {}, context: context(sessionId) })).toMatchObject({ state: expect.any(String) });
-		expect(await client.success("usage.read", {})).toMatchObject({ reports: expect.any(Array), generatedAt: expect.any(Number) });
-		expect(await client.request("operation.settingsRead", { args: { path: "unknown.setting" }, context: context(sessionId) }).response)
-			.toMatchObject({ ok: false });
+		await client.success("operation.settingsWrite", {
+			args: { path: "advisor.enabled", value: true, expectedRevision: settingsRevision },
+			context: context(sessionId, settingsRevision),
+		});
+		const settingsAfter = (await client.success("operation.settingsRead", {
+			args: {},
+			context: context(sessionId),
+		})) as Record<string, unknown>;
+		await client.success("operation.configWrite", {
+			args: { path: "prewalk.enabled", value: true, expectedRevision: settingsAfter.revision },
+			context: context(sessionId, String(settingsAfter.revision)),
+		});
+		expect(await client.success("operation.brokerStatus", { args: {}, context: context(sessionId) })).toMatchObject({
+			state: expect.any(String),
+		});
+		expect(await client.success("usage.read", {})).toMatchObject({
+			reports: expect.any(Array),
+			generatedAt: expect.any(Number),
+		});
+		expect(
+			await client.request("operation.settingsRead", {
+				args: { path: "unknown.setting" },
+				context: context(sessionId),
+			}).response,
+		).toMatchObject({ ok: false });
 		await client.success("session.delete", { session: { ...forked, entriesLoaded: false, entries: [] } });
 		await client.success("authority.flush", {});
 		await client.success("authority.quiesce", {});
 
 		const fenced: OmpAuthorityBridgeMethod[] = [
-			"session.create", "session.fork", "session.archive", "session.restore", "session.delete",
-			"operation.filesWrite", "operation.filesPatch", "operation.reviewApply", "operation.bashRun",
-			"operation.termOpen", "operation.settingsWrite", "operation.configWrite",
-			"terminal.input", "terminal.resize", "terminal.close",
+			"session.create",
+			"session.fork",
+			"session.archive",
+			"session.restore",
+			"session.delete",
+			"operation.filesWrite",
+			"operation.filesPatch",
+			"operation.reviewApply",
+			"operation.bashRun",
+			"operation.termOpen",
+			"operation.settingsWrite",
+			"operation.configWrite",
+			"terminal.input",
+			"terminal.resize",
+			"terminal.close",
 		];
-		for (const method of fenced) expect(await client.request(method, {}).response).toMatchObject({ ok: false, error: { code: "QUIESCED" } });
+		for (const method of fenced)
+			expect(await client.request(method, {}).response).toMatchObject({ ok: false, error: { code: "QUIESCED" } });
 		expect(await client.success("session.list", {})).toMatchObject({ sessions: expect.any(Array) });
 
 		await client.close();
