@@ -5,7 +5,7 @@ import { type SessionId, sessionId, type UsageReadResult } from "@oh-my-pi/app-w
 import { getAgentDir, getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
 import { ModelRegistry } from "../config/model-registry";
 import { Settings } from "../config/settings";
-import { discoverAuthStorage, discoverSkills } from "../sdk";
+import { discoverAuthStorage, discoverSkills, loadCliExtensionProviders } from "../sdk";
 import { createAppserverBrokerStatus } from "./appserver-broker";
 import { AppserverSessionLifecycleStore } from "./appserver-session-lifecycle";
 import { createAppserverUsageAuthority } from "./appserver-usage";
@@ -191,6 +191,9 @@ export async function createDefaultOmpAuthorityBridgeAuthority(): Promise<OmpAut
 	const settings = await Settings.loadIsolated({ cwd: process.cwd() });
 	const authStorage = await discoverAuthStorage();
 	const modelRegistry = new ModelRegistry(authStorage);
+	try {
+		await loadCliExtensionProviders(modelRegistry, settings, process.cwd());
+	} catch {}
 	const usage = createAppserverUsageAuthority(authStorage, modelRegistry);
 	const records = new Map<string, BridgeSessionRecord>();
 	const dirtyManagers = new Set<SessionManager>();
@@ -253,15 +256,18 @@ export async function createDefaultOmpAuthorityBridgeAuthority(): Promise<OmpAut
 			if (!record) throw Object.assign(new Error("unknown session"), { code: "NOT_FOUND" });
 			const manager = await SessionManager.open(record.path);
 			dirtyManagers.add(manager);
-			manager.appendCustomEntry(REVIEW_APPLIED_TYPE, {
-				reviewId: request.reviewId,
-				revision: current.revision,
-				appliedAt: new Date().toISOString(),
-			});
-			await manager.flush();
-			dirtyManagers.delete(manager);
-			await manager.close();
-			return { ...current, status: "applied" };
+			try {
+				manager.appendCustomEntry(REVIEW_APPLIED_TYPE, {
+					reviewId: request.reviewId,
+					revision: current.revision,
+					appliedAt: new Date().toISOString(),
+				});
+				await manager.flush();
+				return { ...current, status: "applied" };
+			} finally {
+				dirtyManagers.delete(manager);
+				await manager.close();
+			}
 		},
 	};
 	const coding = new CodingAgentDesktopAuthority(
@@ -305,12 +311,13 @@ export async function createDefaultOmpAuthorityBridgeAuthority(): Promise<OmpAut
 		termOpen: async (args, context) => {
 			let terminalId: string | undefined;
 			let sequence = 0;
-			const pending: unknown[] = [];
+			const pending: Array<(id: string) => unknown> = [];
 			let active = true;
-			const emit = (payload: unknown): void => {
+			let exited = false;
+			const emit = (payload: (id: string) => unknown): void => {
 				if (!active) return;
 				if (!terminalId) pending.push(payload);
-				else context.emitTerminalOutput?.(payload);
+				else context.emitTerminalOutput?.(payload(terminalId));
 			};
 			const onAbort = (): void => {
 				active = false;
@@ -329,34 +336,42 @@ export async function createDefaultOmpAuthorityBridgeAuthority(): Promise<OmpAut
 					{
 						...request,
 						onOutput: (stream, data) =>
-							emit({
+							emit(id => ({
 								v: "omp-app/1",
 								type: "terminal.output",
 								hostId: context.hostId,
 								sessionId: context.sessionId,
-								terminalId,
+								terminalId: id,
 								cursor: { epoch: "terminal", seq: ++sequence },
 								stream,
 								data,
-							}),
+							})),
 						onExit: exit => {
-							emit({
+							exited = true;
+							emit(id => ({
 								v: "omp-app/1",
 								type: "terminal.exit",
 								hostId: context.hostId,
 								sessionId: context.sessionId,
-								terminalId,
+								terminalId: id,
 								cursor: { epoch: "terminal", seq: ++sequence },
 								exitCode: exit.exitCode ?? -1,
-							});
+							}));
 							if (terminalId) terminalOwners.delete(terminalId);
 						},
 					},
 					context,
 				);
 				terminalId = result.terminalId;
-				terminalOwners.set(terminalId, context.connectionId);
-				for (const payload of pending.splice(0)) context.emitTerminalOutput?.(payload);
+				if (!active) {
+					try {
+						coding.closeTerminal(terminalId);
+					} finally {
+						checkCancelled(context.abortSignal);
+					}
+				}
+				if (!exited) terminalOwners.set(terminalId, context.connectionId);
+				for (const payload of pending.splice(0)) context.emitTerminalOutput?.(payload(terminalId));
 				return result;
 			} finally {
 				context.abortSignal.removeEventListener("abort", onAbort);
@@ -413,7 +428,19 @@ export async function createDefaultOmpAuthorityBridgeAuthority(): Promise<OmpAut
 			checkCancelled(signal);
 			const available = (await refresh(signal)).find(item => item.sessionId === source.sessionId);
 			if (!available) throw Object.assign(new Error("unknown session"), { code: "NOT_FOUND" });
-			const manager = await SessionManager.forkFrom(available.path, cwd ?? available.cwd);
+			const targetCwd = cwd ?? available.cwd;
+			if (!path.isAbsolute(targetCwd))
+				throw Object.assign(new Error("fork target must be absolute"), { code: "FORBIDDEN" });
+			let target: fs.Stats;
+			try {
+				target = await fs.promises.stat(targetCwd);
+			} catch (error) {
+				if (error && typeof error === "object" && "code" in error && error.code === "ENOENT")
+					throw Object.assign(new Error("fork target was not found"), { code: "NOT_FOUND" });
+				throw error;
+			}
+			if (!target.isDirectory()) throw Object.assign(new Error("fork target was not found"), { code: "NOT_FOUND" });
+			const manager = await SessionManager.forkFrom(available.path, targetCwd);
 			dirtyManagers.add(manager);
 			try {
 				const file = manager.getSessionFile();

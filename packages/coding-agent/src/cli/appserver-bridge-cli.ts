@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { sessionId } from "@oh-my-pi/app-wire";
-import { getBlobsDir, VERSION } from "@oh-my-pi/pi-utils/dirs";
+import { getBlobsDir } from "@oh-my-pi/pi-utils/dirs";
 import {
 	decodeOmpAuthorityBridgeClientFrame,
 	decodeOmpAuthorityBridgeServerFrame,
@@ -17,6 +17,7 @@ import {
 	createDefaultOmpAuthorityBridgeAuthority,
 	type OmpAuthorityBridgeAuthority,
 } from "../session/appserver-bridge-authority";
+import { getCodingAgentAppserverIdentity } from "./appserver-identity";
 
 export type { BridgeSessionRecord, OmpAuthorityBridgeAuthority } from "../session/appserver-bridge-authority";
 
@@ -302,6 +303,8 @@ function safeError(error: unknown): { code: string; message: string } {
 		NOT_FOUND: "resource was not found",
 		QUIESCED: "authority is quiesced",
 		STALE_GENERATION: "runtime generation is stale",
+		OPERATION_FAILED: "operation failed",
+		STALE_REVISION: "resource revision is stale",
 		TIMEOUT: "operation timed out",
 		UNSUPPORTED: "operation is unsupported",
 	};
@@ -476,9 +479,10 @@ export async function runOmpAuthorityBridge(options: OmpAuthorityBridgeRunnerOpt
 	};
 	const generation = options.generation ?? process.env.T4_RUNTIME_GENERATION ?? `standalone:${randomUUID()}`;
 	if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(generation)) throw new Error("runtime generation is invalid");
+	const detectedIdentity = getCodingAgentAppserverIdentity();
 	const identity = options.identity ?? {
-		ompVersion: VERSION,
-		ompBuild: process.env.T4_OMP_BUILD ?? process.env.OMP_BUILD ?? "source",
+		ompVersion: detectedIdentity.ompVersion,
+		ompBuild: process.env.T4_OMP_BUILD ?? process.env.OMP_BUILD ?? detectedIdentity.ompBuild,
 	};
 	await write({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "ready", methods: METHODS, ...identity });
 	const state: BridgeState = { quiesced: false, generation, requests: new Map() };

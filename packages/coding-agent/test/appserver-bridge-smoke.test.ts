@@ -151,6 +151,16 @@ describe("OMP authority bridge source CLI", () => {
 		});
 		const inventory = (await client.success("session.list", {})) as Record<string, unknown>;
 		expect((inventory.sessions as unknown[]).length).toBe(1);
+		expect(await client.request("session.fork", { session, cwd: "relative-project" }).response).toMatchObject({
+			ok: false,
+			error: { code: "FORBIDDEN" },
+		});
+		expect(
+			await client.request("session.fork", { session, cwd: path.join(home, "missing-project") }).response,
+		).toMatchObject({
+			ok: false,
+			error: { code: "NOT_FOUND" },
+		});
 		const forked = (await client.success("session.fork", { session, cwd: project })) as Record<string, unknown>;
 		await client.success("session.archive", { session, archivedAt: new Date(0).toISOString() });
 		await client.success("session.restore", { session });
@@ -192,6 +202,13 @@ describe("OMP authority bridge source CLI", () => {
 			context: context(sessionId),
 		})) as Record<string, unknown>;
 		expect((listing.entries as Record<string, unknown>[]).some(entry => entry.path === "note.txt")).toBe(true);
+		const staleRevision = "0".repeat(64);
+		expect(
+			await client.request("operation.filesWrite", {
+				args: { path: "note.txt", content: "stale\n", expectedRevision: staleRevision },
+				context: context(sessionId, staleRevision),
+			}).response,
+		).toMatchObject({ ok: false, error: { code: "STALE_REVISION" } });
 		const written = (await client.success("operation.filesWrite", {
 			args: { path: "note.txt", content: "hello two\n", expectedRevision: revision },
 			context: context(sessionId, revision),
@@ -203,6 +220,12 @@ describe("OMP authority bridge source CLI", () => {
 		})) as Record<string, unknown>;
 		expect(String(diff.diff)).toContain("+patched");
 		const patch = "*** Begin Patch\n*** Update File: note.txt\n@@\n-hello two\n+patched\n*** End Patch\n";
+		expect(
+			await client.request("operation.filesPatch", {
+				args: { path: "note.txt", patch: "not a patch", expectedRevision: writtenRevision },
+				context: context(sessionId, writtenRevision),
+			}).response,
+		).toMatchObject({ ok: false, error: { code: "OPERATION_FAILED" } });
 		await client.success("operation.filesPatch", {
 			args: { path: "note.txt", patch, expectedRevision: writtenRevision },
 			context: context(sessionId, writtenRevision),
@@ -246,7 +269,8 @@ describe("OMP authority bridge source CLI", () => {
 			frame: { terminalId, data: "printf 'bridge-term\\n'\n" },
 			context: context(sessionId),
 		});
-		await client.waitForEvent(event => JSON.stringify(event).includes("bridge-term"));
+		const outputEvent = await client.waitForEvent(event => JSON.stringify(event).includes("bridge-term"));
+		expect(outputEvent).toMatchObject({ payload: { terminalId } });
 		await client.success("terminal.resize", {
 			frame: { terminalId, cols: 100, rows: 30 },
 			context: context(sessionId),
