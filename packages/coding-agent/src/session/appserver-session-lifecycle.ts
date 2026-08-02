@@ -168,6 +168,9 @@ export class AppserverSessionLifecycleStore {
 		await this.#tail;
 		return new Map((await this.#read()).archived);
 	}
+	async flush(): Promise<void> {
+		await this.#tail;
+	}
 
 	archive(id: SessionId, archivedAt: string): Promise<void> {
 		if (!isIsoTimestamp(archivedAt)) throw new Error("archivedAt must be a canonical ISO timestamp");

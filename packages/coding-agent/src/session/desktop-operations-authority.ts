@@ -32,6 +32,7 @@ export interface OperationContextLike {
 	currentRevision?: string;
 	abortSignal?: AbortSignal;
 }
+
 export interface SecureFsAdapter {
 	secureReadFile(
 		root: string,
@@ -129,6 +130,7 @@ interface TerminalHandle {
 	pty: PtySession;
 	closed: boolean;
 }
+
 const DEFAULT_SECURE_FS: SecureFsAdapter = { secureReadFile, secureListDirectory, secureWriteFileAtomic };
 const CATALOG_KINDS = new Set(["tool", "model", "command", "setting", "skill", "agent", "provider", "mode"]);
 

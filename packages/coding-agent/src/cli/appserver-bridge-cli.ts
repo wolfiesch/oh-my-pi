@@ -1,65 +1,49 @@
 import { randomUUID } from "node:crypto";
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { type DeviceCapability, MAX_ARRAY_ITEMS } from "@oh-my-pi/app-wire";
+import { sessionId } from "@oh-my-pi/app-wire";
+import { getBlobsDir } from "@oh-my-pi/pi-utils/dirs";
 import {
 	decodeOmpAuthorityBridgeClientFrame,
 	decodeOmpAuthorityBridgeServerFrame,
 	encodeOmpAuthorityBridgeFrame,
 	OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES,
+	OMP_AUTHORITY_BRIDGE_METHODS,
 	OMP_AUTHORITY_BRIDGE_PROTOCOL,
 	type OmpAuthorityBridgeClientFrame,
 	type OmpAuthorityBridgeMethod,
-	type OperationContext,
-	type SessionRecord,
-} from "@oh-my-pi/appserver";
-import { getBlobsDir } from "@oh-my-pi/pi-utils/dirs";
-import { SESSION_TITLE_SLOT_BYTES, T4_AUTHORITY_PROTOCOL } from "../session/session-entries";
-import { SessionManager } from "../session/session-manager";
-import { createDefaultAppserverRuntime } from "./appserver-cli";
+} from "../../../appserver/src/omp-authority-bridge-contract";
+import {
+	type BridgeOperationContext,
+	type BridgeSessionRecord,
+	createDefaultOmpAuthorityBridgeAuthority,
+	type OmpAuthorityBridgeAuthority,
+} from "../session/appserver-bridge-authority";
 import { getCodingAgentAppserverIdentity } from "./appserver-identity";
 
-type Runtime = Awaited<ReturnType<typeof createDefaultAppserverRuntime>>;
-type AuthoritySessionRecord = SessionRecord & { readonly authorityProtocol?: typeof T4_AUTHORITY_PROTOCOL };
+export type { BridgeSessionRecord, OmpAuthorityBridgeAuthority } from "../session/appserver-bridge-authority";
+
+const MAX_SESSION_RECORDS = 1_000;
 const MAX_SESSION_LIST_SNAPSHOTS = 4;
 const SESSION_LIST_SNAPSHOT_TTL_MS = 30_000;
-const SESSION_HEADER_PREFIX_BYTES = OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES + SESSION_TITLE_SLOT_BYTES + 2;
-const SESSION_HEADER_READ_CONCURRENCY = 32;
-
-interface SessionListSnapshot {
-	readonly references: readonly AuthoritySessionRecord[];
-	readonly offset: number;
-	readonly expiresAt: number;
-	readonly complete: boolean;
-	readonly totalCount: number;
-}
-
-interface SessionListPage {
-	readonly sessions: readonly AuthoritySessionRecord[];
-	readonly nextCursor?: string;
-	readonly complete: boolean;
-	readonly totalCount: number;
-}
-
-const BASE_METHODS = [
-	"host.info",
-	"session.create",
-	"session.fork",
-	"session.list",
-	"session.archive",
-	"session.restore",
-	"session.delete",
-	"discovery.load",
-	"discovery.page",
-	"project.rootForProject",
-	"project.rootForSession",
-	"lock.check",
-	"lock.status",
-	"terminal.input",
-	"terminal.resize",
-	"terminal.close",
-] as const satisfies readonly OmpAuthorityBridgeMethod[];
-
+const DEFAULT_LIFECYCLE_TIMEOUT_MS = 10_000;
+const MAX_LIFECYCLE_TIMEOUT_MS = 30_000;
+const METHODS = OMP_AUTHORITY_BRIDGE_METHODS;
+const MUTATING_METHODS: Partial<Record<OmpAuthorityBridgeMethod, true>> = {
+	"session.create": true,
+	"session.fork": true,
+	"session.archive": true,
+	"session.restore": true,
+	"session.delete": true,
+	"operation.filesWrite": true,
+	"operation.filesPatch": true,
+	"operation.reviewApply": true,
+	"operation.bashRun": true,
+	"operation.termOpen": true,
+	"operation.settingsWrite": true,
+	"operation.configWrite": true,
+	"terminal.input": true,
+	"terminal.resize": true,
+	"terminal.close": true,
+};
 const OPERATION_METHODS = {
 	"operation.filesRead": "filesRead",
 	"operation.filesList": "filesList",
@@ -75,98 +59,109 @@ const OPERATION_METHODS = {
 	"operation.brokerStatus": "brokerStatus",
 	"operation.settingsWrite": "settingsWrite",
 	"operation.configWrite": "configWrite",
-} as const satisfies Partial<Record<OmpAuthorityBridgeMethod, keyof Runtime["operationsAuthority"]>>;
+} as const;
 
+interface SessionListSnapshot {
+	readonly references: readonly BridgeSessionRecord[];
+	readonly offset: number;
+	readonly expiresAt: number;
+	readonly complete: boolean;
+	readonly totalCount: number;
+}
+interface SessionListPage {
+	readonly sessions: readonly BridgeSessionRecord[];
+	readonly nextCursor?: string;
+	readonly complete: boolean;
+	readonly totalCount: number;
+}
+interface ActiveRequest {
+	readonly controller: AbortController;
+	readonly method: OmpAuthorityBridgeMethod;
+	promise: Promise<void>;
+}
+interface BridgeState {
+	quiesced: boolean;
+	readonly generation: string;
+	readonly requests: Map<string, ActiveRequest>;
+}
 export interface OmpAuthorityBridgeRunnerOptions {
-	readonly runtime?: Runtime;
+	readonly authority?: OmpAuthorityBridgeAuthority;
 	readonly input?: AsyncIterable<string | Uint8Array>;
 	readonly write?: (line: string) => void | Promise<void>;
 	readonly identity?: { readonly ompVersion: string; readonly ompBuild: string };
+	readonly generation?: string;
 }
 
 function record(value: unknown, label: string): Record<string, unknown> {
-	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} is invalid`);
+	if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype)
+		throw new Error(`${label} is invalid`);
 	return value as Record<string, unknown>;
 }
-
 function exact(value: Record<string, unknown>, keys: readonly string[], label: string): void {
 	const actual = Object.keys(value).sort();
 	const expected = [...keys].sort();
 	if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index]))
 		throw new Error(`${label} is invalid`);
 }
-
-function string(value: unknown, label: string): string {
+function requiredString(value: unknown, label: string): string {
 	if (typeof value !== "string" || value.length === 0) throw new Error(`${label} is invalid`);
 	return value;
 }
-
 function optionalString(value: unknown, label: string): string | undefined {
-	return value === undefined ? undefined : string(value, label);
+	return value === undefined ? undefined : requiredString(value, label);
 }
-
-async function directory(path: string): Promise<boolean> {
-	try {
-		return (await fs.stat(path)).isDirectory();
-	} catch {
-		return false;
-	}
-}
-
-function session(value: unknown): SessionRecord {
+function requestedSession(value: unknown): BridgeSessionRecord {
 	const item = record(value, "session");
-	for (const key of ["sessionId", "path", "cwd", "projectId", "title", "updatedAt", "status"])
-		string(item[key], `session.${key}`);
-	if (!Array.isArray(item.entries)) throw new Error("session.entries is invalid");
-	return item as unknown as SessionRecord;
-}
-
-async function transcriptAuthorityProtocol(sessionPath: string): Promise<typeof T4_AUTHORITY_PROTOCOL | undefined> {
-	try {
-		const prefix = await Bun.file(sessionPath).slice(0, SESSION_HEADER_PREFIX_BYTES).text();
-		for (const line of prefix.split(/\r?\n/u)) {
-			if (!line) continue;
-			const entry: unknown = JSON.parse(line);
-			if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
-			const record = entry as Record<string, unknown>;
-			if (record.type === "title") continue;
-			if (record.type !== "session") return undefined;
-			return record.authorityProtocol === T4_AUTHORITY_PROTOCOL ? T4_AUTHORITY_PROTOCOL : undefined;
-		}
-		return undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-async function withTranscriptAuthority(value: SessionRecord): Promise<AuthoritySessionRecord> {
-	const authorityProtocol = await transcriptAuthorityProtocol(value.path);
-	const unverified: Record<string, unknown> = { ...value };
-	delete unverified.authorityProtocol;
 	return {
-		...unverified,
-		...(authorityProtocol === undefined ? {} : { authorityProtocol }),
-	} as unknown as AuthoritySessionRecord;
-}
-
-async function sessionReference(value: SessionRecord): Promise<AuthoritySessionRecord> {
-	const authoritative = await withTranscriptAuthority(value);
-	return {
-		sessionId: authoritative.sessionId,
-		path: authoritative.path,
-		cwd: authoritative.cwd,
-		projectId: authoritative.projectId,
-		...(authoritative.projectName === undefined ? {} : { projectName: authoritative.projectName }),
-		title: authoritative.title,
-		updatedAt: authoritative.updatedAt,
-		status: authoritative.status,
-		...(authoritative.archivedAt === undefined ? {} : { archivedAt: authoritative.archivedAt }),
-		...(authoritative.model === undefined ? {} : { model: authoritative.model }),
-		...(authoritative.thinking === undefined ? {} : { thinking: authoritative.thinking }),
-		...(authoritative.runtime === undefined ? {} : { runtime: authoritative.runtime }),
-		...(authoritative.authorityProtocol === undefined ? {} : { authorityProtocol: authoritative.authorityProtocol }),
+		sessionId: sessionId(requiredString(item.sessionId, "session id"), "sessionId"),
+		path: requiredString(item.path, "session path"),
+		cwd: requiredString(item.cwd, "session cwd"),
+		projectId: requiredString(item.projectId, "session project id"),
+		...(item.projectName === undefined
+			? {}
+			: { projectName: requiredString(item.projectName, "session project name") }),
+		title: requiredString(item.title, "session title"),
+		updatedAt: requiredString(item.updatedAt, "session update time"),
+		status: "idle",
 		entriesLoaded: false,
 		entries: [],
+	};
+}
+function operationContext(
+	value: unknown,
+	abortSignal: AbortSignal,
+	emitTerminalOutput: (frame: unknown) => void,
+): BridgeOperationContext {
+	const item = record(value, "operation context");
+	exact(
+		item,
+		[
+			"hostId",
+			...(item.sessionId === undefined ? [] : ["sessionId"]),
+			"deviceId",
+			"connectionId",
+			"capabilities",
+			...(item.currentRevision === undefined ? [] : ["currentRevision"]),
+			...(item.expectedRevision === undefined ? [] : ["expectedRevision"]),
+		],
+		"operation context",
+	);
+	if (!Array.isArray(item.capabilities) || item.capabilities.some(capability => typeof capability !== "string"))
+		throw new Error("operation context capabilities are invalid");
+	return {
+		hostId: requiredString(item.hostId, "operation host id"),
+		...(item.sessionId === undefined ? {} : { sessionId: requiredString(item.sessionId, "operation session id") }),
+		deviceId: requiredString(item.deviceId, "operation device id"),
+		connectionId: requiredString(item.connectionId, "operation connection id"),
+		capabilities: new Set(item.capabilities as string[]),
+		...(item.currentRevision === undefined
+			? {}
+			: { currentRevision: requiredString(item.currentRevision, "current revision") }),
+		...(item.expectedRevision === undefined
+			? {}
+			: { expectedRevision: requiredString(item.expectedRevision, "expected revision") }),
+		abortSignal,
+		emitTerminalOutput,
 	};
 }
 
@@ -187,14 +182,17 @@ function sessionListPage(
 			totalCount: snapshot.totalCount,
 		};
 		try {
-			const encoded = encodeOmpAuthorityBridgeFrame({
-				v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
-				type: "response",
-				id,
-				ok: true,
-				result,
-			});
-			decodeOmpAuthorityBridgeServerFrame(JSON.parse(encoded));
+			decodeOmpAuthorityBridgeServerFrame(
+				JSON.parse(
+					encodeOmpAuthorityBridgeFrame({
+						v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+						type: "response",
+						id,
+						ok: true,
+						result,
+					}),
+				),
+			);
 			lower = end;
 		} catch {
 			upper = end - 1;
@@ -208,27 +206,25 @@ function sessionListPage(
 		complete: snapshot.complete,
 		totalCount: snapshot.totalCount,
 	};
-	if (result.nextCursor) {
+	if (result.nextCursor)
 		snapshots.set(result.nextCursor, {
-			references: snapshot.references,
+			...snapshot,
 			offset: lower,
 			expiresAt: Date.now() + SESSION_LIST_SNAPSHOT_TTL_MS,
-			complete: snapshot.complete,
-			totalCount: snapshot.totalCount,
 		});
-	}
 	return result;
 }
 
 async function listSessionPage(
-	runtime: Runtime,
+	authority: OmpAuthorityBridgeAuthority,
 	id: string,
 	params: Record<string, unknown>,
 	snapshots: Map<string, SessionListSnapshot>,
+	signal: AbortSignal,
 ): Promise<SessionListPage> {
 	const now = Date.now();
 	for (const [cursor, snapshot] of snapshots) if (snapshot.expiresAt <= now) snapshots.delete(cursor);
-	const cursor = params.cursor === undefined ? undefined : string(params.cursor, "session.list cursor");
+	const cursor = params.cursor === undefined ? undefined : requiredString(params.cursor, "session.list cursor");
 	exact(params, cursor === undefined ? [] : ["cursor"], "session.list params");
 	if (cursor !== undefined) {
 		const snapshot = snapshots.get(cursor);
@@ -238,65 +234,62 @@ async function listSessionPage(
 	}
 	if (snapshots.size >= MAX_SESSION_LIST_SNAPSHOTS)
 		throw Object.assign(new Error("too many session inventory snapshots"), { code: "BOUNDS" });
-	const sessions = await runtime.sessionAuthority.list();
-	const bounded = sessions.slice(0, MAX_ARRAY_ITEMS);
-	const references: AuthoritySessionRecord[] = [];
-	for (let offset = 0; offset < bounded.length; offset += SESSION_HEADER_READ_CONCURRENCY) {
-		references.push(
-			...(await Promise.all(bounded.slice(offset, offset + SESSION_HEADER_READ_CONCURRENCY).map(sessionReference))),
-		);
-	}
+	const all = await authority.list(signal);
+	const references = all.slice(0, MAX_SESSION_RECORDS);
 	return sessionListPage(
 		id,
 		{
 			references,
 			offset: 0,
 			expiresAt: now + SESSION_LIST_SNAPSHOT_TTL_MS,
-			complete: sessions.length <= MAX_ARRAY_ITEMS,
-			totalCount: sessions.length,
+			complete: all.length <= MAX_SESSION_RECORDS,
+			totalCount: all.length,
 		},
 		snapshots,
 	);
 }
 
-function operationContext(
-	value: unknown,
-	abortSignal: AbortSignal,
-	emitTerminalOutput: (frame: unknown) => void,
-): OperationContext {
-	const item = record(value, "operation context");
+function lifecycleParams(
+	params: Record<string, unknown>,
+	generation: string,
+): { timeoutMs: number; interrupt: boolean } {
 	exact(
-		item,
+		params,
 		[
-			"hostId",
-			...(item.sessionId === undefined ? [] : ["sessionId"]),
-			"deviceId",
-			"connectionId",
-			"capabilities",
-			...(item.currentRevision === undefined ? [] : ["currentRevision"]),
-			...(item.expectedRevision === undefined ? [] : ["expectedRevision"]),
+			...(params.generation === undefined ? [] : ["generation"]),
+			...(params.timeoutMs === undefined ? [] : ["timeoutMs"]),
+			...(params.interrupt === undefined ? [] : ["interrupt"]),
 		],
-		"operation context",
+		"authority lifecycle params",
 	);
-	if (!Array.isArray(item.capabilities) || item.capabilities.some(value => typeof value !== "string"))
-		throw new Error("operation context capabilities are invalid");
-	return {
-		hostId: string(item.hostId, "operation host id") as never,
-		...(item.sessionId === undefined ? {} : { sessionId: string(item.sessionId, "operation session id") as never }),
-		deviceId: string(item.deviceId, "operation device id"),
-		connectionId: string(item.connectionId, "operation connection id"),
-		capabilities: new Set(item.capabilities as DeviceCapability[]),
-		...(item.currentRevision === undefined
-			? {}
-			: { currentRevision: string(item.currentRevision, "current revision") as never }),
-		...(item.expectedRevision === undefined
-			? {}
-			: { expectedRevision: string(item.expectedRevision, "expected revision") as never }),
-		abortSignal,
-		emitTerminalOutput,
-	};
+	if (params.generation !== undefined && requiredString(params.generation, "runtime generation") !== generation)
+		throw Object.assign(new Error("runtime generation is stale"), { code: "STALE_GENERATION" });
+	const timeoutMs = params.timeoutMs ?? DEFAULT_LIFECYCLE_TIMEOUT_MS;
+	if (
+		!Number.isSafeInteger(timeoutMs) ||
+		(timeoutMs as number) < 1 ||
+		(timeoutMs as number) > MAX_LIFECYCLE_TIMEOUT_MS
+	)
+		throw Object.assign(new Error("lifecycle timeout is invalid"), { code: "BOUNDS" });
+	if (params.interrupt !== undefined && typeof params.interrupt !== "boolean")
+		throw new Error("interrupt policy is invalid");
+	return { timeoutMs: timeoutMs as number, interrupt: params.interrupt !== false };
 }
-
+async function bounded<T>(task: Promise<T>, timeoutMs: number): Promise<T> {
+	const timeout = Promise.withResolvers<never>();
+	const timer = setTimeout(
+		() => timeout.reject(Object.assign(new Error("operation timed out"), { code: "TIMEOUT" })),
+		timeoutMs,
+	);
+	try {
+		return await Promise.race([task, timeout.promise]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+function acknowledgement(generation: string, quiesced: boolean): Record<string, unknown> {
+	return { schemaVersion: 1, generation, durable: true, ...(quiesced ? { quiesced: true } : {}) };
+}
 function safeError(error: unknown): { code: string; message: string } {
 	const raw =
 		error && typeof error === "object" && "code" in error && typeof error.code === "string"
@@ -308,8 +301,11 @@ function safeError(error: unknown): { code: string; message: string } {
 		CONFLICT: "operation conflicts with current state",
 		FORBIDDEN: "operation is not permitted",
 		NOT_FOUND: "resource was not found",
+		QUIESCED: "authority is quiesced",
+		STALE_GENERATION: "runtime generation is stale",
 		OPERATION_FAILED: "operation failed",
 		STALE_REVISION: "resource revision is stale",
+		TIMEOUT: "operation timed out",
 		UNSUPPORTED: "operation is unsupported",
 	};
 	const code = known[raw] ? raw : "BRIDGE_FAILED";
@@ -339,131 +335,105 @@ async function* lines(input: AsyncIterable<string | Uint8Array>): AsyncGenerator
 	if (pending) yield pending;
 }
 
-function advertisedMethods(runtime: Runtime): OmpAuthorityBridgeMethod[] {
-	const methods: OmpAuthorityBridgeMethod[] = [...BASE_METHODS];
-	if (!runtime.discovery.load) methods.splice(methods.indexOf("discovery.load"), 1);
-	if (!runtime.discovery.page) methods.splice(methods.indexOf("discovery.page"), 1);
-	if (
-		!runtime.operationsAuthority.terminalInput ||
-		!runtime.operationsAuthority.terminalResize ||
-		!runtime.operationsAuthority.terminalClose
-	) {
-		for (const name of ["terminal.input", "terminal.resize", "terminal.close"] as const) {
-			const index = methods.indexOf(name);
-			if (index >= 0) methods.splice(index, 1);
-		}
-	}
-	for (const [method, property] of Object.entries(OPERATION_METHODS) as Array<
-		[OmpAuthorityBridgeMethod, keyof Runtime["operationsAuthority"]]
-	>)
-		if (typeof runtime.operationsAuthority[property] === "function") methods.push(method);
-	if (runtime.usageAuthority) methods.push("usage.read");
-	return methods;
-}
-
 async function dispatch(
-	runtime: Runtime,
+	authority: OmpAuthorityBridgeAuthority,
 	frame: Extract<OmpAuthorityBridgeClientFrame, { type: "request" }>,
-	abortSignal: AbortSignal,
-	emitTerminalOutput: (value: unknown) => void,
-	sessionListSnapshots: Map<string, SessionListSnapshot>,
+	signal: AbortSignal,
+	snapshots: Map<string, SessionListSnapshot>,
+	emitTerminalOutput: (frame: unknown) => void,
+	state: BridgeState,
 ): Promise<unknown> {
 	const params = frame.params;
 	switch (frame.method) {
 		case "host.info":
 			exact(params, [], "host.info params");
 			return { transcriptImageRoot: getBlobsDir() };
+		case "authority.flush": {
+			const policy = lifecycleParams(params, state.generation);
+			const pending = [...state.requests.entries()]
+				.filter(([id, request]) => id !== frame.id && MUTATING_METHODS[request.method])
+				.map(([, request]) => request.promise);
+			await bounded(
+				Promise.allSettled(pending).then(() => undefined),
+				policy.timeoutMs,
+			);
+			await bounded(authority.flush(), policy.timeoutMs);
+			return acknowledgement(state.generation, false);
+		}
+		case "authority.quiesce": {
+			const policy = lifecycleParams(params, state.generation);
+			const previous = state.quiesced;
+			state.quiesced = true;
+			try {
+				const active = [...state.requests.entries()]
+					.filter(([id]) => id !== frame.id)
+					.map(([, request]) => request);
+				if (!policy.interrupt && active.length > 0)
+					throw Object.assign(new Error("authority work is active"), { code: "CONFLICT" });
+				if (policy.interrupt) for (const request of active) request.controller.abort();
+				await bounded(
+					Promise.allSettled(active.map(request => request.promise)).then(() => undefined),
+					policy.timeoutMs,
+				);
+				await bounded(authority.quiesce({ interrupt: policy.interrupt }), policy.timeoutMs);
+				return acknowledgement(state.generation, true);
+			} catch (error) {
+				state.quiesced = previous;
+				throw error;
+			}
+		}
 		case "session.create": {
 			exact(params, ["cwd", ...(params.title === undefined ? [] : ["title"])], "session.create params");
-			return runtime.sessionAuthority.create(
-				string(params.cwd, "session cwd"),
+			return authority.create(
+				requiredString(params.cwd, "session cwd"),
 				optionalString(params.title, "session title"),
+				signal,
 			);
 		}
 		case "session.fork": {
 			exact(params, ["session", ...(params.cwd === undefined ? [] : ["cwd"])], "session.fork params");
-			// The supplied record carries no authority of its own. Resolve the
-			// source from OMP's own inventory by id and ignore the sent path, so
-			// this method can never be aimed at an arbitrary file.
-			const requested = session(params.session);
-			const source = (await runtime.sessionAuthority.list()).find(
-				candidate => candidate.sessionId === requested.sessionId,
-			);
-			if (!source) throw new Error("unknown session");
-			// forkFrom only reads the source: it loads and migrates the entries,
-			// resolves blob refs, then writes a new file with a fresh id naming
-			// the parent. The source keeps its writer and its bytes.
-			// A historic transcript routinely names a project directory that has
-			// since been deleted, and a copy has to live somewhere real. The
-			// caller may name an existing directory; nothing is substituted
-			// silently, so an absent choice still means the source's own cwd.
-			const target = optionalString(params.cwd, "fork working directory") ?? source.cwd;
-			if (!path.isAbsolute(target)) throw new Error("fork working directory must be absolute");
-			if (!(await directory(target))) throw new Error("fork working directory does not exist");
-			// forkFrom writes the copy's header and storage slug for this cwd, so
-			// the choice survives rediscovery rather than living only in memory.
-			const forked = await SessionManager.forkFrom(source.path, target);
-			try {
-				const forkedFile = forked.getSessionFile();
-				if (!forkedFile) throw new Error("forked session was not written");
-				const forkedTitle = forked.getSessionName();
-				// The transcript body stays out of this response: it would not fit
-				// a bounded frame. The host reads the copy back through
-				// discovery.load.
-				return {
-					sessionId: forked.getSessionId(),
-					path: forkedFile,
-					cwd: target,
-					...(forkedTitle === undefined ? {} : { title: forkedTitle }),
-					entries: [],
-				};
-			} finally {
-				// The atomic rewrite inside forkFrom takes the new file's lock and
-				// starts its heartbeat. Hand the copy over unlocked, or the host
-				// sees its own fork as live elsewhere and refuses to write it.
-				await forked.dispose();
-			}
+			return authority.fork(requestedSession(params.session), optionalString(params.cwd, "fork cwd"), signal);
 		}
-		case "session.list": {
-			return listSessionPage(runtime, frame.id, params, sessionListSnapshots);
-		}
+		case "session.list":
+			return listSessionPage(authority, frame.id, params, snapshots, signal);
 		case "session.archive":
 			exact(params, ["session", "archivedAt"], "session.archive params");
-			await runtime.sessionAuthority.archive(session(params.session), string(params.archivedAt, "archive time"));
-			return null;
-		case "session.restore":
-		case "session.delete": {
-			exact(params, ["session"], `${frame.method} params`);
-			await runtime.sessionAuthority[frame.method === "session.restore" ? "restore" : "delete"](
-				session(params.session),
+			await authority.archive(
+				requestedSession(params.session),
+				requiredString(params.archivedAt, "archive time"),
+				signal,
 			);
 			return null;
-		}
+		case "session.restore":
+			exact(params, ["session"], "session.restore params");
+			await authority.restore(requestedSession(params.session), signal);
+			return null;
+		case "session.delete":
+			exact(params, ["session"], "session.delete params");
+			await authority.delete(requestedSession(params.session), signal);
+			return null;
 		case "discovery.load":
 			exact(params, ["session"], "discovery.load params");
-			if (!runtime.discovery.load) throw Object.assign(new Error("unsupported"), { code: "UNSUPPORTED" });
-			return withTranscriptAuthority(await runtime.discovery.load(session(params.session)));
+			return authority.load(requestedSession(params.session), signal);
 		case "discovery.page":
 			exact(params, ["session", "args"], "discovery.page params");
-			if (!runtime.discovery.page) throw Object.assign(new Error("unsupported"), { code: "UNSUPPORTED" });
-			return runtime.discovery.page(session(params.session), record(params.args, "transcript page args") as never);
+			return authority.page(requestedSession(params.session), record(params.args, "transcript page args"), signal);
 		case "project.rootForProject":
 			exact(params, ["projectId"], "project.rootForProject params");
-			return runtime.projectRootForProject(string(params.projectId, "project id") as never);
+			return authority.rootForProject(requiredString(params.projectId, "project id"), signal);
 		case "project.rootForSession":
 			exact(params, ["sessionId"], "project.rootForSession params");
-			return runtime.projectRootForSession(string(params.sessionId, "session id") as never);
+			return authority.rootForSession(requiredString(params.sessionId, "session id"), signal);
 		case "lock.check":
 			exact(params, ["session"], "lock.check params");
-			await runtime.lockCheck(session(params.session));
+			await authority.lockCheck(requestedSession(params.session), signal);
 			return null;
 		case "lock.status":
 			exact(params, ["session"], "lock.status params");
-			return runtime.lockStatus(session(params.session));
+			return authority.lockStatus(requestedSession(params.session), signal);
 		case "usage.read":
 			exact(params, [], "usage.read params");
-			if (!runtime.usageAuthority) throw Object.assign(new Error("unsupported"), { code: "UNSUPPORTED" });
-			return runtime.usageAuthority.read(abortSignal);
+			return authority.usageRead(signal);
 		case "terminal.input":
 		case "terminal.resize":
 		case "terminal.close": {
@@ -474,30 +444,26 @@ async function dispatch(
 					: frame.method === "terminal.resize"
 						? "terminalResize"
 						: "terminalClose";
-			const handler = runtime.operationsAuthority[property];
-			if (!handler) throw Object.assign(new Error("unsupported"), { code: "UNSUPPORTED" });
-			await (handler as (frame: never, context: OperationContext) => Promise<void>)(
-				record(params.frame, "terminal frame") as never,
-				operationContext(params.context, abortSignal, emitTerminalOutput),
+			await authority.operations[property](
+				record(params.frame, "terminal frame"),
+				operationContext(params.context, signal, emitTerminalOutput),
 			);
 			return null;
 		}
 		default: {
 			const property = OPERATION_METHODS[frame.method as keyof typeof OPERATION_METHODS];
-			const handler = property ? runtime.operationsAuthority[property] : undefined;
-			if (!property || typeof handler !== "function")
-				throw Object.assign(new Error("unsupported"), { code: "UNSUPPORTED" });
+			if (!property) throw Object.assign(new Error("unsupported"), { code: "UNSUPPORTED" });
 			exact(params, ["args", "context"], `${frame.method} params`);
-			return (handler as (args: never, context: OperationContext) => Promise<unknown>)(
-				record(params.args, "operation args") as never,
-				operationContext(params.context, abortSignal, emitTerminalOutput),
+			return authority.operations[property](
+				record(params.args, "operation args"),
+				operationContext(params.context, signal, emitTerminalOutput),
 			);
 		}
 	}
 }
 
 export async function runOmpAuthorityBridge(options: OmpAuthorityBridgeRunnerOptions = {}): Promise<void> {
-	const runtime = options.runtime ?? (await createDefaultAppserverRuntime());
+	const authority = options.authority ?? (await createDefaultOmpAuthorityBridgeAuthority());
 	const input = options.input ?? (process.stdin as unknown as AsyncIterable<Uint8Array>);
 	const output =
 		options.write ??
@@ -511,46 +477,63 @@ export async function runOmpAuthorityBridge(options: OmpAuthorityBridgeRunnerOpt
 		writeTail = writeTail.then(() => output(line));
 		return writeTail;
 	};
-	const identity = options.identity ?? getCodingAgentAppserverIdentity();
-	const methods = advertisedMethods(runtime);
-	await write({
-		v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
-		type: "ready",
-		methods,
-		ompVersion: identity.ompVersion,
-		ompBuild: identity.ompBuild,
-	});
-	const controllers = new Map<string, AbortController>();
-	const requests = new Set<Promise<void>>();
-	const sessionListSnapshots = new Map<string, SessionListSnapshot>();
+	const generation = options.generation ?? process.env.T4_RUNTIME_GENERATION ?? `standalone:${randomUUID()}`;
+	if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(generation)) throw new Error("runtime generation is invalid");
+	const detectedIdentity = getCodingAgentAppserverIdentity();
+	const identity = options.identity ?? {
+		ompVersion: detectedIdentity.ompVersion,
+		ompBuild: process.env.T4_OMP_BUILD ?? process.env.OMP_BUILD ?? detectedIdentity.ompBuild,
+	};
+	await write({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "ready", methods: METHODS, ...identity });
+	const state: BridgeState = { quiesced: false, generation, requests: new Map() };
+	const snapshots = new Map<string, SessionListSnapshot>();
 	for await (const line of lines(input)) {
 		if (!line) continue;
 		const frame = decodeOmpAuthorityBridgeClientFrame(JSON.parse(line));
 		if (frame.type === "cancel") {
-			controllers.get(frame.id)?.abort();
+			state.requests.get(frame.id)?.controller.abort();
 			continue;
 		}
-		if (!methods.includes(frame.method)) {
+		if (!(METHODS as readonly OmpAuthorityBridgeMethod[]).includes(frame.method)) {
 			await write({
 				v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
 				type: "response",
 				id: frame.id,
 				ok: false,
-				error: { code: "UNSUPPORTED", message: "operation is unsupported" },
+				error: safeError({ code: "UNSUPPORTED" }),
 			});
 			continue;
 		}
-		if (controllers.has(frame.id)) throw new Error("duplicate bridge request id");
+		if (state.requests.has(frame.id)) throw new Error("duplicate bridge request id");
+		if (state.quiesced && MUTATING_METHODS[frame.method]) {
+			await write({
+				v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+				type: "response",
+				id: frame.id,
+				ok: false,
+				error: safeError({ code: "QUIESCED" }),
+			});
+			continue;
+		}
 		const controller = new AbortController();
-		controllers.set(frame.id, controller);
-		const request = dispatch(
-			runtime,
+		const active: ActiveRequest = { controller, method: frame.method, promise: Promise.resolve() };
+		state.requests.set(frame.id, active);
+		active.promise = dispatch(
+			authority,
 			frame,
 			controller.signal,
+			snapshots,
 			payload => {
-				void write({ v: OMP_AUTHORITY_BRIDGE_PROTOCOL, type: "event", id: frame.id, event: "terminal", payload });
+				if (!controller.signal.aborted)
+					void write({
+						v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+						type: "event",
+						id: frame.id,
+						event: "terminal",
+						payload,
+					});
 			},
-			sessionListSnapshots,
+			state,
 		)
 			.then(
 				result =>
@@ -571,13 +554,10 @@ export async function runOmpAuthorityBridge(options: OmpAuthorityBridgeRunnerOpt
 					}),
 			)
 			.then(() => undefined)
-			.finally(() => {
-				controllers.delete(frame.id);
-				requests.delete(request);
-			});
-		requests.add(request);
+			.finally(() => state.requests.delete(frame.id));
 	}
-	for (const controller of controllers.values()) controller.abort();
-	await Promise.allSettled(requests);
+	for (const request of state.requests.values()) request.controller.abort();
+	await Promise.allSettled([...state.requests.values()].map(request => request.promise));
+	await authority.shutdown?.();
 	await writeTail;
 }
