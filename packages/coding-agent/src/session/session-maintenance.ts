@@ -1791,10 +1791,9 @@ export class SessionMaintenance {
 	 * When the model/window is unknown we cannot evaluate the band, so we
 	 * optimistically allow the continuation (preserving prior behavior).
 	 */
-	#compactionCreatedHeadroom(): boolean {
+	#compactionCreatedHeadroom(compactionSettings = this.#host.settings.getGroup("compaction")): boolean {
 		const contextWindow = this.#model?.contextWindow ?? 0;
 		if (contextWindow <= 0) return true;
-		const compactionSettings = this.#host.settings.getGroup("compaction");
 		const residualTokens = compactionContextTokens(
 			this.#host.getContextUsage({ contextWindow })?.tokens ?? 0,
 			this.#estimateStoredContextTokens(),
@@ -2348,7 +2347,7 @@ export class SessionMaintenance {
 					if (frameRescueResult) {
 						rescueRewroteHistory = true;
 						pathEntriesForCompaction = this.#host.sessionManager.getBranch();
-						frameRescueCreatedHeadroom = this.#compactionCreatedHeadroom();
+						frameRescueCreatedHeadroom = this.#compactionCreatedHeadroom(compactionSettings);
 					}
 					if (!frameRescueCreatedHeadroom) {
 						await this.#rescueCompactionDeadEnd(autoCompactionSignal, {
@@ -2857,11 +2856,11 @@ export class SessionMaintenance {
 				// when auto-continue is disabled, a no-headroom threshold pass must still
 				// block later automatic continuations (todo reminders/session_stop hooks)
 				// from re-entering the same oversized context.
-				hasHeadroom = this.#compactionCreatedHeadroom();
+				hasHeadroom = this.#compactionCreatedHeadroom(compactionSettings);
 				if (!hasHeadroom) {
 					hasHeadroom = await this.#rescueCompactionDeadEnd(autoCompactionSignal, {
 						skipElide: fallbackFromShake,
-						hasProgress: () => this.#compactionCreatedHeadroom(),
+						hasProgress: () => this.#compactionCreatedHeadroom(compactionSettings),
 					});
 				}
 				if (!hasHeadroom) {
