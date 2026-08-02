@@ -196,6 +196,12 @@ function isOlderReleaseVersion(candidate, current) {
 	return false;
 }
 
+// A concurrently starting older OMP binary creates or refreshes this directory
+// before extracting its addon. Keep fresh directories long enough for that
+// startup to finish; a later launch can reclaim them once they are genuinely
+// stale.
+const NATIVE_CACHE_CLEANUP_GRACE_MS = 10 * 60_000;
+
 /**
  * Remove version-pinned native cache directories older than the loaded package.
  * Best-effort by design: permission errors and concurrent processes must not
@@ -217,6 +223,8 @@ export function cleanupStaleNativeVersions({ nativesDir, currentVersion }) {
 		if (!entry.isDirectory() || !isOlderReleaseVersion(entry.name, currentVersion)) continue;
 		const targetPath = path.join(nativesDir, entry.name);
 		try {
+			const stat = fs.statSync(targetPath);
+			if (Date.now() - stat.mtimeMs < NATIVE_CACHE_CLEANUP_GRACE_MS) continue;
 			fs.rmSync(targetPath, { recursive: true, force: true });
 			removed.push(targetPath);
 		} catch {
