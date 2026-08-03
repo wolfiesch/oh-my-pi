@@ -60,6 +60,28 @@ describe("RPC command registry", () => {
 			},
 		});
 	});
+	test("advertises bounded queue and owner-scoped job controls", () => {
+		const manifest = getRpcCapabilityManifest();
+		for (const name of ["get_queue", "remove_queued_message", "reorder_queued_message", "clear_queue"]) {
+			expect(manifest.commands.find(command => command.name === name)).toMatchObject({
+				scope: "session",
+				execution: "sync",
+				concurrencyClass: "control",
+			});
+		}
+		expect(manifest.commands.find(command => command.name === "cancel_job")).toMatchObject({
+			scope: "agent",
+			concurrencyClass: "control",
+			inputSchema: { properties: { jobIds: { maxItems: 64, uniqueItems: true } } },
+		});
+		expect(manifest.events).toEqual(expect.arrayContaining(["queue_update", "job_update"]));
+		expect(
+			validateRpcCommand({ type: "cancel_job", jobIds: Array.from({ length: 65 }, (_, i) => `job-${i}`) }),
+		).toMatchObject({
+			ok: false,
+			code: "invalid_request",
+		});
+	});
 
 	test("evaluates runtime-gated availability on every manifest query", () => {
 		const unavailable = getRpcCapabilityManifest();

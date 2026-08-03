@@ -16,6 +16,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { serviceTierFamily } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isEnoent, isRecord, Snowflake } from "@oh-my-pi/pi-utils";
+import { JobProjectionService } from "../../async";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import type { EvalToolDetails } from "../../eval/types";
@@ -41,6 +42,7 @@ import {
 	resolveSessionCatalogReference,
 	SessionCatalogError,
 } from "../../session/session-catalog";
+import { SessionQueueEntryNotFoundError, SessionQueueInvalidPositionError } from "../../session/session-queue-service";
 import { FileSessionStorage } from "../../session/session-storage";
 import { ToolInventoryUnavailableError } from "../../session/session-tools";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
@@ -804,7 +806,7 @@ export function requestRpcAgentMutationConfirmation(
 export function requestRpcPrivilegedConfirmation(
 	pendingRequests: Map<string, PendingExtensionRequest>,
 	output: RpcOutput,
-	command: "eval_execute" | "delete_session" | "remove_provider_auth",
+	command: "eval_execute" | "cancel_job" | "delete_session" | "remove_provider_auth",
 	title: string,
 	message: string,
 	options: { operationId?: string; signal?: AbortSignal; timeout?: number } = {},
@@ -1038,6 +1040,16 @@ export async function runRpcMode(
 	const unsubscribeAgentRegistry = agentControl.onRegistryUpdate(update => {
 		output({ type: "agent_registry_update", ...update });
 	});
+	const rpcJobOwnerId = session.getAgentId();
+	const jobProjection =
+		session.asyncJobManager && rpcJobOwnerId
+			? new JobProjectionService({
+					manager: session.asyncJobManager,
+					ownerId: rpcJobOwnerId,
+					registry: AgentRegistry.global(),
+					lifecycle: AgentLifecycleManager.global(),
+				})
+			: undefined;
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
@@ -1264,9 +1276,18 @@ export async function runRpcMode(
 	});
 
 	// Output all agent events as JSON
+	let lastQueueFrame = "";
+	const emitQueueUpdate = () => {
+		const queue = session.getQueueSnapshot();
+		const serialized = JSON.stringify(queue);
+		if (serialized === lastQueueFrame) return;
+		lastQueueFrame = serialized;
+		output({ type: "queue_update", queue });
+	};
 	session.subscribe(event => {
 		if (event.type === "message_start") operationOwnership.observeMessageStart(event.message);
 		output(event);
+		emitQueueUpdate();
 	});
 	session.planMode.onStateChange(state => {
 		output({ type: "plan_state_update", state });
@@ -1283,6 +1304,11 @@ export async function runRpcMode(
 	session.planMode.onApprovalSettled(result => {
 		output({ type: "plan_approval_settled", approvalId: result.approvalId, result });
 	});
+	const emitJobUpdate = () => {
+		const snapshot = jobProjection?.list();
+		if (snapshot) output({ type: "job_update", ...snapshot });
+	};
+	const unsubscribeJobUpdates = jobProjection?.subscribe(emitJobUpdate);
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
 	const getAdvisorState = () => session.getAdvisorStateOverview();
@@ -1313,6 +1339,8 @@ export async function runRpcMode(
 		output({ type: "tool_inventory_update" });
 	});
 	await emitAvailableCommandsUpdate();
+	emitQueueUpdate();
+	emitJobUpdate();
 
 	const completeSessionTransition = async (
 		id: string | undefined,
@@ -1459,6 +1487,7 @@ export async function runRpcMode(
 					return error(id, "steer", "Session tool activation is in progress", "session_busy");
 				}
 				await session.steer(command.message, command.images);
+				emitQueueUpdate();
 				return success(id, "steer");
 			}
 
@@ -1467,6 +1496,7 @@ export async function runRpcMode(
 					return error(id, "follow_up", "Session tool activation is in progress", "session_busy");
 				}
 				await session.followUp(command.message, command.images);
+				emitQueueUpdate();
 				return success(id, "follow_up");
 			}
 
@@ -1474,6 +1504,7 @@ export async function runRpcMode(
 				const protectedOperations = providerAuthController.cancelAll("user", "cancelled_by_client");
 				operationManager.cancelAll("user", "cancelled_by_client", protectedOperations);
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
+				emitQueueUpdate();
 				return success(id, "abort");
 			}
 
@@ -1977,6 +2008,77 @@ export async function runRpcMode(
 				} catch (err) {
 					return error(id, "get_subagent_messages", err instanceof Error ? err.message : String(err));
 				}
+			}
+			case "get_queue":
+				return success(id, "get_queue", session.getQueueSnapshot());
+
+			case "remove_queued_message": {
+				try {
+					const result = session.queueService.remove(command.entryId);
+					emitQueueUpdate();
+					return success(id, "remove_queued_message", { removed: result.removed, queue: result.snapshot });
+				} catch (cause) {
+					if (cause instanceof SessionQueueEntryNotFoundError) {
+						return error(id, "remove_queued_message", cause.message, "stale_queue_entry");
+					}
+					throw cause;
+				}
+			}
+
+			case "reorder_queued_message": {
+				try {
+					const queue = session.queueService.reorder(command.entryId, command.toIndex);
+					emitQueueUpdate();
+					return success(id, "reorder_queued_message", queue);
+				} catch (cause) {
+					if (cause instanceof SessionQueueEntryNotFoundError) {
+						return error(id, "reorder_queued_message", cause.message, "stale_queue_entry");
+					}
+					if (cause instanceof SessionQueueInvalidPositionError) {
+						return error(id, "reorder_queued_message", cause.message, "invalid_queue_position");
+					}
+					throw cause;
+				}
+			}
+
+			case "clear_queue": {
+				const result = session.clearQueue({ lane: command.lane });
+				emitQueueUpdate();
+				return success(id, "clear_queue", result);
+			}
+
+			case "list_jobs": {
+				if (!jobProjection) return error(id, "list_jobs", "Background job manager is unavailable", "unavailable");
+				return success(id, "list_jobs", jobProjection.list());
+			}
+
+			case "get_job": {
+				if (!jobProjection) return error(id, "get_job", "Background job manager is unavailable", "unavailable");
+				return success(id, "get_job", { job: jobProjection.get(command.jobId) ?? null });
+			}
+
+			case "cancel_job": {
+				if (!jobProjection) return error(id, "cancel_job", "Background job manager is unavailable", "unavailable");
+				const resolvedTargets = jobProjection.resolveCancellationTargets(command.jobIds);
+				let confirmed = false;
+				try {
+					confirmed = await requestRpcPrivilegedConfirmation(
+						pendingExtensionRequests,
+						output,
+						"cancel_job",
+						"Cancel background jobs?",
+						`Cancel ${command.jobIds.length} background job${command.jobIds.length === 1 ? "" : "s"}: ${command.jobIds.join(", ")}`,
+						{ timeout: 15_000 },
+					);
+				} catch {
+					return error(id, "cancel_job", "Cancellation confirmation was not completed", "confirmation_required");
+				}
+				if (!confirmed) {
+					return error(id, "cancel_job", "Cancellation was not confirmed", "confirmation_required");
+				}
+				const outcomes = await jobProjection.cancelResolved(resolvedTargets);
+				emitJobUpdate();
+				return success(id, "cancel_job", { outcomes });
 			}
 
 			case "list_agents":
@@ -2625,11 +2727,14 @@ export async function runRpcMode(
 	operationManager.cancelAll("client_disconnected", "client_disconnected", protectedOperations);
 	for (const operationId of rpcEvalsToAbort) session.abortEvalExecution(operationId);
 	unsubscribeAgentRegistry();
+	unsubscribeJobUpdates?.();
 	subagentRegistry?.dispose();
-	// Dispose the main session before exiting so the browser reaper and other
-	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a
-	// prior pi.shutdown() through the coordinator makes this await settle
-	// immediately.
-	await session.dispose();
+	// Jobs are process-scoped rather than transport-scoped: keep the host alive
+	// until this owner's accepted jobs settle, then tear down without cancelling
+	// or evicting their retained outcomes.
+	if (session.asyncJobManager && rpcJobOwnerId) {
+		await session.asyncJobManager.waitForOwnerJobs(rpcJobOwnerId);
+	}
+	await session.dispose({ preserveAsyncJobs: true });
 	process.exit(0);
 }

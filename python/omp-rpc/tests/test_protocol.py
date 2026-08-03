@@ -6,27 +6,21 @@ from pathlib import Path
 
 from omp_rpc import (
     AgentEndEvent,
-    assistant_text,
-    assistant_text_with_thinking,
     AutoCompactionEndEvent,
     AutoCompactionStartEvent,
     ExtensionUiRequest,
+    JobUpdateEvent,
     ModeChangeResult,
     OperationCancelledEvent,
     OperationCompletedEvent,
     OperationFailedEvent,
     OperationStartedEvent,
-    parse_advisor_state,
-    parse_mode_change_result,
-    parse_notification,
-    parse_session_state,
-    parse_tool_activation_result,
-    parse_tool_inventory,
     PlanApprovalRequestEvent,
     PlanApprovalSettledEvent,
     PlanStateUpdateEvent,
     ProviderAuthRequest,
     ProviderAuthUpdate,
+    QueueUpdateEvent,
     ReadyEvent,
     SessionState,
     SubagentEvent,
@@ -35,6 +29,14 @@ from omp_rpc import (
     TodoReminderEvent,
     ToolActivationResult,
     ToolInventoryUpdateEvent,
+    assistant_text,
+    assistant_text_with_thinking,
+    parse_advisor_state,
+    parse_mode_change_result,
+    parse_notification,
+    parse_session_state,
+    parse_tool_activation_result,
+    parse_tool_inventory,
 )
 
 
@@ -1116,6 +1118,75 @@ class ProtocolParsingTests(unittest.TestCase):
             events[1].payload.progress.extracted_tool_data,
             {"read": [{"path": "protocol.py", "line": 1083}]},
         )
+
+    def test_parse_queue_and_job_updates_into_typed_models(self) -> None:
+        queue = parse_notification(
+            {
+                "type": "queue_update",
+                "queue": {
+                    "steering": [
+                        {
+                            "entryId": "queue-1",
+                            "lane": "steering",
+                            "text": "Review",
+                            "operationId": "operation-1",
+                        }
+                    ],
+                    "followUp": [],
+                    "rowCount": 1,
+                    "displayableCount": 1,
+                    "pendingCount": 1,
+                    "pendingNextTurnCount": 0,
+                    "future": True,
+                },
+                "futureTopLevel": True,
+            }
+        )
+        jobs = parse_notification(
+            {
+                "type": "job_update",
+                "jobs": [
+                    {
+                        "id": "job-1",
+                        "type": "task",
+                        "status": "running",
+                        "label": "Review",
+                        "durationMs": 12,
+                        "future": True,
+                    }
+                ],
+                "agents": [
+                    {
+                        "id": "AgentA",
+                        "parentId": "Main",
+                        "activity": "Reading",
+                        "ageMs": 25,
+                    }
+                ],
+                "futureTopLevel": True,
+            }
+        )
+        self.assertIsInstance(queue, QueueUpdateEvent)
+        self.assertEqual(queue.queue.steering[0].entry_id, "queue-1")
+        self.assertEqual(queue.queue.pending_count, 1)
+        self.assertIsInstance(jobs, JobUpdateEvent)
+        self.assertEqual(jobs.jobs[0].id, "job-1")
+        self.assertEqual(jobs.jobs[0].duration_ms, 12.0)
+        self.assertEqual(jobs.agents[0].parent_id, "Main")
+
+        with self.assertRaisesRegex(ValueError, "displayableCount"):
+            parse_notification(
+                {
+                    "type": "queue_update",
+                    "queue": {
+                        "steering": [],
+                        "followUp": [],
+                        "rowCount": 0,
+                        "pendingCount": 0,
+                        "pendingNextTurnCount": 0,
+                    },
+                }
+            )
 
 
 if __name__ == "__main__":

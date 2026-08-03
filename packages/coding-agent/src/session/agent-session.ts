@@ -319,7 +319,11 @@ import {
 	queueChipText,
 	toRestoredQueuedMessage,
 } from "./queued-messages";
-import type { ServingModel } from "./retry-fallback-chains";
+import {
+	formatRetryFallbackSelector,
+	type RetryFallbackSelector,
+	type ServingModel,
+} from "./retry-fallback-chains";
 import { type AdvisorStats, SessionAdvisors, type SessionAdvisorsHost } from "./session-advisors";
 import type { BuildSessionContextOptions, SessionContext } from "./session-context";
 import { getRestorableSessionModels } from "./session-context";
@@ -336,6 +340,12 @@ import { cleanupEmptyMoveSession, copySessionArtifacts, type SessionManager } fr
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
+import {
+	type SessionQueueClearResult,
+	type SessionQueueLane,
+	SessionQueueService,
+	type SessionQueueSnapshot,
+} from "./session-queue-service";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import {
 	SessionTools,
@@ -475,6 +485,8 @@ export class AgentSession {
 	fileSnapshotStore?: InMemorySnapshotStore;
 	/** Per-session `CUT`/`PASTE` clipboard register shared across edit calls. */
 	editClipboard?: Clipboard;
+	/** Authoritative queue projection and read-filter-replace mutation boundary. */
+	readonly queueService: SessionQueueService;
 
 	#powerAssertion: MacOSPowerAssertion | undefined;
 
@@ -509,8 +521,7 @@ export class AgentSession {
 	#pendingNextTurnMessages: CustomMessage[] = [];
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	#queuedMessageDrainScheduled = false;
-	/** Caller-owned tags keyed by exact message identity; never serialized into provider payloads. */
-	readonly #messageTags = new WeakMap<AgentMessage, string>();
+	/** Caller-owned tags and stable queue entry identities live in queueService WeakMaps. */
 	#planModeState: PlanModeState | undefined;
 	/** Authoritative plan transition owner shared by every host surface. */
 	readonly planMode: PlanModeController;
@@ -894,17 +905,7 @@ export class AgentSession {
 		}
 		// Park only a *blocked* follow-up (one a user interrupt is intentionally holding); an
 		// already-resumable follow-up can ride the wake turn normally without reordering.
-		const parkedFollowUps =
-			this.agent.peekSteeringQueue().length === 0 &&
-			this.agent.peekFollowUpQueue().length > 0 &&
-			!this.#canAutoContinueForFollowUp()
-				? [...this.agent.peekFollowUpQueue()]
-				: [];
-		const parkedQueueDrainBlocked = parkedFollowUps.length > 0 && this.#queuedMessageDrainBlocked;
-		if (parkedFollowUps.length > 0) {
-			this.agent.replaceQueues([...this.agent.peekSteeringQueue()], []);
-			if (parkedQueueDrainBlocked) this.#queuedMessageDrainBlocked = false;
-		}
+		const parkedFollowUps = this.queueService.parkBlockedFollowUps(!this.#canAutoContinueForFollowUp());
 		let finishObservation: ((error?: unknown) => void | Promise<void>) | undefined;
 		try {
 			finishObservation = this.#ircWakeTurnObserver?.(records);
@@ -934,13 +935,7 @@ export class AgentSession {
 					turnError ??= error;
 					logger.warn("IRC wake turn recovery failed", { error: String(error) });
 				}
-				if (parkedFollowUps.length > 0) {
-					this.agent.replaceQueues(
-						[...this.agent.peekSteeringQueue()],
-						[...parkedFollowUps, ...this.agent.peekFollowUpQueue()],
-					);
-					this.#queuedMessageDrainBlocked ||= parkedQueueDrainBlocked;
-				}
+				this.queueService.restoreParkedFollowUps(parkedFollowUps);
 				this.#endInFlight(async () => {
 					try {
 						await finishObservation?.(turnError);
@@ -957,16 +952,7 @@ export class AgentSession {
 	 *  steered in just before the user stopped; real user follow-ups stay queued.
 	 *  Synchronous and await-free so it runs before the abort path polls the queue. */
 	#extractQueuedAdvisorCards(): CustomMessage[] {
-		const steering = this.agent.peekSteeringQueue();
-		const followUp = this.agent.peekFollowUpQueue();
-		const cards = [...steering, ...followUp].filter(isAdvisorCard);
-		if (cards.length === 0) return [];
-		this.agent.replaceQueues(
-			steering.filter(m => !isAdvisorCard(m)),
-			followUp.filter(m => !isAdvisorCard(m)),
-		);
-		this.#reconcileQueuedMessageDrain();
-		return cards;
+		return this.queueService.extractAdvisorCards();
 	}
 
 	/** Record a suppressed advisor concern as visible, persisted advice without
@@ -1041,6 +1027,7 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.queueService = new SessionQueueService(this.agent, () => this.#pendingNextTurnMessages.length);
 		this.#modelRegistry = config.modelRegistry;
 		this.#codexResetCoordinator = config.codexResetCoordinator ?? defaultCodexAutoRedeemCoordinator;
 		const bashHost: BashRunnerHost = {
@@ -4139,8 +4126,12 @@ export class AgentSession {
 		const hindsightState = this.getHindsightSessionState();
 		const mnemopiState = setMnemopiSessionState(this, undefined);
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
+		if (options.preserveAsyncJobs) {
+			this.#unregisterAsyncDeliverySink?.();
+			this.#unregisterAsyncDeliverySink = undefined;
+		}
 		const results = await Promise.allSettled([
-			this.#disposeOwnedAsyncJobs(),
+			options.preserveAsyncJobs ? Promise.resolve(true) : this.#disposeOwnedAsyncJobs(),
 			this.#eval.disposeKernels(),
 			this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId()),
 			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),
@@ -5681,7 +5672,7 @@ export class AgentSession {
 		// every pre-dispatch bail (generation bump from abort, disposal, usage
 		// preflight denial) exits silently, and prompt() uses the outcome to hand
 		// the typed text back to the host instead of losing it.
-		if (options?.messageTag) this.#messageTags.set(message, options.messageTag);
+		if (options?.messageTag) this.queueService.setTag(message, options.messageTag);
 		this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		try {
@@ -6166,7 +6157,7 @@ export class AgentSession {
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
 		this.#allowQueuedMessageDrainRetry();
-		if (imageDescriptionNotice && messageTag) this.#messageTags.set(imageDescriptionNotice, messageTag);
+		if (imageDescriptionNotice && messageTag) this.queueService.setTag(imageDescriptionNotice, messageTag);
 		const queuedMessage: AgentMessage =
 			mode === "followUp"
 				? {
@@ -6182,7 +6173,7 @@ export class AgentSession {
 						attribution: "user",
 						timestamp: Date.now(),
 					};
-		if (messageTag) this.#messageTags.set(queuedMessage, messageTag);
+		if (messageTag) this.queueService.setTag(queuedMessage, messageTag);
 		if (mode === "followUp") {
 			if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 			this.agent.followUp(queuedMessage);
@@ -6402,7 +6393,7 @@ export class AgentSession {
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
 		this.#allowQueuedMessageDrainRetry();
-		if (messageTag) this.#messageTags.set(normalizedAppMessage, messageTag);
+		if (messageTag) this.queueService.setTag(normalizedAppMessage, messageTag);
 		if (deliverAs === "followUp") {
 			this.agent.followUp(normalizedAppMessage);
 		} else {
@@ -6569,52 +6560,31 @@ export class AgentSession {
 	 *  non-user steer (hidden goal/plan/budget, IRC/extension asides) is dropped, so abort()'s
 	 *  #drainStrandedQueuedMessages can't auto-resume the run the user just interrupted (the drain only
 	 *  fires while agent.hasQueuedMessages()). Plain Alt+Up dequeue preserves those non-user steers. */
-	clearQueue(options?: { forInterrupt?: boolean }): {
-		steering: RestoredQueuedMessage[];
-		followUp: RestoredQueuedMessage[];
-	} {
-		const steeringAll = this.agent.peekSteeringQueue();
-		const followUpAll = this.agent.peekFollowUpQueue();
-		const steering = steeringAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage);
-		const followUp = followUpAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage);
-		const keep: (m: AgentMessage) => boolean = options?.forInterrupt
-			? isAdvisorCard
-			: m => !isUserQueuedMessage(m) && !isHiddenUserCompanion(m);
-		this.agent.replaceQueues(steeringAll.filter(keep), followUpAll.filter(keep));
-		this.#reconcileQueuedMessageDrain();
-		return { steering, followUp };
+	clearQueue(options?: { lane?: SessionQueueLane | "all"; forInterrupt?: boolean }): SessionQueueClearResult {
+		return this.queueService.clear(options);
 	}
 	/** Return the stable caller tag attached to this exact message instance. */
 	getMessageTag(message: AgentMessage): string | undefined {
-		return this.#messageTags.get(message);
+		return this.queueService.getTag(message);
 	}
 
 	/** Remove only queued messages owned by `tag`, preserving unrelated queue entries. */
 	removeQueuedMessagesByTag(tag: string): number {
-		const steering = this.agent.peekSteeringQueue();
-		const followUp = this.agent.peekFollowUpQueue();
-		const keptSteering = steering.filter(message => this.#messageTags.get(message) !== tag);
-		const keptFollowUp = followUp.filter(message => this.#messageTags.get(message) !== tag);
-		const removed = steering.length + followUp.length - keptSteering.length - keptFollowUp.length;
-		if (removed > 0) this.agent.replaceQueues(keptSteering, keptFollowUp);
-		return removed;
+		return this.queueService.removeByTag(tag);
 	}
 
 	/** Number of pending displayable messages (includes steering, follow-up, and next-turn messages).
 	 *  Reflects actual queued work (advisor cards included) — feeds hasPendingMessages()/RPC and the
 	 *  empty-submit abort gate. The user-restorable subset is surfaced by getQueuedMessages()/clearQueue(). */
 	get queuedMessageCount(): number {
-		return (
-			this.agent.peekSteeringQueue().filter(isDisplayableQueuedMessage).length +
-			this.agent.peekFollowUpQueue().filter(isDisplayableQueuedMessage).length +
-			this.#pendingNextTurnMessages.length
-		);
+		return this.queueService.snapshot().pendingCount;
 	}
 
 	getQueuedMessages(): { steering: readonly string[]; followUp: readonly string[] } {
+		const snapshot = this.queueService.snapshot();
 		return {
-			steering: this.agent.peekSteeringQueue().filter(isUserQueuedMessage).map(queueChipText),
-			followUp: this.agent.peekFollowUpQueue().filter(isUserQueuedMessage).map(queueChipText),
+			steering: snapshot.steering.map(entry => entry.text),
+			followUp: snapshot.followUp.map(entry => entry.text),
 		};
 	}
 
@@ -6624,39 +6594,11 @@ export class AgentSession {
 	 * Steps over agent-authored queued messages (advisor cards, hidden/internal steers).
 	 */
 	popLastQueuedMessage(): RestoredQueuedMessage | undefined {
-		const steering = this.agent.peekSteeringQueue();
-		const followUp = this.agent.peekFollowUpQueue();
-		const lastUserIndex = (queue: readonly AgentMessage[]): number => {
-			for (let i = queue.length - 1; i >= 0; i--) {
-				if (isUserQueuedMessage(queue[i])) return i;
-			}
-			return -1;
-		};
-		// Notices queue immediately before their user message, so dropping the popped
-		// prompt means also dropping the contiguous hidden-user companions right before
-		// it — companions of other queued prompts stay put.
-		const removeWithCompanions = (queue: readonly AgentMessage[], userIndex: number): AgentMessage[] => {
-			let start = userIndex;
-			while (start > 0 && isHiddenUserCompanion(queue[start - 1])) start--;
-			const next = queue.slice();
-			next.splice(start, userIndex - start + 1);
-			return next;
-		};
-		const fromSteer = lastUserIndex(steering);
-		if (fromSteer >= 0) {
-			const removed = steering[fromSteer];
-			this.agent.replaceQueues(removeWithCompanions(steering, fromSteer), followUp.slice());
-			this.#reconcileQueuedMessageDrain();
-			return toRestoredQueuedMessage(removed);
-		}
-		const fromFollowUp = lastUserIndex(followUp);
-		if (fromFollowUp >= 0) {
-			const removed = followUp[fromFollowUp];
-			this.agent.replaceQueues(steering.slice(), removeWithCompanions(followUp, fromFollowUp));
-			this.#reconcileQueuedMessageDrain();
-			return toRestoredQueuedMessage(removed);
-		}
-		return undefined;
+		return this.queueService.popLast();
+	}
+
+	getQueueSnapshot(): SessionQueueSnapshot {
+		return this.queueService.snapshot();
 	}
 
 	get skillsSettings(): SkillsSettings | undefined {

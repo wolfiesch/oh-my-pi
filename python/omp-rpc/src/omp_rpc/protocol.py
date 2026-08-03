@@ -47,6 +47,14 @@ AgentJobStatus: TypeAlias = Literal["running", "completed", "failed", "cancelled
 CancelAgentStatus: TypeAlias = Literal["cancelled", "not_found", "already_completed"]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
+QueueLane: TypeAlias = Literal["steering", "followUp"]
+
+JobType: TypeAlias = Literal["bash", "task"]
+
+JobStatus: TypeAlias = Literal["running", "completed", "failed", "cancelled"]
+
+CancelJobStatus: TypeAlias = Literal["cancelled", "not_found", "already_completed"]
+
 AgentSource: TypeAlias = Literal["bundled", "user", "project"]
 SubagentLifecycleStatus: TypeAlias = Literal[
     "started", "completed", "failed", "aborted"
@@ -946,6 +954,84 @@ class ModeChangeResult:
 
 
 @dataclass(slots=True, frozen=True)
+class SessionQueueEntry:
+    entry_id: str
+    lane: QueueLane
+    text: str
+    operation_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SessionQueueSnapshot:
+    steering: tuple[SessionQueueEntry, ...]
+    follow_up: tuple[SessionQueueEntry, ...]
+    row_count: int
+    displayable_count: int
+    pending_count: int
+    pending_next_turn_count: int
+
+
+@dataclass(slots=True, frozen=True)
+class QueuedMessage:
+    text: str
+    images: tuple[ImageContent, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class QueueRemoveResult:
+    removed: QueuedMessage
+    queue: SessionQueueSnapshot
+
+
+@dataclass(slots=True, frozen=True)
+class SessionQueueClearResult:
+    steering: tuple[QueuedMessage, ...]
+    follow_up: tuple[QueuedMessage, ...]
+    snapshot: SessionQueueSnapshot
+
+
+@dataclass(slots=True, frozen=True)
+class JobSnapshot:
+    id: str
+    type: JobType
+    status: JobStatus
+    label: str
+    duration_ms: float
+    queued: bool | None = None
+    resolved_model: str | None = None
+    result_text: str | None = None
+    result_truncated: bool | None = None
+    error_text: str | None = None
+    error_truncated: bool | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AgentActivitySnapshot:
+    id: str
+    age_ms: float
+    parent_id: str | None = None
+    activity: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class JobListResult:
+    jobs: tuple[JobSnapshot, ...]
+    agents: tuple[AgentActivitySnapshot, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class CancelJobOutcome:
+    id: str
+    status: CancelJobStatus
+    message: str
+
+
+@dataclass(slots=True, frozen=True)
+class CancelJobResult:
+    outcomes: tuple[CancelJobOutcome, ...]
+
+
+@dataclass(slots=True, frozen=True)
 class SubagentLifecycle:
     id: str
     agent: str
@@ -1726,6 +1812,19 @@ class AgentRegistryUpdateEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class QueueUpdateEvent:
+    queue: SessionQueueSnapshot
+    type: Literal["queue_update"] = "queue_update"
+
+
+@dataclass(slots=True, frozen=True)
+class JobUpdateEvent:
+    jobs: tuple[JobSnapshot, ...]
+    agents: tuple[AgentActivitySnapshot, ...]
+    type: Literal["job_update"] = "job_update"
+
+
+@dataclass(slots=True, frozen=True)
 class UnknownNotification:
     payload: JsonObject
     type: Literal["unknown"] = "unknown"
@@ -1769,6 +1868,8 @@ RpcNotification: TypeAlias = (
     | SubagentProgressEvent
     | SubagentEvent
     | AgentRegistryUpdateEvent
+    | QueueUpdateEvent
+    | JobUpdateEvent
     | RpcAgentEvent
     | PlanStateUpdateEvent
     | PlanApprovalRequestEvent
@@ -2898,6 +2999,176 @@ def _require_number_value(payload: JsonObject, field: str) -> float:
     return value
 
 
+def _parse_image_content(payload: object, *, field: str) -> ImageContent:
+    image = _clone_json_object(payload, field=field)
+    if image.get("type") != "image":
+        raise ValueError(f"{field}.type must be image")
+    _require_str(image, "mimeType")
+    _require_str(image, "data")
+    return cast(ImageContent, image)
+
+
+def _parse_queued_message(payload: object, *, field: str) -> QueuedMessage:
+    message = _clone_json_object(payload, field=field)
+    raw_images = message.get("images")
+    if raw_images is None:
+        images: tuple[ImageContent, ...] = ()
+    elif isinstance(raw_images, list):
+        images = tuple(
+            _parse_image_content(item, field=f"{field}.images[{index}]")
+            for index, item in enumerate(raw_images)
+        )
+    else:
+        raise ValueError(f"{field}.images must be an array")
+    return QueuedMessage(text=_require_str(message, "text"), images=images)
+
+
+def parse_session_queue_entry(payload: JsonObject) -> SessionQueueEntry:
+    lane = _require_literal(
+        payload.get("lane"),
+        frozenset({"steering", "followUp"}),
+        field="queue.entry.lane",
+    )
+    return SessionQueueEntry(
+        entry_id=_require_str(payload, "entryId"),
+        lane=cast(QueueLane, lane),
+        text=_require_str(payload, "text"),
+        operation_id=_optional_str(payload, "operationId"),
+    )
+
+
+def parse_session_queue_snapshot(payload: JsonObject) -> SessionQueueSnapshot:
+    def parse_lane(field: str) -> tuple[SessionQueueEntry, ...]:
+        raw_entries = payload.get(field)
+        if not isinstance(raw_entries, list):
+            raise ValueError(f"queue.{field} must be an array")
+        entries = tuple(
+            parse_session_queue_entry(
+                _clone_json_object(item, field=f"queue.{field}[{index}]")
+            )
+            for index, item in enumerate(raw_entries)
+        )
+        expected_lane: QueueLane = "steering" if field == "steering" else "followUp"
+        if any(entry.lane != expected_lane for entry in entries):
+            raise ValueError(f"queue.{field} entries must use lane {expected_lane}")
+        return entries
+
+    return SessionQueueSnapshot(
+        steering=parse_lane("steering"),
+        follow_up=parse_lane("followUp"),
+        row_count=_require_int_value(payload, "rowCount"),
+        displayable_count=_require_int_value(payload, "displayableCount"),
+        pending_count=_require_int_value(payload, "pendingCount"),
+        pending_next_turn_count=_require_int_value(payload, "pendingNextTurnCount"),
+    )
+
+
+def parse_queue_remove_result(payload: JsonObject) -> QueueRemoveResult:
+    return QueueRemoveResult(
+        removed=_parse_queued_message(
+            payload.get("removed"), field="remove_queued_message.removed"
+        ),
+        queue=parse_session_queue_snapshot(
+            _clone_json_object(
+                payload.get("queue"), field="remove_queued_message.queue"
+            )
+        ),
+    )
+
+
+def parse_session_queue_clear_result(payload: JsonObject) -> SessionQueueClearResult:
+    def parse_messages(field: str) -> tuple[QueuedMessage, ...]:
+        values = payload.get(field)
+        if not isinstance(values, list):
+            raise ValueError(f"clear_queue.{field} must be an array")
+        return tuple(
+            _parse_queued_message(item, field=f"clear_queue.{field}[{index}]")
+            for index, item in enumerate(values)
+        )
+
+    return SessionQueueClearResult(
+        steering=parse_messages("steering"),
+        follow_up=parse_messages("followUp"),
+        snapshot=parse_session_queue_snapshot(
+            _clone_json_object(payload.get("snapshot"), field="clear_queue.snapshot")
+        ),
+    )
+
+
+def parse_job_snapshot(payload: JsonObject) -> JobSnapshot:
+    job_type = _require_literal(
+        payload.get("type"), frozenset({"bash", "task"}), field="job.type"
+    )
+    status = _require_literal(
+        payload.get("status"),
+        frozenset({"running", "completed", "failed", "cancelled"}),
+        field="job.status",
+    )
+    return JobSnapshot(
+        id=_require_str(payload, "id"),
+        type=cast(JobType, job_type),
+        status=cast(JobStatus, status),
+        label=_require_str(payload, "label"),
+        duration_ms=_require_number_value(payload, "durationMs"),
+        queued=_optional_bool(payload, "queued"),
+        resolved_model=_optional_str(payload, "resolvedModel"),
+        result_text=_optional_str(payload, "resultText"),
+        result_truncated=_optional_bool(payload, "resultTruncated"),
+        error_text=_optional_str(payload, "errorText"),
+        error_truncated=_optional_bool(payload, "errorTruncated"),
+    )
+
+
+def parse_agent_activity_snapshot(payload: JsonObject) -> AgentActivitySnapshot:
+    return AgentActivitySnapshot(
+        id=_require_str(payload, "id"),
+        age_ms=_require_number_value(payload, "ageMs"),
+        parent_id=_optional_str(payload, "parentId"),
+        activity=_optional_str(payload, "activity"),
+    )
+
+
+def parse_job_list_result(payload: JsonObject) -> JobListResult:
+    raw_jobs = payload.get("jobs")
+    raw_agents = payload.get("agents")
+    if not isinstance(raw_jobs, list) or not isinstance(raw_agents, list):
+        raise ValueError("list_jobs jobs and agents must be arrays")
+    return JobListResult(
+        jobs=tuple(
+            parse_job_snapshot(_clone_json_object(item, field=f"jobs[{index}]"))
+            for index, item in enumerate(raw_jobs)
+        ),
+        agents=tuple(
+            parse_agent_activity_snapshot(
+                _clone_json_object(item, field=f"agents[{index}]")
+            )
+            for index, item in enumerate(raw_agents)
+        ),
+    )
+
+
+def parse_cancel_job_result(payload: JsonObject) -> CancelJobResult:
+    raw_outcomes = payload.get("outcomes")
+    if not isinstance(raw_outcomes, list):
+        raise ValueError("cancel_job.outcomes must be an array")
+    outcomes: list[CancelJobOutcome] = []
+    for index, item in enumerate(raw_outcomes):
+        outcome = _clone_json_object(item, field=f"cancel_job.outcomes[{index}]")
+        status = _require_literal(
+            outcome.get("status"),
+            frozenset({"cancelled", "not_found", "already_completed"}),
+            field=f"cancel_job.outcomes[{index}].status",
+        )
+        outcomes.append(
+            CancelJobOutcome(
+                id=_require_str(outcome, "id"),
+                status=cast(CancelJobStatus, status),
+                message=_require_str(outcome, "message"),
+            )
+        )
+    return CancelJobResult(outcomes=tuple(outcomes))
+
+
 def _parse_agent_progress(payload: object, *, field: str) -> AgentProgress:
     progress = _clone_json_object(payload, field=field)
     source = _require_literal(
@@ -3168,6 +3439,17 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             change=cast(Literal["registered", "status_changed", "removed"], change),
             agent=parse_agent_snapshot(cast(JsonObject, raw_agent)),
         )
+    if event_type == "queue_update":
+        return QueueUpdateEvent(
+            queue=parse_session_queue_snapshot(
+                _clone_json_object(payload.get("queue"), field="queue_update.queue")
+            )
+        )
+    if event_type == "job_update":
+        result = parse_job_list_result(
+            {"jobs": payload.get("jobs"), "agents": payload.get("agents")}
+        )
+        return JobUpdateEvent(jobs=result.jobs, agents=result.agents)
     if event_type in {
         "operation_started",
         "operation_completed",

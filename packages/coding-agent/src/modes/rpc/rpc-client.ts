@@ -62,6 +62,8 @@ import type {
 	RpcHostUriRequest,
 	RpcHostUriResult,
 	RpcHostUriSchemeDefinition,
+	RpcJobListResult,
+	RpcJobUpdateFrame,
 	RpcModeChangeResult,
 	RpcOperationAccepted,
 	RpcOperationStartedFrame,
@@ -77,6 +79,7 @@ import type {
 	RpcProviderAuthRequestFrame,
 	RpcProviderAuthState,
 	RpcProviderAuthUpdateFrame,
+	RpcQueueUpdateFrame,
 	RpcRenameSessionResult,
 	RpcResponse,
 	RpcResumeSessionResult,
@@ -94,6 +97,8 @@ import type {
 	RpcSubagentSubscriptionLevel,
 	RpcToolActivationResult,
 	RpcToolInventoryUpdateFrame,
+	SessionQueueClearResult,
+	SessionQueueSnapshot,
 } from "./rpc-types";
 
 /** Distributive Omit that works with union types */
@@ -150,6 +155,8 @@ export type RpcSettingsUpdateListener = (frame: RpcSettingsUpdateFrame) => void;
 export type RpcExtensionUIRequestListener = (request: RpcExtensionUIRequest) => void;
 export type RpcProviderAuthRequestListener = (request: RpcProviderAuthRequestFrame) => void;
 export type RpcProviderAuthUpdateListener = (state: RpcProviderAuthState) => void;
+export type RpcQueueUpdateListener = (frame: RpcQueueUpdateFrame) => void;
+export type RpcJobUpdateListener = (frame: RpcJobUpdateFrame) => void;
 
 export interface RpcClientHostUriContext {
 	signal: AbortSignal;
@@ -619,6 +626,8 @@ export class RpcClient {
 	#agentRegistryUpdateListeners = new Set<RpcAgentRegistryUpdateListener>();
 	#availableCommandsUpdateListeners = new Set<RpcAvailableCommandsUpdateListener>();
 	#toolInventoryUpdateListeners = new Set<RpcToolInventoryUpdateListener>();
+	#queueUpdateListeners = new Set<RpcQueueUpdateListener>();
+	#jobUpdateListeners = new Set<RpcJobUpdateListener>();
 	#rawFrameListeners = new Set<RpcRawFrameListener>();
 	#promptResultListeners = new Set<RpcPromptResultListener>();
 	#evalOutputListeners = new Set<RpcEvalOutputListener>();
@@ -966,6 +975,16 @@ export class RpcClient {
 		return () => this.#toolInventoryUpdateListeners.delete(listener);
 	}
 
+	onQueueUpdate(listener: RpcQueueUpdateListener): () => void {
+		this.#queueUpdateListeners.add(listener);
+		return () => this.#queueUpdateListeners.delete(listener);
+	}
+
+	onJobUpdate(listener: RpcJobUpdateListener): () => void {
+		this.#jobUpdateListeners.add(listener);
+		return () => this.#jobUpdateListeners.delete(listener);
+	}
+
 	/** Subscribe to every decoded JSON frame, including unknown future frames. */
 	onRawFrame(listener: RpcRawFrameListener): () => void {
 		this.#rawFrameListeners.add(listener);
@@ -1269,6 +1288,40 @@ export class RpcClient {
 	async setToolActivation(options: { activate?: string[]; deactivate?: string[] }): Promise<RpcToolActivationResult> {
 		const response = await this.#send({ type: "set_tool_activation", ...options });
 		return this.#getData(response);
+	}
+
+	async getQueue(): Promise<SessionQueueSnapshot> {
+		return this.#getData(await this.#send({ type: "get_queue" }));
+	}
+
+	async removeQueuedMessage(entryId: string): Promise<{
+		removed: { text: string; images?: ImageContent[] };
+		queue: SessionQueueSnapshot;
+	}> {
+		return this.#getData(await this.#send({ type: "remove_queued_message", entryId }));
+	}
+
+	async reorderQueuedMessage(entryId: string, toIndex: number): Promise<SessionQueueSnapshot> {
+		return this.#getData(await this.#send({ type: "reorder_queued_message", entryId, toIndex }));
+	}
+
+	async clearQueue(lane?: "steering" | "followUp" | "all"): Promise<SessionQueueClearResult> {
+		return this.#getData(await this.#send({ type: "clear_queue", lane }));
+	}
+
+	async listJobs(): Promise<RpcJobListResult> {
+		return this.#getData(await this.#send({ type: "list_jobs" }));
+	}
+
+	async getJob(jobId: string): Promise<RpcJobListResult["jobs"][number] | null> {
+		const result = this.#getData<{ job: RpcJobListResult["jobs"][number] | null }>(
+			await this.#send({ type: "get_job", jobId }),
+		);
+		return result.job;
+	}
+
+	async cancelJobs(jobIds: string[]): Promise<{ outcomes: Array<{ id: string; status: string; message: string }> }> {
+		return this.#getData(await this.#send({ type: "cancel_job", jobIds }, 60_000));
 	}
 
 	/**
@@ -2086,6 +2139,14 @@ export class RpcClient {
 		}
 		if (isRpcToolInventoryUpdateFrame(data)) {
 			for (const listener of this.#toolInventoryUpdateListeners) listener(data);
+			return;
+		}
+		if (isRecord(data) && data.type === "queue_update" && isRecord(data.queue)) {
+			for (const listener of this.#queueUpdateListeners) listener(data as unknown as RpcQueueUpdateFrame);
+			return;
+		}
+		if (isRecord(data) && data.type === "job_update" && Array.isArray(data.jobs) && Array.isArray(data.agents)) {
+			for (const listener of this.#jobUpdateListeners) listener(data as unknown as RpcJobUpdateFrame);
 			return;
 		}
 

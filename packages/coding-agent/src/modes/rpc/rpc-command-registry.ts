@@ -139,7 +139,33 @@ const opaqueIdField = required(
 	value => typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= MAX_OPAQUE_ID_BYTES,
 	{ type: "string", minLength: 1, maxLength: MAX_OPAQUE_ID_BYTES, "x-maxUtf8Bytes": MAX_OPAQUE_ID_BYTES },
 );
-
+const queueIndexField = required("a non-negative integer", value => Number.isSafeInteger(value) && Number(value) >= 0, {
+	type: "integer",
+	minimum: 0,
+});
+const jobIdArrayField = required(
+	"an array of 1 to 64 unique opaque job ids",
+	value =>
+		Array.isArray(value) &&
+		value.length >= 1 &&
+		value.length <= 64 &&
+		new Set(value).size === value.length &&
+		value.every(
+			id => typeof id === "string" && id.length > 0 && Buffer.byteLength(id, "utf8") <= MAX_OPAQUE_ID_BYTES,
+		),
+	{
+		type: "array",
+		minItems: 1,
+		maxItems: 64,
+		uniqueItems: true,
+		items: {
+			type: "string",
+			minLength: 1,
+			maxLength: MAX_OPAQUE_ID_BYTES,
+			"x-maxUtf8Bytes": MAX_OPAQUE_ID_BYTES,
+		},
+	},
+);
 const MAX_TOOL_ACTIVATION_NAMES = 2048;
 const MAX_TOOL_ACTIVATION_NAME_BYTES = 256;
 const optionalToolNameArrayField: RpcFieldDefinition = {
@@ -586,6 +612,33 @@ export const RPC_COMMAND_DEFINITIONS = {
 		"control",
 		{ ...requiresFeature("agent-control"), confirmation: "required" },
 	),
+	get_queue: sessionCommand({ type: "get_queue" }, {}, "control"),
+	remove_queued_message: sessionCommand(
+		{ type: "remove_queued_message", entryId: "queue-entry" },
+		{ entryId: opaqueIdField },
+		"control",
+	),
+	reorder_queued_message: sessionCommand(
+		{ type: "reorder_queued_message", entryId: "queue-entry", toIndex: 0 },
+		{ entryId: opaqueIdField, toIndex: queueIndexField },
+		"control",
+	),
+	clear_queue: sessionCommand(
+		{ type: "clear_queue", lane: "all" },
+		{ lane: optionalEnumField("steering", "followUp", "all") },
+		"control",
+	),
+	list_jobs: agentCommand({ type: "list_jobs" }, {}, "concurrent", requiresFeature("job-control")),
+	get_job: agentCommand(
+		{ type: "get_job", jobId: "job-id" },
+		{ jobId: opaqueIdField },
+		"concurrent",
+		requiresFeature("job-control"),
+	),
+	cancel_job: agentCommand({ type: "cancel_job", jobIds: ["job-id"] }, { jobIds: jobIdArrayField }, "control", {
+		...requiresFeature("job-control"),
+		confirmation: "required",
+	}),
 	set_model: sessionCommand(
 		{ type: "set_model", provider: "anthropic", modelId: "claude" },
 		{ provider: stringField, modelId: stringField },

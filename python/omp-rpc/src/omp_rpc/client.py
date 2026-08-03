@@ -35,6 +35,7 @@ from .protocol import (
     BranchMessage,
     BranchResult,
     CancelAgentResult,
+    CancelJobResult,
     CancellationResult,
     CancelOperationResult,
     CompactionResult,
@@ -48,6 +49,9 @@ from .protocol import (
     ForkSessionResult,
     ImageContent,
     InterruptMode,
+    JobListResult,
+    JobSnapshot,
+    JobUpdateEvent,
     JsonObject,
     JsonValue,
     MessageEndEvent,
@@ -65,6 +69,8 @@ from .protocol import (
     PlanState,
     PlanWorkflow,
     ProviderAuthState,
+    QueueRemoveResult,
+    QueueUpdateEvent,
     ReadyEvent,
     RenameSessionResult,
     ResumeSessionResult,
@@ -80,6 +86,8 @@ from .protocol import (
     SessionCatalogScope,
     SessionInfoResult,
     SessionMode,
+    SessionQueueClearResult,
+    SessionQueueSnapshot,
     SessionState,
     SessionStats,
     SessionWorkspaceRoot,
@@ -119,23 +127,29 @@ from .protocol import (
     parse_branch_messages,
     parse_branch_result,
     parse_cancel_agent_result,
+    parse_cancel_job_result,
     parse_cancellation_result,
     parse_compaction_result,
     parse_delete_session_result,
     parse_eval_history_entry,
     parse_fast_mode_result,
     parse_fork_session_result,
+    parse_job_list_result,
+    parse_job_snapshot,
     parse_mode_change_result,
     parse_model_cycle_result,
     parse_model_info,
     parse_notification,
     parse_plan_state,
     parse_provider_auth_state,
+    parse_queue_remove_result,
     parse_rename_session_result,
     parse_resume_session_result,
     parse_rpc_capability_manifest,
     parse_session_catalog_page,
     parse_session_info_result,
+    parse_session_queue_clear_result,
+    parse_session_queue_snapshot,
     parse_session_state,
     parse_session_stats,
     parse_session_workspace_roots,
@@ -162,6 +176,8 @@ AgentRegistryUpdateListener = Callable[[AgentRegistryUpdateEvent], None]
 SubagentLifecycleListener = Callable[[SubagentLifecycleEvent], None]
 SubagentProgressListener = Callable[[SubagentProgressEvent], None]
 SubagentEventListener = Callable[[SubagentEvent], None]
+QueueUpdateListener = Callable[[QueueUpdateEvent], None]
+JobUpdateListener = Callable[[JobUpdateEvent], None]
 AgentStartListener = Callable[[AgentStartEvent], None]
 AgentEndListener = Callable[[AgentEndEvent], None]
 TurnStartListener = Callable[[TurnStartEvent], None]
@@ -196,6 +212,35 @@ _RPC_CHUNK_PAYLOAD_BYTES = 256 * 1024
 _RPC_MESSAGES_PAGE_BUSY_ERROR = "Cannot page messages while the session is changing"
 _RPC_MESSAGES_PAGE_STALE_ERROR = "RPC message cursor is stale"
 _RPC_MESSAGES_PAGE_FALLBACK_CODES = frozenset({"session_busy", "stale_cursor"})
+
+_AGENT_EVENT_TYPES = frozenset(
+    {
+        "agent_start",
+        "agent_end",
+        "turn_start",
+        "turn_end",
+        "message_start",
+        "message_update",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_update",
+        "tool_execution_end",
+        "auto_compaction_start",
+        "auto_compaction_end",
+        "auto_retry_start",
+        "auto_retry_end",
+        "retry_fallback_applied",
+        "retry_fallback_succeeded",
+        "ttsr_triggered",
+        "todo_reminder",
+        "todo_auto_clear",
+        "model_changed",
+        "irc_message",
+        "notice",
+        "thinking_level_changed",
+        "goal_updated",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -837,6 +882,12 @@ class RpcClient:
             self._tool_inventory_update_listeners, listener
         )
 
+    def on_queue_update(self, listener: QueueUpdateListener) -> Callable[[], None]:
+        return self._add_typed_notification_listener("queue_update", listener)
+
+    def on_job_update(self, listener: JobUpdateListener) -> Callable[[], None]:
+        return self._add_typed_notification_listener("job_update", listener)
+
     def on_agent_start(self, listener: AgentStartListener) -> Callable[[], None]:
         return self._add_typed_event_listener("agent_start", listener)
 
@@ -1258,6 +1309,48 @@ class RpcClient:
     ) -> AgentReleaseResult:
         return parse_agent_release_result(
             self._request("release_agent", agentId=agent_id, tombstone=tombstone)
+        )
+
+    def get_queue(self) -> SessionQueueSnapshot:
+        return parse_session_queue_snapshot(self._request("get_queue"))
+
+    def remove_queued_message(self, entry_id: str) -> QueueRemoveResult:
+        return parse_queue_remove_result(
+            self._request("remove_queued_message", entryId=entry_id)
+        )
+
+    def reorder_queued_message(
+        self, entry_id: str, to_index: int
+    ) -> SessionQueueSnapshot:
+        return parse_session_queue_snapshot(
+            self._request("reorder_queued_message", entryId=entry_id, toIndex=to_index)
+        )
+
+    def clear_queue(
+        self, lane: Literal["steering", "followUp", "all"] | None = None
+    ) -> SessionQueueClearResult:
+        fields: dict[str, JsonValue] = {}
+        if lane is not None:
+            fields["lane"] = lane
+        return parse_session_queue_clear_result(self._request("clear_queue", **fields))
+
+    def list_jobs(self) -> JobListResult:
+        return parse_job_list_result(self._request("list_jobs"))
+
+    def get_job(self, job_id: str) -> JobSnapshot | None:
+        payload = self._request("get_job", jobId=job_id)
+        if "job" not in payload:
+            raise ValueError("get_job.job is required")
+        raw_job = payload.get("job")
+        if raw_job is None:
+            return None
+        if not isinstance(raw_job, dict):
+            raise ValueError("get_job.job must be an object or null")
+        return parse_job_snapshot(cast(JsonObject, raw_job))
+
+    def cancel_jobs(self, job_ids: Sequence[str]) -> CancelJobResult:
+        return parse_cancel_job_result(
+            self._request("cancel_job", jobIds=list(job_ids))
         )
 
     def set_model(self, provider: str, model_id: str) -> ModelInfo:
@@ -2803,6 +2896,9 @@ class RpcClient:
                         self._operation_terminal_listeners,
                         notification,
                     )
+                    continue
+
+                if notification.type not in _AGENT_EVENT_TYPES:
                     continue
 
                 event = cast(RpcAgentEvent, notification)

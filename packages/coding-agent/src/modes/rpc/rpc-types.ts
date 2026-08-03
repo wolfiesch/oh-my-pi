@@ -26,7 +26,13 @@ import type {
 	SessionCatalogScope,
 	SessionWorkspaceRoot,
 } from "../../session/session-catalog";
+import type {
+	SessionQueueClearResult,
+	SessionQueueLane,
+	SessionQueueSnapshot,
+} from "../../session/session-queue-service";
 import type { ToolInventory } from "../../session/session-tools";
+import type { AgentActivitySnapshot, CancelOutcome, JobSnapshot } from "../../tools/hub/types";
 
 export type {
 	ToolInventory,
@@ -131,6 +137,13 @@ export type RpcCommand =
 	| { id?: string; type: "resume_agent"; agentId: string }
 	| { id?: string; type: "cancel_agent"; agentId: string }
 	| { id?: string; type: "release_agent"; agentId: string; tombstone?: boolean }
+	| { id?: string; type: "get_queue" }
+	| { id?: string; type: "remove_queued_message"; entryId: string }
+	| { id?: string; type: "reorder_queued_message"; entryId: string; toIndex: number }
+	| { id?: string; type: "clear_queue"; lane?: SessionQueueLane | "all" }
+	| { id?: string; type: "list_jobs" }
+	| { id?: string; type: "get_job"; jobId: string }
+	| { id?: string; type: "cancel_job"; jobIds: string[] }
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
@@ -339,6 +352,23 @@ export interface RpcAvailableCommandsUpdateFrame {
 export interface RpcToolInventoryUpdateFrame {
 	type: "tool_inventory_update";
 }
+export interface RpcQueueUpdateFrame {
+	type: "queue_update";
+	queue: SessionQueueSnapshot;
+}
+
+export interface RpcJobUpdateFrame {
+	type: "job_update";
+	jobs: JobSnapshot[];
+	agents: AgentActivitySnapshot[];
+}
+
+export interface RpcJobListResult {
+	jobs: JobSnapshot[];
+	agents: AgentActivitySnapshot[];
+}
+
+export type { SessionQueueClearResult, SessionQueueSnapshot };
 
 export interface RpcToolActivationResult {
 	/** Enabled names after authoritative reconciliation (top-level plus mounted). */
@@ -773,6 +803,31 @@ export type RpcResponse =
 			success: true;
 			data: RpcSubagentMessagesResult;
 	  }
+	| { id?: string; type: "response"; command: "get_queue"; success: true; data: SessionQueueSnapshot }
+	| {
+			id?: string;
+			type: "response";
+			command: "remove_queued_message";
+			success: true;
+			data: { removed: { text: string; images?: ImageContent[] }; queue: SessionQueueSnapshot };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "reorder_queued_message";
+			success: true;
+			data: SessionQueueSnapshot;
+	  }
+	| { id?: string; type: "response"; command: "clear_queue"; success: true; data: SessionQueueClearResult }
+	| { id?: string; type: "response"; command: "list_jobs"; success: true; data: RpcJobListResult }
+	| { id?: string; type: "response"; command: "get_job"; success: true; data: { job: JobSnapshot | null } }
+	| {
+			id?: string;
+			type: "response";
+			command: "cancel_job";
+			success: true;
+			data: { outcomes: CancelOutcome[] };
+	  }
 	| {
 			id?: string;
 			type: "response";
@@ -1152,6 +1207,8 @@ type RpcManifestEvent =
 	| RpcSessionEventFrame
 	| RpcExtensionUIRequest
 	| RpcSettingsUpdateFrame
+	| RpcQueueUpdateFrame
+	| RpcJobUpdateFrame
 	| RpcHostToolCallRequest
 	| RpcHostToolCancelRequest
 	| RpcHostUriRequest
@@ -1180,6 +1237,8 @@ export const RPC_EVENT_TYPES = eventInventory([
 	"tool_inventory_update",
 	"eval_output",
 	"eval_complete",
+	"queue_update",
+	"job_update",
 	"operation_started",
 	"operation_completed",
 	"operation_failed",

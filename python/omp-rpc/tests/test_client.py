@@ -400,6 +400,115 @@ FAKE_SERVER = textwrap.dedent(
             )
         elif command_type == "get_plan":
             respond(request_id, "get_plan", plan_state)
+        elif command_type == "get_queue":
+            queue_snapshot = {
+                "steering": [
+                    {
+                        "entryId": "queue-1",
+                        "lane": "steering",
+                        "text": "Steer now",
+                        "operationId": "operation-prompt",
+                    }
+                ],
+                "followUp": [],
+                "rowCount": 1,
+                "displayableCount": 1,
+                "pendingCount": 1,
+                "pendingNextTurnCount": 0,
+            }
+            print(
+                json.dumps({"type": "queue_update", "queue": queue_snapshot}),
+                flush=True,
+            )
+            respond(request_id, "get_queue", queue_snapshot)
+        elif command_type == "remove_queued_message":
+            respond(
+                request_id,
+                "remove_queued_message",
+                {
+                    "removed": {"text": "Steer now"},
+                    "queue": {
+                        "steering": [],
+                        "followUp": [],
+                        "rowCount": 0,
+                        "displayableCount": 0,
+                        "pendingCount": 0,
+                        "pendingNextTurnCount": 0,
+                    },
+                },
+            )
+        elif command_type == "reorder_queued_message":
+            respond(
+                request_id,
+                "reorder_queued_message",
+                {
+                    "steering": [],
+                    "followUp": [],
+                    "rowCount": 0,
+                    "displayableCount": 0,
+                    "pendingCount": 0,
+                    "pendingNextTurnCount": 0,
+                },
+            )
+        elif command_type == "clear_queue":
+            empty_queue = {
+                "steering": [],
+                "followUp": [],
+                "rowCount": 0,
+                "displayableCount": 0,
+                "pendingCount": 0,
+                "pendingNextTurnCount": 0,
+            }
+            respond(
+                request_id,
+                "clear_queue",
+                {"steering": [], "followUp": [], "snapshot": empty_queue},
+            )
+        elif command_type == "list_jobs":
+            jobs = [
+                {
+                    "id": "job-1",
+                    "type": "task",
+                    "status": "running",
+                    "label": "Review",
+                    "durationMs": 25,
+                    "queued": False,
+                }
+            ]
+            agents = [{"id": "AgentA", "ageMs": 50, "activity": "Reading"}]
+            print(
+                json.dumps({"type": "job_update", "jobs": jobs, "agents": agents}),
+                flush=True,
+            )
+            respond(request_id, "list_jobs", {"jobs": jobs, "agents": agents})
+        elif command_type == "get_job":
+            respond(
+                request_id,
+                "get_job",
+                {
+                    "job": {
+                        "id": "job-1",
+                        "type": "task",
+                        "status": "running",
+                        "label": "Review",
+                        "durationMs": 25,
+                    }
+                },
+            )
+        elif command_type == "cancel_job":
+            respond(
+                request_id,
+                "cancel_job",
+                {
+                    "outcomes": [
+                        {
+                            "id": command["jobIds"][0],
+                            "status": "cancelled",
+                            "message": "Cancelled",
+                        }
+                    ]
+                },
+            )
         elif command_type == "resolve_plan_approval":
             operation_id = "operation-resolve-plan"
             respond(
@@ -1871,6 +1980,32 @@ class RpcClientTests(unittest.TestCase):
             )
             self.assertEqual(approval_operation, "operation-resolve-plan")
         self.assertEqual(started_operations[0].operation_id, "operation-set-mode")
+
+    def test_queue_and_job_commands_return_typed_models(self) -> None:
+        agent_events = []
+        queue_updates = []
+        job_updates = []
+        with self.make_client() as client:
+            client.on_event(agent_events.append)
+            client.on_queue_update(queue_updates.append)
+            client.on_job_update(job_updates.append)
+            queue = client.get_queue()
+            self.assertEqual(queue.steering[0].entry_id, "queue-1")
+            self.assertEqual(queue.steering[0].operation_id, "operation-prompt")
+            removed = client.remove_queued_message("queue-1")
+            self.assertEqual(removed.removed.text, "Steer now")
+            cleared = client.clear_queue("all")
+            self.assertEqual(cleared.snapshot.pending_count, 0)
+            jobs = client.list_jobs()
+            self.assertEqual(jobs.jobs[0].duration_ms, 25.0)
+            self.assertEqual(jobs.agents[0].activity, "Reading")
+            self.assertEqual(client.get_job("job-1").label, "Review")
+            cancelled = client.cancel_jobs(["job-1"])
+            self.assertEqual(cancelled.outcomes[0].status, "cancelled")
+
+        self.assertEqual(queue_updates[0].queue.row_count, 1)
+        self.assertEqual(job_updates[0].jobs[0].id, "job-1")
+        self.assertEqual(agent_events, [])
 
     def test_model_mode_and_session_commands(self) -> None:
         with self.make_client() as client:

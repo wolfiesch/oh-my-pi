@@ -290,6 +290,25 @@ entries.
 - `{ id?, type: "set_follow_up_mode", mode: "all" | "one-at-a-time" }`
 - `{ id?, type: "set_interrupt_mode", mode: "immediate" | "wait" }`
 
+### Queue and jobs
+
+- `{ id?, type: "get_queue" }`
+- `{ id?, type: "remove_queued_message", entryId: string }`
+- `{ id?, type: "reorder_queued_message", entryId: string, toIndex: number }`
+- `{ id?, type: "clear_queue", lane?: "steering" | "followUp" | "all" }`
+- `{ id?, type: "list_jobs" }`
+- `{ id?, type: "get_job", jobId: string }`
+- `{ id?, type: "cancel_job", jobIds: string[] }`
+
+Queue commands project and mutate the steering and follow-up lanes that `steer`
+and `follow_up` feed, and every mutation is echoed as `queue_update`. An entry id
+that no longer exists fails with `stale_queue_entry`, and a `toIndex` outside the
+lane fails with `invalid_queue_position`; neither partially applies. Job commands
+share one owner-filtered view and cancellation boundary with the Agent Hub, so a
+host sees exactly the background bash and task jobs the session owns and receives
+`job_update` instead of scraping interactive output. `cancel_job` takes 1 to 64
+unique ids and is confirmation-gated.
+
 ### Compaction
 
 - `{ id?, type: "compact", customInstructions?: string }`
