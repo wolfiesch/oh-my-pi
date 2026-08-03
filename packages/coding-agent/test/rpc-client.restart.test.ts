@@ -42,6 +42,56 @@ describe("RpcClient lifecycle (issue #4079 B)", () => {
 		expect(state.fastModeActive).toBe(false);
 		expect(state.tokensPerSecond).toBeNull();
 		expect(state.activityPhase).toBe("idle");
+		expect(state.advisor).toBeUndefined();
+	}, 20_000);
+
+	test("normalizes advisor snapshots without conflating configured and active", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_ADVISOR_STATE: "1" },
+		});
+
+		await client.start();
+		const state = await client.getState();
+		expect(state.advisor).toEqual({
+			configured: true,
+			active: false,
+			advisors: [{ name: "reviewer", status: "no_model" }],
+		});
+	}, 20_000);
+
+	test("returns authoritative advisor state and emits typed config updates", async () => {
+		using client = new RpcClient({ cliPath: MOCK_AGENT });
+		const updates: unknown[] = [];
+		client.onConfigUpdate(frame => updates.push(frame.advisor));
+
+		await client.start();
+		expect(await client.getAdvisorState()).toEqual({
+			configured: true,
+			active: false,
+			advisors: [{ name: "reviewer", status: "no_model" }],
+		});
+		const disabled = {
+			configured: false,
+			active: false,
+			advisors: [{ name: "reviewer", status: "paused" as const }],
+		};
+		expect(await client.setAdvisorEnabled(false)).toEqual(disabled);
+		expect(updates).toContainEqual(disabled);
+	}, 20_000);
+
+	test("rejects malformed and future-status advisor snapshots as a whole", async () => {
+		const environments: Record<string, string>[] = [
+			{ MOCK_RPC_INVALID_ADVISOR: "1" },
+			{ MOCK_RPC_FUTURE_ADVISOR_STATUS: "1" },
+		];
+		for (const env of environments) {
+			using client = new RpcClient({ cliPath: MOCK_AGENT, env });
+			await client.start();
+
+			expect((await client.getState()).advisor).toBeUndefined();
+			await expect(client.getAdvisorState()).rejects.toThrow("Invalid get_advisor_state response");
+		}
 	}, 20_000);
 
 	test("preserves all authoritative activity phases from get_state", async () => {

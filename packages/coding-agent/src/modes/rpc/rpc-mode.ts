@@ -1083,6 +1083,15 @@ export async function runRpcMode(
 	});
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
+	const getAdvisorState = () => session.getAdvisorStateOverview();
+	const emitConfigUpdate = () => {
+		output({
+			type: "config_update",
+			model: session.model,
+			thinkingLevel: session.thinkingLevel,
+			advisor: getAdvisorState(),
+		});
+	};
 	const reloadPluginState = async () => {
 		const cwd = session.sessionManager.getCwd();
 		const projectPath = await resolveActiveProjectRegistryPath(cwd);
@@ -1172,7 +1181,7 @@ export async function runRpcMode(
 								});
 							},
 							notifyConfigChanged: async () => {
-								output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
+								emitConfigUpdate();
 							},
 						});
 						if (!operationManager.isActive(operation)) return;
@@ -1361,8 +1370,19 @@ export async function runRpcMode(
 						examples: tool.examples,
 					})),
 					contextUsage: session.getContextUsage(),
+					advisor: getAdvisorState(),
 				};
 				return success(id, "get_state", state);
+			}
+
+			case "get_advisor_state":
+				return success(id, "get_advisor_state", getAdvisorState());
+
+			case "set_advisor_enabled": {
+				session.setAdvisorEnabled(command.enabled);
+				const advisor = getAdvisorState();
+				emitConfigUpdate();
+				return success(id, "set_advisor_enabled", advisor);
 			}
 
 			case "set_fast_mode": {

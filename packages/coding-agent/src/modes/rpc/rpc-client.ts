@@ -27,6 +27,7 @@ import {
 	type RpcMessagesPageOptions,
 } from "./rpc-messages";
 import type {
+	RpcAdvisorState,
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
 	RpcCancelOperationResult,
@@ -288,6 +289,28 @@ function parseRpcOperationAccepted(value: unknown): RpcOperationAccepted | undef
 	return { operationId: value.operationId, accepted: true };
 }
 
+const RPC_ADVISOR_STATUSES = ["running", "paused", "quota_exhausted", "error", "no_model"] as const;
+
+function parseRpcAdvisorState(value: unknown): RpcAdvisorState | undefined {
+	if (
+		!isRecord(value) ||
+		typeof value.configured !== "boolean" ||
+		typeof value.active !== "boolean" ||
+		!Array.isArray(value.advisors)
+	) {
+		return undefined;
+	}
+	const advisors: RpcAdvisorState["advisors"] = [];
+	for (const advisor of value.advisors) {
+		if (!isRecord(advisor) || typeof advisor.name !== "string" || typeof advisor.status !== "string")
+			return undefined;
+		const status = RPC_ADVISOR_STATUSES.find(candidate => candidate === advisor.status);
+		if (!status) return undefined;
+		advisors.push({ name: advisor.name, status });
+	}
+	return { configured: value.configured, active: value.active, advisors };
+}
+
 function isRpcCommandOutputFrame(value: unknown): value is RpcCommandOutputFrame {
 	if (!isRecord(value)) return false;
 	return value.type === "command_output" && typeof value.text === "string";
@@ -307,7 +330,8 @@ function isRpcConfigUpdateFrame(value: unknown): value is RpcConfigUpdateFrame {
 	return (
 		value.type === "config_update" &&
 		(value.model === undefined || isRecord(value.model)) &&
-		(value.thinkingLevel === undefined || typeof value.thinkingLevel === "string")
+		(value.thinkingLevel === undefined || typeof value.thinkingLevel === "string") &&
+		(value.advisor === undefined || parseRpcAdvisorState(value.advisor) !== undefined)
 	);
 }
 
@@ -989,7 +1013,24 @@ export class RpcClient {
 				typeof state.tokensPerSecond === "number" && Number.isFinite(state.tokensPerSecond)
 					? state.tokensPerSecond
 					: null,
+			advisor: parseRpcAdvisorState(state.advisor),
 		};
+	}
+
+	/** Read configured intent and effective live advisor runtime state. */
+	async getAdvisorState(): Promise<RpcAdvisorState> {
+		const response = await this.#send({ type: "get_advisor_state" });
+		const advisor = parseRpcAdvisorState(this.#getData<unknown>(response));
+		if (!advisor) throw new Error("Invalid get_advisor_state response");
+		return advisor;
+	}
+
+	/** Enable or disable advisors for this session and return authoritative runtime state. */
+	async setAdvisorEnabled(enabled: boolean): Promise<RpcAdvisorState> {
+		const response = await this.#send({ type: "set_advisor_enabled", enabled });
+		const advisor = parseRpcAdvisorState(this.#getData<unknown>(response));
+		if (!advisor) throw new Error("Invalid set_advisor_enabled response");
+		return advisor;
 	}
 
 	/**
@@ -1715,8 +1756,9 @@ export class RpcClient {
 		}
 
 		if (isRpcConfigUpdateFrame(data)) {
+			const frame = { ...data, advisor: parseRpcAdvisorState(data.advisor) };
 			for (const listener of this.#configUpdateListeners) {
-				listener(data);
+				listener(frame);
 			}
 			return;
 		}

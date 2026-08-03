@@ -239,6 +239,9 @@ for await (const raw of console) {
 				(Bun.env.MOCK_RPC_LEGACY_STATE === "1" ||
 					Bun.env.MOCK_RPC_LEGACY_STREAMING === "1" ||
 					Bun.env.MOCK_RPC_INVALID_TPS === "1" ||
+					Bun.env.MOCK_RPC_ADVISOR_STATE === "1" ||
+					Bun.env.MOCK_RPC_INVALID_ADVISOR === "1" ||
+					Bun.env.MOCK_RPC_FUTURE_ADVISOR_STATUS === "1" ||
 					Bun.env.MOCK_RPC_ACTIVITY_PHASE)
 			) {
 				const data = {
@@ -248,6 +251,25 @@ for await (const raw of console) {
 						? { fastModeEnabled: false, fastModeActive: false, tokensPerSecond: "invalid" }
 						: {}),
 					...(Bun.env.MOCK_RPC_ACTIVITY_PHASE ? { activityPhase: Bun.env.MOCK_RPC_ACTIVITY_PHASE } : {}),
+					...(Bun.env.MOCK_RPC_ADVISOR_STATE === "1"
+						? {
+								advisor: {
+									configured: true,
+									active: false,
+									advisors: [{ name: "reviewer", status: "no_model" }],
+								},
+							}
+						: {}),
+					...(Bun.env.MOCK_RPC_INVALID_ADVISOR === "1" ? { advisor: {} } : {}),
+					...(Bun.env.MOCK_RPC_FUTURE_ADVISOR_STATUS === "1"
+						? {
+								advisor: {
+									configured: true,
+									active: true,
+									advisors: [{ name: "reviewer", status: "future_status" }],
+								},
+							}
+						: {}),
 				};
 				writeFrame({
 					id,
@@ -255,6 +277,41 @@ for await (const raw of console) {
 					command: frame.type,
 					success: true,
 					data,
+				});
+				continue;
+			}
+			if (frame.type === "get_advisor_state" || frame.type === "set_advisor_enabled") {
+				if (Bun.env.MOCK_RPC_INVALID_ADVISOR === "1") {
+					writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+					continue;
+				}
+				if (Bun.env.MOCK_RPC_FUTURE_ADVISOR_STATUS === "1") {
+					writeFrame({
+						id,
+						type: "response",
+						command: frame.type,
+						success: true,
+						data: {
+							configured: true,
+							active: true,
+							advisors: [{ name: "reviewer", status: "future_status" }],
+						},
+					});
+					continue;
+				}
+				const configured = frame.type === "get_advisor_state" || frame.enabled === true;
+				const advisor = {
+					configured,
+					active: false,
+					advisors: [{ name: "reviewer", status: configured ? "no_model" : "paused" }],
+				};
+				if (frame.type === "set_advisor_enabled") writeFrame({ type: "config_update", advisor });
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: advisor,
 				});
 				continue;
 			}

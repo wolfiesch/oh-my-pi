@@ -18,6 +18,7 @@ from omp_rpc import (
     TodoReminderEvent,
     assistant_text,
     assistant_text_with_thinking,
+    parse_advisor_state,
     parse_notification,
     parse_session_state,
 )
@@ -251,6 +252,54 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertFalse(state.fast_mode_enabled)
         self.assertTrue(state.fast_mode_active)
         self.assertEqual(state.tokens_per_second, 12.5)
+
+    def test_parse_advisor_state_keeps_configured_and_active_distinct(self) -> None:
+        advisor = parse_advisor_state(
+            {
+                "configured": True,
+                "active": False,
+                "advisors": [{"name": "reviewer", "status": "no_model"}],
+            }
+        )
+
+        self.assertIsNotNone(advisor)
+        assert advisor is not None
+        self.assertTrue(advisor.configured)
+        self.assertFalse(advisor.active)
+        self.assertEqual(advisor.advisors[0].status, "no_model")
+
+    def test_parse_session_state_accepts_missing_advisor_snapshot(self) -> None:
+        state = parse_session_state(
+            {
+                "sessionId": "session-123",
+                "steeringMode": "one-at-a-time",
+                "followUpMode": "all",
+                "interruptMode": "immediate",
+            }
+        )
+        self.assertIsNone(state.advisor)
+
+    def test_advisor_parser_rejects_malformed_and_future_status_snapshots(self) -> None:
+        self.assertIsNone(parse_advisor_state({}))
+        self.assertIsNone(
+            parse_advisor_state(
+                {
+                    "configured": True,
+                    "active": True,
+                    "advisors": [{"name": "reviewer", "status": "future_status"}],
+                }
+            )
+        )
+        state = parse_session_state(
+            {
+                "sessionId": "session-123",
+                "steeringMode": "one-at-a-time",
+                "followUpMode": "all",
+                "interruptMode": "immediate",
+                "advisor": {},
+            }
+        )
+        self.assertIsNone(state.advisor)
 
     def test_parse_session_state_defaults_missing_fast_mode_and_throughput(
         self,

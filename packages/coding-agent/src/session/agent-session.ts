@@ -9580,6 +9580,23 @@ export class AgentSession {
 		return this.#advisors.getAdvisorStatusOverview();
 	}
 
+	/**
+	 * Authoritative lightweight advisor state for external control surfaces.
+	 * Configured intent is kept separate from whether a live runtime exists.
+	 */
+	getAdvisorStateOverview(): {
+		configured: boolean;
+		active: boolean;
+		advisors: { name: string; status: AdvisorRuntimeStatus }[];
+	} {
+		const { advisors } = this.getAdvisorStatusOverview();
+		return {
+			configured: this.isAdvisorEnabled(),
+			active: this.isAdvisorActive(),
+			advisors,
+		};
+	}
+
 	/** Return cumulative cost recorded for the current session's advisor activity. */
 	getAdvisorCost(): number {
 		return this.#advisors.getAdvisorCost();

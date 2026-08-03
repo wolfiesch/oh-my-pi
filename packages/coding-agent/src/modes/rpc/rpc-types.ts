@@ -7,6 +7,7 @@
 import type { AgentMessage, AgentToolResult, ThinkingLevel, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
+import type { AdvisorRuntimeStatus } from "../../advisor";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
@@ -50,6 +51,8 @@ export type RpcCommand =
 	| { id?: string; type: "get_state" }
 	| { id?: string; type: "get_operations" }
 	| { id?: string; type: "set_fast_mode"; enabled: boolean }
+	| { id?: string; type: "get_advisor_state" }
+	| { id?: string; type: "set_advisor_enabled"; enabled: boolean }
 	| { id?: string; type: "get_available_commands" }
 	| { id?: string; type: "set_todos"; phases: TodoPhase[] }
 	| { id?: string; type: "set_host_tools"; tools: RpcHostToolDefinition[] }
@@ -122,6 +125,11 @@ export type RpcCommand =
 // ============================================================================
 
 export type RpcSessionActivityPhase = "provider" | "maintenance" | "idle";
+export interface RpcAdvisorState {
+	configured: boolean;
+	active: boolean;
+	advisors: Array<{ name: string; status: AdvisorRuntimeStatus }>;
+}
 
 export interface RpcSessionState {
 	model?: Model;
@@ -148,6 +156,7 @@ export interface RpcSessionState {
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
 	/** Current context window usage. */
 	contextUsage?: ContextUsage;
+	advisor?: RpcAdvisorState;
 }
 
 export interface RpcAvailableSlashCommand {
@@ -247,6 +256,7 @@ export interface RpcConfigUpdateFrame {
 	type: "config_update";
 	model?: Model;
 	thinkingLevel?: ThinkingLevel;
+	advisor?: RpcAdvisorState;
 }
 
 export interface RpcExtensionErrorFrame {
@@ -423,6 +433,8 @@ export type RpcResponse =
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
 	| { id?: string; type: "response"; command: "get_operations"; success: true; data: RpcOperationsSnapshot }
+	| { id?: string; type: "response"; command: "get_advisor_state"; success: true; data: RpcAdvisorState }
+	| { id?: string; type: "response"; command: "set_advisor_enabled"; success: true; data: RpcAdvisorState }
 	| {
 			id?: string;
 			type: "response";

@@ -17,6 +17,7 @@ from .host_tools import HostTool, HostToolContext
 from .host_uris import HostUri, HostUriContext, normalize_read_result
 from .protocol import (
     ActiveOperation,
+    AdvisorState,
     AgentEndEvent,
     AgentMessage,
     AgentStartEvent,
@@ -84,6 +85,7 @@ from .protocol import (
     TurnStartEvent,
     UnknownNotification,
     assistant_text,
+    parse_advisor_state,
     parse_agent_messages,
     parse_bash_result,
     parse_branch_messages,
@@ -980,6 +982,20 @@ class RpcClient:
             else self._request_with_timeout("get_state", timeout)
         )
         return parse_session_state(payload)
+
+    def get_advisor_state(self) -> AdvisorState:
+        state = parse_advisor_state(self._request("get_advisor_state"))
+        if state is None:
+            raise RpcError("get_advisor_state returned an empty payload")
+        return state
+
+    def set_advisor_enabled(self, enabled: bool) -> AdvisorState:
+        state = parse_advisor_state(
+            self._request("set_advisor_enabled", enabled=enabled)
+        )
+        if state is None:
+            raise RpcError("set_advisor_enabled returned an empty payload")
+        return state
 
     def set_fast_mode(self, enabled: bool) -> FastModeResult:
         return parse_fast_mode_result(self._request("set_fast_mode", enabled=enabled))

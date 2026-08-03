@@ -20,6 +20,9 @@ SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
 SessionActivityPhase: TypeAlias = Literal["provider", "maintenance", "idle"]
 SessionCatalogScope: TypeAlias = Literal["cwd", "all"]
+AdvisorRuntimeStatus: TypeAlias = Literal[
+    "running", "paused", "quota_exhausted", "error", "no_model"
+]
 RpcOperationCommand: TypeAlias = Literal["prompt", "abort_and_prompt"]
 RpcOperationCancellationReason: TypeAlias = Literal[
     "user", "replaced", "session_transition", "client_disconnected"
@@ -91,6 +94,9 @@ _STEERING_MODE_VALUES: Final[frozenset[str]] = frozenset({"all", "one-at-a-time"
 _INTERRUPT_MODE_VALUES: Final[frozenset[str]] = frozenset({"immediate", "wait"})
 _SESSION_ACTIVITY_PHASE_VALUES: Final[frozenset[str]] = frozenset(
     {"provider", "maintenance", "idle"}
+)
+_ADVISOR_RUNTIME_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    {"running", "paused", "quota_exhausted", "error", "no_model"}
 )
 _STOP_REASON_VALUES: Final[frozenset[str]] = frozenset(
     {"stop", "length", "toolUse", "error", "aborted"}
@@ -816,6 +822,19 @@ class ContextUsage:
 
 
 @dataclass(slots=True, frozen=True)
+class AdvisorRuntimeState:
+    name: str
+    status: AdvisorRuntimeStatus
+
+
+@dataclass(slots=True, frozen=True)
+class AdvisorState:
+    configured: bool
+    active: bool
+    advisors: tuple[AdvisorRuntimeState, ...]
+
+
+@dataclass(slots=True, frozen=True)
 class SessionState:
     model: ModelInfo | None
     thinking_level: ThinkingLevel | None
@@ -838,6 +857,7 @@ class SessionState:
     fast_mode_active: bool = False
     tokens_per_second: float | None = None
     context_usage: ContextUsage | None = None
+    advisor: AdvisorState | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -1545,6 +1565,36 @@ def parse_todo_phases(payload: JsonValue | None) -> tuple[TodoPhase, ...]:
     return tuple(parse_todo_phase(cast(JsonObject, item)) for item in payload)
 
 
+def parse_advisor_state(payload: object) -> AdvisorState | None:
+    if not isinstance(payload, dict):
+        return None
+    configured = payload.get("configured")
+    active = payload.get("active")
+    raw_advisors = payload.get("advisors")
+    if (
+        not isinstance(configured, bool)
+        or not isinstance(active, bool)
+        or not isinstance(raw_advisors, list)
+    ):
+        return None
+    advisors: list[AdvisorRuntimeState] = []
+    for item in raw_advisors:
+        if not isinstance(item, dict):
+            return None
+        name = item.get("name")
+        status = item.get("status")
+        if (
+            not isinstance(name, str)
+            or not isinstance(status, str)
+            or status not in _ADVISOR_RUNTIME_STATUS_VALUES
+        ):
+            return None
+        advisors.append(
+            AdvisorRuntimeState(name=name, status=cast(AdvisorRuntimeStatus, status))
+        )
+    return AdvisorState(configured=configured, active=active, advisors=tuple(advisors))
+
+
 def _parse_session_activity_phase(payload: JsonObject) -> SessionActivityPhase:
     if "activityPhase" not in payload:
         # Legacy isStreaming conflates provider work with prompt settlement.
@@ -1621,6 +1671,7 @@ def parse_session_state(payload: JsonObject) -> SessionState:
                 payload.get("contextUsage"), field="sessionState.contextUsage"
             )
         ),
+        advisor=parse_advisor_state(payload.get("advisor")),
     )
 
 

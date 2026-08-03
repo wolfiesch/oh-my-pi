@@ -49,6 +49,27 @@ describe("RPC command registry", () => {
 		}
 	});
 
+	test("advertises advisor reads as concurrent and mutations as serial", () => {
+		const manifest = getRpcCapabilityManifest();
+		const read = manifest.commands.find(command => command.name === "get_advisor_state");
+		const mutation = manifest.commands.find(command => command.name === "set_advisor_enabled");
+
+		expect(read).toMatchObject({ scope: "session", concurrencyClass: "concurrent" });
+		expect(mutation).toMatchObject({ scope: "session", concurrencyClass: "serial" });
+		expect(validateRpcCommand({ type: "get_advisor_state" })).toMatchObject({
+			ok: true,
+			scheduling: "concurrent",
+		});
+		expect(validateRpcCommand({ type: "set_advisor_enabled", enabled: false })).toMatchObject({
+			ok: true,
+			scheduling: "serial",
+		});
+		expect(validateRpcCommand({ type: "get_advisor_state", enabled: true })).toMatchObject({
+			ok: false,
+			code: "invalid_request",
+		});
+	});
+
 	test("preserves request ids on invalid and unsupported commands", () => {
 		expect(validateRpcCommand({ id: "bad-1", type: "set_model", provider: "anthropic" })).toEqual({
 			ok: false,

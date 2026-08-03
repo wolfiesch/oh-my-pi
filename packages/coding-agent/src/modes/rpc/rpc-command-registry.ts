@@ -211,6 +211,8 @@ export const RPC_COMMAND_DEFINITIONS = {
 	new_session: sessionCommand({ type: "new_session" }, { parentSession: optionalStringField }),
 	get_state: sessionCommand({ type: "get_state" }),
 	get_operations: sessionCommand({ type: "get_operations" }, {}, "concurrent"),
+	get_advisor_state: sessionCommand({ type: "get_advisor_state" }, {}, "concurrent"),
+	set_advisor_enabled: sessionCommand({ type: "set_advisor_enabled", enabled: false }, { enabled: booleanField }),
 	set_fast_mode: sessionCommand(
 		{ type: "set_fast_mode", enabled: false },
 		{ enabled: booleanField },

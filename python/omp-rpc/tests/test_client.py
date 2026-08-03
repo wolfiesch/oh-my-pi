@@ -290,6 +290,32 @@ FAKE_SERVER = textwrap.dedent(
             )
         elif command_type == "get_state":
             respond(request_id, "get_state", current_state())
+        elif command_type == "get_advisor_state":
+            respond(
+                request_id,
+                "get_advisor_state",
+                {
+                    "configured": True,
+                    "active": False,
+                    "advisors": [{"name": "reviewer", "status": "no_model"}],
+                },
+            )
+        elif command_type == "set_advisor_enabled":
+            enabled = command.get("enabled") is True
+            respond(
+                request_id,
+                "set_advisor_enabled",
+                {
+                    "configured": enabled,
+                    "active": False,
+                    "advisors": [
+                        {
+                            "name": "reviewer",
+                            "status": "no_model" if enabled else "paused",
+                        }
+                    ],
+                },
+            )
         elif command_type == "set_host_tools":
             registered_host_tools = command.get("tools", [])
             respond(
@@ -1345,6 +1371,18 @@ class RpcClientTests(unittest.TestCase):
                 },
             ),
         )
+
+    def test_advisor_state_methods_preserve_authoritative_runtime_state(self) -> None:
+        with self.make_client() as client:
+            configured = client.get_advisor_state()
+            disabled = client.set_advisor_enabled(False)
+
+        self.assertTrue(configured.configured)
+        self.assertFalse(configured.active)
+        self.assertEqual(configured.advisors[0].status, "no_model")
+        self.assertFalse(disabled.configured)
+        self.assertFalse(disabled.active)
+        self.assertEqual(disabled.advisors[0].status, "paused")
 
     def test_prompt_operations_settle_without_guessing_from_agent_end(self) -> None:
         terminal_types: list[str] = []

@@ -198,6 +198,17 @@ that omits a command:
 - `{ id?, type: "get_subagents" }`
 - `{ id?, type: "get_subagent_messages", subagentId?: string, sessionFile?: string, fromByte?: number }`
 
+### Advisors
+
+- `{ id?, type: "get_advisor_state" }`
+- `{ id?, type: "set_advisor_enabled", enabled: boolean }`
+
+`get_advisor_state` reports whether advisors are configured and whether they are
+effectively active, and gives every advisor a `running`, `paused`,
+`quota_exhausted`, `error`, or `no_model` status instead of one opaque flag.
+`get_state` carries the same configured/active pair so a host can render advisor
+availability without a second round trip.
+
 ### Model
 
 - `{ id?, type: "set_model", provider: string, modelId: string }`
