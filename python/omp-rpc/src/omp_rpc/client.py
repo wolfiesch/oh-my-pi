@@ -11,27 +11,29 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Generic, Mapping, Sequence, TypeVar, cast
+from typing import Any, Callable, Generic, Literal, Mapping, Sequence, TypeVar, cast
 
 from .host_tools import HostTool, HostToolContext
 from .host_uris import HostUri, HostUriContext, normalize_read_result
 from .protocol import (
-    AgentStartEvent,
+    ActiveOperation,
     AgentEndEvent,
     AgentMessage,
+    AgentStartEvent,
     AssistantMessage,
     AutoCompactionEndEvent,
     AutoCompactionStartEvent,
     AutoRetryEndEvent,
     AutoRetryStartEvent,
     BashResult,
-    FastModeResult,
     BranchMessage,
     BranchResult,
     CancellationResult,
+    CancelOperationResult,
     CompactionResult,
     ExtensionError,
     ExtensionUiRequest,
+    FastModeResult,
     ImageContent,
     InterruptMode,
     JsonObject,
@@ -42,22 +44,29 @@ from .protocol import (
     MessageUpdateEvent,
     ModelCycleResult,
     ModelInfo,
+    OperationCancelledEvent,
+    OperationCompletedEvent,
+    OperationFailedEvent,
+    OperationsSnapshot,
+    OperationStartedEvent,
     ReadyEvent,
     RetryFallbackAppliedEvent,
     RetryFallbackSucceededEvent,
     RpcAgentEvent,
     RpcNotification,
+    RpcOperationCommand,
+    RpcOperationTerminalEvent,
     SessionState,
     SessionStats,
     SteeringMode,
     StreamingBehavior,
     ThinkingLevel,
     ThinkingLevelCycleResult,
+    TodoAutoClearEvent,
     TodoItem,
     TodoPhase,
-    TodoStatus,
-    TodoAutoClearEvent,
     TodoReminderEvent,
+    TodoStatus,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
@@ -68,11 +77,11 @@ from .protocol import (
     assistant_text,
     parse_agent_messages,
     parse_bash_result,
-    parse_fast_mode_result,
     parse_branch_messages,
     parse_branch_result,
     parse_cancellation_result,
     parse_compaction_result,
+    parse_fast_mode_result,
     parse_model_cycle_result,
     parse_model_info,
     parse_notification,
@@ -88,6 +97,8 @@ UiRequestListener = Callable[[ExtensionUiRequest], None]
 ExtensionErrorListener = Callable[[ExtensionError], None]
 ReadyListener = Callable[[ReadyEvent], None]
 UnknownNotificationListener = Callable[[UnknownNotification], None]
+OperationStartedListener = Callable[[OperationStartedEvent], None]
+OperationTerminalListener = Callable[[RpcOperationTerminalEvent], None]
 AgentStartListener = Callable[[AgentStartEvent], None]
 AgentEndListener = Callable[[AgentEndEvent], None]
 TurnStartListener = Callable[[TurnStartEvent], None]
@@ -520,6 +531,13 @@ class RpcClient:
         self._scheduled_agent_runs = 0
         self._completed_agent_runs = 0
         self._last_schedule_async_error_index = 0
+        self._operation_results: dict[str, RpcOperationTerminalEvent] = {}
+        self._operation_errors: dict[str, RpcError] = {}
+        self._active_operation_ids: set[str] = set()
+        self._agent_streaming = False
+        self._continuation_request_count = 0
+        self._continuation_generation = 0
+        self._confirmed_continuation_generation = 0
         self._ui_requests: queue.Queue[ExtensionUiRequest] = queue.Queue()
         self._stderr_chunks = _BoundedHistory[str](self._max_stderr_chunks)
         self._closed_error: BaseException | None = None
@@ -540,8 +558,10 @@ class RpcClient:
         self._notification_listeners: list[NotificationListener] = []
         self._event_listeners: list[AgentEventListener] = []
         self._typed_event_listeners: dict[str, list[AgentEventListener]] = {}
+        self._typed_notification_listeners: dict[str, list[NotificationListener]] = {}
         self._ready_listeners: list[ReadyListener] = []
         self._unknown_notification_listeners: list[UnknownNotificationListener] = []
+        self._operation_terminal_listeners: list[OperationTerminalListener] = []
         self._ui_request_listeners: list[UiRequestListener] = []
         self._extension_error_listeners: list[ExtensionErrorListener] = []
         self._protocol_error_listeners: list[ProtocolErrorListener] = []
@@ -586,6 +606,12 @@ class RpcClient:
         self._frame_decoder = _RpcFrameDecoder()
         self._events.clear()
         self._async_errors.clear()
+        self._operation_results.clear()
+        self._active_operation_ids.clear()
+        self._agent_streaming = False
+        self._continuation_request_count = 0
+        self._continuation_generation = 0
+        self._confirmed_continuation_generation = 0
         self._scheduled_agent_runs = 0
         self._completed_agent_runs = 0
         self._last_schedule_async_error_index = 0
@@ -831,6 +857,19 @@ class RpcClient:
             self._unknown_notification_listeners, listener
         )
 
+    def on_operation_started(
+        self, listener: OperationStartedListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("operation_started", listener)
+
+    def on_operation_terminal(
+        self, listener: OperationTerminalListener
+    ) -> Callable[[], None]:
+        self._operation_terminal_listeners.append(listener)
+        return lambda: self._remove_listener(
+            self._operation_terminal_listeners, listener
+        )
+
     def install_headless_ui(
         self,
         *,
@@ -915,7 +954,14 @@ class RpcClient:
         self._send_notification(payload)
 
     def get_state(self) -> SessionState:
-        payload = self._request("get_state")
+        return self._get_state()
+
+    def _get_state(self, timeout: float | None = None) -> SessionState:
+        payload = (
+            self._request("get_state")
+            if timeout is None
+            else self._request_with_timeout("get_state", timeout)
+        )
         return parse_session_state(payload)
 
     def set_fast_mode(self, enabled: bool) -> FastModeResult:
@@ -1140,45 +1186,167 @@ class RpcClient:
         *,
         images: Sequence[ImageContent] | None = None,
         streaming_behavior: StreamingBehavior | None = None,
-    ) -> None:
-        self._request(
+    ) -> str | None:
+        start_event_index = self._current_event_index()
+        response = self._request(
             "prompt",
             message=message,
             images=list(images) if images is not None else None,
             streamingBehavior=streaming_behavior,
         )
-        self._mark_agent_run_scheduled()
+        operation_id = response.get("operationId")
+        if isinstance(operation_id, str):
+            self._register_operation(operation_id)
+            return operation_id
+        self._register_legacy_agent_run(start_event_index)
+        return None
 
     def steer(
         self, message: str, *, images: Sequence[ImageContent] | None = None
     ) -> None:
-        self._request(
-            "steer",
-            message=message,
-            images=list(images) if images is not None else None,
-        )
+        with self._event_condition:
+            self._continuation_request_count += 1
+        try:
+            self._request(
+                "steer",
+                message=message,
+                images=list(images) if images is not None else None,
+            )
+            with self._event_condition:
+                self._continuation_generation += 1
+                self._agent_streaming = True
+        finally:
+            with self._event_condition:
+                self._continuation_request_count -= 1
+                self._event_condition.notify_all()
 
     def follow_up(
         self, message: str, *, images: Sequence[ImageContent] | None = None
     ) -> None:
-        self._request(
-            "follow_up",
-            message=message,
-            images=list(images) if images is not None else None,
-        )
+        with self._event_condition:
+            self._continuation_request_count += 1
+        try:
+            self._request(
+                "follow_up",
+                message=message,
+                images=list(images) if images is not None else None,
+            )
+            with self._event_condition:
+                self._continuation_generation += 1
+                self._agent_streaming = True
+        finally:
+            with self._event_condition:
+                self._continuation_request_count -= 1
+                self._event_condition.notify_all()
 
     def abort(self) -> None:
         self._request("abort")
 
     def abort_and_prompt(
         self, message: str, *, images: Sequence[ImageContent] | None = None
-    ) -> None:
-        self._request(
+    ) -> str | None:
+        start_event_index = self._current_event_index()
+        response = self._request(
             "abort_and_prompt",
             message=message,
             images=list(images) if images is not None else None,
         )
-        self._mark_agent_run_scheduled()
+        operation_id = response.get("operationId")
+        if isinstance(operation_id, str):
+            self._register_operation(operation_id)
+            return operation_id
+        self._register_legacy_agent_run(start_event_index)
+        return None
+
+    def cancel_operation(self, operation_id: str) -> CancelOperationResult:
+        payload = self._request("cancel_operation", operationId=operation_id)
+        status = payload.get("status")
+        if status not in {"cancelled", "completed", "failed", "not_found"}:
+            raise RpcError("cancel_operation response has an invalid status")
+        terminal_payload = payload.get("terminal")
+        terminal: RpcOperationTerminalEvent | None = None
+        if isinstance(terminal_payload, dict):
+            parsed = parse_notification(cast(JsonObject, terminal_payload))
+            if not isinstance(
+                parsed,
+                (
+                    OperationCompletedEvent,
+                    OperationFailedEvent,
+                    OperationCancelledEvent,
+                ),
+            ):
+                raise RpcError("cancel_operation response has an invalid terminal")
+            terminal = parsed
+        return CancelOperationResult(
+            operation_id=operation_id,
+            status=cast(
+                Literal["cancelled", "completed", "failed", "not_found"], status
+            ),
+            terminal=terminal,
+        )
+
+    def get_operations(self) -> OperationsSnapshot:
+        payload = self._request("get_operations")
+        raw_active = payload.get("active")
+        raw_recent = payload.get("recent")
+        if not isinstance(raw_active, list) or not isinstance(raw_recent, list):
+            raise RpcError(
+                "get_operations response must contain active and recent arrays"
+            )
+        active: list[ActiveOperation] = []
+        for item in raw_active:
+            if not isinstance(item, dict):
+                raise RpcError("get_operations active entry must be an object")
+            operation_id = item.get("operationId")
+            command = item.get("command")
+            status = item.get("status")
+            accepted_at = item.get("acceptedAt")
+            if (
+                not isinstance(operation_id, str)
+                or command not in {"prompt", "abort_and_prompt"}
+                or status not in {"accepted", "started"}
+                or not isinstance(accepted_at, (int, float))
+                or isinstance(accepted_at, bool)
+            ):
+                raise RpcError("get_operations active entry is invalid")
+            active.append(
+                ActiveOperation(
+                    operation_id=operation_id,
+                    request_id=item.get("requestId")
+                    if isinstance(item.get("requestId"), str)
+                    else None,
+                    command=cast(RpcOperationCommand, command),
+                    status=cast(Literal["accepted", "started"], status),
+                    accepted_at=float(accepted_at),
+                    started_at=float(item["startedAt"])
+                    if isinstance(item.get("startedAt"), (int, float))
+                    and not isinstance(item.get("startedAt"), bool)
+                    else None,
+                )
+            )
+        recent: list[RpcOperationTerminalEvent] = []
+        for item in raw_recent:
+            if not isinstance(item, dict):
+                raise RpcError("get_operations recent entry must be an object")
+            parsed = parse_notification(cast(JsonObject, item))
+            if not isinstance(
+                parsed,
+                (
+                    OperationCompletedEvent,
+                    OperationFailedEvent,
+                    OperationCancelledEvent,
+                ),
+            ):
+                raise RpcError("get_operations recent entry is not terminal")
+            recent.append(parsed)
+        with self._event_condition:
+            self._active_operation_ids = {
+                operation.operation_id for operation in active
+            }
+            for terminal in recent:
+                self._remember_operation_result(terminal)
+            self._event_condition.notify_all()
+        return OperationsSnapshot(active=tuple(active), recent=tuple(recent))
 
     def prompt_and_wait(
         self,
@@ -1193,9 +1361,15 @@ class RpcClient:
         try:
             start_index = self._current_event_index()
             start_async_error_index = self._current_async_error_index()
-            self.prompt(message, images=images, streaming_behavior=streaming_behavior)
-            events = self._wait_for_agent_end(
-                start_index, start_async_error_index, timeout=timeout
+            operation_id = self.prompt(
+                message, images=images, streaming_behavior=streaming_behavior
+            )
+            events = (
+                self._wait_for_operation(operation_id, start_index, timeout=timeout)
+                if operation_id is not None
+                else self._wait_for_agent_end(
+                    start_index, start_async_error_index, timeout=timeout
+                )
             )
             return self._build_prompt_turn(events)
         finally:
@@ -1205,14 +1379,58 @@ class RpcClient:
         operation = "wait_for_idle"
         self._prompt_lifecycle.acquire(operation)
         try:
-            if self._is_agent_idle():
-                self._check_async_errors()
-                return
-            start_index = self._current_event_index()
-            start_async_error_index = self._current_async_error_index()
-            self._wait_for_agent_end(
-                start_index, start_async_error_index, timeout=timeout
-            )
+            deadline = time.monotonic() + (timeout if timeout is not None else 60.0)
+            while True:
+                with self._event_condition:
+                    continuation_pending = (
+                        self._continuation_request_count > 0
+                        or self._continuation_generation
+                        != self._confirmed_continuation_generation
+                    )
+                    request_pending = self._continuation_request_count > 0
+                    generation = self._continuation_generation
+                if not continuation_pending:
+                    if self._is_agent_idle():
+                        self._check_async_errors()
+                        return
+                    self._wait_until_idle(timeout=max(0.0, deadline - time.monotonic()))
+                    return
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RpcTimeoutError(
+                        "Timed out waiting for RPC client to become idle. "
+                        f"Stderr: {self.stderr}"
+                    )
+                if request_pending:
+                    time.sleep(min(0.01, remaining))
+                    continue
+
+                try:
+                    state = self._get_state(timeout=remaining)
+                except RpcTimeoutError:
+                    if time.monotonic() >= deadline:
+                        raise RpcTimeoutError(
+                            "Timed out waiting for RPC client to become idle. "
+                            f"Stderr: {self.stderr}"
+                        ) from None
+                    raise
+                with self._event_condition:
+                    authoritative_idle = (
+                        self._continuation_request_count == 0
+                        and self._continuation_generation == generation
+                        and self._scheduled_agent_runs == self._completed_agent_runs
+                        and not self._active_operation_ids
+                        and state.activity_phase == "idle"
+                        and state.queued_message_count == 0
+                    )
+                    if authoritative_idle:
+                        self._confirmed_continuation_generation = generation
+                        self._agent_streaming = False
+                if authoritative_idle:
+                    self._check_async_errors()
+                    return
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
         finally:
             self._prompt_lifecycle.release(operation)
 
@@ -1239,25 +1457,74 @@ class RpcClient:
         with self._event_condition:
             return self._async_errors.current_index()
 
-    def _mark_agent_run_scheduled(self) -> None:
+    def _register_legacy_agent_run(self, start_event_index: int) -> None:
         with self._event_condition:
+            history_start = max(start_event_index, self._events.offset)
+            terminal_already_seen = any(
+                payload.get("type") == "agent_end"
+                and payload.get("isTerminal") is not False
+                for payload in self._events.snapshot_from(history_start)
+            )
+            if terminal_already_seen:
+                return
             self._scheduled_agent_runs += 1
             self._last_schedule_async_error_index = self._async_errors.current_index()
 
     def _mark_agent_run_completed(self) -> None:
         with self._event_condition:
-            self._completed_agent_runs += 1
+            if self._completed_agent_runs < self._scheduled_agent_runs:
+                self._completed_agent_runs += 1
             self._event_condition.notify_all()
+
+    def _remember_operation_result(self, terminal: RpcOperationTerminalEvent) -> None:
+        self._operation_errors.pop(terminal.operation_id, None)
+        self._operation_results.pop(terminal.operation_id, None)
+        if len(self._operation_results) >= 128:
+            self._operation_results.pop(next(iter(self._operation_results)))
+        self._operation_results[terminal.operation_id] = terminal
+
+    def _remember_operation_error(self, operation_id: str, error: RpcError) -> None:
+        self._operation_errors.pop(operation_id, None)
+        if len(self._operation_errors) >= 128:
+            self._operation_errors.pop(next(iter(self._operation_errors)))
+        self._operation_errors[operation_id] = error
+
+    def _register_operation(self, operation_id: str) -> None:
+        with self._event_condition:
+            if (
+                operation_id in self._operation_results
+                or operation_id in self._operation_errors
+            ):
+                return
+            if (
+                not self._active_operation_ids
+                and self._scheduled_agent_runs == self._completed_agent_runs
+            ):
+                self._last_schedule_async_error_index = (
+                    self._async_errors.current_index()
+                )
+            self._active_operation_ids.add(operation_id)
 
     def _is_agent_idle(self) -> bool:
         with self._event_condition:
-            return self._scheduled_agent_runs == self._completed_agent_runs
+            return (
+                self._scheduled_agent_runs == self._completed_agent_runs
+                and not self._active_operation_ids
+                and not self._agent_streaming
+            )
 
     def _check_async_errors(self) -> None:
         with self._event_condition:
+            operation_error = (
+                self._operation_errors.pop(next(iter(self._operation_errors)))
+                if self._operation_errors
+                else None
+            )
             errors = self._async_errors.snapshot_from(
                 self._last_schedule_async_error_index
             )
+        if operation_error is not None:
+            raise operation_error
         if errors:
             raise errors[0]
 
@@ -1370,7 +1637,70 @@ class RpcClient:
                     )
                 self._event_condition.wait(remaining)
 
+    def _wait_for_operation(
+        self,
+        operation_id: str,
+        start_index: int,
+        timeout: float | None = None,
+    ) -> tuple[RpcAgentEvent, ...]:
+        deadline = time.monotonic() + (timeout if timeout is not None else 60.0)
+        with self._event_condition:
+            while True:
+                if self._closed_error is not None:
+                    raise RpcProcessExitError(str(self._closed_error))
+                if start_index < self._events.offset:
+                    raise RpcError(
+                        "Event history limit was exceeded while waiting for an RPC operation. "
+                        "Increase max_event_history to retain more streamed events."
+                    )
+
+                operation_error = self._operation_errors.pop(operation_id, None)
+                if operation_error is not None:
+                    raise operation_error
+                terminal = self._operation_results.pop(operation_id, None)
+                if terminal is not None:
+                    return tuple(
+                        cast(RpcAgentEvent, parse_notification(payload))
+                        for payload in self._events.snapshot_from(start_index)
+                    )
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RpcTimeoutError(
+                        f"Timed out waiting for operation {operation_id}. Stderr: {self.stderr}"
+                    )
+                self._event_condition.wait(remaining)
+
+    def _wait_until_idle(self, timeout: float | None = None) -> None:
+        deadline = time.monotonic() + (timeout if timeout is not None else 60.0)
+        with self._event_condition:
+            while (
+                self._scheduled_agent_runs != self._completed_agent_runs
+                or self._active_operation_ids
+                or self._agent_streaming
+            ):
+                if self._closed_error is not None:
+                    raise RpcProcessExitError(str(self._closed_error))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RpcTimeoutError(
+                        f"Timed out waiting for RPC client to become idle. "
+                        f"Stderr: {self.stderr}"
+                    )
+                self._event_condition.wait(remaining)
+        self._check_async_errors()
+
     def _request(self, command_type: str, **payload: JsonValue) -> JsonObject:
+        return self._request_with_timeout(
+            command_type, self._request_timeout, **payload
+        )
+
+    def _request_with_timeout(
+        self,
+        command_type: str,
+        response_timeout: float,
+        **payload: JsonValue,
+    ) -> JsonObject:
         process = self._require_process()
         request_id = self._next_request_id()
         envelope: JsonObject = {"id": request_id, "type": command_type}
@@ -1391,8 +1721,9 @@ class RpcClient:
                 self._pending.pop(request_id, None)
             raise
 
+        response_timeout = min(self._request_timeout, response_timeout)
         try:
-            response = response_queue.get(timeout=self._request_timeout)
+            response = response_queue.get(timeout=response_timeout)
         except queue.Empty as exc:
             with self._state_lock:
                 self._pending.pop(request_id, None)
@@ -1678,6 +2009,14 @@ class RpcClient:
         listeners.append(typed_listener)
         return lambda: self._remove_listener(listeners, typed_listener)
 
+    def _add_typed_notification_listener(
+        self, event_type: str, listener: TEventListener
+    ) -> Callable[[], None]:
+        listeners = self._typed_notification_listeners.setdefault(event_type, [])
+        typed_listener = cast(NotificationListener, listener)
+        listeners.append(typed_listener)
+        return lambda: self._remove_listener(listeners, typed_listener)
+
     @staticmethod
     def _normalize_todo_phases(
         todos: Sequence[TodoSeed | TodoPhaseSeed],
@@ -1917,10 +2256,49 @@ class RpcClient:
                             RpcError(f"Failed to parse terminal agent_end: {exc}")
                         )
                         self._mark_agent_run_completed()
+                    if payload_type in (
+                        "operation_completed",
+                        "operation_failed",
+                        "operation_cancelled",
+                    ):
+                        operation_id = payload.get("operationId")
+                        with self._event_condition:
+                            if isinstance(operation_id, str):
+                                self._active_operation_ids.discard(operation_id)
+                            error = RpcError(
+                                f"Failed to parse terminal {payload_type}: {exc}"
+                            )
+                            if isinstance(operation_id, str):
+                                self._remember_operation_error(operation_id, error)
+                            else:
+                                self._async_errors.append(error)
+                            self._event_condition.notify_all()
+                if isinstance(notification, OperationStartedEvent):
+                    with self._event_condition:
+                        self._active_operation_ids.add(notification.operation_id)
+                        self._event_condition.notify_all()
+                elif isinstance(
+                    notification,
+                    (
+                        OperationCompletedEvent,
+                        OperationFailedEvent,
+                        OperationCancelledEvent,
+                    ),
+                ):
+                    with self._event_condition:
+                        self._active_operation_ids.discard(notification.operation_id)
+                        self._remember_operation_result(notification)
+                        self._event_condition.notify_all()
                 self._dispatch_listeners(
                     "notification",
                     notification.type,
                     self._notification_listeners,
+                    notification,
+                )
+                self._dispatch_listeners(
+                    "typed_notification",
+                    notification.type,
+                    self._typed_notification_listeners.get(notification.type, []),
                     notification,
                 )
 
@@ -1964,12 +2342,32 @@ class RpcClient:
                     )
                     continue
 
+                if isinstance(notification, OperationStartedEvent):
+                    continue
+                if isinstance(
+                    notification,
+                    (
+                        OperationCompletedEvent,
+                        OperationFailedEvent,
+                        OperationCancelledEvent,
+                    ),
+                ):
+                    self._dispatch_listeners(
+                        "operation_terminal",
+                        notification.type,
+                        self._operation_terminal_listeners,
+                        notification,
+                    )
+                    continue
+
                 event = cast(RpcAgentEvent, notification)
                 self._append_event(payload)
-                if (
-                    isinstance(event, AgentEndEvent)
-                    and event.is_terminal is not False
-                ):
+                if isinstance(event, (AgentStartEvent, TurnStartEvent)):
+                    with self._event_condition:
+                        self._agent_streaming = True
+                if isinstance(event, AgentEndEvent) and event.is_terminal is not False:
+                    with self._event_condition:
+                        self._agent_streaming = False
                     self._mark_agent_run_completed()
                 self._dispatch_listeners(
                     "event", event.type, self._event_listeners, event

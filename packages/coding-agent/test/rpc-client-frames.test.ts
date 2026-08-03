@@ -112,6 +112,62 @@ describe("RpcClient frame coverage", () => {
 		expect(promptResults[0]?.id).toMatch(/^req_/);
 	});
 
+	test("waitForIdle keeps a legacy prompt pending until delayed terminal agent_end", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_CLIENT_FRAMES: "1" },
+		});
+		let terminalSeen = false;
+		client.onEvent(event => {
+			if (event.type === "agent_end" && Reflect.get(event, "isTerminal") !== false) terminalSeen = true;
+		});
+
+		await client.start();
+		expect(await client.prompt("hello")).toBeUndefined();
+		await client.waitForIdle(2_000);
+
+		expect(terminalSeen).toBe(true);
+	});
+
+	test("waitForIdle reconciles an accepted follow-up after a stale agent_end", async () => {
+		using tempDir = TempDir.createSync("@omp-rpc-client-continuation-");
+		const captureFile = tempDir.join("captured.jsonl");
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: {
+				MOCK_RPC_CONTINUATION_RACE: "1",
+				MOCK_RPC_CAPTURE_FILE: captureFile,
+			},
+		});
+
+		await client.start();
+		await client.followUp("queued");
+		await client.waitForIdle(2_000);
+
+		const captured = await waitForCapturedFrames(
+			captureFile,
+			frames => frames.filter(frame => frame.type === "get_state").length >= 2,
+		);
+		expect(captured.filter(frame => frame.type === "get_state")).toHaveLength(2);
+	});
+
+	test("waitForIdle bounds stalled continuation reconciliation by its timeout", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: {
+				MOCK_RPC_CONTINUATION_RACE: "1",
+				MOCK_RPC_STALL_CONTINUATION_STATE: "1",
+			},
+		});
+
+		await client.start();
+		await client.followUp("queued");
+		const startedAt = performance.now();
+
+		await expect(client.waitForIdle(50)).rejects.toThrow("Timeout waiting for agent to become idle");
+		expect(performance.now() - startedAt).toBeLessThan(1_000);
+	});
+
 	test("completes local-only prompts from response data", async () => {
 		using client = new RpcClient({
 			cliPath: MOCK_AGENT,

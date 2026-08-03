@@ -233,13 +233,13 @@ describe("RpcInputDispatcher", () => {
 		let depsRef: RpcInputFrameDeps;
 		const { deps, outputs } = makeDeps(async command => {
 			if (command.type !== "prompt") throw new Error(`unexpected command type: ${command.type}`);
-			const response = await requestExtensionInput(depsRef, "ui-active", "Continue?");
+			await requestExtensionInput(depsRef, "ui-active", "Continue?");
 			return {
 				id: command.id,
 				type: "response",
 				command: "prompt",
 				success: true,
-				data: { agentInvoked: "value" in response && response.value === "continue" },
+				data: { operationId: `operation-${command.id}`, accepted: true },
 			};
 		});
 		depsRef = deps;
@@ -272,7 +272,7 @@ describe("RpcInputDispatcher", () => {
 				type: "response",
 				command: "prompt",
 				success: true,
-				data: { agentInvoked: true },
+				data: { operationId: "operation-prompt-1", accepted: true },
 			},
 		]);
 	});
@@ -283,7 +283,7 @@ describe("RpcInputDispatcher", () => {
 			type: "response",
 			command: "prompt",
 			success: true,
-			data: { agentInvoked: false },
+			data: { operationId: `operation-${command.id}`, accepted: true },
 		}));
 		const dispatcher = new RpcInputDispatcher({ deps });
 
@@ -317,6 +317,7 @@ describe("RpcInputDispatcher", () => {
 					data: {
 						thinkingLevel: undefined,
 						isStreaming: false,
+						activityPhase: "idle",
 						isCompacting: false,
 						steeringMode: "all",
 						followUpMode: "all",
@@ -413,7 +414,7 @@ describe("RpcInputDispatcher", () => {
 				type: "response",
 				command: "prompt",
 				success: true,
-				data: { agentInvoked: true },
+				data: { operationId: `operation-${command.id}`, accepted: true },
 			};
 		});
 		const dispatcher = new RpcInputDispatcher({ deps });
@@ -469,7 +470,7 @@ describe("RpcInputDispatcher", () => {
 					type: "response",
 					command: "prompt",
 					success: true,
-					data: { agentInvoked: true },
+					data: { operationId: `operation-${command.id}`, accepted: true },
 				};
 			},
 			{ pendingExtensionRequests },

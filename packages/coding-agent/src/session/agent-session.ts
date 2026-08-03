@@ -502,6 +502,8 @@ export class AgentSession {
 	#pendingNextTurnMessages: CustomMessage[] = [];
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	#queuedMessageDrainScheduled = false;
+	/** Caller-owned tags keyed by exact message identity; never serialized into provider payloads. */
+	readonly #messageTags = new WeakMap<AgentMessage, string>();
 	#planModeState: PlanModeState | undefined;
 	/** Session-scoped `/vision` override; undefined = follow persisted `inspect_image.mode`. */
 	#inspectImageModeOverride: InspectImageMode | undefined;
@@ -642,6 +644,9 @@ export class AgentSession {
 	readonly #streamingEditGuard: StreamingEditGuard;
 	readonly #loopGuards: LoopGuards;
 	#promptInFlightCount = 0;
+	/** Lazily shared by waitForIdle callers while session-owned prompt setup/finalization is still active. */
+	#promptInFlightSettled: Promise<void> | undefined;
+	#promptInFlightSettledResolve: (() => void) | undefined;
 	#abortInProgress = false;
 	// Wire-level agent_end emission deferred until #promptInFlightCount drops to 0.
 	// Internal extension hooks and post-emit work (auto-retry, auto-compaction, todo
@@ -652,6 +657,8 @@ export class AgentSession {
 	#promptGeneration = 0;
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
+	#inFlightSettledCallbacksDrain: Promise<void> | undefined;
+	#inFlightSettledCallbacksDrainResolve: (() => void) | undefined;
 	#sessionStopContinuationCount = 0;
 	#sessionStopHookActive = false;
 	#obfuscator: SecretObfuscator | undefined;
@@ -723,23 +730,81 @@ export class AgentSession {
 		if (this.#promptInFlightCount !== 0) return;
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
-		this.#flushPendingAgentEnd();
-		if (this.#inFlightSettledCallbacks.length === 0) {
+		this.#finishInFlightSettlement();
+		const resolve = this.#promptInFlightSettledResolve;
+		this.#promptInFlightSettled = undefined;
+		this.#promptInFlightSettledResolve = undefined;
+		resolve?.();
+	}
+
+	#waitForInFlightPrompts(): Promise<void> {
+		if (this.#promptInFlightCount === 0) return Promise.resolve();
+		if (!this.#promptInFlightSettled) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			this.#promptInFlightSettled = promise;
+			this.#promptInFlightSettledResolve = resolve;
+		}
+		return this.#promptInFlightSettled;
+	}
+
+	#finishInFlightSettlement(): void {
+		const hasActiveDrain = this.#inFlightSettledCallbacksDrain !== undefined;
+		if (!hasActiveDrain && this.#inFlightSettledCallbacks.length === 0) {
+			this.#notifyYieldQueueIfSettled();
+			this.#flushPendingAgentEnd();
 			this.#drainStrandedQueuedMessages();
 			return;
 		}
-		void this.#flushInFlightSettledCallbacks().finally(() => this.#drainStrandedQueuedMessages());
+
+		let startDrain = false;
+		if (!hasActiveDrain) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			this.#inFlightSettledCallbacksDrain = promise;
+			this.#inFlightSettledCallbacksDrainResolve = resolve;
+			startDrain = true;
+		}
+		// Preserve the wire ordering: pending agent_end is emitted before its
+		// settlement observers run, while the explicit drain state keeps the
+		// session authoritatively busy throughout those observers.
+		this.#flushPendingAgentEnd();
+		if (startDrain) void this.#flushInFlightSettledCallbacks();
+	}
+
+	#finalizeInFlightSettledCallbacksDrain(): void {
+		const resolve = this.#inFlightSettledCallbacksDrainResolve;
+		this.#inFlightSettledCallbacksDrain = undefined;
+		this.#inFlightSettledCallbacksDrainResolve = undefined;
+		this.#notifyYieldQueueIfSettled();
+		this.#drainStrandedQueuedMessages();
+		resolve?.();
+	}
+
+	#notifyYieldQueueIfSettled(): void {
+		if (
+			this.agent.state.isStreaming ||
+			this.#promptInFlightCount > 0 ||
+			this.#postPromptTasks.size > 0 ||
+			this.#inFlightSettledCallbacksDrain
+		)
+			return;
+		this.yieldQueue.notifySettled();
 	}
 
 	async #flushInFlightSettledCallbacks(): Promise<void> {
-		const callbacks = this.#inFlightSettledCallbacks;
-		this.#inFlightSettledCallbacks = [];
-		for (const callback of callbacks) {
-			try {
-				await callback();
-			} catch (error) {
-				logger.warn("In-flight settle callback failed", { error: String(error) });
+		try {
+			while (this.#inFlightSettledCallbacks.length > 0) {
+				const callbacks = this.#inFlightSettledCallbacks;
+				this.#inFlightSettledCallbacks = [];
+				for (const callback of callbacks) {
+					try {
+						await callback();
+					} catch (error) {
+						logger.warn("In-flight settle callback failed", { error: String(error) });
+					}
+				}
 			}
+		} finally {
+			this.#finalizeInFlightSettledCallbacksDrain();
 		}
 	}
 
@@ -915,12 +980,7 @@ export class AgentSession {
 		this.#promptInFlightCount = 0;
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
-		this.#flushPendingAgentEnd();
-		if (this.#inFlightSettledCallbacks.length === 0) {
-			this.#drainStrandedQueuedMessages();
-			return;
-		}
-		void this.#flushInFlightSettledCallbacks().finally(() => this.#drainStrandedQueuedMessages());
+		this.#finishInFlightSettlement();
 	}
 
 	#flushPendingAgentEnd(): void {
@@ -1225,7 +1285,10 @@ export class AgentSession {
 			await this.#maintenance.maintainContextMidRun(messages, signal, context);
 		});
 		this.yieldQueue = new YieldQueue({
-			isStreaming: () => this.isStreaming,
+			isStreaming: () =>
+				this.agent.state.isStreaming ||
+				this.#promptInFlightCount > 0 ||
+				this.#inFlightSettledCallbacksDrain !== undefined,
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
@@ -3152,6 +3215,7 @@ export class AgentSession {
 				this.#postPromptTasks.delete(task);
 				if (this.#postPromptTasks.size === 0) {
 					this.#resolvePostPromptTasks();
+					this.#notifyYieldQueueIfSettled();
 				}
 			});
 	}
@@ -4398,15 +4462,47 @@ export class AgentSession {
 		return this.agent.state.isStreaming || this.#promptInFlightCount > 0;
 	}
 
+	/**
+	 * Authoritative session activity phase. Unlike `isStreaming`, this separates
+	 * the core provider loop from prompt settlement and tracked post-prompt work.
+	 */
+	get activityPhase(): "provider" | "maintenance" | "idle" {
+		if (this.agent.state.isStreaming) return "provider";
+		if (this.#promptInFlightCount > 0 || this.#postPromptTasks.size > 0 || this.#inFlightSettledCallbacksDrain)
+			return "maintenance";
+		return "idle";
+	}
+
 	get isAborting(): boolean {
 		return this.agent.isAborting;
 	}
 
 	/** Wait until streaming, event persistence, and deferred recovery work are fully settled. */
 	async waitForIdle(): Promise<void> {
-		await this.agent.waitForIdle();
-		await this.#advisors.waitForPendingCardEvents();
-		await this.#waitForPostPromptRecovery();
+		while (true) {
+			await this.agent.waitForIdle();
+			await this.#advisors.waitForPendingCardEvents();
+			await this.#waitForPostPromptRecovery();
+			const settlementCallbacks = this.#inFlightSettledCallbacksDrain;
+			if (settlementCallbacks) {
+				await settlementCallbacks;
+				continue;
+			}
+			if (this.#promptInFlightCount > 0) {
+				// The Agent can already be idle while its session wrapper is still
+				// running preflight or finalization. Block on that lifecycle edge
+				// instead of spinning microtasks, which starves timers and process I/O
+				// needed by the outstanding work.
+				await this.#waitForInFlightPrompts();
+				continue;
+			}
+			const postPromptTasks = this.#postPromptTasksPromise;
+			if (postPromptTasks) {
+				await postPromptTasks;
+				continue;
+			}
+			if (this.activityPhase === "idle") return;
+		}
 	}
 	/**
 	 * Prevent advisor notes from starting hidden primary turns while a headless
@@ -4732,7 +4828,7 @@ export class AgentSession {
 	 * to avoid racing against the delivery turn.
 	 */
 	get hasPostPromptWork(): boolean {
-		return this.#postPromptTasks.size > 0;
+		return this.#postPromptTasks.size > 0 || this.#inFlightSettledCallbacksDrain !== undefined;
 	}
 
 	/** Register post-prompt work in tests without driving a full agent turn. */
@@ -5372,13 +5468,9 @@ export class AgentSession {
 			// Steer/follow-up the keyword notices BEFORE the queued user message so the
 			// model reads the steering notice ahead of the prompt it modifies.
 			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
+				await this.#queueCustomMessage(notice, streamingBehavior, undefined, options?.messageTag);
 			}
-			if (streamingBehavior === "followUp") {
-				await this.#queueUserMessage(expandedText, options?.images, "followUp");
-			} else {
-				await this.#queueUserMessage(expandedText, options?.images, "steer");
-			}
+			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, options?.messageTag);
 			return true;
 		}
 
@@ -5461,7 +5553,7 @@ export class AgentSession {
 
 	async promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice"> & {
+		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "messageTag"> & {
 			queueChipText?: string;
 			queueOnly?: boolean;
 		},
@@ -5498,9 +5590,9 @@ export class AgentSession {
 			if (!streamingBehavior) throw new AgentBusyError();
 
 			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
+				await this.#queueCustomMessage(notice, streamingBehavior, undefined, options.messageTag);
 			}
-			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText);
+			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText, options.messageTag);
 			return;
 		}
 		if (this.isStreaming) {
@@ -5508,9 +5600,9 @@ export class AgentSession {
 			if (!streamingBehavior) throw new AgentBusyError();
 
 			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
+				await this.#queueCustomMessage(notice, streamingBehavior, undefined, options?.messageTag);
 			}
-			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText);
+			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText, options?.messageTag);
 			return;
 		}
 
@@ -5533,7 +5625,7 @@ export class AgentSession {
 	async #promptWithMessage(
 		message: AgentMessage,
 		expandedText: string,
-		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck"> & {
+		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck" | "messageTag"> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
@@ -5543,6 +5635,7 @@ export class AgentSession {
 		// every pre-dispatch bail (generation bump from abort, disposal, usage
 		// preflight denial) exits silently, and prompt() uses the outcome to hand
 		// the typed text back to the host instead of losing it.
+		if (options?.messageTag) this.#messageTags.set(message, options.messageTag);
 		this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		try {
@@ -6009,6 +6102,7 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		mode: "steer" | "followUp",
+		messageTag?: string,
 	): Promise<void> {
 		// A queued user message (RPC/SDK/collab steer or follow-up, or a typed message
 		// while streaming) is a deliberate resume; re-enable advisor auto-resume that
@@ -6025,23 +6119,29 @@ export class AgentSession {
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
 		this.#allowQueuedMessageDrainRetry();
+		if (imageDescriptionNotice && messageTag) this.#messageTags.set(imageDescriptionNotice, messageTag);
+		const queuedMessage: AgentMessage =
+			mode === "followUp"
+				? {
+						role: "user",
+						content,
+						attribution: "user",
+						timestamp: Date.now(),
+					}
+				: {
+						role: "user",
+						content,
+						steering: true,
+						attribution: "user",
+						timestamp: Date.now(),
+					};
+		if (messageTag) this.#messageTags.set(queuedMessage, messageTag);
 		if (mode === "followUp") {
 			if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
-			this.agent.followUp({
-				role: "user",
-				content,
-				attribution: "user",
-				timestamp: Date.now(),
-			});
+			this.agent.followUp(queuedMessage);
 		} else {
 			if (imageDescriptionNotice) this.agent.steer(imageDescriptionNotice);
-			this.agent.steer({
-				role: "user",
-				content,
-				steering: true,
-				attribution: "user",
-				timestamp: Date.now(),
-			});
+			this.agent.steer(queuedMessage);
 		}
 		this.#scheduleIdleQueueDrain();
 	}
@@ -6232,6 +6332,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		deliverAs: "steer" | "followUp",
 		queueChipText?: string,
+		messageTag?: string,
 	): Promise<void> {
 		const details =
 			queueChipText !== undefined
@@ -6254,6 +6355,7 @@ export class AgentSession {
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
 		this.#allowQueuedMessageDrainRetry();
+		if (messageTag) this.#messageTags.set(normalizedAppMessage, messageTag);
 		if (deliverAs === "followUp") {
 			this.agent.followUp(normalizedAppMessage);
 		} else {
@@ -6434,6 +6536,21 @@ export class AgentSession {
 		this.agent.replaceQueues(steeringAll.filter(keep), followUpAll.filter(keep));
 		this.#reconcileQueuedMessageDrain();
 		return { steering, followUp };
+	}
+	/** Return the stable caller tag attached to this exact message instance. */
+	getMessageTag(message: AgentMessage): string | undefined {
+		return this.#messageTags.get(message);
+	}
+
+	/** Remove only queued messages owned by `tag`, preserving unrelated queue entries. */
+	removeQueuedMessagesByTag(tag: string): number {
+		const steering = this.agent.peekSteeringQueue();
+		const followUp = this.agent.peekFollowUpQueue();
+		const keptSteering = steering.filter(message => this.#messageTags.get(message) !== tag);
+		const keptFollowUp = followUp.filter(message => this.#messageTags.get(message) !== tag);
+		const removed = steering.length + followUp.length - keptSteering.length - keptFollowUp.length;
+		if (removed > 0) this.agent.replaceQueues(keptSteering, keptFollowUp);
+		return removed;
 	}
 
 	/** Number of pending displayable messages (includes steering, follow-up, and next-turn messages).

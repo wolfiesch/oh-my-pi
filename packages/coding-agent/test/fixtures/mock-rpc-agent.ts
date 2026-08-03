@@ -115,6 +115,10 @@ if (Bun.env.MOCK_RPC_CLIENT_FRAMES === "1") {
 
 const captureFile = Bun.env.MOCK_RPC_CAPTURE_FILE;
 let captureText = "";
+let operationSequence = 0;
+const activeOperations = new Map<string, { requestId: string | undefined; timer?: Timer }>();
+const recentOperations = new Map<string, Record<string, unknown>>();
+let continuationStateReads = 0;
 
 // Bun's `console` is an AsyncIterable over stdin lines.
 for await (const raw of console) {
@@ -206,13 +210,44 @@ for await (const raw of console) {
 				});
 				continue;
 			}
+			if (Bun.env.MOCK_RPC_CONTINUATION_RACE === "1" && frame.type === "follow_up") {
+				writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+				setTimeout(() => {
+					writeFrame({ type: "agent_end", messages: [], isTerminal: true });
+				}, 5);
+				continue;
+			}
+			if (Bun.env.MOCK_RPC_CONTINUATION_RACE === "1" && frame.type === "get_state") {
+				if (Bun.env.MOCK_RPC_STALL_CONTINUATION_STATE === "1") continue;
+				continuationStateReads++;
+				const idle = continuationStateReads > 1;
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: {
+						...legacyState,
+						activityPhase: idle ? "idle" : "maintenance",
+						queuedMessageCount: idle ? 0 : 1,
+					},
+				});
+				continue;
+			}
 			if (
 				frame.type === "get_state" &&
-				(Bun.env.MOCK_RPC_LEGACY_STATE === "1" || Bun.env.MOCK_RPC_INVALID_TPS === "1")
+				(Bun.env.MOCK_RPC_LEGACY_STATE === "1" ||
+					Bun.env.MOCK_RPC_LEGACY_STREAMING === "1" ||
+					Bun.env.MOCK_RPC_INVALID_TPS === "1" ||
+					Bun.env.MOCK_RPC_ACTIVITY_PHASE)
 			) {
 				const data = {
 					...legacyState,
-					...(Bun.env.MOCK_RPC_INVALID_TPS === "1" ? { tokensPerSecond: "invalid" } : {}),
+					...(Bun.env.MOCK_RPC_LEGACY_STREAMING === "1" ? { isStreaming: true } : {}),
+					...(Bun.env.MOCK_RPC_INVALID_TPS === "1"
+						? { fastModeEnabled: false, fastModeActive: false, tokensPerSecond: "invalid" }
+						: {}),
+					...(Bun.env.MOCK_RPC_ACTIVITY_PHASE ? { activityPhase: Bun.env.MOCK_RPC_ACTIVITY_PHASE } : {}),
 				};
 				writeFrame({
 					id,
@@ -267,6 +302,124 @@ for await (const raw of console) {
 					success: true,
 					data: { schemes },
 				});
+				continue;
+			}
+			if (Bun.env.MOCK_RPC_OPERATIONS === "1" && frame.type === "cancel_operation") {
+				const operationId = String(frame.operationId);
+				const active = activeOperations.get(operationId);
+				let terminal = recentOperations.get(operationId);
+				if (active) {
+					clearTimeout(active.timer);
+					activeOperations.delete(operationId);
+					terminal = {
+						type: "operation_cancelled",
+						operationId,
+						requestId: active.requestId,
+						command: "prompt",
+						reason: "user",
+						code: "cancelled_by_client",
+						settledAt: Date.now(),
+					};
+					recentOperations.set(operationId, terminal);
+					writeFrame(terminal);
+				}
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: terminal
+						? {
+								operationId,
+								status:
+									terminal.type === "operation_cancelled"
+										? "cancelled"
+										: terminal.type === "operation_completed"
+											? "completed"
+											: "failed",
+								terminal,
+							}
+						: { operationId, status: "not_found" },
+				});
+				continue;
+			}
+			if (Bun.env.MOCK_RPC_OPERATIONS === "1" && frame.type === "get_operations") {
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: {
+						active: Array.from(activeOperations, ([operationId, operation]) => ({
+							operationId,
+							requestId: operation.requestId,
+							command: "prompt",
+							status: "started",
+							acceptedAt: Date.now(),
+							startedAt: Date.now(),
+						})),
+						recent: Array.from(recentOperations.values()),
+					},
+				});
+				continue;
+			}
+			if (Bun.env.MOCK_RPC_OPERATIONS === "1" && frame.type === "prompt") {
+				const operationId = `operation-${++operationSequence}`;
+				const active = { requestId: id, timer: undefined as Timer | undefined };
+				activeOperations.set(operationId, active);
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: { operationId, accepted: true },
+				});
+				writeFrame({
+					type: "operation_started",
+					operationId,
+					requestId: id,
+					command: "prompt",
+					startedAt: Date.now(),
+				});
+				if (frame.message === "hold") continue;
+				active.timer = setTimeout(() => {
+					if (!activeOperations.delete(operationId)) return;
+					let terminal: Record<string, unknown>;
+					if (frame.message === "local") {
+						terminal = {
+							type: "operation_completed",
+							operationId,
+							requestId: id,
+							command: "prompt",
+							agentInvoked: false,
+							settledAt: Date.now(),
+						};
+					} else if (frame.message === "fail") {
+						terminal = {
+							type: "operation_failed",
+							operationId,
+							requestId: id,
+							command: "prompt",
+							error: "fixture scheduling failure",
+							code: "prompt_scheduling_failed",
+							settledAt: Date.now(),
+						};
+					} else {
+						writeFrame({ type: "agent_start" });
+						writeFrame({ type: "agent_end", messages: [], isTerminal: false });
+						writeFrame({ type: "agent_end", messages: [], isTerminal: true });
+						terminal = {
+							type: "operation_completed",
+							operationId,
+							requestId: id,
+							command: "prompt",
+							agentInvoked: true,
+							settledAt: Date.now(),
+						};
+					}
+					recentOperations.set(operationId, terminal);
+					writeFrame(terminal);
+				}, 5);
 				continue;
 			}
 			const localPrompt =

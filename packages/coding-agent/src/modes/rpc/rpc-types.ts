@@ -35,10 +35,12 @@ export type RpcCommand =
 	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
+	| { id?: string; type: "cancel_operation"; operationId: string }
 	| { id?: string; type: "new_session"; parentSession?: string }
 
 	// State
 	| { id?: string; type: "get_state" }
+	| { id?: string; type: "get_operations" }
 	| { id?: string; type: "set_fast_mode"; enabled: boolean }
 	| { id?: string; type: "get_available_commands" }
 	| { id?: string; type: "set_todos"; phases: TodoPhase[] }
@@ -96,10 +98,14 @@ export type RpcCommand =
 // RPC State
 // ============================================================================
 
+export type RpcSessionActivityPhase = "provider" | "maintenance" | "idle";
+
 export interface RpcSessionState {
 	model?: Model;
 	thinkingLevel: ThinkingLevel | undefined;
 	isStreaming: boolean;
+	/** Provider generation, post-turn maintenance, or terminal idle. */
+	activityPhase: RpcSessionActivityPhase;
 	isCompacting: boolean;
 	steeringMode: "all" | "one-at-a-time";
 	followUpMode: "all" | "one-at-a-time";
@@ -138,9 +144,71 @@ export interface RpcAvailableCommandsUpdateFrame {
 export interface RpcPromptResultFrame {
 	type: "prompt_result";
 	id?: string;
+	operationId?: string;
 	agentInvoked: boolean;
 }
 
+export type RpcOperationCommand = "prompt" | "abort_and_prompt";
+export type RpcOperationCancellationReason = "user" | "replaced" | "session_transition" | "client_disconnected";
+export type RpcOperationCancellationCode =
+	| "cancelled_by_client"
+	| "replaced_by_prompt"
+	| "session_changed"
+	| "client_disconnected";
+
+interface RpcOperationFrameBase {
+	operationId: string;
+	requestId?: string;
+	command: RpcOperationCommand;
+}
+
+export interface RpcOperationStartedFrame extends RpcOperationFrameBase {
+	type: "operation_started";
+	startedAt: number;
+}
+
+export type RpcOperationTerminalFrame =
+	| (RpcOperationFrameBase & {
+			type: "operation_completed";
+			agentInvoked: boolean;
+			settledAt: number;
+	  })
+	| (RpcOperationFrameBase & {
+			type: "operation_failed";
+			error: string;
+			code?: string;
+			settledAt: number;
+	  })
+	| (RpcOperationFrameBase & {
+			type: "operation_cancelled";
+			reason: RpcOperationCancellationReason;
+			code: RpcOperationCancellationCode;
+			settledAt: number;
+	  });
+
+export interface RpcOperationAccepted {
+	operationId: string;
+	accepted: true;
+}
+
+export interface RpcActiveOperation extends RpcOperationFrameBase {
+	status: "accepted" | "started";
+	acceptedAt: number;
+	startedAt?: number;
+}
+
+export interface RpcOperationsSnapshot {
+	active: RpcActiveOperation[];
+	recent: RpcOperationTerminalFrame[];
+}
+
+export type RpcCancelOperationResult =
+	| {
+			operationId: string;
+			status: "cancelled" | "completed" | "failed";
+			terminal: RpcOperationTerminalFrame;
+	  }
+	| { operationId: string; status: "not_found" };
 export interface RpcCommandOutputFrame {
 	type: "command_output";
 	text: string;
@@ -228,15 +296,23 @@ export type RpcResponse =
 	  }
 
 	// Prompting (async - events follow)
-	| { id?: string; type: "response"; command: "prompt"; success: true; data?: { agentInvoked: boolean } }
+	| { id?: string; type: "response"; command: "prompt"; success: true; data: RpcOperationAccepted }
 	| { id?: string; type: "response"; command: "steer"; success: true }
 	| { id?: string; type: "response"; command: "follow_up"; success: true }
 	| { id?: string; type: "response"; command: "abort"; success: true }
-	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
+	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true; data: RpcOperationAccepted }
+	| {
+			id?: string;
+			type: "response";
+			command: "cancel_operation";
+			success: true;
+			data: RpcCancelOperationResult;
+	  }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+	| { id?: string; type: "response"; command: "get_operations"; success: true; data: RpcOperationsSnapshot }
 	| {
 			id?: string;
 			type: "response";

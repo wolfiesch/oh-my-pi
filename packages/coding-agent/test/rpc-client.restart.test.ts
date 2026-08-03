@@ -41,6 +41,31 @@ describe("RpcClient lifecycle (issue #4079 B)", () => {
 		expect(state.fastModeEnabled).toBe(false);
 		expect(state.fastModeActive).toBe(false);
 		expect(state.tokensPerSecond).toBeNull();
+		expect(state.activityPhase).toBe("idle");
+	}, 20_000);
+
+	test("preserves all authoritative activity phases from get_state", async () => {
+		for (const activityPhase of ["provider", "maintenance", "idle"] as const) {
+			using client = new RpcClient({
+				cliPath: MOCK_AGENT,
+				env: { MOCK_RPC_ACTIVITY_PHASE: activityPhase },
+			});
+
+			await client.start();
+			expect((await client.getState()).activityPhase).toBe(activityPhase);
+		}
+	}, 20_000);
+
+	test("normalizes unclassified activity as non-idle maintenance", async () => {
+		const cases: Array<Record<string, string>> = [
+			{ MOCK_RPC_LEGACY_STREAMING: "1" },
+			{ MOCK_RPC_ACTIVITY_PHASE: "future-settlement-phase" },
+		];
+		for (const env of cases) {
+			using client = new RpcClient({ cliPath: MOCK_AGENT, env });
+			await client.start();
+			expect((await client.getState()).activityPhase).toBe("maintenance");
+		}
 	}, 20_000);
 
 	test("preserves getMessages snapshot behavior while a v2 page walk is unavailable", async () => {

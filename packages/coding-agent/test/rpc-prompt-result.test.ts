@@ -4,6 +4,7 @@ import {
 	reportLocalOnlyPromptResult,
 	watchAndReportLocalOnlyPromptResult,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
+import { RpcOperationManager } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-operations";
 import type { ExtensionActions } from "../src/extensibility/extensions/types";
 import { initializeExtensions } from "../src/modes/runtime-init";
 import type { AgentSession } from "../src/session/agent-session";
@@ -11,6 +12,12 @@ import type { AgentSession } from "../src/session/agent-session";
 async function waitForPromptHandlers(prompt: Promise<unknown>): Promise<void> {
 	await prompt.catch(() => undefined);
 	await Promise.resolve();
+}
+
+async function waitForImmediate(): Promise<void> {
+	const deferred = Promise.withResolvers<void>();
+	setImmediate(deferred.resolve);
+	await deferred.promise;
 }
 
 async function waitForTrackedPromptHandlers(trackedPrompt: {
@@ -24,6 +31,74 @@ async function waitForTrackedPromptHandlers(trackedPrompt: {
 }
 
 describe("reportLocalOnlyPromptResult", () => {
+	test("settles an accepted local operation once without a late response", async () => {
+		const output: object[] = [];
+		const manager = new RpcOperationManager(
+			frame => output.push(frame),
+			() => "operation-1",
+			() => 100,
+		);
+		const operation = manager.start("req_1", "prompt");
+		const prompt = Promise.resolve(false);
+
+		reportLocalOnlyPromptResult({
+			id: "req_1",
+			prompt,
+			output: frame => output.push(frame),
+			onError: error => {
+				throw error;
+			},
+			operation: { handle: operation, manager },
+		});
+		await waitForPromptHandlers(prompt);
+		await waitForImmediate();
+
+		expect(output).toEqual([
+			{ type: "prompt_result", id: "req_1", operationId: "operation-1", agentInvoked: false },
+			{
+				type: "operation_completed",
+				operationId: "operation-1",
+				requestId: "req_1",
+				command: "prompt",
+				agentInvoked: false,
+				settledAt: 100,
+			},
+		]);
+	});
+
+	test("turns a late scheduling rejection into an operation failure", async () => {
+		const output: object[] = [];
+		const manager = new RpcOperationManager(
+			frame => output.push(frame),
+			() => "operation-2",
+			() => 100,
+		);
+		const operation = manager.start("req_2", "prompt");
+		const prompt = Promise.reject(new Error("no model"));
+
+		reportLocalOnlyPromptResult({
+			id: "req_2",
+			prompt,
+			output: frame => output.push(frame),
+			onError: () => {},
+			operation: { handle: operation, manager },
+		});
+		await waitForPromptHandlers(prompt);
+		await waitForImmediate();
+
+		expect(output).toEqual([
+			{
+				type: "operation_failed",
+				operationId: "operation-2",
+				requestId: "req_2",
+				command: "prompt",
+				error: "no model",
+				code: "prompt_scheduling_failed",
+				settledAt: 100,
+			},
+		]);
+	});
+
 	test("emits prompt_result when prompt resolves without invoking the agent or extension user message", async () => {
 		const output: object[] = [];
 		const extensionUserMessages = new RpcExtensionUserMessageTracker();
@@ -201,7 +276,7 @@ describe("reportLocalOnlyPromptResult", () => {
 		expect(output).toEqual([]);
 	});
 
-	test("emits prompt_result when extension sendUserMessage rejects", async () => {
+	test("reports extension sendUserMessage rejection without a false local completion", async () => {
 		let extensionActions: ExtensionActions | undefined;
 		const output: object[] = [];
 		const reportedErrors: Error[] = [];
@@ -242,15 +317,18 @@ describe("reportLocalOnlyPromptResult", () => {
 			prompt: trackedPrompt.prompt,
 			output: frame => output.push(frame),
 			onError: error => {
-				throw error;
+				reportedErrors.push(error);
 			},
 			hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
 			waitForExtensionAgentMessageTasks: trackedPrompt.waitForAgentMessageTasks,
 		});
-		await waitForTrackedPromptHandlers(trackedPrompt);
+		await trackedPrompt.prompt;
+		await trackedPrompt.waitForAgentMessageTasks().catch(() => undefined);
+		await Promise.resolve();
+		await Promise.resolve();
 
-		expect(reportedErrors).toEqual([thrown]);
-		expect(output).toEqual([{ type: "prompt_result", id: "req_rejected", agentInvoked: false }]);
+		expect(reportedErrors).toEqual([thrown, thrown]);
+		expect(output).toEqual([]);
 	});
 
 	test("does not emit when prompt invokes the agent", async () => {

@@ -11,6 +11,7 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 import { once } from "node:events";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isRecord, Snowflake } from "@oh-my-pi/pi-utils";
@@ -39,8 +40,10 @@ import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
+import { type RpcOperationHandle, RpcOperationManager } from "./rpc-operations";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
+	RpcCancelOperationResult,
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
@@ -118,6 +121,7 @@ export async function tryRunRpcSkillCommand(
 	session: RpcSkillCommandSession,
 	text: string,
 	streamingBehavior: "steer" | "followUp" = "steer",
+	messageTag?: string,
 ): Promise<RpcSkillCommandResult | false> {
 	if (!session.skillsSettings?.enableSkillCommands) return false;
 	const parsed = parseSkillInvocation(text);
@@ -133,7 +137,7 @@ export async function tryRunRpcSkillCommand(
 			details: built.details,
 			attribution: "user",
 		},
-		{ streamingBehavior },
+		{ streamingBehavior, messageTag },
 	);
 	return { agentInvoked: true };
 }
@@ -145,23 +149,52 @@ export function reportLocalOnlyPromptResult(input: {
 	onError: (error: Error) => void;
 	hasExtensionAgentMessageTask?: () => boolean;
 	waitForExtensionAgentMessageTasks?: () => Promise<void>;
+	operation?: {
+		handle: RpcOperationHandle;
+		manager: RpcOperationManager;
+		waitForAgentCompletion?: () => Promise<void>;
+	};
 }): void {
 	void input.prompt
 		.then(async agentInvoked => {
-			if (agentInvoked) return;
 			await input.waitForExtensionAgentMessageTasks?.();
-			if (!input.hasExtensionAgentMessageTask?.()) {
-				input.output({ type: "prompt_result", id: input.id, agentInvoked: false });
+			const resolvedAgentInvoked = agentInvoked || Boolean(input.hasExtensionAgentMessageTask?.());
+			if (resolvedAgentInvoked) {
+				await input.operation?.waitForAgentCompletion?.();
+			}
+			const operation = input.operation;
+			if (operation) {
+				setImmediate(() => {
+					if (!resolvedAgentInvoked) {
+						input.output({
+							type: "prompt_result",
+							id: input.id,
+							operationId: operation.handle.operationId,
+							agentInvoked: false,
+						});
+					}
+					operation.manager.complete(operation.handle, resolvedAgentInvoked);
+				});
+			} else if (!resolvedAgentInvoked) {
+				input.output({
+					type: "prompt_result",
+					id: input.id,
+					agentInvoked: false,
+				});
 			}
 		})
 		.catch(error => {
-			input.onError(error instanceof Error ? error : new Error(String(error)));
+			const promptError = error instanceof Error ? error : new Error(String(error));
+			const operation = input.operation;
+			if (operation) {
+				setImmediate(() => operation.manager.fail(operation.handle, promptError, "prompt_scheduling_failed"));
+			}
+			input.onError(promptError);
 		});
 }
 
 type RpcExtensionUserMessageScope = {
-	hasAgentMessageTask: boolean;
-	pendingAgentMessageTasks: Set<Promise<void>>;
+	agentMessageTasks: Promise<unknown>[];
 };
 
 /**
@@ -175,32 +208,22 @@ export class RpcExtensionUserMessageTracker {
 
 	markAgentMessageTask(): void {
 		for (const scope of this.#activePromptScopes) {
-			scope.hasAgentMessageTask = true;
+			scope.agentMessageTasks.push(Promise.resolve());
 		}
 	}
 
 	trackAgentMessageTask(task: Promise<unknown>): void {
 		for (const scope of this.#activePromptScopes) {
-			this.#trackAgentMessageTaskForScope(scope, task);
+			scope.agentMessageTasks.push(task);
 		}
 	}
 
-	#trackAgentMessageTaskForScope(scope: RpcExtensionUserMessageScope, task: Promise<unknown>): void {
-		const scopedTask = task.then(
-			() => {
-				scope.hasAgentMessageTask = true;
-			},
-			() => {},
-		);
-		scope.pendingAgentMessageTasks.add(scopedTask);
-		void scopedTask.finally(() => {
-			scope.pendingAgentMessageTasks.delete(scopedTask);
-		});
-	}
-
 	async #waitForAgentMessageTasks(scope: RpcExtensionUserMessageScope): Promise<void> {
-		while (scope.pendingAgentMessageTasks.size > 0) {
-			await Promise.allSettled(Array.from(scope.pendingAgentMessageTasks));
+		let observedCount = 0;
+		while (observedCount < scope.agentMessageTasks.length) {
+			const tasks = scope.agentMessageTasks.slice(observedCount);
+			observedCount = scope.agentMessageTasks.length;
+			await Promise.all(tasks);
 		}
 	}
 
@@ -210,8 +233,7 @@ export class RpcExtensionUserMessageTracker {
 		waitForAgentMessageTasks: () => Promise<void>;
 	} {
 		const scope: RpcExtensionUserMessageScope = {
-			hasAgentMessageTask: false,
-			pendingAgentMessageTasks: new Set(),
+			agentMessageTasks: [],
 		};
 		this.#activePromptScopes.add(scope);
 		let prompt: Promise<T>;
@@ -225,7 +247,7 @@ export class RpcExtensionUserMessageTracker {
 			prompt: prompt.finally(() => {
 				this.#activePromptScopes.delete(scope);
 			}),
-			hasAgentMessageTask: () => scope.hasAgentMessageTask,
+			hasAgentMessageTask: () => scope.agentMessageTasks.length > 0,
 			waitForAgentMessageTasks: () => this.#waitForAgentMessageTasks(scope),
 		};
 	}
@@ -237,6 +259,11 @@ export function watchAndReportLocalOnlyPromptResult(input: {
 	output: (obj: object) => void;
 	onError: (error: Error) => void;
 	extensionUserMessageTracker: RpcExtensionUserMessageTracker;
+	operation?: {
+		handle: RpcOperationHandle;
+		manager: RpcOperationManager;
+		waitForAgentCompletion?: () => Promise<void>;
+	};
 }): void {
 	const trackedPrompt = input.extensionUserMessageTracker.watchPrompt(input.startPrompt);
 	reportLocalOnlyPromptResult({
@@ -246,7 +273,48 @@ export function watchAndReportLocalOnlyPromptResult(input: {
 		onError: input.onError,
 		hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
 		waitForExtensionAgentMessageTasks: trackedPrompt.waitForAgentMessageTasks,
+		operation: input.operation,
 	});
+}
+
+async function waitForQueuedRpcPrompt(
+	session: Pick<AgentSession, "isStreaming" | "queuedMessageCount" | "waitForIdle">,
+) {
+	while (true) {
+		await session.waitForIdle();
+		const nextTurn = Promise.withResolvers<void>();
+		setImmediate(nextTurn.resolve);
+		await nextTurn.promise;
+		if (!session.isStreaming && session.queuedMessageCount === 0) return;
+	}
+}
+type RpcOperationMessageSession = Pick<AgentSession, "abort" | "getMessageTag" | "removeQueuedMessagesByTag">;
+
+/** Correlates accepted operations with the exact AgentSession message that owns the active turn. */
+export class RpcOperationMessageOwnership {
+	#activeOperationId: string | undefined;
+
+	constructor(readonly session: RpcOperationMessageSession) {}
+
+	observeMessageStart(message: AgentMessage): void {
+		this.#activeOperationId = this.session.getMessageTag(message);
+	}
+
+	settle(operationId: string): void {
+		if (this.#activeOperationId === operationId) this.#activeOperationId = undefined;
+	}
+
+	async cancel(manager: RpcOperationManager, operationId: string): Promise<RpcCancelOperationResult> {
+		const ownsActiveMessage = this.#activeOperationId === operationId;
+		const cancellation = manager.cancel(operationId);
+		if (!cancellation.wasStarted) return cancellation.result;
+		if (ownsActiveMessage) {
+			await this.session.abort({ reason: USER_INTERRUPT_LABEL });
+		} else {
+			this.session.removeQueuedMessagesByTag(operationId);
+		}
+		return cancellation.result;
+	}
 }
 
 /**
@@ -717,6 +785,11 @@ export async function runRpcMode(
 	const error = (id: string | undefined, command: string, message: string, code?: string): RpcResponse => {
 		return { id, type: "response", command, success: false, error: message, ...(code ? { code } : {}) };
 	};
+	const operationOwnership = new RpcOperationMessageOwnership(session);
+	const operationManager = new RpcOperationManager(frame => {
+		if (frame.type === "operation_completed") operationOwnership.settle(frame.operationId);
+		output(frame);
+	});
 
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
 
@@ -951,6 +1024,7 @@ export async function runRpcMode(
 
 	// Output all agent events as JSON
 	session.subscribe(event => {
+		if (event.type === "message_start") operationOwnership.observeMessageStart(event.message);
 		output(event);
 	});
 
@@ -988,54 +1062,102 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "prompt": {
-				const skillResult = await tryRunRpcSkillCommand(session, command.message, command.streamingBehavior);
-				if (skillResult) {
-					return success(id, "prompt", skillResult);
-				}
-				const builtinResult = await executeAcpBuiltinSlashCommand(command.message, {
-					session,
-					sessionManager: session.sessionManager,
-					settings: session.settings,
-					cwd: session.sessionManager.getCwd(),
-					output: text => output({ type: "command_output", text }),
-					refreshCommands: emitAvailableCommandsUpdate,
-					reloadPlugins: reloadPluginState,
-					notifyTitleChanged: async () => {
-						output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
-					},
-					notifyConfigChanged: async () => {
-						output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
-					},
-				});
-				if (builtinResult !== false) {
-					if ("prompt" in builtinResult) {
+				const operation = operationManager.start(id, "prompt");
+				setImmediate(() => {
+					if (!operationManager.begin(operation)) return;
+					void (async () => {
+						const skillResult = await tryRunRpcSkillCommand(
+							session,
+							command.message,
+							command.streamingBehavior,
+							operation.operationId,
+						);
+						if (!operationManager.isActive(operation)) return;
+						if (skillResult) {
+							reportLocalOnlyPromptResult({
+								id,
+								prompt: Promise.resolve(true),
+								output,
+								onError: () => {},
+								operation: {
+									handle: operation,
+									manager: operationManager,
+									waitForAgentCompletion: () => waitForQueuedRpcPrompt(session),
+								},
+							});
+							return;
+						}
+						const builtinResult = await executeAcpBuiltinSlashCommand(command.message, {
+							session,
+							sessionManager: session.sessionManager,
+							settings: session.settings,
+							cwd: session.sessionManager.getCwd(),
+							output: text => output({ type: "command_output", text }),
+							refreshCommands: emitAvailableCommandsUpdate,
+							reloadPlugins: reloadPluginState,
+							notifyTitleChanged: async () => {
+								output({
+									type: "session_info_update",
+									title: session.sessionName,
+									sessionId: session.sessionId,
+								});
+							},
+							notifyConfigChanged: async () => {
+								output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
+							},
+						});
+						if (!operationManager.isActive(operation)) return;
+						if (builtinResult !== false) {
+							if ("prompt" in builtinResult) {
+								watchAndReportLocalOnlyPromptResult({
+									id,
+									startPrompt: () =>
+										session.prompt(builtinResult.prompt, {
+											images: command.images,
+											messageTag: operation.operationId,
+										}),
+									output,
+									onError: () => {},
+									extensionUserMessageTracker,
+									operation: {
+										handle: operation,
+										manager: operationManager,
+										waitForAgentCompletion: () => waitForQueuedRpcPrompt(session),
+									},
+								});
+								return;
+							}
+							output({ type: "prompt_result", id, operationId: operation.operationId, agentInvoked: false });
+							operationManager.complete(operation, false);
+							return;
+						}
+
 						watchAndReportLocalOnlyPromptResult({
 							id,
-							startPrompt: () => session.prompt(builtinResult.prompt, { images: command.images }),
+							startPrompt: () =>
+								session.prompt(command.message, {
+									images: command.images,
+									streamingBehavior: command.streamingBehavior,
+									messageTag: operation.operationId,
+								}),
 							output,
-							onError: promptError => output(error(id, "prompt", promptError.message)),
+							onError: () => {},
 							extensionUserMessageTracker,
+							operation: {
+								handle: operation,
+								manager: operationManager,
+								waitForAgentCompletion: () => waitForQueuedRpcPrompt(session),
+							},
 						});
-						return success(id, "prompt");
-					}
-					return success(id, "prompt", { agentInvoked: false });
-				}
-
-				// Don't await - events will stream
-				// Extension commands are executed immediately, file prompt templates are expanded
-				// If streaming and streamingBehavior specified, queues via steer/followUp
-				watchAndReportLocalOnlyPromptResult({
-					id,
-					startPrompt: () =>
-						session.prompt(command.message, {
-							images: command.images,
-							streamingBehavior: command.streamingBehavior,
-						}),
-					output,
-					onError: promptError => output(error(id, "prompt", promptError.message)),
-					extensionUserMessageTracker,
+					})().catch(promptError => {
+						operationManager.fail(
+							operation,
+							promptError instanceof Error ? promptError : new Error(String(promptError)),
+							"prompt_scheduling_failed",
+						);
+					});
 				});
-				return success(id, "prompt");
+				return success(id, "prompt", { operationId: operation.operationId, accepted: true });
 			}
 
 			case "steer": {
@@ -1049,35 +1171,75 @@ export async function runRpcMode(
 			}
 
 			case "abort": {
+				operationManager.cancelAll("user", "cancelled_by_client");
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				return success(id, "abort");
 			}
 
 			case "abort_and_prompt": {
-				await session.abort({ reason: USER_INTERRUPT_LABEL });
-				session
-					.prompt(command.message, { images: command.images })
-					.catch(e => output(error(id, "abort_and_prompt", e.message)));
-				return success(id, "abort_and_prompt");
+				operationManager.cancelAll("replaced", "replaced_by_prompt");
+				const operation = operationManager.start(id, "abort_and_prompt");
+				setImmediate(() => {
+					if (!operationManager.begin(operation)) return;
+					void (async () => {
+						await session.abort({ reason: USER_INTERRUPT_LABEL });
+						if (!operationManager.isActive(operation)) return;
+						watchAndReportLocalOnlyPromptResult({
+							id,
+							startPrompt: () =>
+								session.prompt(command.message, {
+									images: command.images,
+									messageTag: operation.operationId,
+								}),
+							output,
+							onError: () => {},
+							extensionUserMessageTracker,
+							operation: {
+								handle: operation,
+								manager: operationManager,
+								waitForAgentCompletion: () => waitForQueuedRpcPrompt(session),
+							},
+						});
+					})().catch(promptError => {
+						operationManager.fail(
+							operation,
+							promptError instanceof Error ? promptError : new Error(String(promptError)),
+							"prompt_scheduling_failed",
+						);
+					});
+				});
+				return success(id, "abort_and_prompt", { operationId: operation.operationId, accepted: true });
+			}
+
+			case "cancel_operation": {
+				const cancellation = await operationOwnership.cancel(operationManager, command.operationId);
+				return success(id, "cancel_operation", cancellation);
 			}
 
 			case "new_session":
 			case "switch_session":
 			case "branch": {
 				const result = await handleRpcSessionChange(session, command, subagentRegistry);
-				if (!result.data.cancelled) await emitAvailableCommandsUpdate();
+				if (!result.data.cancelled) {
+					operationManager.cancelAll("session_transition", "session_changed");
+					await emitAvailableCommandsUpdate();
+				}
 				return success(id, result.type, result.data);
 			}
 
 			// =================================================================
 			// State
 			// =================================================================
+			case "get_operations": {
+				return success(id, "get_operations", operationManager.snapshot());
+			}
 
 			case "get_state": {
 				const state: RpcSessionState = {
 					model: session.model,
 					thinkingLevel: session.thinkingLevel,
 					isStreaming: session.isStreaming,
+					activityPhase: session.activityPhase,
 					isCompacting: session.isCompacting,
 					steeringMode: session.steeringMode,
 					followUpMode: session.followUpMode,
@@ -1494,13 +1656,14 @@ export async function runRpcMode(
 		message => output(error(undefined, "parse", message)),
 	);
 
-	// stdin closed — RPC client is gone. Fail pending side-channel requests
-	// first so active/queued commands can settle, then drain accepted work.
+	// stdin closed — stop accepting side-channel work, drain every command that
+	// already owes a response, then settle any operation still running.
 	pendingExtensionRequests.rejectAll("RPC client disconnected before extension UI response completed");
 	hostToolBridge.close("RPC client disconnected before host tool execution completed");
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
 	await inputDispatcher.drain();
 	await shutdownCoordinator.drain();
+	operationManager.cancelAll("client_disconnected", "client_disconnected");
 	subagentRegistry?.dispose();
 	// Dispose the main session before exiting so the browser reaper and other
 	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a

@@ -4,7 +4,7 @@ import base64
 import mimetypes
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Literal, NotRequired, TypedDict, TypeAlias, cast
+from typing import Any, Final, Literal, NotRequired, TypeAlias, TypedDict, cast
 
 JsonPrimitive: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
@@ -18,6 +18,17 @@ ThinkingLevel: TypeAlias = Literal[
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
+SessionActivityPhase: TypeAlias = Literal["provider", "maintenance", "idle"]
+RpcOperationCommand: TypeAlias = Literal["prompt", "abort_and_prompt"]
+RpcOperationCancellationReason: TypeAlias = Literal[
+    "user", "replaced", "session_transition", "client_disconnected"
+]
+RpcOperationCancellationCode: TypeAlias = Literal[
+    "cancelled_by_client",
+    "replaced_by_prompt",
+    "session_changed",
+    "client_disconnected",
+]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
 WidgetPlacement: TypeAlias = Literal["aboveEditor", "belowEditor"]
@@ -72,6 +83,9 @@ _EFFORT_VALUES: Final[frozenset[str]] = frozenset(
 _THINKING_LEVEL_VALUES: Final[frozenset[str]] = _EFFORT_VALUES | frozenset({"off"})
 _STEERING_MODE_VALUES: Final[frozenset[str]] = frozenset({"all", "one-at-a-time"})
 _INTERRUPT_MODE_VALUES: Final[frozenset[str]] = frozenset({"immediate", "wait"})
+_SESSION_ACTIVITY_PHASE_VALUES: Final[frozenset[str]] = frozenset(
+    {"provider", "maintenance", "idle"}
+)
 _STOP_REASON_VALUES: Final[frozenset[str]] = frozenset(
     {"stop", "length", "toolUse", "error", "aborted"}
 )
@@ -800,6 +814,7 @@ class SessionState:
     model: ModelInfo | None
     thinking_level: ThinkingLevel | None
     is_streaming: bool
+    activity_phase: SessionActivityPhase
     is_compacting: bool
     steering_mode: SteeringMode
     follow_up_mode: SteeringMode
@@ -907,6 +922,76 @@ class ReadyEvent:
     max_frame_bytes: int | None = None
     max_reassembled_frame_bytes: int | None = None
     type: Literal["ready"] = "ready"
+
+
+@dataclass(slots=True, frozen=True)
+class OperationStartedEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    started_at: float
+    request_id: str | None = None
+    type: Literal["operation_started"] = "operation_started"
+
+
+@dataclass(slots=True, frozen=True)
+class OperationCompletedEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    agent_invoked: bool
+    settled_at: float
+    request_id: str | None = None
+    type: Literal["operation_completed"] = "operation_completed"
+
+
+@dataclass(slots=True, frozen=True)
+class OperationFailedEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    error: str
+    settled_at: float
+    request_id: str | None = None
+    code: str | None = None
+    type: Literal["operation_failed"] = "operation_failed"
+
+
+@dataclass(slots=True, frozen=True)
+class OperationCancelledEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    reason: RpcOperationCancellationReason
+    code: RpcOperationCancellationCode
+    settled_at: float
+    request_id: str | None = None
+    type: Literal["operation_cancelled"] = "operation_cancelled"
+
+
+RpcOperationTerminalEvent: TypeAlias = (
+    OperationCompletedEvent | OperationFailedEvent | OperationCancelledEvent
+)
+RpcOperationEvent: TypeAlias = OperationStartedEvent | RpcOperationTerminalEvent
+
+
+@dataclass(slots=True, frozen=True)
+class ActiveOperation:
+    operation_id: str
+    command: RpcOperationCommand
+    status: Literal["accepted", "started"]
+    accepted_at: float
+    request_id: str | None = None
+    started_at: float | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class OperationsSnapshot:
+    active: tuple[ActiveOperation, ...]
+    recent: tuple[RpcOperationTerminalEvent, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class CancelOperationResult:
+    operation_id: str
+    status: Literal["cancelled", "completed", "failed", "not_found"]
+    terminal: RpcOperationTerminalEvent | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -1132,6 +1217,7 @@ RpcAgentEvent: TypeAlias = (
 
 RpcNotification: TypeAlias = (
     ReadyEvent
+    | RpcOperationEvent
     | ExtensionUiRequest
     | ExtensionError
     | RpcAgentEvent
@@ -1344,6 +1430,21 @@ def parse_todo_phases(payload: JsonValue | None) -> tuple[TodoPhase, ...]:
     return tuple(parse_todo_phase(cast(JsonObject, item)) for item in payload)
 
 
+def _parse_session_activity_phase(payload: JsonObject) -> SessionActivityPhase:
+    if "activityPhase" not in payload:
+        # Legacy isStreaming conflates provider work with prompt settlement.
+        # Preserve terminal idle, but never claim provider activity without the
+        # authoritative field.
+        return "maintenance" if bool(payload.get("isStreaming", False)) else "idle"
+    value = payload["activityPhase"]
+    if isinstance(value, str) and value in _SESSION_ACTIVITY_PHASE_VALUES:
+        return cast(SessionActivityPhase, value)
+    # Present null, invalid values, and future phases are conservatively treated
+    # as non-idle maintenance so an additive or malformed server response cannot
+    # make an older client report terminal idle.
+    return "maintenance"
+
+
 def parse_session_state(payload: JsonObject) -> SessionState:
     dump_tools = tuple(
         parse_tool_descriptor(_clone_json_object(item, field="dumpTools[]"))
@@ -1360,6 +1461,7 @@ def parse_session_state(payload: JsonObject) -> SessionState:
             ),
         ),
         is_streaming=bool(payload.get("isStreaming", False)),
+        activity_phase=_parse_session_activity_phase(payload),
         is_compacting=bool(payload.get("isCompacting", False)),
         steering_mode=cast(
             SteeringMode,
@@ -1607,6 +1709,91 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         return parse_extension_ui_request(payload)
     if event_type == "extension_error":
         return parse_extension_error(payload)
+    if event_type in {
+        "operation_started",
+        "operation_completed",
+        "operation_failed",
+        "operation_cancelled",
+    }:
+        operation_id = _require_str(payload, "operationId")
+        command = cast(
+            RpcOperationCommand,
+            _require_literal(
+                payload.get("command"),
+                frozenset({"prompt", "abort_and_prompt"}),
+                field=f"{event_type}.command",
+            ),
+        )
+        request_id = _optional_str(payload, "requestId")
+        if event_type == "operation_started":
+            started_at = _optional_float(payload, "startedAt")
+            if started_at is None:
+                raise ValueError("operation_started.startedAt must be a number")
+            return OperationStartedEvent(
+                operation_id=operation_id,
+                request_id=request_id,
+                command=command,
+                started_at=started_at,
+            )
+        settled_at = _optional_float(payload, "settledAt")
+        if settled_at is None:
+            raise ValueError(f"{event_type}.settledAt must be a number")
+        if event_type == "operation_completed":
+            agent_invoked = _optional_bool(payload, "agentInvoked")
+            if agent_invoked is None:
+                raise ValueError("operation_completed.agentInvoked must be a boolean")
+            return OperationCompletedEvent(
+                operation_id=operation_id,
+                request_id=request_id,
+                command=command,
+                agent_invoked=agent_invoked,
+                settled_at=settled_at,
+            )
+        if event_type == "operation_failed":
+            return OperationFailedEvent(
+                operation_id=operation_id,
+                request_id=request_id,
+                command=command,
+                error=_require_str(payload, "error"),
+                code=_optional_str(payload, "code"),
+                settled_at=settled_at,
+            )
+        return OperationCancelledEvent(
+            operation_id=operation_id,
+            request_id=request_id,
+            command=command,
+            reason=cast(
+                RpcOperationCancellationReason,
+                _require_literal(
+                    payload.get("reason"),
+                    frozenset(
+                        {
+                            "user",
+                            "replaced",
+                            "session_transition",
+                            "client_disconnected",
+                        }
+                    ),
+                    field="operation_cancelled.reason",
+                ),
+            ),
+            code=cast(
+                RpcOperationCancellationCode,
+                _require_literal(
+                    payload.get("code"),
+                    frozenset(
+                        {
+                            "cancelled_by_client",
+                            "replaced_by_prompt",
+                            "session_changed",
+                            "client_disconnected",
+                        }
+                    ),
+                    field="operation_cancelled.code",
+                ),
+            ),
+            settled_at=settled_at,
+        )
     if event_type == "agent_start":
         return AgentStartEvent()
     if event_type == "agent_end":
