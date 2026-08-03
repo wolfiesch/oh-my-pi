@@ -78,12 +78,54 @@ function writeFrame(frame: Record<string, unknown>): void {
 	}
 }
 
+if (Bun.env.MOCK_RPC_CLIENT_FRAMES === "1") {
+	writeFrame({ type: "command_output", text: "extension output" });
+	writeFrame({ type: "session_info_update", title: "RPC test", sessionId: "session-1" });
+	writeFrame({ type: "config_update", thinkingLevel: "high" });
+	writeFrame({
+		type: "extension_error",
+		extensionPath: "/tmp/example-extension.ts",
+		event: "session_start",
+		error: "fixture failure",
+	});
+	writeFrame({
+		type: "extension_ui_request",
+		id: "ui-confirm-1",
+		method: "confirm",
+		title: "Continue?",
+		message: "Proceed with the fixture?",
+	});
+	writeFrame({
+		type: "host_uri_request",
+		id: "host-uri-1",
+		operation: Bun.env.MOCK_RPC_MALFORMED_HOST_URI_WRITE === "1" ? "write" : "read",
+		url: "fixture://resource/1",
+	});
+	if (Bun.env.MOCK_RPC_HOST_URI_CANCEL === "1") {
+		setTimeout(() => {
+			writeFrame({
+				type: "host_uri_cancel",
+				id: "host-uri-cancel-1",
+				targetId: "host-uri-1",
+			});
+		}, 25);
+	}
+	writeFrame({ type: "future_server_frame", value: 1 });
+}
+
+const captureFile = Bun.env.MOCK_RPC_CAPTURE_FILE;
+let captureText = "";
+
 // Bun's `console` is an AsyncIterable over stdin lines.
 for await (const raw of console) {
 	if (!raw) continue;
 	try {
 		const frame = JSON.parse(raw) as Record<string, unknown>;
 		if (frame && typeof frame === "object" && typeof frame.type === "string") {
+			if (captureFile) {
+				captureText += `${JSON.stringify(frame)}\n`;
+				await Bun.write(captureFile, captureText);
+			}
 			if (Bun.env.MOCK_RPC_EXIT_ON_COMMAND) {
 				process.stderr.write(Bun.env.MOCK_RPC_EXIT_STDERR ?? "");
 				process.exit(Number(Bun.env.MOCK_RPC_EXIT_ON_COMMAND));
@@ -182,13 +224,69 @@ for await (const raw of console) {
 				continue;
 			}
 
+			if (Bun.env.MOCK_RPC_CLIENT_FRAMES === "1" && frame.type === "set_todos") {
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: { todoPhases: frame.phases },
+				});
+				continue;
+			}
+			if (Bun.env.MOCK_RPC_REJECT_SESSION_NAME === "1" && frame.type === "set_session_name") {
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: false,
+					error: "Session name cannot be empty",
+				});
+				continue;
+			}
+			if (Bun.env.MOCK_RPC_CLIENT_FRAMES === "1" && frame.type === "set_host_uri_schemes") {
+				const schemes = Array.isArray(frame.schemes)
+					? frame.schemes
+							.map(scheme => (scheme && typeof scheme === "object" ? Reflect.get(scheme, "scheme") : undefined))
+							.filter((scheme): scheme is string => typeof scheme === "string")
+					: [];
+				if (Bun.env.MOCK_RPC_REJECT_HOST_URI_SCHEME && schemes.includes(Bun.env.MOCK_RPC_REJECT_HOST_URI_SCHEME)) {
+					writeFrame({
+						id,
+						type: "response",
+						command: frame.type,
+						success: false,
+						error: `Host URI scheme rejected by fixture: ${Bun.env.MOCK_RPC_REJECT_HOST_URI_SCHEME}`,
+					});
+					continue;
+				}
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: { schemes },
+				});
+				continue;
+			}
+			const localPrompt =
+				frame.type === "prompt" &&
+				(Bun.env.MOCK_RPC_LOCAL_PROMPT_RESPONSE === "1" ||
+					(Bun.env.MOCK_RPC_MIXED_PROMPT_RESULTS === "1" && frame.message === "/local-only"));
 			writeFrame({
 				id,
 				type: "response",
 				command: frame.type,
 				success: true,
-				data: supportsProtocolV2 ? { payload: "😀".repeat(270_000) } : {},
+				data: localPrompt ? { agentInvoked: false } : supportsProtocolV2 ? { payload: "😀".repeat(270_000) } : {},
 			});
+			if (Bun.env.MOCK_RPC_CLIENT_FRAMES === "1" && frame.type === "prompt" && !localPrompt) {
+				writeFrame({ type: "prompt_result", id, agentInvoked: true });
+				writeFrame({ type: "agent_end", messages: [], isTerminal: false });
+				setTimeout(() => {
+					writeFrame({ type: "agent_end", messages: [], isTerminal: true });
+				}, 75);
+			}
 		}
 	} catch {
 		// ignore parse errors — the test harness sends well-formed frames.

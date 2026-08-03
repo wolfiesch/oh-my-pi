@@ -141,6 +141,30 @@ export interface RpcPromptResultFrame {
 	agentInvoked: boolean;
 }
 
+export interface RpcCommandOutputFrame {
+	type: "command_output";
+	text: string;
+}
+
+export interface RpcSessionInfoUpdateFrame {
+	type: "session_info_update";
+	title?: string;
+	sessionId: string;
+}
+
+export interface RpcConfigUpdateFrame {
+	type: "config_update";
+	model?: Model;
+	thinkingLevel?: ThinkingLevel;
+}
+
+export interface RpcExtensionErrorFrame {
+	type: "extension_error";
+	extensionPath: string;
+	event: string;
+	error: string;
+}
+
 export interface RpcReadyFrame {
 	type: "ready";
 	protocolVersion: 1;

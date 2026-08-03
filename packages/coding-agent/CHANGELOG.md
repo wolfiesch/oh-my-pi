@@ -137,6 +137,7 @@
 - Fixed `hub` job and wait lists hiding stale running subagent registrations that have no turn in flight, ensuring they remain visible so operators can cancel them
 - Fixed external thinking scratchpads running alongside native reasoning on xAI Grok 4 and other reasoning-only Responses models that reject `reasoning.effort`
 - Fixed llama.cpp model discovery producing a baseUrl without the /v1 prefix for non-Qwen models, causing 404 errors on OpenAI-compatible endpoints.
+- Fixed the TypeScript RPC client silently dropping prompt results, extension output and errors, session/config updates, host URI requests, and unknown future frames.
 - Fixed prompt caching on open-weight providers (DeepSeek, Qwen, GLM, …) so tool schemas stay cached across directory changes and midnight rollovers.
 - Fixed omp --fork omitting the source session's artifact directory, so CLI-created forks now preserve artifact:// references like interactive /fork.
 - Fixed long ask option labels being hard-truncated at the terminal width; labels now wrap onto indented continuation lines.
