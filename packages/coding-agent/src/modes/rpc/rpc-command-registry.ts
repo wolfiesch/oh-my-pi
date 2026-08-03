@@ -16,7 +16,7 @@ import {
 	type RpcInputSchema,
 } from "./rpc-types";
 
-export const RPC_APPLICATION_API_VERSION = 1;
+export const RPC_APPLICATION_API_VERSION = 2;
 
 interface RpcFieldDefinition {
 	optional: boolean;
@@ -220,6 +220,29 @@ export const RPC_COMMAND_DEFINITIONS = {
 		requiresFeature("model.fast-mode"),
 	),
 	get_available_commands: sessionCommand({ type: "get_available_commands" }),
+	get_settings: sessionCommand({ type: "get_settings" }, { tab: optionalStringField }, "concurrent"),
+	set_settings: sessionCommand(
+		{ type: "set_settings", changes: [{ path: "colorBlindMode", value: true }] },
+		{
+			changes: required("a nonempty array of at most 100 setting changes", value => Array.isArray(value), {
+				type: "array",
+				minItems: 1,
+				maxItems: 100,
+				items: {
+					type: "object",
+					properties: {
+						path: { type: "string" },
+						value: {
+							type: ["string", "number", "boolean", "array", "object", "null"],
+						},
+					},
+					required: ["path", "value"],
+					additionalProperties: false,
+				},
+			}),
+		},
+		"serial",
+	),
 	set_todos: sessionCommand(
 		{ type: "set_todos", phases: [] },
 		{ phases: required("an array of valid todo phases", value => Array.isArray(value) && value.every(isTodoPhase)) },

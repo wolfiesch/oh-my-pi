@@ -16,6 +16,7 @@ from .client import (
     RpcProcessExitError,
     RpcProtocolError,
     RpcTimeoutError,
+    SettingsUpdateListener,
     UiRequestListener,
 )
 from .host_tools import (
@@ -109,6 +110,11 @@ from .protocol import (
     SessionStats,
     SessionWorkspace,
     SessionWorkspaceRoot,
+    SettingsChange,
+    SettingSnapshotEntry,
+    SettingsSnapshot,
+    SettingsTabSnapshot,
+    SettingsUpdateEvent,
     ThinkingConfig,
     ThinkingLevel,
     ThinkingLevelCycleResult,
@@ -143,6 +149,7 @@ from .protocol import (
     parse_session_info_result,
     parse_session_state,
     parse_session_workspace_roots,
+    parse_settings_snapshot,
     parse_todo_phases,
 )
 
@@ -249,6 +256,12 @@ __all__ = [
     "SessionStats",
     "SessionWorkspace",
     "SessionWorkspaceRoot",
+    "SettingSnapshotEntry",
+    "SettingsChange",
+    "SettingsSnapshot",
+    "SettingsTabSnapshot",
+    "SettingsUpdateEvent",
+    "SettingsUpdateListener",
     "ThinkingConfig",
     "ThinkingLevel",
     "ThinkingLevelCycleResult",
@@ -286,5 +299,6 @@ __all__ = [
     "parse_session_info_result",
     "parse_session_state",
     "parse_session_workspace_roots",
+    "parse_settings_snapshot",
     "parse_todo_phases",
 ]

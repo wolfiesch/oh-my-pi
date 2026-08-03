@@ -151,6 +151,31 @@ for await (const raw of console) {
 				protocolV2Enabled = true;
 				continue;
 			}
+			if (frame.type === "get_settings") {
+				// Deterministic stand-in for the real snapshot: one disclosed entry and
+				// one redacted entry, so a client test can assert both shapes.
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: {
+						// Echoed so a client test can prove the tab argument is actually sent.
+						requestedTab: typeof frame.tab === "string" ? frame.tab : null,
+						settings: [
+							{
+								path: "colorBlindMode",
+								type: "boolean",
+								default: false,
+								value: true,
+								configured: true,
+							},
+							{ path: "auth.broker.token", type: "string", redacted: true },
+						],
+					},
+				});
+				continue;
+			}
 			if (frame.type === "get_messages_page") {
 				if (Bun.env.MOCK_RPC_PAGE_BUSY === "1") {
 					writeFrame({

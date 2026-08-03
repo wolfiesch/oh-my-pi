@@ -191,6 +191,8 @@ that omits a command:
 - `{ id?, type: "get_state" }`
 - `{ id?, type: "set_fast_mode", enabled: boolean }`
 - `{ id?, type: "get_available_commands" }`
+- `{ id?, type: "get_settings", tab?: SettingTab }`
+- `{ id?, type: "set_settings", changes: RpcSettingsChange[] }`
 - `{ id?, type: "set_todos", phases: TodoPhase[] }`
 - `{ id?, type: "set_host_tools", tools: RpcHostToolDefinition[] }`
 - `{ id?, type: "set_host_uri_schemes", schemes: RpcHostUriSchemeDefinition[] }`
@@ -488,6 +490,106 @@ The corresponding `get_state` result reports the same computed state:
 {
   "fastModeEnabled": false,
   "fastModeActive": true
+}
+```
+
+### `get_settings` payload
+
+Describes the settings schema. Pass `tab` to scope the result to one settings
+tab; an unknown tab fails with code `invalid_tab` rather than returning an
+empty list. The unscoped response is roughly 90 KB, inside the v1 frame limit.
+
+Metadata is returned for every setting because `SETTINGS_SCHEMA` is compiled-in
+public information. **A configured value is disclosed only when the schema
+marks that setting `rpcReadable`.** That annotation is the only grant, and it
+is never inferred from a setting's name or type, so a newly added setting is
+withheld until someone opts it in deliberately. `secret` is an independent
+deny applied on top: a setting marked both is still withheld.
+
+Initial coverage is deliberately narrow: only the appearance tab's boolean and
+enum settings are marked `rpcReadable`, so every other setting currently
+returns as redacted. Coverage widens by annotating settings in later changes.
+
+Withheld entries carry `redacted: true` and omit both `value` and `configured`:
+whether a credential is configured is user state, not schema metadata.
+`default` is omitted when a setting has no default, so the wire has one shape.
+
+Rendering metadata is carried so a client does not have to duplicate the
+schema. `tabs` preserves the canonical tab order, labels, icons, and ordered
+section groups; settings with no group render before those sections.
+`ui.control` is the canonical built-in control kind (`boolean`, `enum`,
+`submenu`, `text`, `providerLimits`, or `multiselect`), and is `null` for
+config-only entries. `ui.renderable` is true exactly when `ui.control` is
+non-null. Entries without `ui` metadata are also non-renderable.
+`ui.visible` reports current panel visibility after the server evaluates any
+private condition, and is `false` when the setting is not renderable. Condition
+names are not exposed on the wire. `ui.options` holds a fixed choice list or the
+literal string `"runtime"` when choices come from a runtime registry such as
+the theme list. `ui.ordered` marks selections whose order is meaningful. A
+setting with no UI metadata keeps its prose in a top-level `description`.
+
+```json
+{
+  "id": "req_3",
+  "type": "response",
+  "command": "get_settings",
+  "success": true,
+  "data": {
+    "tabs": [
+      {
+        "id": "appearance",
+        "label": "Appearance",
+        "icon": "tab.appearance",
+        "groups": ["Theme", "Status Line", "Display", "Images"]
+      }
+    ],
+    "settings": [
+      {
+        "path": "colorBlindMode",
+        "type": "boolean",
+        "default": false,
+        "value": true,
+        "configured": true,
+        "ui": {
+          "tab": "appearance",
+          "group": "Theme",
+          "label": "Color-Blind Mode",
+          "description": "Use blue instead of green for diff additions",
+          "renderable": true,
+          "control": "boolean",
+          "visible": true
+        }
+      },
+      {
+        "path": "theme.dark",
+        "type": "string",
+        "default": "titanium",
+        "redacted": true,
+        "ui": {
+          "tab": "appearance",
+          "group": "Theme",
+          "label": "Dark Theme",
+          "description": "Theme used when the terminal has a dark background",
+          "renderable": true,
+          "control": "submenu",
+          "visible": true,
+          "options": "runtime"
+        }
+      },
+      {
+        "path": "tui.maxInlineImageColumns",
+        "type": "number",
+        "default": 100,
+        "description": "Maximum width in terminal columns for inline images (default 100). Set to 0 for unlimited (bounded only by terminal width).",
+        "redacted": true
+      },
+      {
+        "path": "auth.broker.token",
+        "type": "string",
+        "redacted": true
+      }
+    ]
+  }
 }
 ```
 

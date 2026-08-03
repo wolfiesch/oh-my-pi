@@ -49,6 +49,7 @@ import {
 	type GroupTypeMap,
 	getDefault,
 	SETTINGS_SCHEMA,
+	type SettingChange,
 	type SettingPath,
 	type SettingValue,
 } from "./settings-schema";
@@ -536,6 +537,81 @@ export class Settings {
 			hook(next, prev);
 		}
 		this.#fireEffectiveSettingChanged(path, next, prev);
+	}
+
+	/**
+	 * Persist a validated global-settings batch without exposing speculative
+	 * values. Hooks and effective-change signals run only after the atomic YAML
+	 * replacement succeeds.
+	 */
+	async setPersistedBatch(changes: readonly SettingChange[]): Promise<void> {
+		clearTimeout(this.#saveTimer);
+		this.#saveTimer = undefined;
+		const previousSave = this.#savePromise;
+		const persist = async () => {
+			// Commit older pending writes first so this batch cannot overwrite
+			// them on disk or be shadowed by their later retry.
+			if (this.#modified.size > 0 || this.#modifiedGlobalModelRoles.size > 0) await this.#saveNow();
+			const previousValues = changes.map(change => this.get(change.path));
+			const stagedGlobal = structuredClone(this.#global);
+			for (const change of changes) {
+				setByPath(stagedGlobal, change.path.split("."), change.value);
+			}
+
+			let committedGlobal = stagedGlobal;
+			if (this.#persist && this.#configPath) {
+				const configPath = this.#configPath;
+				await this.#withYamlWriteLock(configPath, async writePath => {
+					const loaded = await this.#loadYamlIfPresentForWriteLocked(configPath, writePath);
+					const current =
+						loaded ?? (this.#quarantinedYamlTargets.has(configPath) ? structuredClone(this.#global) : {});
+					for (const change of changes) {
+						setByPath(current, change.path.split("."), change.value);
+					}
+					await this.#writeYamlAtomically(writePath, current);
+					this.#quarantinedYamlTargets.delete(configPath);
+					committedGlobal = current;
+				});
+			}
+
+			// Preserve unrelated local writes made while the lock/write was in
+			// flight. A newer write to the same path also wins and has already
+			// run its own public-set hook.
+			if (this.#persist) {
+				const latestGlobal = this.#global;
+				for (const modifiedPath of this.#modified) {
+					const settingPath = modifiedPath as SettingPath;
+					setByPath(
+						committedGlobal,
+						settingPath.split("."),
+						getByPath(latestGlobal, SETTING_PATH_SEGMENTS[settingPath]),
+					);
+				}
+				if (this.#modifiedGlobalModelRoles.size > 0) {
+					setByPath(committedGlobal, ["modelRoles"], getByPath(latestGlobal, ["modelRoles"]));
+				}
+			}
+			this.#global = committedGlobal;
+			this.#rebuildMerged();
+
+			for (let index = 0; index < changes.length; index += 1) {
+				const change = changes[index];
+				if (this.#persist && this.#modified.has(change.path)) continue;
+				const next = this.get(change.path);
+				const previous = previousValues[index];
+				const hook = SETTING_HOOKS[change.path];
+				if (hook) hook(next, previous);
+				this.#fireEffectiveSettingChanged(change.path, next, previous);
+			}
+		};
+		const savePromise = previousSave ? previousSave.then(persist) : persist();
+		this.#savePromise = savePromise;
+		try {
+			await savePromise;
+		} finally {
+			if (this.#savePromise === savePromise) this.#savePromise = undefined;
+			if (this.#modified.size > 0 || this.#modifiedGlobalModelRoles.size > 0) this.#queueSave();
+		}
 	}
 
 	/**

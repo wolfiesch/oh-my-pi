@@ -1019,6 +1019,44 @@ class DeleteSessionResult:
 
 
 @dataclass(slots=True, frozen=True)
+class SettingsChange:
+    path: str
+    value: JsonValue
+
+
+@dataclass(slots=True, frozen=True)
+class SettingSnapshotEntry:
+    path: str
+    type: str
+    default: JsonValue | None
+    value: JsonValue | None
+    redacted: bool
+    configured: bool | None
+    values: tuple[str, ...] | None
+    description: str | None
+    ui: JsonObject | None
+
+
+@dataclass(slots=True, frozen=True)
+class SettingsTabSnapshot:
+    id: str
+    label: str
+    icon: str
+    groups: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class SettingsSnapshot:
+    tabs: tuple[SettingsTabSnapshot, ...]
+    settings: tuple[SettingSnapshotEntry, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class SettingsUpdateEvent:
+    type: Literal["settings_update"] = "settings_update"
+
+
+@dataclass(slots=True, frozen=True)
 class RpcCapabilityDisabledReason:
     code: str
     message: str
@@ -1355,6 +1393,7 @@ RpcNotification: TypeAlias = (
     | RpcOperationEvent
     | ExtensionUiRequest
     | ExtensionError
+    | SettingsUpdateEvent
     | RpcAgentEvent
     | UnknownNotification
 )
@@ -1694,6 +1733,58 @@ def parse_fast_mode_result(payload: JsonObject) -> FastModeResult:
         enabled=_require_bool(payload, "enabled"),
         active=_require_bool(payload, "active"),
     )
+
+
+def parse_settings_snapshot(payload: JsonObject) -> SettingsSnapshot:
+    raw_tabs = payload.get("tabs")
+    raw_settings = payload.get("settings")
+    if not isinstance(raw_tabs, list):
+        raise ValueError("settings.tabs must be a list")
+    if not isinstance(raw_settings, list):
+        raise ValueError("settings.settings must be a list")
+
+    tabs: list[SettingsTabSnapshot] = []
+    for index, raw_tab in enumerate(raw_tabs):
+        tab = _clone_json_object(raw_tab, field=f"settings.tabs[{index}]")
+        tabs.append(
+            SettingsTabSnapshot(
+                id=_require_str(tab, "id"),
+                label=_require_str(tab, "label"),
+                icon=_require_str(tab, "icon"),
+                groups=_optional_str_list(tab, "groups") or (),
+            )
+        )
+
+    entries: list[SettingSnapshotEntry] = []
+    for index, raw_entry in enumerate(raw_settings):
+        entry = _clone_json_object(raw_entry, field=f"settings.settings[{index}]")
+        raw_values = entry.get("values")
+        values = None
+        if raw_values is not None:
+            if not isinstance(raw_values, list) or any(
+                not isinstance(item, str) for item in raw_values
+            ):
+                raise ValueError(f"settings.settings[{index}].values must be strings")
+            values = tuple(raw_values)
+        configured = entry.get("configured")
+        if configured is not None and not isinstance(configured, bool):
+            raise ValueError(f"settings.settings[{index}].configured must be a boolean")
+        entries.append(
+            SettingSnapshotEntry(
+                path=_require_str(entry, "path"),
+                type=_require_str(entry, "type"),
+                default=cast(JsonValue | None, entry.get("default")),
+                value=cast(JsonValue | None, entry.get("value")),
+                redacted=entry.get("redacted") is True,
+                configured=cast(bool | None, configured),
+                values=values,
+                description=_optional_str(entry, "description"),
+                ui=_optional_json_object(
+                    entry.get("ui"), field=f"settings.settings[{index}].ui"
+                ),
+            )
+        )
+    return SettingsSnapshot(tabs=tuple(tabs), settings=tuple(entries))
 
 
 def parse_rpc_capability_manifest(payload: JsonObject) -> RpcCapabilityManifest:
@@ -2089,6 +2180,8 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         return parse_extension_ui_request(payload)
     if event_type == "extension_error":
         return parse_extension_error(payload)
+    if event_type == "settings_update":
+        return SettingsUpdateEvent()
     if event_type in {
         "operation_started",
         "operation_completed",
