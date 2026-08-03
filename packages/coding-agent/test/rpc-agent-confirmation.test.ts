@@ -60,13 +60,13 @@ describe("RPC agent mutation confirmation", () => {
 		const confirmation = requestRpcPrivilegedConfirmation(
 			pending,
 			frame => frames.push(frame as RpcExtensionUIRequest),
-			"eval_execute",
-			"Run eval code?",
-			"print('hi')",
+			"bash",
+			"Run shell command?",
+			"Run echo safe?",
 			{ timeout: 1000 },
 		);
 		const request = frames[0];
-		expect(request).toMatchObject({ method: "confirm", command: "eval_execute" });
+		expect(request).toMatchObject({ method: "confirm", command: "bash" });
 		if (request.method !== "confirm") throw new Error("missing confirmation request");
 		expect(request.operationId).toBeString();
 		pending.get(request.id)?.resolve({

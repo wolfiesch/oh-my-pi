@@ -473,6 +473,40 @@ for await (const raw of console) {
 				});
 				continue;
 			}
+			if (
+				Bun.env.MOCK_RPC_OPERATIONS === "1" &&
+				(frame.type === "set_mode" ||
+					frame.type === "resolve_plan_approval" ||
+					frame.type === "begin_provider_auth")
+			) {
+				const operationId = `operation-${++operationSequence}`;
+				const active = { requestId: id, timer: undefined as Timer | undefined };
+				activeOperations.set(operationId, active);
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data:
+						frame.type === "set_mode"
+							? { operationId, accepted: true, deferred: false }
+							: { operationId, accepted: true },
+				});
+				active.timer = setTimeout(() => {
+					if (!activeOperations.delete(operationId)) return;
+					const terminal = {
+						type: "operation_completed",
+						operationId,
+						requestId: id,
+						command: frame.type,
+						agentInvoked: false,
+						settledAt: Date.now(),
+					};
+					recentOperations.set(operationId, terminal);
+					writeFrame(terminal);
+				}, 25);
+				continue;
+			}
 			if (Bun.env.MOCK_RPC_OPERATIONS === "1" && frame.type === "prompt") {
 				const operationId = `operation-${++operationSequence}`;
 				const active = { requestId: id, timer: undefined as Timer | undefined };

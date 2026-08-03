@@ -1389,7 +1389,13 @@ export class RpcClient {
 		},
 	): Promise<RpcModeChangeResult> {
 		const response = await this.#send({ type: "set_mode", mode, ...options });
-		return this.#getData(response);
+		const data = this.#getData<unknown>(response);
+		const accepted = parseRpcOperationAccepted(data);
+		if (!accepted || !isRecord(data) || typeof data.deferred !== "boolean") {
+			throw new Error("set_mode response did not contain a valid accepted operation");
+		}
+		this.#registerAcceptedOperation(accepted);
+		return { ...accepted, deferred: data.deferred };
 	}
 
 	async getPlan(): Promise<RpcPlanState> {
@@ -1410,7 +1416,10 @@ export class RpcClient {
 			| { decision: "refine" | "reject"; feedback?: string },
 	): Promise<RpcOperationAccepted> {
 		const response = await this.#send({ type: "resolve_plan_approval", approvalId, ...decision });
-		return this.#getData(response);
+		const accepted = parseRpcOperationAccepted(this.#getData<unknown>(response));
+		if (!accepted) throw new Error("resolve_plan_approval response did not contain a valid accepted operation");
+		this.#registerAcceptedOperation(accepted);
+		return accepted;
 	}
 
 	/**
@@ -1826,6 +1835,7 @@ export class RpcClient {
 		const response = await this.#send({ type: "begin_provider_auth", providerId, method });
 		const accepted = parseRpcOperationAccepted(this.#getData<unknown>(response));
 		if (!accepted) throw new Error("RPC begin_provider_auth response is malformed");
+		this.#registerAcceptedOperation(accepted);
 		return accepted;
 	}
 
@@ -2078,6 +2088,16 @@ export class RpcClient {
 			}
 			return;
 		}
+		if (isRpcProviderAuthRequestFrame(data)) {
+			for (const listener of this.#providerAuthRequestListeners) listener(data);
+			return;
+		}
+		if (isRpcProviderAuthUpdateFrame(data)) {
+			const state = parseProviderAuthState(data.state);
+			for (const listener of this.#providerAuthUpdateListeners) listener(state);
+			return;
+		}
+
 		if (isRpcProviderAuthRequestFrame(data)) {
 			for (const listener of this.#providerAuthRequestListeners) listener(data);
 			return;

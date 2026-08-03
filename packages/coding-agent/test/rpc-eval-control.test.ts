@@ -3,6 +3,7 @@ import { RPC_COMMAND_DEFINITIONS, validateRpcCommand } from "../src/modes/rpc/rp
 import { MAX_RPC_EVAL_OUTPUT_CHARACTERS, RpcEvalOutputStream } from "../src/modes/rpc/rpc-eval";
 import {
 	handleRpcSessionChange,
+	RpcOperationMessageOwnership,
 	type RpcSessionChangeSession,
 	requestRpcDialog,
 	requestRpcPrivilegedConfirmation,
@@ -157,9 +158,9 @@ describe("RPC eval control", () => {
 		const confirmation = requestRpcPrivilegedConfirmation(
 			pending,
 			frame => output.push(frame),
-			"eval_execute",
-			"Run eval code?",
-			"print('hi')",
+			"cancel_job",
+			"Cancel job?",
+			"job-1",
 			{ operationId: "confirm-1", timeout: 1_000 },
 		);
 		const request = output[0];
@@ -167,7 +168,7 @@ describe("RPC eval control", () => {
 		expect(request).toMatchObject({
 			type: "extension_ui_request",
 			method: "confirm",
-			command: "eval_execute",
+			command: "cancel_job",
 			operationId: "confirm-1",
 		});
 		pending.get(request.id)?.resolve({
@@ -188,8 +189,62 @@ describe("RPC eval control", () => {
 				return true;
 			},
 		} as unknown as RpcSessionChangeSession;
-		await handleRpcSessionChange(session, { type: "new_session" }, undefined, () => order.push("cancel"));
+		await handleRpcSessionChange(session, { type: "new_session" }, undefined, () => {
+			order.push("cancel");
+		});
 		expect(order).toEqual(["cancel", "mutation"]);
+	});
+	test("session transition awaits asynchronous pre-commit cancellation", async () => {
+		const order: string[] = [];
+		const gate = Promise.withResolvers<void>();
+		const session = {
+			newSession: async (_options: unknown, beforeCommit?: () => void | Promise<void>) => {
+				await beforeCommit?.();
+				order.push("mutation");
+				return true;
+			},
+		} as unknown as RpcSessionChangeSession;
+		const transition = handleRpcSessionChange(session, { type: "new_session" }, undefined, async () => {
+			order.push("cancel-start");
+			await gate.promise;
+			order.push("cancel-end");
+		});
+		await Bun.sleep(0);
+		expect(order).toEqual(["cancel-start"]);
+		gate.resolve();
+		await transition;
+		expect(order).toEqual(["cancel-start", "cancel-end", "mutation"]);
+	});
+
+	test("settling an older operation preserves newer active-turn ownership", async () => {
+		const frames: object[] = [];
+		let nextOperationId = 0;
+		const manager = new RpcOperationManager(
+			frame => frames.push(frame),
+			() => `op-${nextOperationId++}`,
+		);
+		const first = manager.start("request-1", "prompt");
+		const second = manager.start("request-2", "prompt");
+		manager.begin(first);
+		manager.begin(second);
+		const aborts: unknown[] = [];
+		const removed: string[] = [];
+		const ownership = new RpcOperationMessageOwnership({
+			getMessageTag: message => {
+				if ("operationId" in message && typeof message.operationId === "string") return message.operationId;
+				return undefined;
+			},
+			abort: async options => {
+				aborts.push(options);
+			},
+			removeQueuedMessagesByTag: operationId => removed.push(operationId),
+		});
+		ownership.observeMessageStart({ operationId: first.operationId } as never);
+		ownership.observeMessageStart({ operationId: second.operationId } as never);
+		ownership.settle(first.operationId);
+		await ownership.cancel(manager, second.operationId);
+		expect(aborts).toHaveLength(1);
+		expect(removed).toEqual([]);
 	});
 
 	test("completed evals remain visible while awaiting a safe transcript boundary", () => {

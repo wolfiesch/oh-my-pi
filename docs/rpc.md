@@ -937,6 +937,18 @@ From `packages/agent/src/agent.ts` defaults:
   - `"immediate"`: tool execution checks steering between tool calls; pending steering can abort remaining tool calls in the turn
   - `"wait"`: defer steering until turn completion
 
+### Session transitions
+
+`new_session`, `switch_session`, `fork_session`, `branch`, `resume_session`, and
+`delete_session` fence the session they replace. Pending bash confirmations are
+abandoned, in-flight `bash` and `eval_execute` work is cancelled and awaited
+before the swap, and a transition refuses to start while a provider
+authentication, mode, or plan approval commit is in flight (`session_busy`).
+While a transition runs, `prompt`, `abort_and_prompt`, `steer`, `follow_up`,
+`bash`, and `eval_execute` answer `session_busy`, and asynchronous work that
+completes after the swap is discarded instead of settling against the new
+session.
+
 ## Extension UI Sub-Protocol
 
 Extensions in RPC mode use request/response UI frames.

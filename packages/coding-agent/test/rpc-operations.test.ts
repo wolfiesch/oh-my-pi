@@ -55,6 +55,23 @@ describe("RpcOperationManager", () => {
 		expect(frames.filter(frame => frame.type === "operation_cancelled")).toHaveLength(1);
 	});
 
+	test("reports active commands from acceptance through settlement", () => {
+		const manager = new RpcOperationManager(
+			() => {},
+			() => "operation-1",
+		);
+		const operation = manager.start("request-1", "set_mode");
+
+		expect(manager.hasActiveCommand("set_mode")).toBe(true);
+		expect(manager.hasActiveCommand("resolve_plan_approval")).toBe(false);
+
+		manager.begin(operation);
+		expect(manager.hasActiveCommand("set_mode")).toBe(true);
+
+		manager.complete(operation, false);
+		expect(manager.hasActiveCommand("set_mode")).toBe(false);
+	});
+
 	test("bulk cancellation preserves explicitly protected operations", () => {
 		let sequence = 0;
 		const manager = new RpcOperationManager(

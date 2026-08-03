@@ -16,7 +16,7 @@ from typing import cast
 
 from omp_rpc import (
     AgentEndEvent,
-    OperationStartedEvent,
+    ExtensionUiRequest,
     RpcClient,
     RpcCommandError,
     RpcConcurrencyError,
@@ -284,10 +284,15 @@ FAKE_SERVER = textwrap.dedent(
         request_id = command.get("id")
 
         if command_type == "extension_ui_response":
-            if command["id"] == "ui-privileged":
+            if command["id"] in {"ui-privileged", "ui-bash"}:
+                expected_operation_id = (
+                    "operation-bash"
+                    if command["id"] == "ui-bash"
+                    else "operation-eval"
+                )
                 text = (
                     "ui correlated"
-                    if command.get("operationId") == "operation-eval"
+                    if command.get("operationId") == expected_operation_id
                     else "ui correlation missing"
                 )
                 emit_prompt_turn(text)
@@ -670,6 +675,22 @@ FAKE_SERVER = textwrap.dedent(
                     flush=True,
                 )
                 continue
+            if message == "needs bash confirmation":
+                print(
+                    json.dumps(
+                        {
+                            "type": "extension_ui_request",
+                            "id": "ui-bash",
+                            "method": "confirm",
+                            "title": "Run bash command?",
+                            "message": "printf hello",
+                            "operationId": "operation-bash",
+                            "command": "bash",
+                        }
+                    ),
+                    flush=True,
+                )
+                continue
             if message == "needs cancel":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-3", "method": "editor", "title": "Edit", "placeholder": "value"}), flush=True)
                 continue
@@ -760,9 +781,9 @@ FAKE_SERVER = textwrap.dedent(
 ).replace("__CAPABILITY_MANIFEST_JSON__", repr(CAPABILITY_MANIFEST_JSON))
 
 STALLED_STATE_SERVER = FAKE_SERVER.replace(
-    'if command_type == "get_state":\n'
+    'elif command_type == "get_state":\n'
     '        respond(request_id, "get_state", current_state())',
-    'if command_type == "get_state":\n        continue',
+    'elif command_type == "get_state":\n        continue',
 )
 
 
@@ -1424,58 +1445,6 @@ class RpcClientTests(unittest.TestCase):
             self.assertFalse(result.enabled)
             self.assertTrue(result.active)
 
-    def test_wait_for_idle_does_not_fast_path_while_streaming(self) -> None:
-        client = RpcClient()
-        client._agent_streaming = True
-        with self.assertRaises(RpcTimeoutError):
-            client.wait_for_idle(timeout=0)
-
-    def test_wait_for_idle_reconciles_accepted_follow_up_after_stale_agent_end(
-        self,
-    ) -> None:
-        class ContinuationClient(RpcClient):
-            state_reads = 0
-
-            def _request(self, _command_type: str, **_payload: JsonValue) -> JsonObject:
-                return {}
-
-            def _get_state(self, timeout: float | None = None) -> SessionState:
-                del timeout
-                self.state_reads += 1
-                activity_phase = "maintenance" if self.state_reads == 1 else "idle"
-                queued_message_count = 1 if self.state_reads == 1 else 0
-                return cast(
-                    SessionState,
-                    type(
-                        "State",
-                        (),
-                        {
-                            "activity_phase": activity_phase,
-                            "queued_message_count": queued_message_count,
-                        },
-                    )(),
-                )
-
-        client = ContinuationClient()
-        client.follow_up("queued")
-        client._agent_streaming = False
-
-        client.wait_for_idle(timeout=0.5)
-
-        self.assertEqual(client.state_reads, 2)
-
-    def test_wait_for_idle_bounds_stalled_state_read_by_its_timeout(self) -> None:
-        with self.make_client(STALLED_STATE_SERVER) as client:
-            client.follow_up("queued")
-            started_at = time.monotonic()
-
-            with self.assertRaisesRegex(
-                RpcTimeoutError, "Timed out waiting for RPC client to become idle"
-            ):
-                client.wait_for_idle(timeout=0.05)
-
-            self.assertLess(time.monotonic() - started_at, 1.0)
-
     def test_session_catalog_methods_parse_results_and_preserve_scope(self) -> None:
         session = {
             "path": "/sessions/session.jsonl",
@@ -1599,6 +1568,58 @@ class RpcClientTests(unittest.TestCase):
         self.assertFalse(disabled.configured)
         self.assertFalse(disabled.active)
         self.assertEqual(disabled.advisors[0].status, "paused")
+
+    def test_wait_for_idle_does_not_fast_path_while_streaming(self) -> None:
+        client = RpcClient()
+        client._agent_streaming = True
+        with self.assertRaises(RpcTimeoutError):
+            client.wait_for_idle(timeout=0)
+
+    def test_wait_for_idle_reconciles_accepted_follow_up_after_stale_agent_end(
+        self,
+    ) -> None:
+        class ContinuationClient(RpcClient):
+            state_reads = 0
+
+            def _request(self, _command_type: str, **_payload: JsonValue) -> JsonObject:
+                return {}
+
+            def _get_state(self, timeout: float | None = None) -> SessionState:
+                del timeout
+                self.state_reads += 1
+                activity_phase = "maintenance" if self.state_reads == 1 else "idle"
+                queued_message_count = 1 if self.state_reads == 1 else 0
+                return cast(
+                    SessionState,
+                    type(
+                        "State",
+                        (),
+                        {
+                            "activity_phase": activity_phase,
+                            "queued_message_count": queued_message_count,
+                        },
+                    )(),
+                )
+
+        client = ContinuationClient()
+        client.follow_up("queued")
+        client._agent_streaming = False
+
+        client.wait_for_idle(timeout=0.5)
+
+        self.assertEqual(client.state_reads, 2)
+
+    def test_wait_for_idle_bounds_stalled_state_read_by_its_timeout(self) -> None:
+        with self.make_client(STALLED_STATE_SERVER) as client:
+            client.follow_up("queued")
+            started_at = time.monotonic()
+
+            with self.assertRaisesRegex(
+                RpcTimeoutError, "Timed out waiting for RPC client to become idle"
+            ):
+                client.wait_for_idle(timeout=0.05)
+
+            self.assertLess(time.monotonic() - started_at, 1.0)
 
     def test_prompt_operations_settle_without_guessing_from_agent_end(self) -> None:
         terminal_types: list[str] = []
@@ -1918,6 +1939,25 @@ class RpcClientTests(unittest.TestCase):
 
         self.assertEqual(turn.require_assistant_text(), "ui correlated")
 
+    def test_bash_confirmation_stays_typed_and_correlated(self) -> None:
+        requests = []
+        unknown_notifications = []
+
+        with self.make_client() as client:
+            client.on_unknown_notification(unknown_notifications.append)
+            client.install_headless_ui(
+                confirm=True,
+                on_request=requests.append,
+            )
+            turn = client.prompt_and_wait("needs bash confirmation", timeout=2.0)
+
+        self.assertEqual(len(requests), 1)
+        self.assertIsInstance(requests[0], ExtensionUiRequest)
+        self.assertEqual(requests[0].command, "bash")
+        self.assertEqual(requests[0].operation_id, "operation-bash")
+        self.assertEqual(unknown_notifications, [])
+        self.assertEqual(turn.require_assistant_text(), "ui correlated")
+
     def test_ready_and_typed_event_listeners(self) -> None:
         ready_types: list[str] = []
         event_types: list[str] = []
@@ -1956,17 +1996,17 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(state.todo_phases[0].tasks[1].content, "Exercise edits")
 
     def test_plan_workflow_commands(self) -> None:
-        started_operations: list[OperationStartedEvent] = []
+        started_operations = []
         with self.make_client() as client:
             client.on_operation_started(started_operations.append)
-            mode_change = client.set_mode(
+            operation_id = client.set_mode(
                 "plan",
                 plan_file_path="local://REVIEW.md",
                 workflow="iterative",
             )
-            self.assertEqual(mode_change.operation_id, "operation-set-mode")
-            self.assertTrue(mode_change.accepted)
-            self.assertFalse(mode_change.deferred)
+            self.assertEqual(operation_id.operation_id, "operation-set-mode")
+            self.assertTrue(operation_id.accepted)
+            self.assertFalse(operation_id.deferred)
             state = client.get_state()
             self.assertEqual(state.mode, "plan")
             self.assertEqual(state.plan.plan_file_path, "local://REVIEW.md")
@@ -2592,6 +2632,7 @@ class ProviderAuthClientTests(unittest.TestCase):
         inventory = client.list_provider_auth()
         self.assertEqual(inventory[0].methods[0].method, "future_method")
         operation_id = client.begin_provider_auth("openrouter", "future_method")
+        self.assertIn(operation_id, client._active_operation_ids)
 
         self.assertEqual(
             client.cancel_provider_auth(operation_id).status, "future_status"

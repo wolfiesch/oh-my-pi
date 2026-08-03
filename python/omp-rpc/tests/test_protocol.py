@@ -8,9 +8,16 @@ from omp_rpc import (
     AgentEndEvent,
     AutoCompactionEndEvent,
     AutoCompactionStartEvent,
+    AvailableCommandsUpdateEvent,
+    CommandOutputEvent,
+    ConfigUpdateEvent,
     ExtensionUiRequest,
+    GoalUpdatedEvent,
+    IrcMessageEvent,
     JobUpdateEvent,
     ModeChangeResult,
+    ModelChangedEvent,
+    NoticeEvent,
     OperationCancelledEvent,
     OperationCompletedEvent,
     OperationFailedEvent,
@@ -18,14 +25,18 @@ from omp_rpc import (
     PlanApprovalRequestEvent,
     PlanApprovalSettledEvent,
     PlanStateUpdateEvent,
+    PromptResultEvent,
     ProviderAuthRequest,
     ProviderAuthUpdate,
     QueueUpdateEvent,
     ReadyEvent,
+    SessionActivityPhase,
+    SessionInfoUpdateEvent,
     SessionState,
     SubagentEvent,
     SubagentLifecycleEvent,
     SubagentProgressEvent,
+    ThinkingLevelChangedEvent,
     TodoReminderEvent,
     ToolActivationResult,
     ToolInventoryUpdateEvent,
@@ -41,6 +52,9 @@ from omp_rpc import (
 
 
 class ProtocolParsingTests(unittest.TestCase):
+    def test_root_package_exports_session_activity_phase(self) -> None:
+        self.assertIsNotNone(SessionActivityPhase)
+
     def test_parse_operation_lifecycle_notifications(self) -> None:
         started = parse_notification(
             {
@@ -117,7 +131,6 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertEqual(capability.execution, "sync")
         self.assertEqual(capability.availability, "available")
         self.assertEqual(capability.concurrency_class, "serial")
-        self.assertEqual(capability.confirmation, "none")
         self.assertEqual(capability.required_features, ())
         self.assertEqual(capability.input_schema["type"], "object")
         self.assertIn("future_event", notification.capabilities.events)
@@ -240,26 +253,6 @@ class ProtocolParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "deferred"):
             parse_mode_change_result(
                 {"operationId": "operation-mode", "accepted": True}
-            )
-
-    def test_parse_ready_requires_a_known_confirmation_requirement(self) -> None:
-        manifest = json.loads(
-            (
-                Path(__file__).parent / "fixtures" / "rpc-capability-manifest.json"
-            ).read_text(encoding="utf-8")
-        )
-        manifest["commands"][0]["confirmation"] = "required"
-        notification = parse_notification(
-            {"type": "ready", "protocolVersion": 1, "capabilities": manifest}
-        )
-        assert isinstance(notification, ReadyEvent)
-        assert notification.capabilities is not None
-        self.assertEqual(notification.capabilities.commands[0].confirmation, "required")
-
-        manifest["commands"][0]["confirmation"] = "future-confirmation"
-        with self.assertRaises(ValueError):
-            parse_notification(
-                {"type": "ready", "protocolVersion": 1, "capabilities": manifest}
             )
 
     def test_parse_session_state(self) -> None:
@@ -548,6 +541,23 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertIsInstance(notification, ExtensionUiRequest)
         self.assertEqual(notification.operation_id, "operation-eval")
         self.assertEqual(notification.command, "eval_execute")
+
+    def test_parse_bash_privileged_extension_ui_request(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "extension_ui_request",
+                "id": "ui-bash",
+                "method": "confirm",
+                "title": "Run bash command?",
+                "message": "printf hello",
+                "operationId": "operation-bash",
+                "command": "bash",
+            }
+        )
+
+        self.assertIsInstance(notification, ExtensionUiRequest)
+        self.assertEqual(notification.operation_id, "operation-bash")
+        self.assertEqual(notification.command, "bash")
 
     def test_reject_unknown_privileged_extension_ui_command(self) -> None:
         with self.assertRaisesRegex(ValueError, "extension_ui_request.command"):
@@ -1044,6 +1054,41 @@ class ProtocolParsingTests(unittest.TestCase):
         events = [
             parse_notification(
                 {
+                    "type": "prompt_result",
+                    "id": "request-1",
+                    "operationId": "operation-1",
+                    "agentInvoked": True,
+                }
+            ),
+            parse_notification(
+                {
+                    "type": "available_commands_update",
+                    "commands": [
+                        {
+                            "name": "review",
+                            "aliases": ["r"],
+                            "description": "Review changes",
+                            "input": {"hint": "path"},
+                            "subcommands": [
+                                {"name": "quick", "usage": "/review quick"}
+                            ],
+                            "source": "extension",
+                        }
+                    ],
+                }
+            ),
+            parse_notification({"type": "command_output", "text": "done"}),
+            parse_notification(
+                {
+                    "type": "session_info_update",
+                    "title": "Review",
+                    "sessionId": "session-1",
+                    "mode": "plan",
+                }
+            ),
+            parse_notification({"type": "config_update", "thinkingLevel": "high"}),
+            parse_notification(
+                {
                     "type": "subagent_lifecycle",
                     "payload": {
                         "id": "AgentA",
@@ -1100,24 +1145,86 @@ class ProtocolParsingTests(unittest.TestCase):
                     },
                 }
             ),
+            parse_notification({"type": "model_changed"}),
+            parse_notification(
+                {
+                    "type": "irc_message",
+                    "message": {
+                        "role": "custom",
+                        "customType": "irc",
+                        "content": "hello",
+                        "display": True,
+                        "timestamp": 1,
+                    },
+                }
+            ),
+            parse_notification(
+                {
+                    "type": "notice",
+                    "level": "warning",
+                    "message": "careful",
+                    "source": "test",
+                }
+            ),
+            parse_notification(
+                {
+                    "type": "thinking_level_changed",
+                    "thinkingLevel": "high",
+                    "configured": "auto",
+                    "resolved": "high",
+                }
+            ),
+            parse_notification(
+                {
+                    "type": "goal_updated",
+                    "goal": {
+                        "id": "goal-1",
+                        "objective": "Ship",
+                        "status": "active",
+                        "tokensUsed": 10,
+                        "timeUsedSeconds": 2,
+                        "createdAt": 1,
+                        "updatedAt": 2,
+                    },
+                }
+            ),
         ]
 
         expected_types = (
+            PromptResultEvent,
+            AvailableCommandsUpdateEvent,
+            CommandOutputEvent,
+            SessionInfoUpdateEvent,
+            ConfigUpdateEvent,
             SubagentLifecycleEvent,
             SubagentProgressEvent,
             SubagentEvent,
+            ModelChangedEvent,
+            IrcMessageEvent,
+            NoticeEvent,
+            ThinkingLevelChangedEvent,
+            GoalUpdatedEvent,
         )
         for event, expected_type in zip(events, expected_types, strict=True):
             self.assertIsInstance(event, expected_type)
-        self.assertEqual(events[1].payload.progress.recent_tools[0].end_ms, 5.0)
+        self.assertEqual(events[0].operation_id, "operation-1")
+        self.assertEqual(events[1].commands[0].input.hint, "path")
+        self.assertEqual(events[6].payload.progress.recent_tools[0].end_ms, 5.0)
         self.assertEqual(
-            events[1].payload.progress.model_override,
+            events[6].payload.progress.model_override,
             ("anthropic/claude-sonnet-4-6", "auto"),
         )
         self.assertEqual(
-            events[1].payload.progress.extracted_tool_data,
+            events[6].payload.progress.extracted_tool_data,
             {"read": [{"path": "protocol.py", "line": 1083}]},
         )
+        self.assertEqual(events[11].configured, "auto")
+        self.assertEqual(events[12].goal.tokens_used, 10)
+
+        with self.assertRaisesRegex(ValueError, "agentInvoked"):
+            parse_notification({"type": "prompt_result", "agentInvoked": "true"})
+        with self.assertRaisesRegex(ValueError, "commands"):
+            parse_notification({"type": "available_commands_update", "commands": {}})
 
     def test_parse_queue_and_job_updates_into_typed_models(self) -> None:
         queue = parse_notification(

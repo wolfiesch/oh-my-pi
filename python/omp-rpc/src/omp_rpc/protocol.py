@@ -48,13 +48,9 @@ CancelAgentStatus: TypeAlias = Literal["cancelled", "not_found", "already_comple
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
 QueueLane: TypeAlias = Literal["steering", "followUp"]
-
 JobType: TypeAlias = Literal["bash", "task"]
-
 JobStatus: TypeAlias = Literal["running", "completed", "failed", "cancelled"]
-
 CancelJobStatus: TypeAlias = Literal["cancelled", "not_found", "already_completed"]
-
 AgentSource: TypeAlias = Literal["bundled", "user", "project"]
 SubagentLifecycleStatus: TypeAlias = Literal[
     "started", "completed", "failed", "aborted"
@@ -62,6 +58,10 @@ SubagentLifecycleStatus: TypeAlias = Literal[
 SubagentProgressStatus: TypeAlias = Literal[
     "pending", "running", "completed", "failed", "aborted"
 ]
+GoalStatus: TypeAlias = Literal[
+    "active", "paused", "budget-limited", "complete", "dropped"
+]
+ConfiguredThinkingLevel: TypeAlias = ThinkingLevel | Literal["auto"]
 WidgetPlacement: TypeAlias = Literal["aboveEditor", "belowEditor"]
 TodoStatus: TypeAlias = Literal[
     "pending", "in_progress", "completed", "abandoned", "blocked"
@@ -1032,6 +1032,48 @@ class CancelJobResult:
 
 
 @dataclass(slots=True, frozen=True)
+class AvailableCommandInput:
+    hint: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AvailableSubcommand:
+    name: str
+    description: str | None = None
+    usage: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AvailableCommand:
+    name: str
+    source: Literal["builtin", "skill", "extension", "custom", "mcp_prompt", "file"]
+    aliases: tuple[str, ...] = ()
+    description: str | None = None
+    input: AvailableCommandInput | None = None
+    subcommands: tuple[AvailableSubcommand, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class Goal:
+    id: str
+    objective: str
+    status: GoalStatus
+    tokens_used: int
+    time_used_seconds: float
+    created_at: float
+    updated_at: float
+    token_budget: int | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class GoalModeState:
+    enabled: bool
+    mode: Literal["active", "exiting"]
+    goal: Goal
+    reason: Literal["completed"] | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class SubagentLifecycle:
     id: str
     agent: str
@@ -1580,6 +1622,8 @@ class ExtensionUiRequest:
             "cancel_agent",
             "release_agent",
             "eval_execute",
+            "bash",
+            "cancel_job",
             "delete_session",
             "remove_provider_auth",
         ]
@@ -1764,6 +1808,42 @@ class ToolInventoryUpdateEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class PromptResultEvent:
+    agent_invoked: bool
+    id: str | None = None
+    operation_id: str | None = None
+    type: Literal["prompt_result"] = "prompt_result"
+
+
+@dataclass(slots=True, frozen=True)
+class AvailableCommandsUpdateEvent:
+    commands: tuple[AvailableCommand, ...]
+    type: Literal["available_commands_update"] = "available_commands_update"
+
+
+@dataclass(slots=True, frozen=True)
+class CommandOutputEvent:
+    text: str
+    type: Literal["command_output"] = "command_output"
+
+
+@dataclass(slots=True, frozen=True)
+class SessionInfoUpdateEvent:
+    session_id: str
+    mode: SessionMode
+    title: str | None = None
+    type: Literal["session_info_update"] = "session_info_update"
+
+
+@dataclass(slots=True, frozen=True)
+class ConfigUpdateEvent:
+    model: ModelInfo | None = None
+    thinking_level: ThinkingLevel | None = None
+    advisor: AdvisorState | None = None
+    type: Literal["config_update"] = "config_update"
+
+
+@dataclass(slots=True, frozen=True)
 class SubagentLifecycleEvent:
     payload: SubagentLifecycle
     type: Literal["subagent_lifecycle"] = "subagent_lifecycle"
@@ -1780,6 +1860,40 @@ class SubagentEvent:
     id: str
     event: RpcNotification
     type: Literal["subagent_event"] = "subagent_event"
+
+
+@dataclass(slots=True, frozen=True)
+class ModelChangedEvent:
+    type: Literal["model_changed"] = "model_changed"
+
+
+@dataclass(slots=True, frozen=True)
+class IrcMessageEvent:
+    message: CustomMessage
+    type: Literal["irc_message"] = "irc_message"
+
+
+@dataclass(slots=True, frozen=True)
+class NoticeEvent:
+    level: NotifyType
+    message: str
+    source: str | None = None
+    type: Literal["notice"] = "notice"
+
+
+@dataclass(slots=True, frozen=True)
+class ThinkingLevelChangedEvent:
+    thinking_level: ThinkingLevel | None
+    configured: ConfiguredThinkingLevel | None = None
+    resolved: ThinkingLevel | None = None
+    type: Literal["thinking_level_changed"] = "thinking_level_changed"
+
+
+@dataclass(slots=True, frozen=True)
+class GoalUpdatedEvent:
+    goal: Goal | None
+    state: GoalModeState | None = None
+    type: Literal["goal_updated"] = "goal_updated"
 
 
 @dataclass(slots=True, frozen=True)
@@ -1851,19 +1965,29 @@ RpcAgentEvent: TypeAlias = (
     | TtsrTriggeredEvent
     | TodoReminderEvent
     | TodoAutoClearEvent
+    | ModelChangedEvent
+    | IrcMessageEvent
+    | NoticeEvent
+    | ThinkingLevelChangedEvent
+    | GoalUpdatedEvent
 )
 
 RpcNotification: TypeAlias = (
     ReadyEvent
     | RpcOperationEvent
-    | ProviderAuthRequest
-    | ProviderAuthUpdate
     | EvalOutputEvent
     | EvalCompleteEvent
+    | ProviderAuthRequest
+    | ProviderAuthUpdate
     | ExtensionUiRequest
     | ExtensionError
     | SettingsUpdateEvent
     | ToolInventoryUpdateEvent
+    | PromptResultEvent
+    | AvailableCommandsUpdateEvent
+    | CommandOutputEvent
+    | SessionInfoUpdateEvent
+    | ConfigUpdateEvent
     | SubagentLifecycleEvent
     | SubagentProgressEvent
     | SubagentEvent
@@ -2237,17 +2361,6 @@ def _parse_session_activity_phase(payload: JsonObject) -> SessionActivityPhase:
     # as non-idle maintenance so an additive or malformed server response cannot
     # make an older client report terminal idle.
     return "maintenance"
-
-
-def parse_mode_change_result(payload: JsonObject) -> ModeChangeResult:
-    accepted = _require_bool(payload, "accepted")
-    if not accepted:
-        raise ValueError("set_mode.accepted must be true")
-    return ModeChangeResult(
-        operation_id=_require_str(payload, "operationId"),
-        accepted=True,
-        deferred=_require_bool(payload, "deferred"),
-    )
 
 
 def parse_plan_state(payload: JsonObject) -> PlanState:
@@ -2904,6 +3017,8 @@ def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
                 "cancel_agent",
                 "release_agent",
                 "eval_execute",
+                "bash",
+                "cancel_job",
                 "delete_session",
                 "remove_provider_auth",
             ]
@@ -2915,6 +3030,8 @@ def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
                         "cancel_agent",
                         "release_agent",
                         "eval_execute",
+                        "bash",
+                        "cancel_job",
                         "delete_session",
                         "remove_provider_auth",
                     }
@@ -3021,6 +3138,17 @@ def _parse_queued_message(payload: object, *, field: str) -> QueuedMessage:
     else:
         raise ValueError(f"{field}.images must be an array")
     return QueuedMessage(text=_require_str(message, "text"), images=images)
+
+
+def parse_mode_change_result(payload: JsonObject) -> ModeChangeResult:
+    accepted = _require_bool(payload, "accepted")
+    if not accepted:
+        raise ValueError("set_mode.accepted must be true")
+    return ModeChangeResult(
+        operation_id=_require_str(payload, "operationId"),
+        accepted=True,
+        deferred=_require_bool(payload, "deferred"),
+    )
 
 
 def parse_session_queue_entry(payload: JsonObject) -> SessionQueueEntry:
@@ -3169,6 +3297,88 @@ def parse_cancel_job_result(payload: JsonObject) -> CancelJobResult:
     return CancelJobResult(outcomes=tuple(outcomes))
 
 
+def _parse_available_command(payload: object, *, field: str) -> AvailableCommand:
+    command = _clone_json_object(payload, field=field)
+    source = _require_literal(
+        command.get("source"),
+        frozenset({"builtin", "skill", "extension", "custom", "mcp_prompt", "file"}),
+        field=f"{field}.source",
+    )
+    raw_aliases = command.get("aliases")
+    aliases = (
+        ()
+        if raw_aliases is None
+        else _required_string_tuple(raw_aliases, field=f"{field}.aliases")
+    )
+    raw_input = command.get("input")
+    input_model = None
+    if raw_input is not None:
+        input_payload = _clone_json_object(raw_input, field=f"{field}.input")
+        input_model = AvailableCommandInput(hint=_optional_str(input_payload, "hint"))
+    raw_subcommands = command.get("subcommands")
+    subcommands: tuple[AvailableSubcommand, ...] = ()
+    if raw_subcommands is not None:
+        if not isinstance(raw_subcommands, list):
+            raise ValueError(f"{field}.subcommands must be an array")
+        parsed_subcommands: list[AvailableSubcommand] = []
+        for index, item in enumerate(raw_subcommands):
+            subcommand = _clone_json_object(item, field=f"{field}.subcommands[{index}]")
+            parsed_subcommands.append(
+                AvailableSubcommand(
+                    name=_require_str(subcommand, "name"),
+                    description=_optional_str(subcommand, "description"),
+                    usage=_optional_str(subcommand, "usage"),
+                )
+            )
+        subcommands = tuple(parsed_subcommands)
+    return AvailableCommand(
+        name=_require_str(command, "name"),
+        source=cast(
+            Literal["builtin", "skill", "extension", "custom", "mcp_prompt", "file"],
+            source,
+        ),
+        aliases=aliases,
+        description=_optional_str(command, "description"),
+        input=input_model,
+        subcommands=subcommands,
+    )
+
+
+def _parse_goal(payload: object, *, field: str) -> Goal:
+    goal = _clone_json_object(payload, field=field)
+    status = _require_literal(
+        goal.get("status"),
+        frozenset({"active", "paused", "budget-limited", "complete", "dropped"}),
+        field=f"{field}.status",
+    )
+    return Goal(
+        id=_require_str(goal, "id"),
+        objective=_require_str(goal, "objective"),
+        status=cast(GoalStatus, status),
+        token_budget=_optional_int(goal, "tokenBudget"),
+        tokens_used=_require_int_value(goal, "tokensUsed"),
+        time_used_seconds=_require_number_value(goal, "timeUsedSeconds"),
+        created_at=_require_number_value(goal, "createdAt"),
+        updated_at=_require_number_value(goal, "updatedAt"),
+    )
+
+
+def _parse_goal_mode_state(payload: object, *, field: str) -> GoalModeState:
+    state = _clone_json_object(payload, field=field)
+    mode = _require_literal(
+        state.get("mode"), frozenset({"active", "exiting"}), field=f"{field}.mode"
+    )
+    reason = _optional_literal(
+        state.get("reason"), frozenset({"completed"}), field=f"{field}.reason"
+    )
+    return GoalModeState(
+        enabled=_require_bool(state, "enabled"),
+        mode=cast(Literal["active", "exiting"], mode),
+        reason=cast(Literal["completed"] | None, reason),
+        goal=_parse_goal(state.get("goal"), field=f"{field}.goal"),
+    )
+
+
 def _parse_agent_progress(payload: object, *, field: str) -> AgentProgress:
     progress = _clone_json_object(payload, field=field)
     source = _require_literal(
@@ -3301,6 +3511,67 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         return SettingsUpdateEvent()
     if event_type == "tool_inventory_update":
         return ToolInventoryUpdateEvent()
+    if event_type == "prompt_result":
+        return PromptResultEvent(
+            id=_optional_str(payload, "id"),
+            operation_id=_optional_str(payload, "operationId"),
+            agent_invoked=_require_bool(payload, "agentInvoked"),
+        )
+    if event_type == "available_commands_update":
+        raw_commands = payload.get("commands")
+        if not isinstance(raw_commands, list):
+            raise ValueError("available_commands_update.commands must be an array")
+        return AvailableCommandsUpdateEvent(
+            commands=tuple(
+                _parse_available_command(
+                    item, field=f"available_commands_update.commands[{index}]"
+                )
+                for index, item in enumerate(raw_commands)
+            )
+        )
+    if event_type == "command_output":
+        return CommandOutputEvent(text=_require_str(payload, "text"))
+    if event_type == "session_info_update":
+        return SessionInfoUpdateEvent(
+            title=_optional_str(payload, "title"),
+            session_id=_require_str(payload, "sessionId"),
+            mode=cast(
+                SessionMode,
+                _require_literal(
+                    payload.get("mode"),
+                    _SESSION_MODE_VALUES,
+                    field="session_info_update.mode",
+                ),
+            ),
+        )
+    if event_type == "config_update":
+        raw_model = payload.get("model")
+        model = (
+            parse_model_info(_clone_json_object(raw_model, field="config_update.model"))
+            if raw_model is not None
+            else None
+        )
+        raw_advisor = payload.get("advisor")
+        advisor = None
+        if raw_advisor is not None:
+            advisor_payload = _clone_json_object(
+                raw_advisor, field="config_update.advisor"
+            )
+            advisor = parse_advisor_state(advisor_payload)
+            if advisor is None:
+                raise ValueError("config_update.advisor must be a valid advisor state")
+        return ConfigUpdateEvent(
+            model=model,
+            thinking_level=cast(
+                ThinkingLevel | None,
+                _optional_literal(
+                    payload.get("thinkingLevel"),
+                    _THINKING_LEVEL_VALUES,
+                    field="config_update.thinkingLevel",
+                ),
+            ),
+            advisor=advisor,
+        )
     if event_type == "subagent_lifecycle":
         lifecycle = _clone_json_object(
             payload.get("payload"), field="subagent_lifecycle.payload"
@@ -3532,6 +3803,71 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
                 ),
             ),
             settled_at=settled_at,
+        )
+    if event_type == "model_changed":
+        return ModelChangedEvent()
+    if event_type == "irc_message":
+        message = _parse_agent_message(
+            _clone_json_object(payload.get("message"), field="irc_message.message"),
+            field="irc_message.message",
+        )
+        if message.get("role") != "custom":
+            raise ValueError("irc_message.message.role must be custom")
+        return IrcMessageEvent(message=cast(CustomMessage, message))
+    if event_type == "notice":
+        return NoticeEvent(
+            level=cast(
+                NotifyType,
+                _require_literal(
+                    payload.get("level"), _NOTIFY_TYPE_VALUES, field="notice.level"
+                ),
+            ),
+            message=_require_str(payload, "message"),
+            source=_optional_str(payload, "source"),
+        )
+    if event_type == "thinking_level_changed":
+        return ThinkingLevelChangedEvent(
+            thinking_level=cast(
+                ThinkingLevel | None,
+                _optional_literal(
+                    payload.get("thinkingLevel"),
+                    _THINKING_LEVEL_VALUES,
+                    field="thinking_level_changed.thinkingLevel",
+                ),
+            ),
+            configured=cast(
+                ConfiguredThinkingLevel | None,
+                _optional_literal(
+                    payload.get("configured"),
+                    _THINKING_LEVEL_VALUES | frozenset({"auto"}),
+                    field="thinking_level_changed.configured",
+                ),
+            ),
+            resolved=cast(
+                ThinkingLevel | None,
+                _optional_literal(
+                    payload.get("resolved"),
+                    _THINKING_LEVEL_VALUES,
+                    field="thinking_level_changed.resolved",
+                ),
+            ),
+        )
+    if event_type == "goal_updated":
+        if "goal" not in payload:
+            raise ValueError("goal_updated.goal is required")
+        raw_goal = payload.get("goal")
+        raw_state = payload.get("state")
+        return GoalUpdatedEvent(
+            goal=(
+                _parse_goal(raw_goal, field="goal_updated.goal")
+                if raw_goal is not None
+                else None
+            ),
+            state=(
+                _parse_goal_mode_state(raw_state, field="goal_updated.state")
+                if raw_state is not None
+                else None
+            ),
         )
     if event_type == "agent_start":
         return AgentStartEvent()

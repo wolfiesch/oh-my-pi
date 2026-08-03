@@ -80,6 +80,27 @@ describe("RpcClient operation lifecycle", () => {
 		expect(order).toEqual(["accepted", "started", "terminal"]);
 	});
 
+	test("registers mode, plan approval, and provider auth operations before waitForIdle", async () => {
+		const client = await startClient();
+		const settledCommands: string[] = [];
+		client.onOperationTerminal(frame => settledCommands.push(frame.command));
+
+		const modeChange = await client.setMode("plan");
+		expect(modeChange).toMatchObject({ accepted: true, deferred: false });
+		await client.waitForIdle(1_000);
+		expect(settledCommands).toEqual(["set_mode"]);
+
+		const approval = await client.resolvePlanApproval("approval-1", { decision: "reject" });
+		expect(approval.accepted).toBe(true);
+		await client.waitForIdle(1_000);
+		expect(settledCommands).toEqual(["set_mode", "resolve_plan_approval"]);
+
+		const providerAuth = await client.beginProviderAuth("openrouter", "api_key");
+		expect(providerAuth.accepted).toBe(true);
+		await client.waitForIdle(1_000);
+		expect(settledCommands).toEqual(["set_mode", "resolve_plan_approval", "begin_provider_auth"]);
+	});
+
 	test("cancels only the target idempotently and reconciles snapshots", async () => {
 		const client = await startClient();
 		const accepted = await client.prompt("hold");

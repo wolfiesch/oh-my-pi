@@ -60,8 +60,27 @@ describe("RPC command registry", () => {
 			},
 		});
 	});
+	test("advertises every operation, plan, and provider-auth lifecycle event exactly once", () => {
+		const events = getRpcCapabilityManifest().events;
+		expect(events).toEqual(
+			expect.arrayContaining([
+				"operation_started",
+				"operation_completed",
+				"operation_failed",
+				"operation_cancelled",
+				"plan_state_update",
+				"plan_approval_request",
+				"plan_approval_settled",
+				"provider_auth_request",
+				"provider_auth_update",
+			]),
+		);
+		expect(new Set(events).size).toBe(events.length);
+	});
+
 	test("advertises bounded queue and owner-scoped job controls", () => {
 		const manifest = getRpcCapabilityManifest();
+		const enabledManifest = getRpcCapabilityManifest({ features: new Set(["job-control"]) });
 		for (const name of ["get_queue", "remove_queued_message", "reorder_queued_message", "clear_queue"]) {
 			expect(manifest.commands.find(command => command.name === name)).toMatchObject({
 				scope: "session",
@@ -69,9 +88,20 @@ describe("RPC command registry", () => {
 				concurrencyClass: "control",
 			});
 		}
+		for (const name of ["list_jobs", "get_job", "cancel_job"]) {
+			expect(manifest.commands.find(command => command.name === name)).toMatchObject({
+				scope: "agent",
+				availability: "conditional",
+				requiredFeatures: ["job-control"],
+			});
+			expect(enabledManifest.commands.find(command => command.name === name)).toMatchObject({
+				availability: "available",
+				requiredFeatures: ["job-control"],
+			});
+		}
 		expect(manifest.commands.find(command => command.name === "cancel_job")).toMatchObject({
-			scope: "agent",
 			concurrencyClass: "control",
+			confirmation: "required",
 			inputSchema: { properties: { jobIds: { maxItems: 64, uniqueItems: true } } },
 		});
 		expect(manifest.events).toEqual(expect.arrayContaining(["queue_update", "job_update"]));
@@ -81,6 +111,15 @@ describe("RPC command registry", () => {
 			ok: false,
 			code: "invalid_request",
 		});
+	});
+
+	test("requires confirmation for eval, job cancellation, session deletion, and credential removal", () => {
+		const manifest = getRpcCapabilityManifest();
+		for (const name of ["eval_execute", "cancel_job", "delete_session", "remove_provider_auth"]) {
+			expect(manifest.commands.find(command => command.name === name)).toMatchObject({
+				confirmation: "required",
+			});
+		}
 	});
 
 	test("evaluates runtime-gated availability on every manifest query", () => {
@@ -183,9 +222,5 @@ describe("RPC command registry", () => {
 				concurrencyClass,
 			});
 		}
-
-		const deleteSession = manifest.commands.find(candidate => candidate.name === "delete_session");
-		expect(deleteSession?.confirmation).toBe("required");
-		expect(manifest.commands.find(candidate => candidate.name === "rename_session")?.confirmation).toBe("none");
 	});
 });

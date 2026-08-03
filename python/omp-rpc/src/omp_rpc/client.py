@@ -9,9 +9,10 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Generic, Literal, Mapping, Sequence, TypeVar, cast
+from typing import Any, Generic, Literal, TypeVar, cast
 
 from .host_tools import HostTool, HostToolContext
 from .host_uris import HostUri, HostUriContext, normalize_read_result
@@ -31,6 +32,7 @@ from .protocol import (
     AutoCompactionStartEvent,
     AutoRetryEndEvent,
     AutoRetryStartEvent,
+    AvailableCommandsUpdateEvent,
     BashResult,
     BranchMessage,
     BranchResult,
@@ -38,7 +40,9 @@ from .protocol import (
     CancelJobResult,
     CancellationResult,
     CancelOperationResult,
+    CommandOutputEvent,
     CompactionResult,
+    ConfigUpdateEvent,
     DeleteSessionResult,
     EvalCompleteEvent,
     EvalHistoryEntry,
@@ -47,8 +51,10 @@ from .protocol import (
     ExtensionUiRequest,
     FastModeResult,
     ForkSessionResult,
+    GoalUpdatedEvent,
     ImageContent,
     InterruptMode,
+    IrcMessageEvent,
     JobListResult,
     JobSnapshot,
     JobUpdateEvent,
@@ -59,16 +65,24 @@ from .protocol import (
     MessageStartEvent,
     MessageUpdateEvent,
     ModeChangeResult,
+    ModelChangedEvent,
     ModelCycleResult,
     ModelInfo,
+    NoticeEvent,
     OperationCancelledEvent,
     OperationCompletedEvent,
     OperationFailedEvent,
     OperationsSnapshot,
     OperationStartedEvent,
+    PlanApprovalRequestEvent,
+    PlanApprovalSettledEvent,
     PlanState,
+    PlanStateUpdateEvent,
     PlanWorkflow,
+    PromptResultEvent,
+    ProviderAuthRequest,
     ProviderAuthState,
+    ProviderAuthUpdate,
     QueueRemoveResult,
     QueueUpdateEvent,
     ReadyEvent,
@@ -85,6 +99,7 @@ from .protocol import (
     SessionCatalogPage,
     SessionCatalogScope,
     SessionInfoResult,
+    SessionInfoUpdateEvent,
     SessionMode,
     SessionQueueClearResult,
     SessionQueueSnapshot,
@@ -100,6 +115,7 @@ from .protocol import (
     SubagentLifecycleEvent,
     SubagentProgressEvent,
     ThinkingLevel,
+    ThinkingLevelChangedEvent,
     ThinkingLevelCycleResult,
     TodoAutoClearEvent,
     TodoItem,
@@ -166,16 +182,31 @@ UiRequestListener = Callable[[ExtensionUiRequest], None]
 ExtensionErrorListener = Callable[[ExtensionError], None]
 ReadyListener = Callable[[ReadyEvent], None]
 UnknownNotificationListener = Callable[[UnknownNotification], None]
-OperationStartedListener = Callable[[OperationStartedEvent], None]
 SettingsUpdateListener = Callable[[SettingsUpdateEvent], None]
 ToolInventoryUpdateListener = Callable[[ToolInventoryUpdateEvent], None]
+OperationStartedListener = Callable[[OperationStartedEvent], None]
 OperationTerminalListener = Callable[[RpcOperationTerminalEvent], None]
+PromptResultListener = Callable[[PromptResultEvent], None]
 EvalOutputListener = Callable[[EvalOutputEvent], None]
 EvalCompleteListener = Callable[[EvalCompleteEvent], None]
+PlanStateUpdateListener = Callable[[PlanStateUpdateEvent], None]
+PlanApprovalRequestListener = Callable[[PlanApprovalRequestEvent], None]
+PlanApprovalSettledListener = Callable[[PlanApprovalSettledEvent], None]
 AgentRegistryUpdateListener = Callable[[AgentRegistryUpdateEvent], None]
+ProviderAuthRequestListener = Callable[[ProviderAuthRequest], None]
+ProviderAuthUpdateListener = Callable[[ProviderAuthUpdate], None]
+AvailableCommandsUpdateListener = Callable[[AvailableCommandsUpdateEvent], None]
+CommandOutputListener = Callable[[CommandOutputEvent], None]
+SessionInfoUpdateListener = Callable[[SessionInfoUpdateEvent], None]
+ConfigUpdateListener = Callable[[ConfigUpdateEvent], None]
 SubagentLifecycleListener = Callable[[SubagentLifecycleEvent], None]
 SubagentProgressListener = Callable[[SubagentProgressEvent], None]
 SubagentEventListener = Callable[[SubagentEvent], None]
+ModelChangedListener = Callable[[ModelChangedEvent], None]
+IrcMessageListener = Callable[[IrcMessageEvent], None]
+NoticeListener = Callable[[NoticeEvent], None]
+ThinkingLevelChangedListener = Callable[[ThinkingLevelChangedEvent], None]
+GoalUpdatedListener = Callable[[GoalUpdatedEvent], None]
 QueueUpdateListener = Callable[[QueueUpdateEvent], None]
 JobUpdateListener = Callable[[JobUpdateEvent], None]
 AgentStartListener = Callable[[AgentStartEvent], None]
@@ -882,6 +913,98 @@ class RpcClient:
             self._tool_inventory_update_listeners, listener
         )
 
+    def on_operation_started(
+        self, listener: OperationStartedListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("operation_started", listener)
+
+    def on_prompt_result(self, listener: PromptResultListener) -> Callable[[], None]:
+        return self._add_typed_notification_listener("prompt_result", listener)
+
+    def on_eval_output(self, listener: EvalOutputListener) -> Callable[[], None]:
+        return self._add_typed_notification_listener("eval_output", listener)
+
+    def on_eval_complete(self, listener: EvalCompleteListener) -> Callable[[], None]:
+        return self._add_typed_notification_listener("eval_complete", listener)
+
+    def on_plan_state_update(
+        self, listener: PlanStateUpdateListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("plan_state_update", listener)
+
+    def on_plan_approval_request(
+        self, listener: PlanApprovalRequestListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("plan_approval_request", listener)
+
+    def on_plan_approval_settled(
+        self, listener: PlanApprovalSettledListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("plan_approval_settled", listener)
+
+    def on_agent_registry_update(
+        self, listener: AgentRegistryUpdateListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("agent_registry_update", listener)
+
+    def on_provider_auth_request(
+        self, listener: ProviderAuthRequestListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("provider_auth_request", listener)
+
+    def on_provider_auth_update(
+        self, listener: ProviderAuthUpdateListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("provider_auth_update", listener)
+
+    def on_available_commands_update(
+        self, listener: AvailableCommandsUpdateListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener(
+            "available_commands_update", listener
+        )
+
+    def on_command_output(self, listener: CommandOutputListener) -> Callable[[], None]:
+        return self._add_typed_notification_listener("command_output", listener)
+
+    def on_session_info_update(
+        self, listener: SessionInfoUpdateListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("session_info_update", listener)
+
+    def on_config_update(self, listener: ConfigUpdateListener) -> Callable[[], None]:
+        return self._add_typed_notification_listener("config_update", listener)
+
+    def on_subagent_lifecycle(
+        self, listener: SubagentLifecycleListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("subagent_lifecycle", listener)
+
+    def on_subagent_progress(
+        self, listener: SubagentProgressListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("subagent_progress", listener)
+
+    def on_subagent_event(self, listener: SubagentEventListener) -> Callable[[], None]:
+        return self._add_typed_notification_listener("subagent_event", listener)
+
+    def on_model_changed(self, listener: ModelChangedListener) -> Callable[[], None]:
+        return self._add_typed_notification_listener("model_changed", listener)
+
+    def on_irc_message(self, listener: IrcMessageListener) -> Callable[[], None]:
+        return self._add_typed_notification_listener("irc_message", listener)
+
+    def on_notice(self, listener: NoticeListener) -> Callable[[], None]:
+        return self._add_typed_notification_listener("notice", listener)
+
+    def on_thinking_level_changed(
+        self, listener: ThinkingLevelChangedListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("thinking_level_changed", listener)
+
+    def on_goal_updated(self, listener: GoalUpdatedListener) -> Callable[[], None]:
+        return self._add_typed_notification_listener("goal_updated", listener)
+
     def on_queue_update(self, listener: QueueUpdateListener) -> Callable[[], None]:
         return self._add_typed_notification_listener("queue_update", listener)
 
@@ -987,11 +1110,6 @@ class RpcClient:
             self._unknown_notification_listeners, listener
         )
 
-    def on_operation_started(
-        self, listener: OperationStartedListener
-    ) -> Callable[[], None]:
-        return self._add_typed_notification_listener("operation_started", listener)
-
     def on_operation_terminal(
         self, listener: OperationTerminalListener
     ) -> Callable[[], None]:
@@ -999,30 +1117,6 @@ class RpcClient:
         return lambda: self._remove_listener(
             self._operation_terminal_listeners, listener
         )
-
-    def on_eval_output(self, listener: EvalOutputListener) -> Callable[[], None]:
-        return self._add_typed_notification_listener("eval_output", listener)
-
-    def on_eval_complete(self, listener: EvalCompleteListener) -> Callable[[], None]:
-        return self._add_typed_notification_listener("eval_complete", listener)
-
-    def on_agent_registry_update(
-        self, listener: AgentRegistryUpdateListener
-    ) -> Callable[[], None]:
-        return self._add_typed_notification_listener("agent_registry_update", listener)
-
-    def on_subagent_lifecycle(
-        self, listener: SubagentLifecycleListener
-    ) -> Callable[[], None]:
-        return self._add_typed_notification_listener("subagent_lifecycle", listener)
-
-    def on_subagent_progress(
-        self, listener: SubagentProgressListener
-    ) -> Callable[[], None]:
-        return self._add_typed_notification_listener("subagent_progress", listener)
-
-    def on_subagent_event(self, listener: SubagentEventListener) -> Callable[[], None]:
-        return self._add_typed_notification_listener("subagent_event", listener)
 
     def install_headless_ui(
         self,
@@ -1134,6 +1228,7 @@ class RpcClient:
         operation_id = payload.get("operationId")
         if not isinstance(operation_id, str):
             raise RpcError("begin_provider_auth returned a malformed operation handle")
+        self._register_operation(operation_id)
         return operation_id
 
     def cancel_provider_auth(self, operation_id: str) -> CancelOperationResult:

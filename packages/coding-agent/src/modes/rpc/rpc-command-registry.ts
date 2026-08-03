@@ -375,8 +375,10 @@ export const RPC_COMMAND_DEFINITIONS = {
 			code: boundedStringField("code no longer than 262144 characters", 262_144),
 			title: optionalBoundedStringField("a title no longer than 512 characters", 512),
 			timeout: optionalBoundedPositiveIntegerField(3_600),
-			reset: optionalBooleanField,
-			excludeFromContext: optionalBooleanField,
+			reset: optional("a boolean", value => typeof value === "boolean", { type: ["boolean", "null"] }),
+			excludeFromContext: optional("a boolean", value => typeof value === "boolean", {
+				type: ["boolean", "null"],
+			}),
 		},
 		"concurrent",
 		{
@@ -666,7 +668,9 @@ export const RPC_COMMAND_DEFINITIONS = {
 	set_auto_compaction: sessionCommand({ type: "set_auto_compaction", enabled: true }, { enabled: booleanField }),
 	set_auto_retry: sessionCommand({ type: "set_auto_retry", enabled: true }, { enabled: booleanField }),
 	abort_retry: sessionCommand({ type: "abort_retry" }, {}, "control"),
-	bash: sessionCommand({ type: "bash", command: "pwd" }, { command: stringField }, "concurrent"),
+	bash: sessionCommand({ type: "bash", command: "pwd" }, { command: stringField }, "concurrent", {
+		confirmation: "required",
+	}),
 	abort_bash: sessionCommand({ type: "abort_bash" }, {}, "control"),
 	get_session_stats: sessionCommand({ type: "get_session_stats" }),
 	export_html: sessionCommand({ type: "export_html" }, { outputPath: optionalStringField }),

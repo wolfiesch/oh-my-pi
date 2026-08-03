@@ -1023,7 +1023,14 @@ export type RpcExtensionUIRequest =
 			timeout?: number;
 			/** Server-issued correlation for privileged RPC mutations. */
 			operationId?: string;
-			command?: "cancel_agent" | "release_agent" | "eval_execute" | "delete_session" | "remove_provider_auth";
+			command?:
+				| "cancel_agent"
+				| "release_agent"
+				| "eval_execute"
+				| "bash"
+				| "cancel_job"
+				| "delete_session"
+				| "remove_provider_auth";
 	  }
 	| {
 			type: "extension_ui_request";
@@ -1204,6 +1211,11 @@ type RpcManifestEvent =
 	| RpcEvalCompleteFrame
 	| RpcOperationStartedFrame
 	| RpcOperationTerminalFrame
+	| RpcPlanStateUpdateFrame
+	| RpcPlanApprovalRequestFrame
+	| RpcPlanApprovalSettledFrame
+	| RpcProviderAuthRequestFrame
+	| RpcProviderAuthUpdateFrame
 	| RpcSessionEventFrame
 	| RpcExtensionUIRequest
 	| RpcSettingsUpdateFrame
@@ -1243,6 +1255,11 @@ export const RPC_EVENT_TYPES = eventInventory([
 	"operation_completed",
 	"operation_failed",
 	"operation_cancelled",
+	"plan_state_update",
+	"plan_approval_request",
+	"plan_approval_settled",
+	"provider_auth_request",
+	"provider_auth_update",
 	"command_output",
 	"session_info_update",
 	"config_update",

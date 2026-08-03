@@ -209,6 +209,9 @@ describe("AgentSession concurrent disposal", () => {
 		Object.defineProperty(current.agent.state, "isStreaming", {
 			configurable: true,
 			get: () => providerStreaming,
+			set: value => {
+				providerStreaming = value;
+			},
 		});
 
 		expect(current.activityPhase).toBe("idle");
