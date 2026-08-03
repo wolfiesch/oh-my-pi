@@ -12,6 +12,7 @@
  */
 import { once } from "node:events";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { serviceTierFamily } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isRecord, Snowflake } from "@oh-my-pi/pi-utils";
@@ -37,6 +38,7 @@ import { calculateTokensPerSecond } from "../../utils/token-rate";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
+import { getRpcCapabilityManifest, validateRpcCommand } from "./rpc-command-registry";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
@@ -324,7 +326,7 @@ export class RpcOperationMessageOwnership {
 export interface RpcInputFrameDeps {
 	handleCommand: (command: RpcCommand) => Promise<RpcResponse>;
 	output: RpcOutput;
-	errorResponse: (id: string | undefined, command: string, message: string) => RpcResponse;
+	errorResponse: (id: string | undefined, command: string, message: string, code?: string) => RpcResponse;
 	trackBackgroundTask?: (task: Promise<void>) => void;
 	pendingExtensionRequests: Map<string, PendingExtensionRequest>;
 	onHostToolResult: (frame: RpcHostToolResult) => void;
@@ -372,37 +374,34 @@ export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps
 /**
  * Dispatch a single parsed frame from the RPC input stream.
  *
- * Bash commands are dispatched in the background so the caller can keep reading
- * subsequent frames while a shell command is still running. This lets a client
- * send `abort_bash` while a long-running `bash` is in flight. Response
- * correlation is preserved via each command's `id`; ordering across concurrent
- * commands is not guaranteed and clients MUST match on `id`.
+ * Concurrent and control commands are dispatched in the background so the
+ * caller can keep reading while a long-running serial command is in flight.
+ * This lets abort, steering, and cancellation commands preempt queued work.
+ * Response correlation is preserved via each command's `id`; ordering across
+ * concurrent commands is not guaranteed and clients MUST match on `id`.
  *
  * @returns `undefined` when the frame was routed to a side-channel handler
  *   (extension UI response, host tool/URI frames) or dispatched in the
- *   background (`bash`). Otherwise a promise that resolves once the response
+ *   background (`concurrent` or `control`). Otherwise a promise that resolves once the response
  *   for the command has been emitted via `output`. Errors from `handleCommand`
- *   on non-`bash` commands propagate; the caller is expected to wrap them.
+ *   on serial commands propagate; the caller is expected to wrap them.
  */
 export function dispatchRpcInputFrame(parsed: unknown, deps: RpcInputFrameDeps): Promise<void> | undefined {
 	if (dispatchRpcControlFrame(parsed, deps)) return undefined;
-	// Regular RPC command. The transport contract states each remaining frame
-	// is an {@link RpcCommand}; `handleCommand`'s `default` arm surfaces
-	// unknown discriminants as an error response, so we do not shape-check
-	// the union here.
-	const command = parsed as RpcCommand;
+	const validation = validateRpcCommand(parsed);
+	if (!validation.ok) {
+		deps.output(deps.errorResponse(validation.id, validation.command, validation.error, validation.code));
+		return undefined;
+	}
+	const command = validation.command;
 
-	// `bash` can run for a long time. Dispatch it in the background so a
-	// subsequent `abort_bash` frame can be read and handled without waiting
-	// for the shell command to finish on its own. The response is emitted
-	// when `handleCommand` resolves; clients correlate via `command.id`.
-	if (command.type === "bash") {
+	if (validation.scheduling !== "serial") {
 		const task = (async () => {
 			try {
 				deps.output(await deps.handleCommand(command));
 			} catch (err: unknown) {
 				const message = err instanceof Error ? err.message : String(err);
-				deps.output(deps.errorResponse(command.id, "bash", message));
+				deps.output(deps.errorResponse(command.id, command.type, message));
 			}
 		})();
 		deps.trackBackgroundTask?.(task);
@@ -431,15 +430,21 @@ export class RpcInputDispatcher {
 		try {
 			if (dispatchRpcControlFrame(parsed, this.#deps)) return;
 
-			const command = parsed as RpcCommand;
-			if (command.type === "bash") {
-				dispatchRpcInputFrame(command, this.#deps);
+			const validation = validateRpcCommand(parsed);
+			if (!validation.ok) {
+				this.#deps.output(
+					this.#deps.errorResponse(validation.id, validation.command, validation.error, validation.code),
+				);
+				return;
+			}
+			if (validation.scheduling !== "serial") {
+				dispatchRpcInputFrame(validation.command, this.#deps);
 				return;
 			}
 
 			const task = this.#tail.then(
-				() => this.#dispatchSerialCommand(command),
-				() => this.#dispatchSerialCommand(command),
+				() => this.#dispatchSerialCommand(validation.command),
+				() => this.#dispatchSerialCommand(validation.command),
 			);
 			this.#tail = task.catch(() => {});
 			this.#tasks.add(task);
@@ -448,7 +453,8 @@ export class RpcInputDispatcher {
 			});
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
-			this.#deps.output(this.#deps.errorResponse(undefined, "parse", `Failed to parse command: ${message}`));
+			const id = isRecord(parsed) && typeof parsed.id === "string" ? parsed.id : undefined;
+			this.#deps.output(this.#deps.errorResponse(id, "parse", `Failed to parse command: ${message}`));
 		}
 	}
 
@@ -476,7 +482,7 @@ export class RpcInputDispatcher {
  * Coordinates deferred shutdown with in-flight background input tasks.
  *
  * `pi.shutdown()` from an extension only *requests* shutdown; the process must
- * not exit while a background-dispatched command (`bash`, see
+ * not exit while a background-dispatched command (see
  * {@link dispatchRpcInputFrame}) still owes the client a response frame. The
  * coordinator tracks those tasks, re-checks the shutdown request whenever one
  * settles (covering a shutdown requested mid-bash with no follow-up client
@@ -741,6 +747,13 @@ export async function runRpcMode(
 	process.env.PI_NOTIFICATIONS = "off";
 
 	const frameEncoder = new RpcFrameEncoder();
+	const getCapabilityManifest = () => {
+		const features = new Set<string>();
+		if (eventBus) features.add("subagent-event-bus");
+		if (session.model && serviceTierFamily(session.model)) features.add("model.fast-mode");
+		return getRpcCapabilityManifest({ features });
+	};
+	const capabilityManifest = getCapabilityManifest();
 	// Ordered stdout writer honoring backpressure: chunked v2 frames are produced
 	// lazily by the encoder and written one physical line at a time, so a near-limit
 	// logical frame never materializes its full base64 transport in memory.
@@ -762,6 +775,7 @@ export async function runRpcMode(
 			supportedProtocolVersions: [1, 2],
 			maxFrameBytes: MAX_RPC_FRAME_BYTES,
 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
+			capabilities: capabilityManifest,
 		}),
 	);
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
@@ -1056,6 +1070,9 @@ export async function runRpcMode(
 					return error(id, "negotiate_protocol", `Unsupported RPC protocol version: ${command.protocolVersion}`);
 				return success(id, "negotiate_protocol", { protocolVersion: 2 });
 			}
+
+			case "get_capabilities":
+				return success(id, "get_capabilities", getCapabilityManifest());
 
 			// =================================================================
 			// Prompting
@@ -1605,14 +1622,14 @@ export async function runRpcMode(
 			}
 
 			default: {
-				const unknownCommand = command as { type: string };
-				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
+				const exhaustiveCommand: never = command;
+				return exhaustiveCommand;
 			}
 		}
 	};
 
 	// Deferred shutdown (pi.shutdown() from an extension) must not kill the
-	// process while a background-dispatched bash still owes the client its
+	// process while a background-dispatched command still owes the client its
 	// response frame. The coordinator drains tracked tasks before exiting and
 	// re-checks the request as each task settles.
 	const shutdownCoordinator = new RpcShutdownCoordinator({
@@ -1645,11 +1662,10 @@ export async function runRpcMode(
 	});
 
 	// Keep the stdin reader moving: side-channel frames dispatch immediately,
-	// ordinary commands serialize through inputDispatcher, and bash remains
-	// background-dispatched so abort_bash can overtake it. Frames are read
-	// line-by-line by readRpcInputFrames so a single malformed line is reported
-	// as an error frame and the loop keeps running instead of throwing out of
-	// the reader and killing the whole process (issue #5194).
+	// ordinary commands serialize through inputDispatcher, while concurrent
+	// and control commands can overtake them. Frames are read line-by-line by
+	// readRpcInputFrames so a single malformed line is reported as an error frame
+	// and the loop keeps running instead of killing the process (issue #5194).
 	await readRpcInputFrames(
 		input ?? Bun.stdin.stream(),
 		parsed => inputDispatcher.dispatch(parsed),

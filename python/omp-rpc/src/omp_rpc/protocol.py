@@ -29,6 +29,10 @@ RpcOperationCancellationCode: TypeAlias = Literal[
     "session_changed",
     "client_disconnected",
 ]
+RpcCommandScope: TypeAlias = str
+RpcCommandExecution: TypeAlias = str
+RpcCommandAvailability: TypeAlias = str
+RpcCommandConcurrencyClass: TypeAlias = str
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
 WidgetPlacement: TypeAlias = Literal["aboveEditor", "belowEditor"]
@@ -916,11 +920,42 @@ class SessionStats:
 
 
 @dataclass(slots=True, frozen=True)
+class RpcCapabilityDisabledReason:
+    code: str
+    message: str
+
+
+@dataclass(slots=True, frozen=True)
+class RpcCommandCapability:
+    id: str
+    name: str
+    version: int
+    scope: RpcCommandScope
+    execution: RpcCommandExecution
+    availability: RpcCommandAvailability
+    required_features: tuple[str, ...]
+    input_schema: JsonObject | None = None
+    output_schema: JsonObject | None = None
+    concurrency_class: RpcCommandConcurrencyClass | None = None
+    disabled_reason: RpcCapabilityDisabledReason | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class RpcCapabilityManifest:
+    application_api_version: int
+    commands: tuple[RpcCommandCapability, ...]
+    events: tuple[str, ...]
+    extension_ui_methods: tuple[str, ...]
+    host_protocols: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
 class ReadyEvent:
     protocol_version: int | None = None
     supported_protocol_versions: tuple[int, ...] | None = None
     max_frame_bytes: int | None = None
     max_reassembled_frame_bytes: int | None = None
+    capabilities: RpcCapabilityManifest | None = None
     type: Literal["ready"] = "ready"
 
 
@@ -1530,6 +1565,80 @@ def parse_fast_mode_result(payload: JsonObject) -> FastModeResult:
     )
 
 
+def parse_rpc_capability_manifest(payload: JsonObject) -> RpcCapabilityManifest:
+    raw_api_version = payload.get("applicationApiVersion")
+    if not isinstance(raw_api_version, int) or isinstance(raw_api_version, bool):
+        raise ValueError("capabilities.applicationApiVersion must be an integer")
+
+    def string_tuple(value: object, *, field: str) -> tuple[str, ...]:
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must be a list")
+        result: list[str] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, str):
+                raise ValueError(f"{field}[{index}] must be a string")
+            result.append(item)
+        return tuple(result)
+
+    raw_commands = payload.get("commands")
+    if not isinstance(raw_commands, list):
+        raise ValueError("capabilities.commands must be a list")
+    commands: list[RpcCommandCapability] = []
+    for index, raw_command in enumerate(raw_commands):
+        field = f"capabilities.commands[{index}]"
+        command = _clone_json_object(raw_command, field=field)
+        version = command.get("version")
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise ValueError(f"{field}.version must be an integer")
+
+        raw_disabled_reason = command.get("disabledReason")
+        disabled_reason = None
+        if raw_disabled_reason is not None:
+            reason = _clone_json_object(
+                raw_disabled_reason, field=f"{field}.disabledReason"
+            )
+            disabled_reason = RpcCapabilityDisabledReason(
+                code=_require_str(reason, "code"),
+                message=_require_str(reason, "message"),
+            )
+
+        commands.append(
+            RpcCommandCapability(
+                id=_require_str(command, "id"),
+                name=_require_str(command, "name"),
+                version=version,
+                scope=_require_str(command, "scope"),
+                execution=_require_str(command, "execution"),
+                availability=_require_str(command, "availability"),
+                required_features=string_tuple(
+                    command.get("requiredFeatures"),
+                    field=f"{field}.requiredFeatures",
+                ),
+                input_schema=_optional_json_object(
+                    command.get("inputSchema"), field=f"{field}.inputSchema"
+                ),
+                output_schema=_optional_json_object(
+                    command.get("outputSchema"), field=f"{field}.outputSchema"
+                ),
+                concurrency_class=_optional_str(command, "concurrencyClass"),
+                disabled_reason=disabled_reason,
+            )
+        )
+
+    return RpcCapabilityManifest(
+        application_api_version=raw_api_version,
+        commands=tuple(commands),
+        events=string_tuple(payload.get("events"), field="capabilities.events"),
+        extension_ui_methods=string_tuple(
+            payload.get("extensionUiMethods"),
+            field="capabilities.extensionUiMethods",
+        ),
+        host_protocols=string_tuple(
+            payload.get("hostProtocols"), field="capabilities.hostProtocols"
+        ),
+    )
+
+
 def parse_compaction_result(payload: JsonObject) -> CompactionResult:
     return CompactionResult(
         summary=str(payload.get("summary", "")),
@@ -1697,6 +1806,14 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             ):
                 raise ValueError("ready.supportedProtocolVersions must be integers")
             supported_versions = tuple(raw_versions)
+        raw_capabilities = payload.get("capabilities")
+        capabilities = (
+            parse_rpc_capability_manifest(
+                _clone_json_object(raw_capabilities, field="ready.capabilities")
+            )
+            if raw_capabilities is not None
+            else None
+        )
         return ReadyEvent(
             protocol_version=_optional_int(payload, "protocolVersion"),
             supported_protocol_versions=supported_versions,
@@ -1704,6 +1821,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             max_reassembled_frame_bytes=_optional_int(
                 payload, "maxReassembledFrameBytes"
             ),
+            capabilities=capabilities,
         )
     if event_type == "extension_ui_request":
         return parse_extension_ui_request(payload)

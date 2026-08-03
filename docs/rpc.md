@@ -41,9 +41,50 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "protocolVersion": 1,
   "supportedProtocolVersions": [1, 2],
   "maxFrameBytes": 1048576,
-  "maxReassembledFrameBytes": 67108864
+  "maxReassembledFrameBytes": 67108864,
+  "capabilities": {
+    "applicationApiVersion": 1,
+    "commands": [
+      {
+        "id": "rpc.command.get_capabilities",
+        "name": "get_capabilities",
+        "version": 1,
+        "scope": "host",
+        "execution": "sync",
+        "availability": "available",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string" },
+            "type": { "const": "get_capabilities" }
+          },
+          "required": ["type"],
+          "additionalProperties": false
+        },
+        "concurrencyClass": "serial",
+        "requiredFeatures": []
+      }
+    ],
+    "events": ["ready", "agent_start", "agent_end"],
+    "extensionUiMethods": ["select", "confirm", "input"],
+    "hostProtocols": ["tools", "uris"]
+  }
 }
 ```
+
+The example capability arrays are abbreviated. The actual ready frame contains
+the complete startup snapshot. Hosts can query current, session-dependent
+availability at any time with `{ id?, type: "get_capabilities" }`.
+
+Command `id` is the stable protocol identity; `name` is the command sent in the
+`type` field. `scope`, `execution`, and `availability` describe where and how the
+command can run. An unavailable command includes a machine-readable
+`disabledReason: { code, message }`; conditional commands declare their
+`requiredFeatures` without pretending that a runtime prerequisite is always met.
+`inputSchema` is derived from the same field definitions used for
+wire validation. `outputSchema` and `concurrencyClass` are omitted when the
+server cannot advertise them truthfully. Command versions are assigned per
+registry entry.
 
 Clients that support protocol v2 SHOULD immediately send:
 
@@ -99,8 +140,15 @@ All commands accept optional `id?: string`.
 
 Important edge behavior from runtime:
 
-- Unknown command responses are emitted with `id: undefined` (even if the request had an `id`).
-- Parse/handler exceptions in the input loop emit `command: "parse"` with `id: undefined`.
+- Runtime validation rejects unknown commands and malformed fields before a
+  handler runs. Error responses preserve a valid request `id` and use
+  `code: "unsupported_command"` or `code: "invalid_request"`.
+- Each command's registry entry owns its internal dispatch scheduling and its
+  advertised `concurrencyClass`. `serial` commands preserve input order,
+  `concurrent` commands may run independently, and `control` commands can
+  overtake blocked serial work so abort and steering remain responsive.
+- Invalid JSON or reassembly errors that cannot yield a valid request object emit
+  `command: "parse"` with `id: undefined`.
 - `prompt` and `abort_and_prompt` synchronously acknowledge accepted work with
   server-generated `data.operationId` and `data.accepted: true`.
 - The request `id`, operation ID, and any session turn ID are distinct
@@ -112,12 +160,13 @@ Important edge behavior from runtime:
   already-consumed request ID.
 - `agent_end` remains a streaming session event. It is not the operation
   completion primitive, and `agent_end.isTerminal: false` never settles a wait.
-- Unknown command responses and parse/handler exceptions retain their legacy
-  correlation behavior described above.
 
 ## Command Schema (canonical)
 
-`RpcCommand` is defined in `packages/coding-agent/src/modes/rpc/rpc-types.ts`:
+`RpcCommand` is defined in `packages/coding-agent/src/modes/rpc/rpc-types.ts`. Runtime field
+validation, examples, versions, and scheduling are defined exhaustively in
+`packages/coding-agent/src/modes/rpc/rpc-command-registry.ts`; the type checker rejects a registry
+that omits a command:
 
 ### Prompting
 
@@ -132,6 +181,7 @@ Important edge behavior from runtime:
 ### Protocol
 
 - `{ id?, type: "negotiate_protocol", protocolVersion: 2 }`
+- `{ id?, type: "get_capabilities" }`
 
 ### State
 
@@ -178,12 +228,11 @@ Important edge behavior from runtime:
 - `{ id?, type: "bash", command: string }`
 - `{ id?, type: "abort_bash" }`
 
-`bash` is dispatched concurrently: the RPC server continues reading commands
-while the shell command runs, so `abort_bash` (or any other command) sent
-during a long-running `bash` is handled without waiting for it to finish on
-its own. The `bash` response is emitted when the command completes; hosts
-correlate it via `id`. Ordering across concurrent commands is not guaranteed
-— clients MUST match responses on `id`, not on emission order.
+`bash` is dispatched concurrently. Control commands such as `abort_bash`,
+`abort_retry`, `abort`, `steer`, and `follow_up` can also overtake blocked
+serial work. The server therefore continues reading commands while long-running
+work is active. Ordering across concurrent/control responses is not guaranteed;
+clients MUST correlate responses by `id`, not emission order.
 
 ### Session
 

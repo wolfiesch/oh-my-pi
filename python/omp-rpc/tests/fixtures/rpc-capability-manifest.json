@@ -1,0 +1,29 @@
+{
+  "applicationApiVersion": 1,
+  "commands": [
+    {
+      "id": "rpc.command.get_capabilities",
+      "name": "get_capabilities",
+      "version": 1,
+      "scope": "host",
+      "execution": "sync",
+      "availability": "available",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "const": "get_capabilities" }
+        },
+        "required": ["type"],
+        "additionalProperties": false
+      },
+      "concurrencyClass": "serial",
+      "requiredFeatures": [],
+      "futureDescriptorField": { "safeToIgnore": true }
+    }
+  ],
+  "events": ["ready", "agent_end", "future_event"],
+  "extensionUiMethods": ["confirm", "future_method"],
+  "hostProtocols": ["tools", "uris"],
+  "futureManifestField": true
+}

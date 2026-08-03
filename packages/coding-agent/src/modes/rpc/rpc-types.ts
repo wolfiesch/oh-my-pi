@@ -28,6 +28,7 @@ import type { RpcMessagesPage } from "./rpc-messages";
 export type RpcCommand =
 	// Protocol
 	| { id?: string; type: "negotiate_protocol"; protocolVersion: number }
+	| { id?: string; type: "get_capabilities" }
 
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
@@ -233,12 +234,59 @@ export interface RpcExtensionErrorFrame {
 	error: string;
 }
 
+export type RpcCommandSchedulingClass = "serial" | "concurrent" | "control";
+export type RpcCommandScope = "host" | "session" | "turn" | "agent";
+export type RpcCommandExecution = "sync" | "operation" | "host-only" | "unavailable";
+export type RpcCommandAvailability = "available" | "conditional" | "unavailable";
+export type RpcCommandConcurrencyClass = RpcCommandSchedulingClass;
+
+export interface RpcCapabilityDisabledReason {
+	code: string;
+	message: string;
+}
+
+export interface RpcInputSchema {
+	type: "object";
+	properties: Record<string, Record<string, unknown>>;
+	required: string[];
+	additionalProperties: false;
+}
+
+interface RpcCommandCapabilityBase {
+	/** Stable protocol identity. Unlike the display name, this must never be repurposed. */
+	id: string;
+	name: RpcCommandType;
+	version: number;
+	scope: RpcCommandScope;
+	execution: RpcCommandExecution;
+	inputSchema?: RpcInputSchema;
+	outputSchema?: Record<string, unknown>;
+	concurrencyClass?: RpcCommandConcurrencyClass;
+	requiredFeatures: string[];
+}
+
+export type RpcCommandCapability = RpcCommandCapabilityBase &
+	(
+		| { availability: "available" | "conditional"; disabledReason?: never }
+		| { availability: "unavailable"; disabledReason: RpcCapabilityDisabledReason }
+	);
+
+export interface RpcCapabilityManifest {
+	applicationApiVersion: number;
+	commands: RpcCommandCapability[];
+	events: RpcEventType[];
+	extensionUiMethods: RpcExtensionUIMethod[];
+	hostProtocols: string[];
+}
+
 export interface RpcReadyFrame {
 	type: "ready";
 	protocolVersion: 1;
 	supportedProtocolVersions: [1, 2];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
+	/** Present on servers with application-level capability discovery. */
+	capabilities?: RpcCapabilityManifest;
 }
 
 export interface RpcChunkFrame {
@@ -293,6 +341,13 @@ export type RpcResponse =
 			command: "negotiate_protocol";
 			success: true;
 			data: { protocolVersion: 2 };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_capabilities";
+			success: true;
+			data: RpcCapabilityManifest;
 	  }
 
 	// Prompting (async - events follow)
@@ -637,6 +692,104 @@ export type RpcExtensionUIResponse =
 	| { type: "extension_ui_response"; id: string; confirmed: boolean }
 	| { type: "extension_ui_response"; id: string; cancelled: true; timedOut?: boolean };
 
+type RpcManifestEvent =
+	| RpcReadyFrame
+	| RpcPromptResultFrame
+	| RpcAvailableCommandsUpdateFrame
+	| RpcOperationStartedFrame
+	| RpcOperationTerminalFrame
+	| RpcSessionEventFrame
+	| RpcExtensionUIRequest
+	| RpcHostToolCallRequest
+	| RpcHostToolCancelRequest
+	| RpcHostUriRequest
+	| RpcHostUriCancelRequest
+	| {
+			type:
+				| "command_output"
+				| "session_info_update"
+				| "config_update"
+				| "extension_error"
+				| "notice"
+				| "goal_updated";
+	  };
+
+function eventInventory<const T extends readonly RpcManifestEvent["type"][]>(
+	events: T & (Exclude<RpcManifestEvent["type"], T[number]> extends never ? unknown : never),
+): T {
+	return events;
+}
+
+/** Event names advertised by capability discovery, exhaustively linked to RPC output event discriminants. */
+export const RPC_EVENT_TYPES = eventInventory([
+	"ready",
+	"prompt_result",
+	"available_commands_update",
+	"operation_started",
+	"operation_completed",
+	"operation_failed",
+	"operation_cancelled",
+	"command_output",
+	"session_info_update",
+	"config_update",
+	"extension_ui_request",
+	"extension_error",
+	"host_tool_call",
+	"host_tool_cancel",
+	"host_uri_request",
+	"host_uri_cancel",
+	"subagent_lifecycle",
+	"subagent_progress",
+	"subagent_event",
+	"agent_start",
+	"agent_end",
+	"turn_start",
+	"turn_end",
+	"message_start",
+	"message_update",
+	"message_end",
+	"tool_execution_start",
+	"tool_execution_update",
+	"tool_execution_end",
+	"auto_compaction_start",
+	"auto_compaction_end",
+	"auto_retry_start",
+	"auto_retry_end",
+	"retry_fallback_applied",
+	"retry_fallback_succeeded",
+	"model_changed",
+	"ttsr_triggered",
+	"todo_reminder",
+	"todo_auto_clear",
+	"irc_message",
+	"notice",
+	"thinking_level_changed",
+	"goal_updated",
+] as const);
+
+export type RpcEventType = (typeof RPC_EVENT_TYPES)[number];
+export type RpcExtensionUIMethod = RpcExtensionUIRequest["method"];
+
+function extensionUiMethodInventory<const T extends readonly RpcExtensionUIMethod[]>(
+	methods: T & (Exclude<RpcExtensionUIMethod, T[number]> extends never ? unknown : never),
+): T {
+	return methods;
+}
+
+/** Extension UI method inventory, exhaustively linked to RpcExtensionUIRequest. */
+export const RPC_EXTENSION_UI_METHODS = extensionUiMethodInventory([
+	"select",
+	"confirm",
+	"input",
+	"editor",
+	"cancel",
+	"notify",
+	"setStatus",
+	"setWidget",
+	"setTitle",
+	"set_editor_text",
+	"open_url",
+] as const);
 // ============================================================================
 // Helper type for extracting command types
 // ============================================================================

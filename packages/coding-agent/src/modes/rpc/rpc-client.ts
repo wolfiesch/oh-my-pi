@@ -24,6 +24,7 @@ import type {
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
 	RpcCancelOperationResult,
+	RpcCapabilityManifest,
 	RpcCommand,
 	RpcCommandOutputFrame,
 	RpcConfigUpdateFrame,
@@ -811,6 +812,12 @@ export class RpcClient {
 	// =========================================================================
 	// Command Methods
 	// =========================================================================
+
+	/** Return the server's application-level RPC capability manifest. */
+	async getCapabilities(): Promise<RpcCapabilityManifest> {
+		const response = await this.#send({ type: "get_capabilities" });
+		return this.#getData(response);
+	}
 
 	/**
 	 * Send a prompt to the agent.

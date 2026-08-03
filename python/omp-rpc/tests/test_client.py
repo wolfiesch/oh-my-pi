@@ -11,6 +11,7 @@ import textwrap
 import threading
 import time
 import unittest
+from pathlib import Path
 from typing import cast
 
 from omp_rpc import (
@@ -25,11 +26,16 @@ from omp_rpc import (
 from omp_rpc.client import _RpcFrameDecoder
 from omp_rpc.protocol import JsonObject, JsonValue, SessionState
 
+CAPABILITY_MANIFEST_JSON = (
+    Path(__file__).parent / "fixtures" / "rpc-capability-manifest.json"
+).read_text(encoding="utf-8")
+
 FAKE_SERVER = textwrap.dedent(
     """
     import json
     import sys
     import time
+    capability_manifest = json.loads(__CAPABILITY_MANIFEST_JSON__)
 
     def usage():
         return {
@@ -276,7 +282,13 @@ FAKE_SERVER = textwrap.dedent(
             emit_prompt_turn("ui acknowledged")
             continue
 
-        if command_type == "get_state":
+        if command_type == "get_capabilities":
+            respond(
+                request_id,
+                "get_capabilities",
+                capability_manifest,
+            )
+        elif command_type == "get_state":
             respond(request_id, "get_state", current_state())
         elif command_type == "set_host_tools":
             registered_host_tools = command.get("tools", [])
@@ -503,7 +515,7 @@ FAKE_SERVER = textwrap.dedent(
         else:
             respond(request_id, command_type, success=False, error=f"unsupported: {command_type}")
     """
-)
+).replace("__CAPABILITY_MANIFEST_JSON__", repr(CAPABILITY_MANIFEST_JSON))
 
 STALLED_STATE_SERVER = FAKE_SERVER.replace(
     'if command_type == "get_state":\n'
@@ -1141,6 +1153,14 @@ class RpcClientTests(unittest.TestCase):
 
     def test_get_state_and_bash(self) -> None:
         with self.make_client() as client:
+            capabilities = client.get_capabilities()
+            self.assertEqual(capabilities.application_api_version, 1)
+            self.assertEqual(
+                capabilities.commands[0].id, "rpc.command.get_capabilities"
+            )
+            self.assertEqual(capabilities.commands[0].name, "get_capabilities")
+            self.assertEqual(capabilities.commands[0].concurrency_class, "serial")
+
             state = client.get_state()
             self.assertEqual(state.session_id, "fake-session")
             self.assertEqual(
