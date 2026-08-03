@@ -2377,5 +2377,62 @@ class TerminatesProcessGroupTests(unittest.TestCase):
         )
 
 
+class ProviderAuthClientTests(unittest.TestCase):
+    class StubClient(RpcClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[tuple[str, JsonObject]] = []
+
+        def _request(self, command_type: str, **payload: JsonValue) -> JsonObject:
+            self.calls.append((command_type, payload))
+            if command_type == "list_provider_auth":
+                return {
+                    "providers": [
+                        {
+                            "providerId": "openrouter",
+                            "name": "OpenRouter",
+                            "authenticated": False,
+                            "disabled": False,
+                            "available": True,
+                            "methods": [
+                                {
+                                    "method": "future_method",
+                                    "available": True,
+                                    "exclusive": True,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            if command_type == "begin_provider_auth":
+                return {"operationId": "operation-auth", "accepted": True}
+            if command_type == "cancel_provider_auth":
+                return {"operationId": "operation-auth", "status": "future_status"}
+            if command_type == "remove_provider_auth":
+                return {
+                    "state": {
+                        "providerId": "openrouter",
+                        "name": "OpenRouter",
+                        "authenticated": False,
+                        "disabled": False,
+                        "available": True,
+                        "methods": [],
+                    }
+                }
+            return {}
+
+    def test_provider_auth_commands_and_future_values(self) -> None:
+        client = self.StubClient()
+        inventory = client.list_provider_auth()
+        self.assertEqual(inventory[0].methods[0].method, "future_method")
+        operation_id = client.begin_provider_auth("openrouter", "future_method")
+
+        self.assertEqual(
+            client.cancel_provider_auth(operation_id).status, "future_status"
+        )
+        self.assertFalse(client.remove_provider_auth("openrouter").authenticated)
+        self.assertNotIn("secret-test-value", repr(inventory))
+
+
 if __name__ == "__main__":
     unittest.main()

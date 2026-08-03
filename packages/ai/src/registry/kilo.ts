@@ -110,5 +110,6 @@ export async function loginKilo(callbacks: OAuthController): Promise<OAuthCreden
 export const kiloProvider = {
 	id: "kilo",
 	name: "Kilo Gateway",
+	deviceCodeFlow: true,
 	login: loginKilo,
 } as const satisfies ProviderDefinition;

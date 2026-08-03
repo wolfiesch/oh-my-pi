@@ -83,4 +83,8 @@ export interface ProviderDefinition {
 	readonly callbackPort?: number;
 	/** OAuth flow needs a pasted code/redirect URL rather than a callback server. */
 	readonly pasteCodeFlow?: boolean;
+	/** Headless login performs a browser/device-code polling flow rather than accepting an API key. */
+	readonly deviceCodeFlow?: boolean;
+	/** Explicit reason this registry login cannot be driven by the headless provider-auth controller. */
+	readonly headlessAuthUnavailableReason?: string;
 }

@@ -23,9 +23,7 @@ SessionCatalogScope: TypeAlias = Literal["cwd", "all"]
 AdvisorRuntimeStatus: TypeAlias = Literal[
     "running", "paused", "quota_exhausted", "error", "no_model"
 ]
-RpcOperationCommand: TypeAlias = Literal[
-    "prompt", "abort_and_prompt", "set_mode", "resolve_plan_approval"
-]
+RpcOperationCommand: TypeAlias = str
 SessionMode: TypeAlias = Literal["none", "plan", "plan_paused"]
 PlanWorkflow: TypeAlias = Literal["parallel", "iterative"]
 RpcOperationCancellationReason: TypeAlias = Literal[
@@ -1200,6 +1198,53 @@ class ReadyEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class ProviderAuthMethodCapability:
+    method: str
+    available: bool
+    exclusive: bool
+
+
+@dataclass(slots=True, frozen=True)
+class ProviderAuthIdentity:
+    email: str | None = None
+    account_id: str | None = None
+    project_id: str | None = None
+    org_id: str | None = None
+    org_name: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ProviderAuthState:
+    provider_id: str
+    name: str
+    authenticated: bool
+    disabled: bool
+    available: bool
+    methods: tuple[ProviderAuthMethodCapability, ...]
+    credential_origin: str | None = None
+    unavailable_reason: str | None = None
+    identity: ProviderAuthIdentity | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ProviderAuthRequest:
+    operation_id: str
+    request_id: str
+    provider_id: str
+    method: Literal["open_url"]
+    url: str
+    launch_url: str | None = None
+    instructions: str | None = None
+    type: Literal["provider_auth_request"] = "provider_auth_request"
+
+
+@dataclass(slots=True, frozen=True)
+class ProviderAuthUpdate:
+    state: ProviderAuthState
+    type: Literal["provider_auth_update"] = "provider_auth_update"
+
+
+@dataclass(slots=True, frozen=True)
 class OperationStartedEvent:
     operation_id: str
     command: RpcOperationCommand
@@ -1214,6 +1259,7 @@ class OperationCompletedEvent:
     command: RpcOperationCommand
     agent_invoked: bool
     settled_at: float
+    state: ProviderAuthState | None = None
     request_id: str | None = None
     type: Literal["operation_completed"] = "operation_completed"
 
@@ -1250,7 +1296,7 @@ RpcOperationEvent: TypeAlias = OperationStartedEvent | RpcOperationTerminalEvent
 class ActiveOperation:
     operation_id: str
     command: RpcOperationCommand
-    status: Literal["accepted", "started"]
+    status: str
     accepted_at: float
     request_id: str | None = None
     started_at: float | None = None
@@ -1265,7 +1311,7 @@ class OperationsSnapshot:
 @dataclass(slots=True, frozen=True)
 class CancelOperationResult:
     operation_id: str
-    status: Literal["cancelled", "completed", "failed", "not_found"]
+    status: str
     terminal: RpcOperationTerminalEvent | None = None
 
 
@@ -1286,8 +1332,13 @@ class ExtensionUiRequest:
     placeholder: str | None = None
     prefill: str | None = None
     timeout: int | None = None
+    sensitive: bool | None = None
+    operation_id: str | None = None
+    purpose: str | None = None
+    provider_id: str | None = None
     prompt_style: bool | None = None
     target_id: str | None = None
+    command: Literal["delete_session", "remove_provider_auth"] | None = None
     notify_type: NotifyType | None = None
     status_key: str | None = None
     status_text: str | None = None
@@ -1520,6 +1571,8 @@ RpcAgentEvent: TypeAlias = (
 RpcNotification: TypeAlias = (
     ReadyEvent
     | RpcOperationEvent
+    | ProviderAuthRequest
+    | ProviderAuthUpdate
     | ExtensionUiRequest
     | ExtensionError
     | SettingsUpdateEvent
@@ -2396,6 +2449,47 @@ def parse_context_usage(payload: JsonObject | None) -> ContextUsage | None:
     )
 
 
+def parse_provider_auth_state(payload: JsonObject) -> ProviderAuthState:
+    raw_methods = payload.get("methods")
+    methods: list[ProviderAuthMethodCapability] = []
+    if isinstance(raw_methods, list):
+        for raw_method in raw_methods:
+            if not isinstance(raw_method, dict) or not isinstance(
+                raw_method.get("method"), str
+            ):
+                continue
+            methods.append(
+                ProviderAuthMethodCapability(
+                    method=raw_method["method"],
+                    available=raw_method.get("available") is True,
+                    exclusive=raw_method.get("exclusive") is True,
+                )
+            )
+    raw_identity = payload.get("identity")
+    identity = (
+        ProviderAuthIdentity(
+            email=_optional_str(raw_identity, "email"),
+            account_id=_optional_str(raw_identity, "accountId"),
+            project_id=_optional_str(raw_identity, "projectId"),
+            org_id=_optional_str(raw_identity, "orgId"),
+            org_name=_optional_str(raw_identity, "orgName"),
+        )
+        if isinstance(raw_identity, dict)
+        else None
+    )
+    return ProviderAuthState(
+        provider_id=_require_str(payload, "providerId"),
+        name=_require_str(payload, "name"),
+        authenticated=payload.get("authenticated") is True,
+        disabled=payload.get("disabled") is True,
+        available=payload.get("available") is True,
+        credential_origin=_optional_str(payload, "credentialOrigin"),
+        unavailable_reason=_optional_str(payload, "unavailableReason"),
+        identity=identity,
+        methods=tuple(methods),
+    )
+
+
 def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
     return ExtensionUiRequest(
         id=_require_str(payload, "id"),
@@ -2415,8 +2509,20 @@ def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
         placeholder=_optional_str(payload, "placeholder"),
         prefill=_optional_str(payload, "prefill"),
         timeout=_optional_int(payload, "timeout"),
+        sensitive=_optional_bool(payload, "sensitive"),
+        operation_id=_optional_str(payload, "operationId"),
+        purpose=_optional_str(payload, "purpose"),
+        provider_id=_optional_str(payload, "providerId"),
         prompt_style=_optional_bool(payload, "promptStyle"),
         target_id=_optional_str(payload, "targetId"),
+        command=cast(
+            Literal["delete_session", "remove_provider_auth"] | None,
+            _optional_literal(
+                payload.get("command"),
+                frozenset({"delete_session", "remove_provider_auth"}),
+                field="extension_ui_request.command",
+            ),
+        ),
         notify_type=cast(
             NotifyType | None,
             _optional_literal(
@@ -2485,6 +2591,24 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         )
     if event_type == "extension_ui_request":
         return parse_extension_ui_request(payload)
+    if event_type == "provider_auth_request":
+        method = _require_str(payload, "method")
+        if method != "open_url":
+            raise ValueError("provider_auth_request.method must be open_url")
+        return ProviderAuthRequest(
+            operation_id=_require_str(payload, "operationId"),
+            request_id=_require_str(payload, "requestId"),
+            provider_id=_require_str(payload, "providerId"),
+            method="open_url",
+            url=_require_str(payload, "url"),
+            launch_url=_optional_str(payload, "launchUrl"),
+            instructions=_optional_str(payload, "instructions"),
+        )
+    if event_type == "provider_auth_update":
+        state = payload.get("state")
+        if not isinstance(state, dict):
+            raise ValueError("provider_auth_update.state must be an object")
+        return ProviderAuthUpdate(state=parse_provider_auth_state(state))
     if event_type == "extension_error":
         return parse_extension_error(payload)
     if event_type == "settings_update":
@@ -2543,16 +2667,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         "operation_cancelled",
     }:
         operation_id = _require_str(payload, "operationId")
-        command = cast(
-            RpcOperationCommand,
-            _require_literal(
-                payload.get("command"),
-                frozenset(
-                    {"prompt", "abort_and_prompt", "set_mode", "resolve_plan_approval"}
-                ),
-                field=f"{event_type}.command",
-            ),
-        )
+        command = _require_str(payload, "command")
         request_id = _optional_str(payload, "requestId")
         if event_type == "operation_started":
             started_at = _optional_float(payload, "startedAt")
@@ -2571,12 +2686,17 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             agent_invoked = _optional_bool(payload, "agentInvoked")
             if agent_invoked is None:
                 raise ValueError("operation_completed.agentInvoked must be a boolean")
+            raw_data = payload.get("data")
+            state: ProviderAuthState | None = None
+            if isinstance(raw_data, dict) and isinstance(raw_data.get("state"), dict):
+                state = parse_provider_auth_state(raw_data["state"])
             return OperationCompletedEvent(
                 operation_id=operation_id,
                 request_id=request_id,
                 command=command,
                 agent_invoked=agent_invoked,
                 settled_at=settled_at,
+                state=state,
             )
         if event_type == "operation_failed":
             return OperationFailedEvent(

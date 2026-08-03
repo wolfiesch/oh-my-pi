@@ -17,6 +17,8 @@ from omp_rpc import (
     PlanApprovalRequestEvent,
     PlanApprovalSettledEvent,
     PlanStateUpdateEvent,
+    ProviderAuthRequest,
+    ProviderAuthUpdate,
     ReadyEvent,
     SessionState,
     TodoReminderEvent,
@@ -503,16 +505,24 @@ class ProtocolParsingTests(unittest.TestCase):
             {
                 "type": "extension_ui_request",
                 "id": "ui-1",
-                "method": "confirm",
-                "title": "Confirm",
-                "message": "Continue?",
+                "method": "input",
+                "title": "API key",
+                "placeholder": "sk-...",
                 "timeout": 1000,
+                "sensitive": True,
+                "operationId": "operation-auth",
+                "purpose": "provider_auth",
+                "providerId": "openrouter",
             }
         )
 
         self.assertIsInstance(notification, ExtensionUiRequest)
-        self.assertEqual(notification.method, "confirm")
-        self.assertEqual(notification.message, "Continue?")
+        self.assertEqual(notification.method, "input")
+        self.assertEqual(notification.placeholder, "sk-...")
+        self.assertTrue(notification.sensitive)
+        self.assertEqual(notification.operation_id, "operation-auth")
+        self.assertEqual(notification.purpose, "provider_auth")
+        self.assertEqual(notification.provider_id, "openrouter")
         self.assertTrue(notification.is_interactive())
         self.assertTrue(notification.requires_response())
         self.assertFalse(notification.is_passive())
@@ -850,6 +860,56 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertEqual(entry.source.server_name, "server")
         self.assertEqual(entry.source.remote_name, "search")
         self.assertEqual(entry.parameters["properties"]["query"]["type"], "string")
+
+    def test_provider_auth_parsing_is_secret_free_and_future_tolerant(self) -> None:
+        request = parse_notification(
+            {
+                "type": "provider_auth_request",
+                "operationId": "operation-auth",
+                "requestId": "request-auth",
+                "providerId": "openrouter",
+                "method": "open_url",
+                "url": "https://auth.example.test/start",
+            }
+        )
+        self.assertIsInstance(request, ProviderAuthRequest)
+        self.assertEqual(request.method, "open_url")
+        self.assertEqual(request.url, "https://auth.example.test/start")
+        with self.assertRaisesRegex(ValueError, "must be open_url"):
+            parse_notification(
+                {
+                    "type": "provider_auth_request",
+                    "operationId": "operation-auth",
+                    "requestId": "request-secret",
+                    "providerId": "openrouter",
+                    "method": "future_secret_method",
+                    "prompt": "Enter credential",
+                }
+            )
+        update = parse_notification(
+            {
+                "type": "provider_auth_update",
+                "state": {
+                    "providerId": "openrouter",
+                    "name": "OpenRouter",
+                    "authenticated": True,
+                    "available": True,
+                    "disabled": False,
+                    "credentialOrigin": "api_key",
+                    "methods": [
+                        {"method": "api_key", "available": True, "exclusive": True},
+                        {
+                            "method": "future_method",
+                            "available": True,
+                            "exclusive": True,
+                        },
+                    ],
+                },
+            }
+        )
+        self.assertIsInstance(update, ProviderAuthUpdate)
+        self.assertEqual(update.state.methods[1].method, "future_method")
+        self.assertFalse(hasattr(update.state, "key"))
 
     def test_parse_tool_inventory_minimal_and_open_source_kind(self) -> None:
         inventory = parse_tool_inventory(

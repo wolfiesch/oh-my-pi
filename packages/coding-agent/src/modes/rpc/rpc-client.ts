@@ -64,6 +64,10 @@ import type {
 	RpcPlanStateUpdateFrame,
 	RpcPlanWorkflow,
 	RpcPromptResultFrame,
+	RpcProviderAuthMethod,
+	RpcProviderAuthRequestFrame,
+	RpcProviderAuthState,
+	RpcProviderAuthUpdateFrame,
 	RpcRenameSessionResult,
 	RpcResponse,
 	RpcResumeSessionResult,
@@ -132,6 +136,8 @@ export type RpcConfigUpdateListener = (frame: RpcConfigUpdateFrame) => void;
 export type RpcExtensionErrorListener = (frame: RpcExtensionErrorFrame) => void;
 export type RpcSettingsUpdateListener = (frame: RpcSettingsUpdateFrame) => void;
 export type RpcExtensionUIRequestListener = (request: RpcExtensionUIRequest) => void;
+export type RpcProviderAuthRequestListener = (request: RpcProviderAuthRequestFrame) => void;
+export type RpcProviderAuthUpdateListener = (state: RpcProviderAuthState) => void;
 
 export interface RpcClientHostUriContext {
 	signal: AbortSignal;
@@ -362,9 +368,23 @@ function parseRpcOperationAccepted(value: unknown): RpcOperationAccepted | undef
 	}
 	return { operationId: value.operationId, accepted: true };
 }
+function isRpcProviderAuthRequestFrame(value: unknown): value is RpcProviderAuthRequestFrame {
+	return (
+		isRecord(value) &&
+		value.type === "provider_auth_request" &&
+		typeof value.operationId === "string" &&
+		typeof value.requestId === "string" &&
+		typeof value.providerId === "string" &&
+		value.method === "open_url" &&
+		typeof value.url === "string"
+	);
+}
+
+function isRpcProviderAuthUpdateFrame(value: unknown): value is RpcProviderAuthUpdateFrame {
+	return isRecord(value) && value.type === "provider_auth_update" && isRecord(value.state);
+}
 
 const RPC_ADVISOR_STATUSES = ["running", "paused", "quota_exhausted", "error", "no_model"] as const;
-
 function parseRpcAdvisorState(value: unknown): RpcAdvisorState | undefined {
 	if (
 		!isRecord(value) ||
@@ -383,6 +403,57 @@ function parseRpcAdvisorState(value: unknown): RpcAdvisorState | undefined {
 		advisors.push({ name: advisor.name, status });
 	}
 	return { configured: value.configured, active: value.active, advisors };
+}
+
+function parseProviderAuthState(value: unknown): RpcProviderAuthState {
+	if (!isRecord(value) || typeof value.providerId !== "string" || typeof value.name !== "string")
+		throw new Error("RPC provider auth state is malformed");
+	const knownMethods = new Set<RpcProviderAuthMethod>(["oauth_callback", "paste_code", "device_code", "api_key"]);
+	const methods = Array.isArray(value.methods)
+		? value.methods.flatMap(method => {
+				if (
+					!isRecord(method) ||
+					typeof method.method !== "string" ||
+					!knownMethods.has(method.method as RpcProviderAuthMethod)
+				)
+					return [];
+				return [
+					{
+						method: method.method as RpcProviderAuthMethod,
+						available: method.available === true,
+						exclusive: true as const,
+					},
+				];
+			})
+		: [];
+	const origin =
+		value.credentialOrigin === "runtime" ||
+		value.credentialOrigin === "config" ||
+		value.credentialOrigin === "oauth" ||
+		value.credentialOrigin === "api_key" ||
+		value.credentialOrigin === "env" ||
+		value.credentialOrigin === "fallback"
+			? value.credentialOrigin
+			: undefined;
+	return {
+		providerId: value.providerId,
+		name: value.name,
+		credentialOrigin: origin,
+		authenticated: value.authenticated === true,
+		disabled: value.disabled === true,
+		available: value.available === true,
+		unavailableReason: typeof value.unavailableReason === "string" ? value.unavailableReason : undefined,
+		identity: isRecord(value.identity)
+			? {
+					email: typeof value.identity.email === "string" ? value.identity.email : undefined,
+					accountId: typeof value.identity.accountId === "string" ? value.identity.accountId : undefined,
+					projectId: typeof value.identity.projectId === "string" ? value.identity.projectId : undefined,
+					orgId: typeof value.identity.orgId === "string" ? value.identity.orgId : undefined,
+					orgName: typeof value.identity.orgName === "string" ? value.identity.orgName : undefined,
+				}
+			: undefined,
+		methods,
+	};
 }
 
 function isRpcCommandOutputFrame(value: unknown): value is RpcCommandOutputFrame {
@@ -537,6 +608,8 @@ export class RpcClient {
 	#requestId = 0;
 	#protocolVersion: RpcProtocolVersion = 1;
 	#extensionUiListeners = new Set<RpcExtensionUIRequestListener>();
+	#providerAuthRequestListeners = new Set<RpcProviderAuthRequestListener>();
+	#providerAuthUpdateListeners = new Set<RpcProviderAuthUpdateListener>();
 	#abortController = new AbortController();
 
 	constructor(private options: RpcClientOptions = {}) {
@@ -920,6 +993,17 @@ export class RpcClient {
 	onExtensionUiRequest(listener: RpcExtensionUIRequestListener): () => void {
 		this.#extensionUiListeners.add(listener);
 		return () => this.#extensionUiListeners.delete(listener);
+	}
+	/** Subscribe to correlated provider-auth prompts. Secret responses are never emitted back by the server. */
+	onProviderAuthRequest(listener: RpcProviderAuthRequestListener): () => void {
+		this.#providerAuthRequestListeners.add(listener);
+		return () => this.#providerAuthRequestListeners.delete(listener);
+	}
+
+	/** Subscribe to authoritative post-login/post-removal auth state. */
+	onProviderAuthUpdate(listener: RpcProviderAuthUpdateListener): () => void {
+		this.#providerAuthUpdateListeners.add(listener);
+		return () => this.#providerAuthUpdateListeners.delete(listener);
 	}
 
 	/** Respond to a confirmation request from an extension. */
@@ -1555,70 +1639,28 @@ export class RpcClient {
 		return this.#getData<{ messages: AgentMessage[] }>(response).messages;
 	}
 
-	/**
-	 * Get list of OAuth providers available for login, with their current authentication status.
-	 */
-	async getLoginProviders(): Promise<Array<{ id: string; name: string; available: boolean; authenticated: boolean }>> {
-		const response = await this.#send({ type: "get_login_providers" });
-		return this.#getData<{
-			providers: Array<{ id: string; name: string; available: boolean; authenticated: boolean }>;
-		}>(response).providers;
+	async listProviderAuth(): Promise<RpcProviderAuthState[]> {
+		const response = await this.#send({ type: "list_provider_auth" });
+		const data = this.#getData<{ providers?: unknown }>(response);
+		if (!Array.isArray(data.providers)) throw new Error("RPC provider auth inventory is malformed");
+		return data.providers.map(parseProviderAuthState);
 	}
 
-	/**
-	 * Trigger OAuth login for the given provider.
-	 * The server will emit an `open_url` extension_ui_request for the auth URL.
-	 * Providers that require pasted-code completion may then emit an `input`
-	 * extension_ui_request; pass `onManualCodeInput` to satisfy it.
-	 * Resolves when login completes or rejects on failure.
-	 *
-	 * @param onOpenUrl Called when the server emits the auth URL. The host must
-	 *   open `url` in a browser. When the flow's callback server hosts a
-	 *   `/launch` redirect, `launchUrl` is a short loopback URL that 302s to
-	 *   `url` — hosts SHOULD surface it as the truncation-safe copy target so
-	 *   terminal viewport clipping cannot corrupt trailing OAuth query
-	 *   parameters (e.g. `code_challenge_method=S256`).
-	 */
-	async login(
-		providerId: string,
-		options?: {
-			onOpenUrl?: (url: string, instructions?: string, launchUrl?: string) => void;
-			onManualCodeInput?: (prompt: { title: string; placeholder?: string }) => string | Promise<string>;
-		},
-	): Promise<{ providerId: string }> {
-		const { onManualCodeInput, onOpenUrl } = options ?? {};
-		const listener =
-			onOpenUrl || onManualCodeInput
-				? (req: RpcExtensionUIRequest) => {
-						if (req.method === "open_url") {
-							onOpenUrl?.(req.url, req.instructions, req.launchUrl);
-							return;
-						}
-						if (req.method !== "input" || !onManualCodeInput) return;
-						void Promise.resolve(onManualCodeInput({ title: req.title, placeholder: req.placeholder }))
-							.then(value => {
-								this.#writeFrame({
-									type: "extension_ui_response",
-									id: req.id,
-									value,
-								});
-							})
-							.catch(() => {
-								this.#writeFrame({
-									type: "extension_ui_response",
-									id: req.id,
-									cancelled: true,
-								});
-							});
-					}
-				: undefined;
-		if (listener) this.#extensionUiListeners.add(listener);
-		try {
-			const response = await this.#send({ type: "login", providerId }, 600_000);
-			return this.#getData<{ providerId: string }>(response);
-		} finally {
-			if (listener) this.#extensionUiListeners.delete(listener);
-		}
+	async beginProviderAuth(providerId: string, method: RpcProviderAuthMethod): Promise<RpcOperationAccepted> {
+		const response = await this.#send({ type: "begin_provider_auth", providerId, method });
+		const accepted = parseRpcOperationAccepted(this.#getData<unknown>(response));
+		if (!accepted) throw new Error("RPC begin_provider_auth response is malformed");
+		return accepted;
+	}
+
+	async cancelProviderAuth(operationId: string): Promise<RpcCancelOperationResult> {
+		return this.#getData<RpcCancelOperationResult>(await this.#send({ type: "cancel_provider_auth", operationId }));
+	}
+
+	async removeProviderAuth(providerId: string): Promise<RpcProviderAuthState> {
+		const response = await this.#send({ type: "remove_provider_auth", providerId });
+		const data = this.#getData<{ state?: unknown }>(response);
+		return parseProviderAuthState(data.state);
 	}
 
 	/**
@@ -1858,6 +1900,15 @@ export class RpcClient {
 			for (const listener of this.#extensionUiListeners) {
 				listener(data);
 			}
+			return;
+		}
+		if (isRpcProviderAuthRequestFrame(data)) {
+			for (const listener of this.#providerAuthRequestListeners) listener(data);
+			return;
+		}
+		if (isRpcProviderAuthUpdateFrame(data)) {
+			const state = parseProviderAuthState(data.state);
+			for (const listener of this.#providerAuthUpdateListeners) listener(state);
 			return;
 		}
 

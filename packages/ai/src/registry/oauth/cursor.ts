@@ -1,4 +1,5 @@
 import * as AIError from "../../error";
+import { abortableOAuthSleep } from "./device-code";
 import { generatePKCE } from "./pkce";
 import type { OAuthCredentials } from "./types";
 
@@ -37,15 +38,16 @@ export async function generateCursorAuthParams(): Promise<CursorAuthParams> {
 export async function pollCursorAuth(
 	uuid: string,
 	verifier: string,
+	signal?: AbortSignal,
 ): Promise<{ accessToken: string; refreshToken: string }> {
 	let delay = POLL_BASE_DELAY;
 	let consecutiveErrors = 0;
 
 	for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt++) {
-		await Bun.sleep(delay);
+		await abortableOAuthSleep(delay, signal);
 
 		try {
-			const response = await fetch(`${CURSOR_POLL_URL}?uuid=${uuid}&verifier=${verifier}`);
+			const response = await fetch(`${CURSOR_POLL_URL}?uuid=${uuid}&verifier=${verifier}`, { signal });
 
 			if (response.status === 404) {
 				consecutiveErrors = 0;
@@ -69,7 +71,10 @@ export async function pollCursorAuth(
 				provider: "cursor",
 				status: response.status,
 			});
-		} catch {
+		} catch (error) {
+			if (signal?.aborted || error instanceof AIError.LoginCancelledError) {
+				throw new AIError.LoginCancelledError();
+			}
 			consecutiveErrors++;
 			if (consecutiveErrors >= 3) {
 				throw new AIError.OAuthError("Too many consecutive errors during Cursor auth polling", {
@@ -89,13 +94,14 @@ export async function pollCursorAuth(
 export async function loginCursor(
 	onAuthUrl: (url: string) => void,
 	onPollStart?: () => void,
+	signal?: AbortSignal,
 ): Promise<OAuthCredentials> {
 	const { verifier, uuid, loginUrl } = await generateCursorAuthParams();
 
 	onAuthUrl(loginUrl);
 	onPollStart?.();
 
-	const { accessToken, refreshToken } = await pollCursorAuth(uuid, verifier);
+	const { accessToken, refreshToken } = await pollCursorAuth(uuid, verifier, signal);
 
 	const expiresAt = getTokenExpiry(accessToken);
 

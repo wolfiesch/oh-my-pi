@@ -55,6 +55,7 @@ from .protocol import (
     OperationStartedEvent,
     PlanState,
     PlanWorkflow,
+    ProviderAuthState,
     ReadyEvent,
     RenameSessionResult,
     ResumeSessionResult,
@@ -110,6 +111,7 @@ from .protocol import (
     parse_model_info,
     parse_notification,
     parse_plan_state,
+    parse_provider_auth_state,
     parse_rename_session_result,
     parse_resume_session_result,
     parse_rpc_capability_manifest,
@@ -1005,6 +1007,37 @@ class RpcClient:
             payload["timedOut"] = True
         self._send_notification(payload)
 
+    def list_provider_auth(self) -> tuple[ProviderAuthState, ...]:
+        payload = self._request("list_provider_auth")
+        providers = payload.get("providers")
+        if not isinstance(providers, list):
+            raise RpcError("list_provider_auth returned a malformed provider inventory")
+        return tuple(
+            parse_provider_auth_state(provider)
+            for provider in providers
+            if isinstance(provider, dict)
+        )
+
+    def begin_provider_auth(self, provider_id: str, method: str) -> str:
+        payload = self._request(
+            "begin_provider_auth", providerId=provider_id, method=method
+        )
+        operation_id = payload.get("operationId")
+        if not isinstance(operation_id, str):
+            raise RpcError("begin_provider_auth returned a malformed operation handle")
+        return operation_id
+
+    def cancel_provider_auth(self, operation_id: str) -> CancelOperationResult:
+        payload = self._request("cancel_provider_auth", operationId=operation_id)
+        return self._parse_cancel_operation_result(operation_id, payload)
+
+    def remove_provider_auth(self, provider_id: str) -> ProviderAuthState:
+        payload = self._request("remove_provider_auth", providerId=provider_id)
+        state = payload.get("state")
+        if not isinstance(state, dict):
+            raise RpcError("remove_provider_auth returned malformed state")
+        return parse_provider_auth_state(state)
+
     def get_state(self) -> SessionState:
         return self._get_state()
 
@@ -1498,9 +1531,14 @@ class RpcClient:
 
     def cancel_operation(self, operation_id: str) -> CancelOperationResult:
         payload = self._request("cancel_operation", operationId=operation_id)
+        return self._parse_cancel_operation_result(operation_id, payload)
+
+    def _parse_cancel_operation_result(
+        self, operation_id: str, payload: JsonObject
+    ) -> CancelOperationResult:
         status = payload.get("status")
-        if status not in {"cancelled", "completed", "failed", "not_found"}:
-            raise RpcError("cancel_operation response has an invalid status")
+        if not isinstance(status, str):
+            raise RpcError("cancel operation response has an invalid status")
         terminal_payload = payload.get("terminal")
         terminal: RpcOperationTerminalEvent | None = None
         if isinstance(terminal_payload, dict):
@@ -1513,13 +1551,11 @@ class RpcClient:
                     OperationCancelledEvent,
                 ),
             ):
-                raise RpcError("cancel_operation response has an invalid terminal")
+                raise RpcError("cancel operation response has an invalid terminal")
             terminal = parsed
         return CancelOperationResult(
             operation_id=operation_id,
-            status=cast(
-                Literal["cancelled", "completed", "failed", "not_found"], status
-            ),
+            status=status,
             terminal=terminal,
         )
 
@@ -1541,8 +1577,8 @@ class RpcClient:
             accepted_at = item.get("acceptedAt")
             if (
                 not isinstance(operation_id, str)
-                or command not in {"prompt", "abort_and_prompt"}
-                or status not in {"accepted", "started"}
+                or not isinstance(command, str)
+                or not isinstance(status, str)
                 or not isinstance(accepted_at, (int, float))
                 or isinstance(accepted_at, bool)
             ):

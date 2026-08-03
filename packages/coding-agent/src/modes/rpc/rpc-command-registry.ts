@@ -342,6 +342,24 @@ export const RPC_COMMAND_DEFINITIONS = {
 		{ type: "set_tool_activation", activate: ["read"], deactivate: ["bash"] },
 		{ activate: optionalToolNameArrayField, deactivate: optionalToolNameArrayField },
 	),
+	list_provider_auth: sessionCommand({ type: "list_provider_auth" }, {}, "concurrent"),
+	begin_provider_auth: sessionCommand(
+		{ type: "begin_provider_auth", providerId: "anthropic", method: "oauth_callback" },
+		{ providerId: stringField, method: enumField("oauth_callback", "paste_code", "device_code", "api_key") },
+		"serial",
+		{ execution: "operation" },
+	),
+	cancel_provider_auth: sessionCommand(
+		{ type: "cancel_provider_auth", operationId: "operation-1" },
+		{ operationId: opaqueIdField },
+		"control",
+	),
+	remove_provider_auth: sessionCommand(
+		{ type: "remove_provider_auth", providerId: "anthropic" },
+		{ providerId: stringField },
+		"serial",
+		{ confirmation: "required" },
+	),
 	set_fast_mode: sessionCommand(
 		{ type: "set_fast_mode", enabled: false },
 		{ enabled: booleanField },
@@ -505,8 +523,6 @@ export const RPC_COMMAND_DEFINITIONS = {
 		{ type: "get_messages_page" },
 		{ cursor: optionalStringField, limit: positiveIntegerField },
 	),
-	get_login_providers: hostCommand({ type: "get_login_providers" }),
-	login: hostCommand({ type: "login", providerId: "anthropic" }, { providerId: stringField }),
 } as const satisfies RpcCommandDefinitions;
 
 function inputSchemaFor(name: RpcCommandType, definition: RpcCommandDefinition): RpcInputSchema {

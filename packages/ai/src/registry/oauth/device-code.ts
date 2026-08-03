@@ -27,7 +27,7 @@ export interface OAuthDeviceCodeFlowOptions<T> {
 	signal?: AbortSignal;
 }
 
-async function abortableDeviceFlowSleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+export async function abortableOAuthSleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
 	if (!signal) {
 		await Bun.sleep(ms);
 		return;
@@ -82,7 +82,7 @@ export async function pollOAuthDeviceCodeFlow<T>(options: OAuthDeviceCodeFlowOpt
 		if (remainingMs <= 0) {
 			break;
 		}
-		await abortableDeviceFlowSleep(Math.min(intervalMs, remainingMs), options.signal);
+		await abortableOAuthSleep(Math.min(intervalMs, remainingMs), options.signal);
 	}
 
 	throw new AIError.OAuthError(

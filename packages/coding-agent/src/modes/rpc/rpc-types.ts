@@ -89,6 +89,10 @@ export type RpcCommand =
 	| { id?: string; type: "get_operations" }
 	| { id?: string; type: "get_tool_inventory" }
 	| { id?: string; type: "set_tool_activation"; activate?: string[]; deactivate?: string[] }
+	| { id?: string; type: "list_provider_auth" }
+	| { id?: string; type: "begin_provider_auth"; providerId: string; method: RpcProviderAuthMethod }
+	| { id?: string; type: "cancel_provider_auth"; operationId: string }
+	| { id?: string; type: "remove_provider_auth"; providerId: string }
 	| { id?: string; type: "set_fast_mode"; enabled: boolean }
 	| { id?: string; type: "get_advisor_state" }
 	| { id?: string; type: "set_advisor_enabled"; enabled: boolean }
@@ -155,11 +159,7 @@ export type RpcCommand =
 
 	// Messages
 	| { id?: string; type: "get_messages" }
-	| { id?: string; type: "get_messages_page"; cursor?: string; limit?: number }
-
-	// Login
-	| { id?: string; type: "get_login_providers" }
-	| { id?: string; type: "login"; providerId: string };
+	| { id?: string; type: "get_messages_page"; cursor?: string; limit?: number };
 
 // ============================================================================
 // RPC State
@@ -254,6 +254,48 @@ export interface RpcSessionState {
 	contextUsage?: ContextUsage;
 	advisor?: RpcAdvisorState;
 }
+export type RpcProviderAuthMethod = "oauth_callback" | "paste_code" | "device_code" | "api_key";
+export type RpcProviderAuthCredentialOrigin = "runtime" | "config" | "oauth" | "api_key" | "env" | "fallback";
+
+export interface RpcProviderAuthMethodCapability {
+	method: RpcProviderAuthMethod;
+	available: boolean;
+	exclusive: true;
+}
+
+export interface RpcProviderAuthState {
+	providerId: string;
+	name: string;
+	credentialOrigin?: RpcProviderAuthCredentialOrigin;
+	authenticated: boolean;
+	disabled: boolean;
+	available: boolean;
+	unavailableReason?: string;
+	identity?: {
+		email?: string;
+		accountId?: string;
+		projectId?: string;
+		orgId?: string;
+		orgName?: string;
+	};
+	methods: RpcProviderAuthMethodCapability[];
+}
+
+export interface RpcProviderAuthRequestFrame {
+	type: "provider_auth_request";
+	operationId: string;
+	requestId: string;
+	providerId: string;
+	method: "open_url";
+	url: string;
+	launchUrl?: string;
+	instructions?: string;
+}
+
+export interface RpcProviderAuthUpdateFrame {
+	type: "provider_auth_update";
+	state: RpcProviderAuthState;
+}
 
 export interface RpcAvailableSlashCommand {
 	name: string;
@@ -295,7 +337,12 @@ export interface RpcPromptResultFrame {
 	agentInvoked: boolean;
 }
 
-export type RpcOperationCommand = "prompt" | "abort_and_prompt" | "set_mode" | "resolve_plan_approval";
+export type RpcOperationCommand =
+	| "prompt"
+	| "abort_and_prompt"
+	| "set_mode"
+	| "resolve_plan_approval"
+	| "provider_auth";
 export type RpcOperationCancellationReason = "user" | "replaced" | "session_transition" | "client_disconnected";
 export type RpcOperationCancellationCode =
 	| "cancelled_by_client"
@@ -319,6 +366,7 @@ export type RpcOperationTerminalFrame =
 			type: "operation_completed";
 			agentInvoked: boolean;
 			settledAt: number;
+			data?: { state: RpcProviderAuthState };
 	  })
 	| (RpcOperationFrameBase & {
 			type: "operation_failed";
@@ -576,6 +624,48 @@ export type RpcResponse =
 	| {
 			id?: string;
 			type: "response";
+			command: "list_provider_auth";
+			success: true;
+			data: { providers: RpcProviderAuthState[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "begin_provider_auth";
+			success: true;
+			data: RpcOperationAccepted;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "cancel_provider_auth";
+			success: true;
+			data: RpcCancelOperationResult;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "remove_provider_auth";
+			success: true;
+			data: { state: RpcProviderAuthState };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "list_provider_auth";
+			success: true;
+			data: { providers: RpcProviderAuthState[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "begin_provider_auth";
+			success: true;
+			data: RpcOperationAccepted;
+	  }
+	| {
+			id?: string;
+			type: "response";
 			command: "set_fast_mode";
 			success: true;
 			data: { enabled: boolean; active: boolean };
@@ -715,16 +805,6 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "get_messages"; success: true; data: { messages: AgentMessage[] } }
 	| { id?: string; type: "response"; command: "get_messages_page"; success: true; data: RpcMessagesPage }
 
-	// Login
-	| {
-			id?: string;
-			type: "response";
-			command: "get_login_providers";
-			success: true;
-			data: { providers: Array<{ id: string; name: string; available: boolean; authenticated: boolean }> };
-	  }
-	| { id?: string; type: "response"; command: "login"; success: true; data: { providerId: string } }
-
 	// Error response (any command can fail); `code` is an optional machine-readable reason.
 	| { id?: string; type: "response"; command: string; success: false; error: string; code?: string };
 
@@ -767,7 +847,7 @@ export type RpcExtensionUIRequest =
 			timeout?: number;
 			/** Server-issued correlation for privileged RPC mutations. */
 			operationId?: string;
-			command?: "delete_session";
+			command?: "delete_session" | "remove_provider_auth";
 	  }
 	| {
 			type: "extension_ui_request";
@@ -776,6 +856,10 @@ export type RpcExtensionUIRequest =
 			title: string;
 			placeholder?: string;
 			timeout?: number;
+			sensitive?: boolean;
+			operationId?: string;
+			purpose?: "provider_auth";
+			providerId?: string;
 	  }
 	| {
 			type: "extension_ui_request";

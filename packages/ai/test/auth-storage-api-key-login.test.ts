@@ -253,4 +253,28 @@ describe("AuthStorage api-key login upsert", () => {
 		expect(await authStorage.getApiKey("opencode-go", "session-opencode-go-login")).toBe("new-opencode-key");
 		expect(await authStorage.peekApiKey("opencode-go")).toBe("new-opencode-key");
 	});
+
+	it("enters the commit boundary before uninterruptible remote API-key persistence", async () => {
+		if (!store || !authStorage) throw new Error("test setup failed");
+		loginKagiSpy.mockResolvedValueOnce("remote-kagi-key");
+		const remoteUpsert = vi.fn(
+			async (
+				provider: string,
+				credential: Parameters<SqliteAuthCredentialStore["upsertAuthCredentialForProvider"]>[1],
+			) => store!.upsertAuthCredentialForProvider(provider, credential),
+		);
+		Object.assign(store, { upsertAuthCredentialRemote: remoteUpsert });
+		const abortController = new AbortController();
+		const beforePersist = vi.fn();
+
+		await authStorage.login("kagi", {
+			onAuth: () => {},
+			onPrompt: async () => "",
+			signal: abortController.signal,
+			beforePersist,
+		});
+
+		expect(beforePersist).toHaveBeenCalledTimes(1);
+		expect(remoteUpsert).toHaveBeenCalledWith("kagi", expect.objectContaining({ type: "api_key", source: "login" }));
+	});
 });

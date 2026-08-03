@@ -4,12 +4,14 @@ import type { ProviderDefinition } from "./types";
 export const cursorProvider = {
 	id: "cursor",
 	name: "Cursor (Claude, GPT, etc.)",
+	deviceCodeFlow: true,
 	login: async (cb: OAuthLoginCallbacks) => {
 		// Lazy import: keep heavy OAuth flow modules out of the eager registry graph.
 		const { loginCursor } = await import("./oauth/cursor");
 		return loginCursor(
 			url => cb.onAuth({ url }),
 			cb.onProgress ? () => cb.onProgress?.("Waiting for browser authentication...") : undefined,
+			cb.signal,
 		);
 	},
 	refreshToken: async (credentials: OAuthCredentials) => {

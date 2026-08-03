@@ -55,6 +55,26 @@ describe("RpcOperationManager", () => {
 		expect(frames.filter(frame => frame.type === "operation_cancelled")).toHaveLength(1);
 	});
 
+	test("bulk cancellation preserves explicitly protected operations", () => {
+		let sequence = 0;
+		const manager = new RpcOperationManager(
+			() => {},
+			() => `operation-${++sequence}`,
+		);
+		const protectedOperation = manager.start("request-protected", "provider_auth");
+		const cancellableOperation = manager.start("request-cancellable", "prompt");
+		manager.begin(protectedOperation);
+		manager.begin(cancellableOperation);
+
+		manager.cancelAll("user", "cancelled_by_client", new Set([protectedOperation.operationId]));
+
+		expect(manager.isActive(protectedOperation)).toBeTrue();
+		expect(manager.isActive(cancellableOperation)).toBeFalse();
+		expect(manager.snapshot().recent).toContainEqual(
+			expect.objectContaining({ type: "operation_cancelled", operationId: cancellableOperation.operationId }),
+		);
+	});
+
 	test("cancelling a queued follow-up never aborts the active operation", async () => {
 		const frames: Array<RpcOperationStartedFrame | RpcOperationTerminalFrame> = [];
 		let sequence = 0;

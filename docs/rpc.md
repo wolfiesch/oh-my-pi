@@ -321,6 +321,45 @@ The bundled TypeScript `RpcClient.getMessages()` and Python `RpcClient.get_messa
 - `{ id?, type: "get_login_providers" }`
 - `{ id?, type: "login", providerId: string }`
 
+### Provider Authentication
+
+- `{ id?, type: "list_provider_auth" }`
+- `{ id?, type: "begin_provider_auth", providerId: string, method: "oauth_callback" | "paste_code" | "device_code" | "api_key" }`
+- `{ id?, type: "cancel_provider_auth", operationId: string }`
+- `{ id?, type: "remove_provider_auth", providerId: string }`
+
+`list_provider_auth` projects the registry without secrets: each entry carries
+`providerId`, `name`, `authenticated`, `disabled`, `available`, an optional
+`credentialOrigin` and `unavailableReason`, the signed-in `identity`, and the
+`methods` this provider actually supports. A provider whose login flow cannot run
+headlessly reports `available: false` with `unavailableReason` instead of
+advertising a method that would fail.
+
+`begin_provider_auth` is a server-owned operation: the response carries
+`operationId` and `accepted`, and the flow settles through
+`operation_completed`, `operation_failed`, or `operation_cancelled`. One
+authentication or credential mutation runs at a time per connection; a second
+attempt fails with `provider_auth_busy`. Interactive steps arrive as
+`provider_auth_request` events (`method: "open_url"`) or, for paste-code and
+API-key entry, as `extension_ui_request` input prompts correlated by
+`operationId`. Every credential change emits `provider_auth_update` for each
+affected provider, because providers that share a credential store change
+together.
+
+`cancel_provider_auth` is accepted only before the credential write begins. Once
+persistence starts, the operation is protected and cancellation returns
+`provider_auth_commit_in_progress` so a durable credential never reports a
+cancelled terminal.
+
+`remove_provider_auth` is confirmation-gated: the server sends an
+`extension_ui_request` with `command: "remove_provider_auth"` and the
+server-issued `operationId`, names the credential store and every provider that
+shares it, and removes nothing until the host echoes that exact `operationId`
+with `confirmed: true`. Declined or unanswered confirmations fail with
+`confirmation_required`. Only `oauth` and `api_key` origins are removable;
+environment, config, and fallback credentials fail with
+`provider_auth_origin_not_removable`.
+
 ## Response Schema
 
 All command results use `RpcResponse`:

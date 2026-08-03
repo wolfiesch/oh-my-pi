@@ -88,13 +88,18 @@ export class RpcOperationManager {
 		return false;
 	}
 
-	complete(handle: RpcOperationHandle, agentInvoked: boolean): boolean {
+	complete(
+		handle: RpcOperationHandle,
+		agentInvoked: boolean,
+		data?: Extract<RpcOperationTerminalFrame, { type: "operation_completed" }>["data"],
+	): boolean {
 		return this.#settle(handle, {
 			type: "operation_completed",
 			operationId: handle.operationId,
 			requestId: handle.requestId,
 			command: handle.command,
 			agentInvoked,
+			data,
 		});
 	}
 
@@ -142,8 +147,13 @@ export class RpcOperationManager {
 		};
 	}
 
-	cancelAll(reason: RpcOperationCancellationReason, code: RpcOperationCancellationCode): void {
+	cancelAll(
+		reason: RpcOperationCancellationReason,
+		code: RpcOperationCancellationCode,
+		excludedOperationIds: ReadonlySet<string> = new Set(),
+	): void {
 		for (const operation of Array.from(this.#active.values())) {
+			if (excludedOperationIds.has(operation.operationId)) continue;
 			this.#settle(operation, this.#cancelFrame(operation, reason, code));
 		}
 	}
