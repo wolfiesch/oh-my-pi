@@ -16,6 +16,7 @@ from typing import cast
 
 from omp_rpc import (
     AgentEndEvent,
+    OperationStartedEvent,
     RpcClient,
     RpcCommandError,
     RpcConcurrencyError,
@@ -90,6 +91,8 @@ FAKE_SERVER = textwrap.dedent(
 
     def current_state():
         return {
+            "mode": session_mode,
+            "plan": plan_state,
             "model": model_info(model_id, model_provider),
             "thinkingLevel": thinking_level,
             "isStreaming": False,
@@ -268,6 +271,8 @@ FAKE_SERVER = textwrap.dedent(
     auto_retry_enabled = True
     session_name = "Scratchpad"
     last_assistant_text = None
+    session_mode = "none"
+    plan_state = {"mode": "none"}
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()
@@ -342,6 +347,57 @@ FAKE_SERVER = textwrap.dedent(
                         }
                     ],
                 },
+            )
+        elif command_type == "set_mode":
+            session_mode = command["mode"]
+            plan_state = {
+                "mode": session_mode,
+                "planFilePath": command.get("planFilePath", "local://PLAN.md"),
+                "workflow": command.get("workflow", "parallel"),
+            }
+            operation_id = "operation-set-mode"
+            respond(
+                request_id,
+                "set_mode",
+                {
+                    "operationId": operation_id,
+                    "accepted": True,
+                    "deferred": command.get("when") == "next_idle",
+                },
+            )
+            print(
+                json.dumps(
+                    {
+                        "type": "operation_started",
+                        "operationId": operation_id,
+                        "requestId": request_id,
+                        "command": "set_mode",
+                        "startedAt": 1,
+                    }
+                ),
+                flush=True,
+            )
+            print(
+                json.dumps(
+                    {
+                        "type": "operation_completed",
+                        "operationId": operation_id,
+                        "requestId": request_id,
+                        "command": "set_mode",
+                        "agentInvoked": False,
+                        "settledAt": 2,
+                    }
+                ),
+                flush=True,
+            )
+        elif command_type == "get_plan":
+            respond(request_id, "get_plan", plan_state)
+        elif command_type == "resolve_plan_approval":
+            operation_id = "operation-resolve-plan"
+            respond(
+                request_id,
+                "resolve_plan_approval",
+                {"operationId": operation_id, "accepted": True},
             )
         elif command_type == "set_host_tools":
             registered_host_tools = command.get("tools", [])
@@ -1758,6 +1814,32 @@ class RpcClientTests(unittest.TestCase):
 
             state = client.get_state()
             self.assertEqual(state.todo_phases[0].tasks[1].content, "Exercise edits")
+
+    def test_plan_workflow_commands(self) -> None:
+        started_operations: list[OperationStartedEvent] = []
+        with self.make_client() as client:
+            client.on_operation_started(started_operations.append)
+            mode_change = client.set_mode(
+                "plan",
+                plan_file_path="local://REVIEW.md",
+                workflow="iterative",
+            )
+            self.assertEqual(mode_change.operation_id, "operation-set-mode")
+            self.assertTrue(mode_change.accepted)
+            self.assertFalse(mode_change.deferred)
+            state = client.get_state()
+            self.assertEqual(state.mode, "plan")
+            self.assertEqual(state.plan.plan_file_path, "local://REVIEW.md")
+
+            plan = client.get_plan()
+            self.assertEqual(plan.workflow, "iterative")
+            approval_operation = client.resolve_plan_approval(
+                "approval-1",
+                "refine",
+                feedback="Revise the rollback section.",
+            )
+            self.assertEqual(approval_operation, "operation-resolve-plan")
+        self.assertEqual(started_operations[0].operation_id, "operation-set-mode")
 
     def test_model_mode_and_session_commands(self) -> None:
         with self.make_client() as client:

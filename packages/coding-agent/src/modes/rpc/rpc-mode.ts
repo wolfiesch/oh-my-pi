@@ -930,6 +930,7 @@ export async function runRpcMode(
 		if (frame.type === "operation_completed") operationOwnership.settle(frame.operationId);
 		output(frame);
 	});
+	const planApprovalOperations = new Map<string, string>();
 
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
 
@@ -1168,6 +1169,21 @@ export async function runRpcMode(
 		if (event.type === "message_start") operationOwnership.observeMessageStart(event.message);
 		output(event);
 	});
+	session.planMode.onStateChange(state => {
+		output({ type: "plan_state_update", state });
+	});
+	session.planMode.onApprovalRequest(approval => {
+		output({
+			type: "plan_approval_request",
+			approvalId: approval.approvalId,
+			planFilePath: approval.planFilePath,
+			title: approval.title,
+			planContent: approval.planContent,
+		});
+	});
+	session.planMode.onApprovalSettled(result => {
+		output({ type: "plan_approval_settled", approvalId: result.approvalId, result });
+	});
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
 	const getAdvisorState = () => session.getAdvisorStateOverview();
@@ -1269,6 +1285,7 @@ export async function runRpcMode(
 									type: "session_info_update",
 									title: session.sessionName,
 									sessionId: session.sessionId,
+									mode: session.planMode.mode,
 								});
 							},
 							notifyConfigChanged: async () => {
@@ -1390,6 +1407,12 @@ export async function runRpcMode(
 			}
 
 			case "cancel_operation": {
+				const approvalId = planApprovalOperations.get(command.operationId);
+				if (approvalId) {
+					planApprovalOperations.delete(command.operationId);
+					const pending = session.planMode.pendingApproval;
+					if (pending?.approvalId === approvalId) await session.planMode.abandonPendingApproval();
+				}
 				const cancellation = await operationOwnership.cancel(operationManager, command.operationId);
 				return success(id, "cancel_operation", cancellation);
 			}
@@ -1433,6 +1456,123 @@ export async function runRpcMode(
 			case "branch": {
 				const result = await handleRpcSessionChange(session, command, subagentRegistry);
 				return completeSessionTransition(id, result.type, result.data);
+			}
+
+			case "set_mode": {
+				if (command.mode !== "plan" && (command.planFilePath !== undefined || command.workflow !== undefined)) {
+					return error(
+						id,
+						"set_mode",
+						"planFilePath and workflow are valid only for plan mode.",
+						"invalid_request",
+					);
+				}
+				if (command.mode !== "none" && !session.settings.get("plan.enabled")) {
+					return error(id, "set_mode", "Plan mode is disabled.", "plan_disabled");
+				}
+				if (session.isStreaming && command.when !== "next_idle") {
+					return error(id, "set_mode", "Session is busy.", "busy");
+				}
+				if (command.mode === "plan" && (session.getGoalModeState() || session.getVibeModeState())) {
+					return error(id, "set_mode", "Another exclusive mode is active.", "mode_conflict");
+				}
+				if (command.mode === "plan" && session.planMode.active) {
+					const current = session.getPlanModeState();
+					if (
+						(command.planFilePath !== undefined && current?.planFilePath !== command.planFilePath) ||
+						(command.workflow !== undefined && current?.workflow !== command.workflow)
+					) {
+						return error(
+							id,
+							"set_mode",
+							"Plan mode is already active with a different plan file or workflow.",
+							"mode_conflict",
+						);
+					}
+				}
+				if (operationManager.hasActiveCommand("set_mode")) {
+					return error(id, "set_mode", "Another mode change is already pending.", "busy");
+				}
+				const operation = operationManager.start(id, "set_mode");
+				const apply = async () => {
+					if (command.mode === "none") await session.planMode.disable();
+					else if (command.mode === "plan_paused") {
+						if (!session.planMode.active && !session.planMode.paused) {
+							await session.planMode.enter({
+								planFilePath: "local://PLAN.md",
+								workflow: "parallel",
+							});
+						}
+						if (session.planMode.active) await session.planMode.pause();
+					} else {
+						await session.planMode.enter({
+							planFilePath: command.planFilePath ?? "local://PLAN.md",
+							workflow: command.workflow ?? "parallel",
+						});
+					}
+				};
+				const deferred = session.isStreaming && command.when === "next_idle";
+				setImmediate(() => {
+					void (async () => {
+						try {
+							if (deferred) await session.waitForIdle();
+							if (!operationManager.begin(operation)) return;
+							await apply();
+							operationManager.complete(operation, false);
+						} catch (cause) {
+							operationManager.fail(operation, cause instanceof Error ? cause : new Error(String(cause)));
+						}
+					})();
+				});
+				return success(id, "set_mode", {
+					operationId: operation.operationId,
+					accepted: true,
+					deferred,
+				});
+			}
+
+			case "get_plan":
+				return success(
+					id,
+					"get_plan",
+					await session.planMode.project({ includeContent: true, includeAvailableFiles: true }),
+				);
+
+			case "resolve_plan_approval": {
+				const pending = session.planMode.pendingApproval;
+				if (!pending || pending.approvalId !== command.approvalId) {
+					return error(id, "resolve_plan_approval", "Unknown plan approval.", "unknown_approval");
+				}
+				if (operationManager.hasActiveCommand("resolve_plan_approval")) {
+					return error(id, "resolve_plan_approval", "The plan approval is already being resolved.", "busy");
+				}
+				const operation = operationManager.start(id, "resolve_plan_approval");
+				planApprovalOperations.set(operation.operationId, command.approvalId);
+				setImmediate(() => {
+					if (!operationManager.begin(operation)) {
+						planApprovalOperations.delete(operation.operationId);
+						return;
+					}
+					void session.planMode
+						.resolveApproval(
+							command.approvalId,
+							command.decision === "approve"
+								? {
+										kind: "approve",
+										preserveContext: command.preserveContext === true,
+										compactBeforeExecute: command.compactBeforeExecute === true,
+										executionModelRole: command.executionModelRole,
+										editedContent: command.editedContent,
+									}
+								: { kind: command.decision, feedback: command.feedback },
+						)
+						.then(result => operationManager.complete(operation, result.executionDispatched))
+						.catch(cause =>
+							operationManager.fail(operation, cause instanceof Error ? cause : new Error(String(cause))),
+						)
+						.finally(() => planApprovalOperations.delete(operation.operationId));
+				});
+				return success(id, "resolve_plan_approval", { operationId: operation.operationId, accepted: true });
 			}
 
 			// =================================================================
@@ -1487,6 +1627,8 @@ export async function runRpcMode(
 
 			case "get_state": {
 				const state: RpcSessionState = {
+					mode: session.planMode.mode,
+					plan: await session.planMode.project(),
 					model: session.model,
 					thinkingLevel: session.thinkingLevel,
 					isStreaming: session.isStreaming,
@@ -2130,9 +2272,10 @@ export async function runRpcMode(
 	// stdin closed — stop accepting side-channel work, drain every command that
 	// already owes a response, then settle any operation still running.
 	pendingExtensionRequests.rejectAll("RPC client disconnected before extension UI response completed");
+	await inputDispatcher.drain();
+	await session.planMode.abandonPendingApproval();
 	hostToolBridge.close("RPC client disconnected before host tool execution completed");
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
-	await inputDispatcher.drain();
 	await shutdownCoordinator.drain();
 	operationManager.cancelAll("client_disconnected", "client_disconnected");
 	subagentRegistry?.dispose();

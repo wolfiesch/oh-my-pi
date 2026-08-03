@@ -53,16 +53,23 @@ import type {
 	RpcHostUriRequest,
 	RpcHostUriResult,
 	RpcHostUriSchemeDefinition,
+	RpcModeChangeResult,
 	RpcOperationAccepted,
 	RpcOperationStartedFrame,
 	RpcOperationsSnapshot,
 	RpcOperationTerminalFrame,
+	RpcPlanApprovalRequestFrame,
+	RpcPlanApprovalSettledFrame,
+	RpcPlanState,
+	RpcPlanStateUpdateFrame,
+	RpcPlanWorkflow,
 	RpcPromptResultFrame,
 	RpcRenameSessionResult,
 	RpcResponse,
 	RpcResumeSessionResult,
 	RpcSessionInfoResult,
 	RpcSessionInfoUpdateFrame,
+	RpcSessionMode,
 	RpcSessionState,
 	RpcSettingsChange,
 	RpcSettingsUpdateFrame,
@@ -116,6 +123,9 @@ export type RpcRawFrameListener = (frame: Readonly<Record<string, unknown>>) => 
 export type RpcPromptResultListener = (frame: RpcPromptResultFrame) => void;
 export type RpcOperationTerminalListener = (frame: RpcOperationTerminalFrame) => void;
 export type RpcOperationStartedListener = (frame: RpcOperationStartedFrame) => void;
+export type RpcPlanStateUpdateListener = (frame: RpcPlanStateUpdateFrame) => void;
+export type RpcPlanApprovalRequestListener = (frame: RpcPlanApprovalRequestFrame) => void;
+export type RpcPlanApprovalSettledListener = (frame: RpcPlanApprovalSettledFrame) => void;
 export type RpcCommandOutputListener = (frame: RpcCommandOutputFrame) => void;
 export type RpcSessionInfoUpdateListener = (frame: RpcSessionInfoUpdateFrame) => void;
 export type RpcConfigUpdateListener = (frame: RpcConfigUpdateFrame) => void;
@@ -202,10 +212,30 @@ function isRpcResponse(value: unknown): value is RpcResponse {
 	if (typeof value.command !== "string") return false;
 	if (typeof value.success !== "boolean") return false;
 	if (value.id !== undefined && typeof value.id !== "string") return false;
-	if (value.success === false) {
-		return typeof value.error === "string";
-	}
+	if (value.success === false) return typeof value.error === "string";
 	return true;
+}
+
+function parseRpcPlanState(value: unknown): RpcPlanState {
+	if (!isRecord(value)) return { mode: "none" };
+	const mode: RpcSessionMode =
+		value.mode === "plan" || value.mode === "plan_paused" || value.mode === "none" ? value.mode : "none";
+	const workflow: RpcPlanWorkflow | undefined =
+		value.workflow === "parallel" || value.workflow === "iterative" ? value.workflow : undefined;
+	return {
+		...value,
+		mode,
+		workflow,
+		awaitingApproval: isRecord(value.awaitingApproval)
+			? {
+					approvalId:
+						typeof value.awaitingApproval.approvalId === "string" ? value.awaitingApproval.approvalId : "",
+					title: typeof value.awaitingApproval.title === "string" ? value.awaitingApproval.title : "",
+					planFilePath:
+						typeof value.awaitingApproval.planFilePath === "string" ? value.awaitingApproval.planFilePath : "",
+				}
+			: undefined,
+	} as RpcPlanState;
 }
 
 function supportsRpcProtocolV2(value: Record<string, unknown>): boolean {
@@ -296,8 +326,40 @@ function isRpcOperationTerminalFrame(value: unknown): value is RpcOperationTermi
 	return typeof value.reason === "string" && typeof value.code === "string";
 }
 
+function isRpcPlanStateUpdateFrame(value: unknown): value is RpcPlanStateUpdateFrame {
+	return isRecord(value) && value.type === "plan_state_update" && isRecord(value.state);
+}
+
+function isRpcPlanApprovalRequestFrame(value: unknown): value is RpcPlanApprovalRequestFrame {
+	return (
+		isRecord(value) &&
+		value.type === "plan_approval_request" &&
+		typeof value.approvalId === "string" &&
+		typeof value.planFilePath === "string" &&
+		typeof value.title === "string" &&
+		typeof value.planContent === "string"
+	);
+}
+
+function isRpcPlanApprovalSettledFrame(value: unknown): value is RpcPlanApprovalSettledFrame {
+	if (!isRecord(value) || value.type !== "plan_approval_settled" || typeof value.approvalId !== "string") return false;
+	const result = value.result;
+	return (
+		isRecord(result) &&
+		typeof result.approvalId === "string" &&
+		(result.decision === "approve" || result.decision === "refine" || result.decision === "reject") &&
+		typeof result.executionDispatched === "boolean" &&
+		typeof result.planFilePath === "string" &&
+		(result.compaction === undefined ||
+			result.compaction === "ok" ||
+			result.compaction === "cancelled" ||
+			result.compaction === "failed")
+	);
+}
 function parseRpcOperationAccepted(value: unknown): RpcOperationAccepted | undefined {
-	if (!isRecord(value) || typeof value.operationId !== "string") return undefined;
+	if (!isRecord(value) || value.accepted !== true || typeof value.operationId !== "string" || !value.operationId) {
+		return undefined;
+	}
 	return { operationId: value.operationId, accepted: true };
 }
 
@@ -449,6 +511,9 @@ export class RpcClient {
 	#promptResultListeners = new Set<RpcPromptResultListener>();
 	#operationTerminalListeners = new Set<RpcOperationTerminalListener>();
 	#operationStartedListeners = new Set<RpcOperationStartedListener>();
+	#planStateUpdateListeners = new Set<RpcPlanStateUpdateListener>();
+	#planApprovalRequestListeners = new Set<RpcPlanApprovalRequestListener>();
+	#planApprovalSettledListeners = new Set<RpcPlanApprovalSettledListener>();
 	#activeOperationIds = new Set<string>();
 	#settledOperationIds = new Set<string>();
 	#agentStreaming = false;
@@ -804,6 +869,23 @@ export class RpcClient {
 		return () => this.#operationStartedListeners.delete(listener);
 	}
 
+	/** Subscribe to plan-state projections emitted after authoritative transitions. */
+	onPlanStateUpdate(listener: RpcPlanStateUpdateListener): () => void {
+		this.#planStateUpdateListeners.add(listener);
+		return () => this.#planStateUpdateListeners.delete(listener);
+	}
+
+	/** Subscribe to explicit plan approvals awaiting a host decision. */
+	onPlanApprovalRequest(listener: RpcPlanApprovalRequestListener): () => void {
+		this.#planApprovalRequestListeners.add(listener);
+		return () => this.#planApprovalRequestListeners.delete(listener);
+	}
+
+	/** Subscribe to approval decisions after they settle. */
+	onPlanApprovalSettled(listener: RpcPlanApprovalSettledListener): () => void {
+		this.#planApprovalSettledListeners.add(listener);
+		return () => this.#planApprovalSettledListeners.delete(listener);
+	}
 	/** Subscribe to text produced by extension commands. */
 	onCommandOutput(listener: RpcCommandOutputListener): () => void {
 		this.#commandOutputListeners.add(listener);
@@ -1043,8 +1125,12 @@ export class RpcClient {
 				: rawActivityPhase === undefined && !state.isStreaming
 					? "idle"
 					: "maintenance";
+		const mode: RpcSessionMode =
+			state.mode === "plan" || state.mode === "plan_paused" || state.mode === "none" ? state.mode : "none";
 		return {
 			...state,
+			mode,
+			plan: state.plan ? parseRpcPlanState(state.plan) : undefined,
 			activityPhase,
 			fastModeEnabled: state.fastModeEnabled === true,
 			fastModeActive: state.fastModeActive === true,
@@ -1070,6 +1156,39 @@ export class RpcClient {
 		const advisor = parseRpcAdvisorState(this.#getData<unknown>(response));
 		if (!advisor) throw new Error("Invalid set_advisor_enabled response");
 		return advisor;
+	}
+
+	async setMode(
+		mode: RpcSessionMode,
+		options?: {
+			planFilePath?: string;
+			workflow?: RpcPlanWorkflow;
+			when?: "immediate" | "next_idle";
+		},
+	): Promise<RpcModeChangeResult> {
+		const response = await this.#send({ type: "set_mode", mode, ...options });
+		return this.#getData(response);
+	}
+
+	async getPlan(): Promise<RpcPlanState> {
+		const response = await this.#send({ type: "get_plan" });
+		return parseRpcPlanState(this.#getData(response));
+	}
+
+	async resolvePlanApproval(
+		approvalId: string,
+		decision:
+			| {
+					decision: "approve";
+					preserveContext?: boolean;
+					compactBeforeExecute?: boolean;
+					executionModelRole?: string;
+					editedContent?: string;
+			  }
+			| { decision: "refine" | "reject"; feedback?: string },
+	): Promise<RpcOperationAccepted> {
+		const response = await this.#send({ type: "resolve_plan_approval", approvalId, ...decision });
+		return this.#getData(response);
 	}
 
 	/**
@@ -1801,7 +1920,19 @@ export class RpcClient {
 			}
 			return;
 		}
-
+		if (isRpcPlanStateUpdateFrame(data)) {
+			const frame: RpcPlanStateUpdateFrame = { ...data, state: parseRpcPlanState(data.state) };
+			for (const listener of this.#planStateUpdateListeners) listener(frame);
+			return;
+		}
+		if (isRpcPlanApprovalRequestFrame(data)) {
+			for (const listener of this.#planApprovalRequestListeners) listener(data);
+			return;
+		}
+		if (isRpcPlanApprovalSettledFrame(data)) {
+			for (const listener of this.#planApprovalSettledListeners) listener(data);
+			return;
+		}
 		if (isRpcCommandOutputFrame(data)) {
 			for (const listener of this.#commandOutputListeners) {
 				listener(data);
@@ -1810,9 +1941,10 @@ export class RpcClient {
 		}
 
 		if (isRpcSessionInfoUpdateFrame(data)) {
-			for (const listener of this.#sessionInfoUpdateListeners) {
-				listener(data);
-			}
+			const mode: RpcSessionMode =
+				data.mode === "plan" || data.mode === "plan_paused" || data.mode === "none" ? data.mode : "none";
+			const frame: RpcSessionInfoUpdateFrame = { ...data, mode };
+			for (const listener of this.#sessionInfoUpdateListeners) listener(frame);
 			return;
 		}
 

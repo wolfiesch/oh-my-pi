@@ -45,6 +45,7 @@ from .protocol import (
     MessagesPage,
     MessageStartEvent,
     MessageUpdateEvent,
+    ModeChangeResult,
     ModelCycleResult,
     ModelInfo,
     OperationCancelledEvent,
@@ -52,6 +53,8 @@ from .protocol import (
     OperationFailedEvent,
     OperationsSnapshot,
     OperationStartedEvent,
+    PlanState,
+    PlanWorkflow,
     ReadyEvent,
     RenameSessionResult,
     ResumeSessionResult,
@@ -65,6 +68,7 @@ from .protocol import (
     SessionCatalogPage,
     SessionCatalogScope,
     SessionInfoResult,
+    SessionMode,
     SessionState,
     SessionStats,
     SessionWorkspaceRoot,
@@ -101,9 +105,11 @@ from .protocol import (
     parse_delete_session_result,
     parse_fast_mode_result,
     parse_fork_session_result,
+    parse_mode_change_result,
     parse_model_cycle_result,
     parse_model_info,
     parse_notification,
+    parse_plan_state,
     parse_rename_session_result,
     parse_resume_session_result,
     parse_rpc_capability_manifest,
@@ -1023,6 +1029,56 @@ class RpcClient:
         if state is None:
             raise RpcError("set_advisor_enabled returned an empty payload")
         return state
+
+    def set_mode(
+        self,
+        mode: SessionMode,
+        *,
+        plan_file_path: str | None = None,
+        workflow: PlanWorkflow | None = None,
+        when: Literal["immediate", "next_idle"] = "immediate",
+    ) -> ModeChangeResult:
+        result = parse_mode_change_result(
+            self._request(
+                "set_mode",
+                mode=mode,
+                planFilePath=plan_file_path,
+                workflow=workflow,
+                when=when,
+            )
+        )
+        self._register_operation(result.operation_id)
+        return result
+
+    def get_plan(self) -> PlanState:
+        return parse_plan_state(self._request("get_plan"))
+
+    def resolve_plan_approval(
+        self,
+        approval_id: str,
+        decision: Literal["approve", "refine", "reject"],
+        *,
+        preserve_context: bool | None = None,
+        compact_before_execute: bool | None = None,
+        execution_model_role: str | None = None,
+        edited_content: str | None = None,
+        feedback: str | None = None,
+    ) -> str:
+        payload = self._request(
+            "resolve_plan_approval",
+            approvalId=approval_id,
+            decision=decision,
+            preserveContext=preserve_context,
+            compactBeforeExecute=compact_before_execute,
+            executionModelRole=execution_model_role,
+            editedContent=edited_content,
+            feedback=feedback,
+        )
+        operation_id = payload.get("operationId")
+        if not isinstance(operation_id, str):
+            raise RpcError("resolve_plan_approval response did not include operationId")
+        self._register_operation(operation_id)
+        return operation_id
 
     def set_fast_mode(self, enabled: bool) -> FastModeResult:
         return parse_fast_mode_result(self._request("set_fast_mode", enabled=enabled))

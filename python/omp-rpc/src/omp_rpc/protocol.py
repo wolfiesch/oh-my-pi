@@ -23,7 +23,11 @@ SessionCatalogScope: TypeAlias = Literal["cwd", "all"]
 AdvisorRuntimeStatus: TypeAlias = Literal[
     "running", "paused", "quota_exhausted", "error", "no_model"
 ]
-RpcOperationCommand: TypeAlias = Literal["prompt", "abort_and_prompt"]
+RpcOperationCommand: TypeAlias = Literal[
+    "prompt", "abort_and_prompt", "set_mode", "resolve_plan_approval"
+]
+SessionMode: TypeAlias = Literal["none", "plan", "plan_paused"]
+PlanWorkflow: TypeAlias = Literal["parallel", "iterative"]
 RpcOperationCancellationReason: TypeAlias = Literal[
     "user", "replaced", "session_transition", "client_disconnected"
 ]
@@ -98,6 +102,8 @@ _SESSION_ACTIVITY_PHASE_VALUES: Final[frozenset[str]] = frozenset(
 _ADVISOR_RUNTIME_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     {"running", "paused", "quota_exhausted", "error", "no_model"}
 )
+_SESSION_MODE_VALUES: Final[frozenset[str]] = frozenset({"none", "plan", "plan_paused"})
+_PLAN_WORKFLOW_VALUES: Final[frozenset[str]] = frozenset({"parallel", "iterative"})
 _STOP_REASON_VALUES: Final[frozenset[str]] = frozenset(
     {"stop", "length", "toolUse", "error", "aborted"}
 )
@@ -894,6 +900,41 @@ class AdvisorState:
 
 
 @dataclass(slots=True, frozen=True)
+class PendingPlanApproval:
+    approval_id: str
+    title: str
+    plan_file_path: str
+
+
+@dataclass(slots=True, frozen=True)
+class PlanState:
+    mode: SessionMode
+    plan_file_path: str | None = None
+    workflow: PlanWorkflow | None = None
+    reentry: bool = False
+    awaiting_approval: PendingPlanApproval | None = None
+    plan_exists: bool | None = None
+    available_plan_files: tuple[str, ...] = ()
+    content: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class PlanApprovalResult:
+    approval_id: str
+    decision: Literal["approve", "refine", "reject"]
+    execution_dispatched: bool
+    plan_file_path: str
+    compaction: Literal["ok", "cancelled", "failed"] | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ModeChangeResult:
+    operation_id: str
+    accepted: bool
+    deferred: bool
+
+
+@dataclass(slots=True, frozen=True)
 class SessionState:
     model: ModelInfo | None
     thinking_level: ThinkingLevel | None
@@ -909,6 +950,8 @@ class SessionState:
     auto_compaction_enabled: bool
     message_count: int
     queued_message_count: int
+    mode: SessionMode = "none"
+    plan: PlanState | None = None
     todo_phases: tuple[TodoPhase, ...] = ()
     system_prompt: tuple[str, ...] = ()
     dump_tools: tuple[ToolDescriptor, ...] = ()
@@ -1424,6 +1467,28 @@ class ToolInventoryUpdateEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class PlanStateUpdateEvent:
+    state: PlanState
+    type: Literal["plan_state_update"] = "plan_state_update"
+
+
+@dataclass(slots=True, frozen=True)
+class PlanApprovalRequestEvent:
+    approval_id: str
+    plan_file_path: str
+    title: str
+    plan_content: str
+    type: Literal["plan_approval_request"] = "plan_approval_request"
+
+
+@dataclass(slots=True, frozen=True)
+class PlanApprovalSettledEvent:
+    approval_id: str
+    result: PlanApprovalResult
+    type: Literal["plan_approval_settled"] = "plan_approval_settled"
+
+
+@dataclass(slots=True, frozen=True)
 class UnknownNotification:
     payload: JsonObject
     type: Literal["unknown"] = "unknown"
@@ -1460,6 +1525,9 @@ RpcNotification: TypeAlias = (
     | SettingsUpdateEvent
     | ToolInventoryUpdateEvent
     | RpcAgentEvent
+    | PlanStateUpdateEvent
+    | PlanApprovalRequestEvent
+    | PlanApprovalSettledEvent
     | UnknownNotification
 )
 
@@ -1825,12 +1893,75 @@ def _parse_session_activity_phase(payload: JsonObject) -> SessionActivityPhase:
     return "maintenance"
 
 
+def parse_mode_change_result(payload: JsonObject) -> ModeChangeResult:
+    accepted = _require_bool(payload, "accepted")
+    if not accepted:
+        raise ValueError("set_mode.accepted must be true")
+    return ModeChangeResult(
+        operation_id=_require_str(payload, "operationId"),
+        accepted=True,
+        deferred=_require_bool(payload, "deferred"),
+    )
+
+
+def parse_plan_state(payload: JsonObject) -> PlanState:
+    raw_mode = payload.get("mode", "none")
+    mode = cast(
+        SessionMode,
+        raw_mode
+        if isinstance(raw_mode, str) and raw_mode in _SESSION_MODE_VALUES
+        else "none",
+    )
+    raw_workflow = payload.get("workflow")
+    workflow = cast(
+        PlanWorkflow | None,
+        raw_workflow
+        if isinstance(raw_workflow, str) and raw_workflow in _PLAN_WORKFLOW_VALUES
+        else None,
+    )
+    raw_approval = payload.get("awaitingApproval")
+    approval = None
+    if isinstance(raw_approval, dict):
+        approval_payload = cast(JsonObject, raw_approval)
+        approval = PendingPlanApproval(
+            approval_id=_require_str(approval_payload, "approvalId"),
+            title=_require_str(approval_payload, "title"),
+            plan_file_path=_require_str(approval_payload, "planFilePath"),
+        )
+    raw_files = payload.get("availablePlanFiles")
+    files = (
+        tuple(value for value in raw_files if isinstance(value, str))
+        if isinstance(raw_files, list)
+        else ()
+    )
+    return PlanState(
+        mode=mode,
+        plan_file_path=_optional_str(payload, "planFilePath"),
+        workflow=workflow,
+        reentry=bool(payload.get("reentry", False)),
+        awaiting_approval=approval,
+        plan_exists=cast(bool | None, payload.get("planExists"))
+        if isinstance(payload.get("planExists"), bool)
+        else None,
+        available_plan_files=files,
+        content=_optional_str(payload, "content"),
+    )
+
+
 def parse_session_state(payload: JsonObject) -> SessionState:
     dump_tools = tuple(
         parse_tool_descriptor(_clone_json_object(item, field="dumpTools[]"))
         for item in cast(list[Any], payload.get("dumpTools") or [])
     )
     return SessionState(
+        mode=parse_plan_state(
+            cast(
+                JsonObject, payload.get("plan") or {"mode": payload.get("mode", "none")}
+            )
+        ).mode,
+        plan=parse_plan_state(cast(JsonObject, payload["plan"]))
+        if isinstance(payload.get("plan"), dict)
+        else None,
         model=parse_model_info(cast(JsonObject | None, payload.get("model"))),
         thinking_level=cast(
             ThinkingLevel | None,
@@ -2360,6 +2491,51 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         return SettingsUpdateEvent()
     if event_type == "tool_inventory_update":
         return ToolInventoryUpdateEvent()
+    if event_type == "plan_state_update":
+        return PlanStateUpdateEvent(
+            state=parse_plan_state(
+                _clone_json_object(
+                    payload.get("state"), field="plan_state_update.state"
+                )
+            )
+        )
+    if event_type == "plan_approval_request":
+        return PlanApprovalRequestEvent(
+            approval_id=_require_str(payload, "approvalId"),
+            plan_file_path=_require_str(payload, "planFilePath"),
+            title=_require_str(payload, "title"),
+            plan_content=_require_str(payload, "planContent"),
+        )
+    if event_type == "plan_approval_settled":
+        result_payload = _clone_json_object(
+            payload.get("result"), field="plan_approval_settled.result"
+        )
+        return PlanApprovalSettledEvent(
+            approval_id=_require_str(payload, "approvalId"),
+            result=PlanApprovalResult(
+                approval_id=_require_str(result_payload, "approvalId"),
+                decision=cast(
+                    Literal["approve", "refine", "reject"],
+                    _require_literal(
+                        result_payload.get("decision"),
+                        frozenset({"approve", "refine", "reject"}),
+                        field="plan_approval_settled.result.decision",
+                    ),
+                ),
+                execution_dispatched=_require_bool(
+                    result_payload, "executionDispatched"
+                ),
+                plan_file_path=_require_str(result_payload, "planFilePath"),
+                compaction=cast(
+                    Literal["ok", "cancelled", "failed"] | None,
+                    _optional_literal(
+                        result_payload.get("compaction"),
+                        frozenset({"ok", "cancelled", "failed"}),
+                        field="plan_approval_settled.result.compaction",
+                    ),
+                ),
+            ),
+        )
     if event_type in {
         "operation_started",
         "operation_completed",
@@ -2371,7 +2547,9 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             RpcOperationCommand,
             _require_literal(
                 payload.get("command"),
-                frozenset({"prompt", "abort_and_prompt"}),
+                frozenset(
+                    {"prompt", "abort_and_prompt", "set_mode", "resolve_plan_approval"}
+                ),
                 field=f"{event_type}.command",
             ),
         )

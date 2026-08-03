@@ -223,6 +223,22 @@ tool names fail with `invalid_request` and change nothing, and a session that is
 streaming, compacting, or running an operation answers `session_busy` rather
 than mutating tools underneath in-flight work.
 
+### Plan
+
+- `{ id?, type: "set_mode", mode: "none" | "plan" | "plan_paused", planFilePath?: string, workflow?: "parallel" | "iterative", when?: "immediate" | "next_idle" }`
+- `{ id?, type: "get_plan" }`
+- `{ id?, type: "resolve_plan_approval", approvalId: string, decision: "approve" | "refine" | "reject", preserveContext?: boolean, compactBeforeExecute?: boolean, executionModelRole?: string, editedContent?: string, feedback?: string }`
+
+`set_mode` and `resolve_plan_approval` are server-owned operations: the response
+carries `operationId` and `accepted`, and the transition settles through
+`operation_completed`, `operation_failed`, or `operation_cancelled`. `when:
+"next_idle"` defers entry until the current turn finishes. Plan state is pushed
+as `plan_state_update`, a pending approval arrives as `plan_approval_request`,
+and its outcome arrives as `plan_approval_settled`. Once a mode or approval
+operation reaches its commit phase, `cancel_operation` answers
+`operation_commit_in_progress` so a half-applied transition never reports a
+cancelled terminal.
+
 ### Model
 
 - `{ id?, type: "set_model", provider: string, modelId: string }`

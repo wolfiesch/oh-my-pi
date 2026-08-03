@@ -80,8 +80,36 @@ function writeFrame(frame: Record<string, unknown>): void {
 
 if (Bun.env.MOCK_RPC_CLIENT_FRAMES === "1") {
 	writeFrame({ type: "command_output", text: "extension output" });
-	writeFrame({ type: "session_info_update", title: "RPC test", sessionId: "session-1" });
+	writeFrame({ type: "session_info_update", title: "RPC test", sessionId: "session-1", mode: "plan" });
 	writeFrame({ type: "config_update", thinkingLevel: "high" });
+	writeFrame({
+		type: "plan_state_update",
+		state: {
+			mode: "future-plan-mode",
+			planFilePath: "local://PLAN.md",
+			workflow: "parallel",
+			futureField: true,
+		},
+	});
+	writeFrame({
+		type: "plan_approval_request",
+		approvalId: "approval-1",
+		planFilePath: "local://PLAN.md",
+		title: "Fixture plan",
+		planContent: "# Fixture plan",
+		futureField: true,
+	});
+	writeFrame({
+		type: "plan_approval_settled",
+		approvalId: "approval-1",
+		result: {
+			approvalId: "approval-1",
+			decision: "refine",
+			executionDispatched: false,
+			planFilePath: "local://PLAN.md",
+			futureField: true,
+		},
+	});
 	writeFrame({
 		type: "extension_error",
 		extensionPath: "/tmp/example-extension.ts",

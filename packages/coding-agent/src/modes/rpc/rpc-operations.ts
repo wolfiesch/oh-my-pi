@@ -80,6 +80,14 @@ export class RpcOperationManager {
 		return this.#active.has(handle.operationId);
 	}
 
+	/** Whether accepted or started work for this command is still unsettled. */
+	hasActiveCommand(command: RpcOperationCommand): boolean {
+		for (const operation of this.#active.values()) {
+			if (operation.command === command) return true;
+		}
+		return false;
+	}
+
 	complete(handle: RpcOperationHandle, agentInvoked: boolean): boolean {
 		return this.#settle(handle, {
 			type: "operation_completed",

@@ -40,15 +40,25 @@ describe("RpcClient frame coverage", () => {
 		const sessionIds: string[] = [];
 		const thinkingLevels: string[] = [];
 		const extensionErrors: string[] = [];
+		const sessionModes: string[] = [];
+		const planModes: string[] = [];
+		const approvalRequests: string[] = [];
+		const approvalSettlements: string[] = [];
 		client.onRawFrame(frame => {
 			if (typeof frame.type === "string") rawTypes.push(frame.type);
 		});
 		client.onCommandOutput(frame => commandOutput.push(frame.text));
-		client.onSessionInfoUpdate(frame => sessionIds.push(frame.sessionId));
+		client.onSessionInfoUpdate(frame => {
+			sessionIds.push(frame.sessionId);
+			sessionModes.push(frame.mode);
+		});
 		client.onConfigUpdate(frame => {
 			if (frame.thinkingLevel) thinkingLevels.push(frame.thinkingLevel);
 		});
 		client.onExtensionError(frame => extensionErrors.push(frame.error));
+		client.onPlanStateUpdate(frame => planModes.push(frame.state.mode));
+		client.onPlanApprovalRequest(frame => approvalRequests.push(frame.approvalId));
+		client.onPlanApprovalSettled(frame => approvalSettlements.push(frame.result.decision));
 		client.onExtensionUiRequest(request => {
 			if (request.method === "confirm") client.sendUiConfirmation(request.id, true);
 		});
@@ -78,6 +88,10 @@ describe("RpcClient frame coverage", () => {
 		expect(sessionIds).toEqual(["session-1"]);
 		expect(thinkingLevels).toEqual(["high"]);
 		expect(extensionErrors).toEqual(["fixture failure"]);
+		expect(sessionModes).toEqual(["plan"]);
+		expect(planModes).toEqual(["none"]);
+		expect(approvalRequests).toEqual(["approval-1"]);
+		expect(approvalSettlements).toEqual(["refine"]);
 		expect(rawTypes).toContain("ready");
 		expect(rawTypes).toContain("future_server_frame");
 		expect(captured.find(frame => frame.type === "extension_ui_response")).toMatchObject({

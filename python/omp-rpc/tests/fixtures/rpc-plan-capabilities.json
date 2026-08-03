@@ -1,0 +1,79 @@
+{
+  "commands": [
+    {
+      "id": "rpc.command.set_mode",
+      "name": "set_mode",
+      "version": 1,
+      "scope": "session",
+      "execution": "operation",
+      "availability": "available",
+      "concurrencyClass": "serial",
+      "requiredFeatures": [],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "const": "set_mode" },
+          "mode": { "enum": ["none", "plan", "plan_paused"] },
+          "planFilePath": { "type": ["string", "null"], "maxLength": 4096 },
+          "workflow": { "enum": ["parallel", "iterative", null] },
+          "when": { "enum": ["immediate", "next_idle", null] }
+        },
+        "required": ["type", "mode"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "rpc.command.get_plan",
+      "name": "get_plan",
+      "version": 1,
+      "scope": "session",
+      "execution": "sync",
+      "availability": "available",
+      "concurrencyClass": "serial",
+      "requiredFeatures": [],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "const": "get_plan" }
+        },
+        "required": ["type"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "rpc.command.resolve_plan_approval",
+      "name": "resolve_plan_approval",
+      "version": 1,
+      "scope": "turn",
+      "execution": "operation",
+      "availability": "available",
+      "concurrencyClass": "serial",
+      "requiredFeatures": [],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "const": "resolve_plan_approval" },
+          "approvalId": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "decision": { "enum": ["approve", "refine", "reject"] },
+          "preserveContext": { "type": ["boolean", "null"] },
+          "compactBeforeExecute": { "type": ["boolean", "null"] },
+          "executionModelRole": { "type": ["string", "null"], "maxLength": 128 },
+          "editedContent": { "type": ["string", "null"], "maxLength": 1048576 },
+          "feedback": { "type": ["string", "null"], "maxLength": 65536 }
+        },
+        "required": ["type", "approvalId", "decision"],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "events": [
+    "plan_state_update",
+    "plan_approval_request",
+    "plan_approval_settled",
+    "future_plan_event"
+  ],
+  "futureManifestField": true
+}

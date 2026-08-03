@@ -74,6 +74,14 @@ const stringField = required("a string", value => typeof value === "string", { t
 const optionalStringField = optional("a string", value => typeof value === "string", {
 	type: ["string", "null"],
 });
+const optionalBoundedStringField = (name: string, maxLength: number): RpcFieldDefinition =>
+	optional(name, value => typeof value === "string" && value.length <= maxLength, {
+		type: ["string", "null"],
+		maxLength,
+	});
+const optionalBooleanField = optional("a boolean", value => typeof value === "boolean", {
+	type: ["boolean", "null"],
+});
 const booleanField = required("a boolean", value => typeof value === "boolean", { type: "boolean" });
 const optionalObjectArrayField = optional(
 	"an array of objects",
@@ -92,6 +100,13 @@ const positiveIntegerField = optional("a positive integer", value => Number.isSa
 const optionalIntegerField = optional("an integer", value => Number.isSafeInteger(value), {
 	type: ["integer", "null"],
 });
+
+const MAX_OPAQUE_ID_BYTES = 256;
+const opaqueIdField = required(
+	`a non-empty opaque id of at most ${MAX_OPAQUE_ID_BYTES} UTF-8 bytes`,
+	value => typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= MAX_OPAQUE_ID_BYTES,
+	{ type: "string", minLength: 1, maxLength: MAX_OPAQUE_ID_BYTES, "x-maxUtf8Bytes": MAX_OPAQUE_ID_BYTES },
+);
 
 const MAX_TOOL_ACTIVATION_NAMES = 2048;
 const MAX_TOOL_ACTIVATION_NAME_BYTES = 256;
@@ -290,6 +305,32 @@ export const RPC_COMMAND_DEFINITIONS = {
 		{ type: "cancel_operation", operationId: "operation-1" },
 		{ operationId: stringField },
 		"control",
+	),
+	set_mode: sessionCommand(
+		{ type: "set_mode", mode: "plan" },
+		{
+			mode: enumField("none", "plan", "plan_paused"),
+			planFilePath: optionalStringField,
+			workflow: optionalEnumField("parallel", "iterative"),
+			when: optionalEnumField("immediate", "next_idle"),
+		},
+		"serial",
+		{ execution: "operation" },
+	),
+	get_plan: sessionCommand({ type: "get_plan" }, {}, "concurrent"),
+	resolve_plan_approval: sessionCommand(
+		{ type: "resolve_plan_approval", approvalId: "approval-1", decision: "approve" },
+		{
+			approvalId: opaqueIdField,
+			decision: enumField("approve", "refine", "reject"),
+			preserveContext: optionalBooleanField,
+			compactBeforeExecute: optionalBooleanField,
+			executionModelRole: optionalBoundedStringField("a model role no longer than 256 characters", 256),
+			editedContent: optionalBoundedStringField("edited plan content no longer than 1048576 characters", 1_048_576),
+			feedback: optionalBoundedStringField("feedback no longer than 65536 characters", 65_536),
+		},
+		"serial",
+		{ execution: "operation" },
 	),
 	new_session: sessionCommand({ type: "new_session" }, { parentSession: optionalStringField }),
 	get_state: sessionCommand({ type: "get_state" }),

@@ -64,7 +64,26 @@ export type RpcCommand =
 	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "cancel_operation"; operationId: string }
 	| { id?: string; type: "new_session"; parentSession?: string }
-
+	| {
+			id?: string;
+			type: "set_mode";
+			mode: RpcSessionMode;
+			planFilePath?: string;
+			workflow?: RpcPlanWorkflow;
+			when?: "immediate" | "next_idle";
+	  }
+	| { id?: string; type: "get_plan" }
+	| {
+			id?: string;
+			type: "resolve_plan_approval";
+			approvalId: string;
+			decision: "approve" | "refine" | "reject";
+			preserveContext?: boolean;
+			compactBeforeExecute?: boolean;
+			executionModelRole?: string;
+			editedContent?: string;
+			feedback?: string;
+	  }
 	// State
 	| { id?: string; type: "get_state" }
 	| { id?: string; type: "get_operations" }
@@ -153,7 +172,62 @@ export interface RpcAdvisorState {
 	advisors: Array<{ name: string; status: AdvisorRuntimeStatus }>;
 }
 
+export type RpcSessionMode = "none" | "plan" | "plan_paused";
+export type RpcPlanWorkflow = "parallel" | "iterative";
+
+export interface RpcPendingPlanApproval {
+	approvalId: string;
+	title: string;
+	planFilePath: string;
+}
+
+export interface RpcPlanState {
+	mode: RpcSessionMode;
+	planFilePath?: string;
+	workflow?: RpcPlanWorkflow;
+	reentry?: boolean;
+	awaitingApproval?: RpcPendingPlanApproval;
+	planExists?: boolean;
+	availablePlanFiles?: string[];
+	content?: string;
+}
+
+export interface RpcModeChangeResult {
+	operationId: string;
+	accepted: true;
+	deferred: boolean;
+}
+
+export interface RpcPlanApprovalResult {
+	approvalId: string;
+	decision: "approve" | "refine" | "reject";
+	executionDispatched: boolean;
+	planFilePath: string;
+	compaction?: "ok" | "cancelled" | "failed";
+}
+
+export interface RpcPlanStateUpdateFrame {
+	type: "plan_state_update";
+	state: RpcPlanState;
+}
+
+export interface RpcPlanApprovalRequestFrame {
+	type: "plan_approval_request";
+	approvalId: string;
+	planFilePath: string;
+	title: string;
+	planContent: string;
+}
+
+export interface RpcPlanApprovalSettledFrame {
+	type: "plan_approval_settled";
+	approvalId: string;
+	result: RpcPlanApprovalResult;
+}
+
 export interface RpcSessionState {
+	mode: RpcSessionMode;
+	plan?: RpcPlanState;
 	model?: Model;
 	thinkingLevel: ThinkingLevel | undefined;
 	isStreaming: boolean;
@@ -221,7 +295,7 @@ export interface RpcPromptResultFrame {
 	agentInvoked: boolean;
 }
 
-export type RpcOperationCommand = "prompt" | "abort_and_prompt";
+export type RpcOperationCommand = "prompt" | "abort_and_prompt" | "set_mode" | "resolve_plan_approval";
 export type RpcOperationCancellationReason = "user" | "replaced" | "session_transition" | "client_disconnected";
 export type RpcOperationCancellationCode =
 	| "cancelled_by_client"
@@ -291,6 +365,7 @@ export interface RpcSessionInfoUpdateFrame {
 	type: "session_info_update";
 	title?: string;
 	sessionId: string;
+	mode: RpcSessionMode;
 }
 
 export interface RpcConfigUpdateFrame {
@@ -475,6 +550,15 @@ export type RpcResponse =
 			data: RpcCancelOperationResult;
 	  }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
+	| { id?: string; type: "response"; command: "set_mode"; success: true; data: RpcModeChangeResult }
+	| { id?: string; type: "response"; command: "get_plan"; success: true; data: RpcPlanState }
+	| {
+			id?: string;
+			type: "response";
+			command: "resolve_plan_approval";
+			success: true;
+			data: RpcOperationAccepted;
+	  }
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
