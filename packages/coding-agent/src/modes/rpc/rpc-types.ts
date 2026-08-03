@@ -63,6 +63,17 @@ export type RpcCommand =
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "cancel_operation"; operationId: string }
+	| {
+			id?: string;
+			type: "eval_execute";
+			language: RpcEvalLanguage;
+			code: string;
+			title?: string;
+			timeout?: number;
+			reset?: boolean;
+			excludeFromContext?: boolean;
+	  }
+	| { id?: string; type: "get_eval_history"; limit?: number }
 	| { id?: string; type: "new_session"; parentSession?: string }
 	| {
 			id?: string;
@@ -337,12 +348,39 @@ export interface RpcPromptResultFrame {
 	agentInvoked: boolean;
 }
 
+export interface RpcEvalHistoryEntry {
+	language: RpcEvalLanguage;
+	code: string;
+	output: string;
+	exitCode: number | undefined;
+	cancelled: boolean;
+	truncated: boolean;
+	timestamp: number;
+	excludeFromContext?: boolean;
+}
+
+export interface RpcEvalOutputFrame {
+	type: "eval_output";
+	operationId: string;
+	sequence: number;
+	chunk: string;
+	truncated: boolean;
+}
+
+export interface RpcEvalCompleteFrame {
+	type: "eval_complete";
+	operationId: string;
+	result: RpcEvalHistoryEntry;
+}
+
+export type RpcEvalLanguage = "py" | "js" | "rb" | "jl";
 export type RpcOperationCommand =
 	| "prompt"
 	| "abort_and_prompt"
 	| "set_mode"
 	| "resolve_plan_approval"
-	| "provider_auth";
+	| "provider_auth"
+	| "eval_execute";
 export type RpcOperationCancellationReason = "user" | "replaced" | "session_transition" | "client_disconnected";
 export type RpcOperationCancellationCode =
 	| "cancelled_by_client"
@@ -462,7 +500,7 @@ interface RpcCommandCapabilityBase {
 	scope: RpcCommandScope;
 	execution: RpcCommandExecution;
 	inputSchema?: RpcInputSchema;
-	outputSchema?: Record<string, unknown>;
+	outputSchema?: RpcInputSchema;
 	concurrencyClass?: RpcCommandConcurrencyClass;
 	confirmation: RpcCommandConfirmation;
 	requiredFeatures: string[];
@@ -596,6 +634,14 @@ export type RpcResponse =
 			command: "cancel_operation";
 			success: true;
 			data: RpcCancelOperationResult;
+	  }
+	| { id?: string; type: "response"; command: "eval_execute"; success: true; data: RpcOperationAccepted }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_eval_history";
+			success: true;
+			data: { entries: RpcEvalHistoryEntry[] };
 	  }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
 	| { id?: string; type: "response"; command: "set_mode"; success: true; data: RpcModeChangeResult }
@@ -847,7 +893,7 @@ export type RpcExtensionUIRequest =
 			timeout?: number;
 			/** Server-issued correlation for privileged RPC mutations. */
 			operationId?: string;
-			command?: "delete_session" | "remove_provider_auth";
+			command?: "eval_execute" | "delete_session" | "remove_provider_auth";
 	  }
 	| {
 			type: "extension_ui_request";
@@ -1023,6 +1069,8 @@ type RpcManifestEvent =
 	| RpcPromptResultFrame
 	| RpcAvailableCommandsUpdateFrame
 	| RpcToolInventoryUpdateFrame
+	| RpcEvalOutputFrame
+	| RpcEvalCompleteFrame
 	| RpcOperationStartedFrame
 	| RpcOperationTerminalFrame
 	| RpcSessionEventFrame
@@ -1054,6 +1102,8 @@ export const RPC_EVENT_TYPES = eventInventory([
 	"prompt_result",
 	"available_commands_update",
 	"tool_inventory_update",
+	"eval_output",
+	"eval_complete",
 	"operation_started",
 	"operation_completed",
 	"operation_failed",

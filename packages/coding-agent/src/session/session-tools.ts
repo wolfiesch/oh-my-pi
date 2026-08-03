@@ -79,6 +79,7 @@ interface SessionToolsOptions {
 	autoApprove?: boolean;
 	toolRegistry?: Map<string, AgentTool>;
 	createVibeTools?: () => AgentTool[];
+	createEvalTool?: () => unknown;
 	createComputerTool?: () => Promise<AgentTool | null>;
 	/** Creates the private `think` scratchpad tool for runtime setting changes. */
 	createThinkTool?: () => Promise<AgentTool | null>;
@@ -446,6 +447,7 @@ export class SessionTools {
 	#autoApprove: boolean;
 	#toolRegistry: Map<string, AgentTool>;
 	#createVibeTools: (() => AgentTool[]) | undefined;
+	#createEvalTool: SessionToolsOptions["createEvalTool"];
 	#createComputerTool: SessionToolsOptions["createComputerTool"];
 	#createThinkTool: SessionToolsOptions["createThinkTool"];
 	#createInspectImageTool: SessionToolsOptions["createInspectImageTool"];
@@ -505,6 +507,7 @@ export class SessionTools {
 		this.#host = host;
 		this.#autoApprove = options.autoApprove === true;
 		this.#toolRegistry = options.toolRegistry ?? new Map();
+		this.#createEvalTool = options.createEvalTool;
 		this.#createVibeTools = options.createVibeTools;
 		this.#createComputerTool = options.createComputerTool;
 		this.#createThinkTool = options.createThinkTool;
@@ -639,6 +642,10 @@ export class SessionTools {
 	/** Looks up a registered tool by name. */
 	getToolByName(name: string): AgentTool | undefined {
 		return this.#toolRegistry.get(name);
+	}
+	/** Returns a session-bound eval tool without changing the model-visible active tool set. */
+	getEvalToolForHost(): unknown {
+		return this.#createEvalTool?.() ?? this.#toolRegistry.get("eval");
 	}
 
 	/**

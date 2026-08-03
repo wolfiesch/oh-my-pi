@@ -241,7 +241,7 @@ export interface ToolSession {
 	/** Reject new eval work once session disposal has started. */
 	assertEvalExecutionAllowed?: () => void;
 	/** Track tool-owned eval work so session disposal can await/abort it like direct session eval runs. */
-	trackEvalExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
+	trackEvalExecution?<T>(execution: Promise<T>, abortController: AbortController, executionId?: string): Promise<T>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
 	/** Get Hindsight runtime state for this agent session. */

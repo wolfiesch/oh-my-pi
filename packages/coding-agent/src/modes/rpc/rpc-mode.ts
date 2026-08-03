@@ -18,6 +18,7 @@ import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isEnoent, isRecord, Snowflake } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
+import type { EvalToolDetails } from "../../eval/types";
 import {
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
@@ -29,7 +30,7 @@ import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibili
 import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
-import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
+import { type PythonExecutionMessage, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import {
 	inspectPersistedSessionWorkspace,
 	listSessionCatalog,
@@ -42,6 +43,7 @@ import { ToolInventoryUnavailableError } from "../../session/session-tools";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
+import { EvalTool } from "../../tools/eval";
 import type { EventBus } from "../../utils/event-bus";
 import { calculateTokensPerSecond } from "../../utils/token-rate";
 import {
@@ -60,6 +62,7 @@ import {
 	validateRpcCommand,
 	validateRpcToolActivationBatch,
 } from "./rpc-command-registry";
+import { RpcEvalOutputStream } from "./rpc-eval";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { handleGetSettings } from "./rpc-get-settings";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
@@ -71,6 +74,7 @@ import type {
 	RpcCancelOperationResult,
 	RpcCommand,
 	RpcDeleteSessionResult,
+	RpcEvalHistoryEntry,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcForkSessionResult,
@@ -576,23 +580,24 @@ export async function handleRpcSessionChange(
 	session: RpcSessionChangeSession,
 	command: RpcSessionChangeCommand,
 	subagentRegistry?: RpcSubagentResetRegistry,
+	beforeCommit?: () => void,
 ): Promise<RpcSessionChangeResult> {
 	switch (command.type) {
 		case "new_session": {
 			const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
-			const cancelled = !(await session.newSession(options));
+			const cancelled = !(await session.newSession(options, beforeCommit));
 			if (!cancelled) subagentRegistry?.clear();
 			return { type: "new_session", data: { cancelled } };
 		}
 
 		case "switch_session": {
-			const cancelled = !(await session.switchSession(command.sessionPath));
+			const cancelled = !(await session.switchSession(command.sessionPath, beforeCommit));
 			if (!cancelled) subagentRegistry?.clear();
 			return { type: "switch_session", data: { cancelled } };
 		}
 
 		case "branch": {
-			const result = await session.branch(command.entryId);
+			const result = await session.branch(command.entryId, beforeCommit);
 			if (!result.cancelled) subagentRegistry?.clear();
 			return { type: "branch", data: { text: result.selectedText, cancelled: result.cancelled } };
 		}
@@ -767,7 +772,7 @@ export function requestRpcDialog<T>(
 export function requestRpcPrivilegedConfirmation(
 	pendingRequests: Map<string, PendingExtensionRequest>,
 	output: RpcOutput,
-	command: "delete_session" | "remove_provider_auth",
+	command: "eval_execute" | "delete_session" | "remove_provider_auth",
 	title: string,
 	message: string,
 	options: { operationId?: string; signal?: AbortSignal; timeout?: number } = {},
@@ -824,7 +829,7 @@ export async function applyRpcToolActivation(
 		}
 	}
 
-	await session.setActiveToolsByName(next, false);
+	await session.setActiveToolsByName(next);
 
 	const enabledToolNames = [...new Set(session.getEnabledToolNames())];
 	const activeToolNames = [...new Set(session.getActiveToolNames())];
@@ -931,8 +936,15 @@ export async function runRpcMode(
 			? error(id, command, cause.message, cause.code)
 			: error(id, command, cause instanceof Error ? cause.message : String(cause));
 	const operationOwnership = new RpcOperationMessageOwnership(session);
+	const rpcEvalOperationIds = new Set<string>();
+	const rpcEvalConfirmationControllers = new Map<string, AbortController>();
 	const operationManager = new RpcOperationManager(frame => {
 		if (frame.type === "operation_completed") operationOwnership.settle(frame.operationId);
+		if (frame.type !== "operation_started") {
+			rpcEvalOperationIds.delete(frame.operationId);
+			rpcEvalConfirmationControllers.get(frame.operationId)?.abort();
+			rpcEvalConfirmationControllers.delete(frame.operationId);
+		}
 		output(frame);
 	});
 	const planApprovalOperations = new Map<string, string>();
@@ -1253,8 +1265,10 @@ export async function runRpcMode(
 		data: { cancelled: boolean } & object,
 	): Promise<RpcResponse> => {
 		if (!data.cancelled) {
+			const evalOperationIds = Array.from(rpcEvalOperationIds);
 			const protectedOperations = providerAuthController.cancelAll("session_transition", "session_changed");
 			operationManager.cancelAll("session_transition", "session_changed", protectedOperations);
+			for (const operationId of evalOperationIds) session.abortEvalExecution(operationId);
 			await emitAvailableCommandsUpdate();
 		}
 		return success(id, command, data);
@@ -1460,6 +1474,13 @@ export async function runRpcMode(
 						"provider_auth_commit_in_progress",
 					);
 				}
+				const isRpcEval = rpcEvalOperationIds.has(command.operationId);
+				if (isRpcEval) {
+					const cancellation = operationManager.cancel(command.operationId);
+					rpcEvalConfirmationControllers.get(command.operationId)?.abort();
+					if (cancellation.wasStarted) session.abortEvalExecution(command.operationId);
+					return success(id, "cancel_operation", cancellation.result);
+				}
 				const cancellation = await operationOwnership.cancel(operationManager, command.operationId);
 				return success(id, "cancel_operation", cancellation);
 			}
@@ -1496,6 +1517,112 @@ export async function runRpcMode(
 				} catch (cause) {
 					return catalogError(id, "resume_session", cause);
 				}
+			}
+
+			case "eval_execute": {
+				const operation = operationManager.start(id, "eval_execute");
+				rpcEvalOperationIds.add(operation.operationId);
+				const confirmationController = new AbortController();
+				rpcEvalConfirmationControllers.set(operation.operationId, confirmationController);
+				setImmediate(() => {
+					if (!operationManager.begin(operation)) return;
+					void (async () => {
+						const confirmed = await requestRpcPrivilegedConfirmation(
+							pendingExtensionRequests,
+							output,
+							"eval_execute",
+							"Run eval code?",
+							`Language: ${command.language}\n\n${command.code}`,
+							{ operationId: operation.operationId, signal: confirmationController.signal },
+						);
+						if (!operationManager.isActive(operation)) return;
+						if (!confirmed) {
+							operationManager.fail(
+								operation,
+								new Error("Eval execution was not confirmed"),
+								"confirmation_denied",
+							);
+							return;
+						}
+
+						const evalOutput = new RpcEvalOutputStream(
+							operation.operationId,
+							() => operationManager.isActive(operation),
+							output,
+						);
+						const registeredEvalTool = session.getEvalToolForHost();
+						if (!(registeredEvalTool instanceof EvalTool)) throw new Error("Eval tool is unavailable");
+						const evalTool = registeredEvalTool;
+						const result = await evalTool.withExecutionId(operation.operationId).execute(
+							operation.operationId,
+							{
+								language: command.language,
+								code: command.code,
+								title: command.title,
+								timeout: command.timeout,
+								reset: command.reset,
+							},
+							undefined,
+							update => {
+								const text =
+									update.details?.cells
+										.map((cell: NonNullable<EvalToolDetails["cells"]>[number]) => cell.output.trim())
+										.filter(Boolean)
+										.join("\n\n") ?? "";
+								evalOutput.push(text);
+							},
+						);
+						if (!operationManager.isActive(operation)) return;
+						const outputText = result.content
+							.filter(part => part.type === "text")
+							.map(part => part.text)
+							.join("");
+						evalOutput.complete(outputText);
+						if (!operationManager.isActive(operation)) return;
+						const firstCell = result.details?.cells?.[0];
+						const boundedOutput = outputText.length > 262_144 ? outputText.slice(-262_144) : outputText;
+						const entry: RpcEvalHistoryEntry = {
+							language: command.language,
+							code: command.code,
+							output: boundedOutput,
+							exitCode: firstCell?.exitCode,
+							cancelled: firstCell?.cancelled === true,
+							truncated:
+								evalOutput.truncated ||
+								outputText.length > boundedOutput.length ||
+								result.details?.meta?.truncation !== undefined,
+							timestamp: Date.now(),
+							excludeFromContext: command.excludeFromContext,
+						};
+						session.recordEvalResult(entry);
+						output({ type: "eval_complete", operationId: operation.operationId, result: entry });
+						operationManager.complete(operation, false);
+					})().catch(cause => {
+						const evalError = cause instanceof Error ? cause : new Error(String(cause));
+						operationManager.fail(operation, evalError, "eval_execution_failed");
+					});
+				});
+				return success(id, "eval_execute", { operationId: operation.operationId, accepted: true });
+			}
+
+			case "get_eval_history": {
+				const limit = command.limit ?? 50;
+				const entries = [...session.messages, ...session.getPendingEvalMessages()]
+					.filter((message): message is PythonExecutionMessage => message.role === "pythonExecution")
+					.slice(-limit)
+					.map(
+						(message): RpcEvalHistoryEntry => ({
+							language: message.language ?? "py",
+							code: message.code.slice(0, 262_144),
+							output: message.output.length > 262_144 ? message.output.slice(-262_144) : message.output,
+							exitCode: message.exitCode,
+							cancelled: message.cancelled,
+							truncated: message.truncated || message.output.length > 262_144,
+							timestamp: message.timestamp,
+							excludeFromContext: message.excludeFromContext,
+						}),
+					);
+				return success(id, "get_eval_history", { entries });
 			}
 
 			case "new_session":
@@ -2364,7 +2491,9 @@ export async function runRpcMode(
 	hostToolBridge.close("RPC client disconnected before host tool execution completed");
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
 	await shutdownCoordinator.drain();
+	const rpcEvalsToAbort = Array.from(rpcEvalOperationIds);
 	operationManager.cancelAll("client_disconnected", "client_disconnected", protectedOperations);
+	for (const operationId of rpcEvalsToAbort) session.abortEvalExecution(operationId);
 	subagentRegistry?.dispose();
 	// Dispose the main session before exiting so the browser reaper and other
 	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a

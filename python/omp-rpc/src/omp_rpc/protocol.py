@@ -23,6 +23,7 @@ SessionCatalogScope: TypeAlias = Literal["cwd", "all"]
 AdvisorRuntimeStatus: TypeAlias = Literal[
     "running", "paused", "quota_exhausted", "error", "no_model"
 ]
+RpcEvalLanguage: TypeAlias = Literal["py", "js", "rb", "jl"]
 RpcOperationCommand: TypeAlias = str
 SessionMode: TypeAlias = Literal["none", "plan", "plan_paused"]
 PlanWorkflow: TypeAlias = Literal["parallel", "iterative"]
@@ -594,6 +595,7 @@ class BashExecutionMessage(TypedDict, total=False):
 
 class PythonExecutionMessage(TypedDict, total=False):
     role: Literal["pythonExecution"]
+    language: NotRequired[RpcEvalLanguage]
     code: str
     output: str
     exitCode: int | None
@@ -1245,6 +1247,34 @@ class ProviderAuthUpdate:
 
 
 @dataclass(slots=True, frozen=True)
+class EvalHistoryEntry:
+    language: RpcEvalLanguage
+    code: str
+    output: str
+    cancelled: bool
+    truncated: bool
+    timestamp: float
+    exit_code: int | None = None
+    exclude_from_context: bool | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class EvalOutputEvent:
+    operation_id: str
+    sequence: int
+    chunk: str
+    truncated: bool
+    type: Literal["eval_output"] = "eval_output"
+
+
+@dataclass(slots=True, frozen=True)
+class EvalCompleteEvent:
+    operation_id: str
+    result: EvalHistoryEntry
+    type: Literal["eval_complete"] = "eval_complete"
+
+
+@dataclass(slots=True, frozen=True)
 class OperationStartedEvent:
     operation_id: str
     command: RpcOperationCommand
@@ -1338,7 +1368,9 @@ class ExtensionUiRequest:
     provider_id: str | None = None
     prompt_style: bool | None = None
     target_id: str | None = None
-    command: Literal["delete_session", "remove_provider_auth"] | None = None
+    command: (
+        Literal["eval_execute", "delete_session", "remove_provider_auth"] | None
+    ) = None
     notify_type: NotifyType | None = None
     status_key: str | None = None
     status_text: str | None = None
@@ -1573,6 +1605,8 @@ RpcNotification: TypeAlias = (
     | RpcOperationEvent
     | ProviderAuthRequest
     | ProviderAuthUpdate
+    | EvalOutputEvent
+    | EvalCompleteEvent
     | ExtensionUiRequest
     | ExtensionError
     | SettingsUpdateEvent
@@ -2516,10 +2550,10 @@ def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
         prompt_style=_optional_bool(payload, "promptStyle"),
         target_id=_optional_str(payload, "targetId"),
         command=cast(
-            Literal["delete_session", "remove_provider_auth"] | None,
+            Literal["eval_execute", "delete_session", "remove_provider_auth"] | None,
             _optional_literal(
                 payload.get("command"),
-                frozenset({"delete_session", "remove_provider_auth"}),
+                frozenset({"eval_execute", "delete_session", "remove_provider_auth"}),
                 field="extension_ui_request.command",
             ),
         ),
@@ -2557,6 +2591,32 @@ def parse_extension_error(payload: JsonObject) -> ExtensionError:
         extension_path=_require_str(payload, "extensionPath"),
         event=_require_str(payload, "event"),
         error=_require_str(payload, "error"),
+    )
+
+
+def parse_eval_history_entry(payload: JsonObject) -> EvalHistoryEntry:
+    language = cast(
+        RpcEvalLanguage,
+        _require_literal(
+            payload.get("language"),
+            frozenset({"py", "js", "rb", "jl"}),
+            field="eval.language",
+        ),
+    )
+    cancelled = _optional_bool(payload, "cancelled")
+    truncated = _optional_bool(payload, "truncated")
+    timestamp = _optional_float(payload, "timestamp")
+    if cancelled is None or truncated is None or timestamp is None:
+        raise ValueError("eval result requires cancelled, truncated, and timestamp")
+    return EvalHistoryEntry(
+        language=language,
+        code=_require_str(payload, "code"),
+        output=_require_str(payload, "output"),
+        exit_code=_optional_int(payload, "exitCode"),
+        cancelled=cancelled,
+        truncated=truncated,
+        timestamp=timestamp,
+        exclude_from_context=_optional_bool(payload, "excludeFromContext"),
     )
 
 
@@ -2659,6 +2719,23 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
                     ),
                 ),
             ),
+        )
+    if event_type == "eval_output":
+        sequence = _optional_int(payload, "sequence")
+        truncated = _optional_bool(payload, "truncated")
+        if sequence is None or sequence < 0 or truncated is None:
+            raise ValueError("eval_output sequence/truncated is invalid")
+        return EvalOutputEvent(
+            operation_id=_require_str(payload, "operationId"),
+            sequence=sequence,
+            chunk=_require_str(payload, "chunk"),
+            truncated=truncated,
+        )
+    if event_type == "eval_complete":
+        result = _clone_json_object(payload.get("result"), field="eval_complete.result")
+        return EvalCompleteEvent(
+            operation_id=_require_str(payload, "operationId"),
+            result=parse_eval_history_entry(result),
         )
     if event_type in {
         "operation_started",

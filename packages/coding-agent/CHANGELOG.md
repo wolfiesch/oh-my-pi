@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added managed RPC eval execution and history: `eval_execute` runs code in the session kernel behind a server-owned operation whose host confirmation is bound to the issued operation id, streams `eval_output` chunks with a bounded canonical transcript, and settles as `eval_complete`; `get_eval_history` replays recorded entries. The host-facing eval tool is resolved without changing the model-visible active tool set, so execution never mutates tool activation.
+
 ## [17.4.0] - 2026-08-20
 
 ### Added

@@ -239,6 +239,18 @@ operation reaches its commit phase, `cancel_operation` answers
 `operation_commit_in_progress` so a half-applied transition never reports a
 cancelled terminal.
 
+### Eval
+
+- `{ id?, type: "eval_execute", language: "py" | "js" | "rb" | "jl", code: string, title?: string, timeout?: number, reset?: boolean, excludeFromContext?: boolean }`
+- `{ id?, type: "get_eval_history", limit?: number }`
+
+`eval_execute` is a confirmation-gated server-owned operation: the host
+confirmation is bound to the issued `operationId`, output streams as
+`eval_output` chunks with a bounded canonical transcript, and the run settles as
+`eval_complete`. Execution resolves the host-facing eval tool without changing
+the model-visible active tool set, so running code never mutates tool
+activation. `get_eval_history` replays recorded entries newest last.
+
 ### Model
 
 - `{ id?, type: "set_model", provider: string, modelId: string }`

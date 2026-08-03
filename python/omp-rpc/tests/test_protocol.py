@@ -527,6 +527,37 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertTrue(notification.requires_response())
         self.assertFalse(notification.is_passive())
 
+    def test_parse_privileged_extension_ui_request(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "extension_ui_request",
+                "id": "ui-eval",
+                "method": "confirm",
+                "title": "Run eval code?",
+                "message": "display(2 + 2)",
+                "operationId": "operation-eval",
+                "command": "eval_execute",
+            }
+        )
+
+        self.assertIsInstance(notification, ExtensionUiRequest)
+        self.assertEqual(notification.operation_id, "operation-eval")
+        self.assertEqual(notification.command, "eval_execute")
+
+    def test_reject_unknown_privileged_extension_ui_command(self) -> None:
+        with self.assertRaisesRegex(ValueError, "extension_ui_request.command"):
+            parse_notification(
+                {
+                    "type": "extension_ui_request",
+                    "id": "ui-unknown",
+                    "method": "confirm",
+                    "title": "Unknown command?",
+                    "message": "Do something privileged",
+                    "operationId": "operation-unknown",
+                    "command": "shell",
+                }
+            )
+
     def test_parse_open_url_request(self) -> None:
         notification = parse_notification(
             {

@@ -944,6 +944,8 @@ export interface BashExecutionMessage {
  */
 export interface PythonExecutionMessage {
 	role: "pythonExecution";
+	/** Runtime token. Missing on legacy entries and interpreted as Python. */
+	language?: "py" | "js" | "rb" | "jl";
 	code: string;
 	output: string;
 	exitCode: number | undefined;

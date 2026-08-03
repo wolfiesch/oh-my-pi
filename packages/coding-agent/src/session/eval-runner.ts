@@ -31,9 +31,9 @@ export class EvalRunner {
 	readonly #host: EvalRunnerHost;
 	readonly #kernelOwnerId: string;
 	readonly #parentSessionId: string | undefined;
-	#abortControllers = new Set<AbortController>();
+	#executions = new Map<string, { controller: AbortController; execution: Promise<unknown> }>();
+	#nextExecutionId = 0;
 	#pendingMessages: PythonExecutionMessage[] = [];
-	#activeExecutions = new Set<Promise<unknown>>();
 	#disposing = false;
 
 	constructor(host: EvalRunnerHost, options: { kernelOwnerId: string; parentSessionId: string | undefined }) {
@@ -52,6 +52,7 @@ export class EvalRunner {
 		const cwd = this.#host.sessionManager.getCwd();
 		this.assertExecutionAllowed();
 		const abortController = new AbortController();
+		const executionId = this.#allocateExecutionId();
 		const execution = (async (): Promise<PythonResult> => {
 			const extensionRunner = this.#host.extensionRunner();
 			if (extensionRunner?.hasHandlers("user_python")) {
@@ -85,7 +86,7 @@ export class EvalRunner {
 			this.recordPythonResult(code, result, options);
 			return result;
 		})();
-		return await this.trackExecution(execution, abortController);
+		return await this.trackExecution(execution, abortController, executionId);
 	}
 
 	/** Rejects new eval work once session disposal begins. */
@@ -93,57 +94,85 @@ export class EvalRunner {
 		if (this.#disposing) throw new Error("Python execution is unavailable while session disposal is in progress");
 	}
 
-	/** Tracks externally started Python work so disposal can await and abort it. */
-	trackExecution<T>(execution: Promise<T>, abortController: AbortController): Promise<T> {
-		this.#abortControllers.add(abortController);
-		this.#activeExecutions.add(execution);
+	/** Tracks eval work so callers can cancel one execution without affecting siblings. */
+	trackExecution<T>(
+		execution: Promise<T>,
+		abortController: AbortController,
+		executionId = this.#allocateExecutionId(),
+	): Promise<T> {
+		if (this.#executions.has(executionId)) {
+			throw new Error(`Eval execution already exists: ${executionId}`);
+		}
+		this.#executions.set(executionId, { controller: abortController, execution });
 		void execution.then(
 			() => {
-				this.#abortControllers.delete(abortController);
-				this.#activeExecutions.delete(execution);
+				this.#deleteExecution(executionId, execution);
 			},
 			() => {
-				this.#abortControllers.delete(abortController);
-				this.#activeExecutions.delete(execution);
+				this.#deleteExecution(executionId, execution);
 			},
 		);
 		return execution;
 	}
 
+	/** Cancels one running eval execution by its server-owned execution ID. */
+	abortExecution(executionId: string): boolean {
+		const active = this.#executions.get(executionId);
+		if (!active) return false;
+		active.controller.abort();
+		return true;
+	}
+
 	/** Records a Python execution result in session history. */
 	recordPythonResult(code: string, result: PythonResult, options?: { excludeFromContext?: boolean }): void {
 		const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
-		const message: PythonExecutionMessage = {
-			role: "pythonExecution",
+		this.recordEvalResult({
+			language: "py",
 			code,
 			output: result.output,
 			exitCode: result.exitCode,
 			cancelled: result.cancelled,
 			truncated: result.truncated,
 			meta,
-			timestamp: Date.now(),
 			excludeFromContext: options?.excludeFromContext,
+		});
+	}
+
+	/** Appends a user-initiated eval to the existing session transcript authority. */
+	recordEvalResult(
+		result: Omit<PythonExecutionMessage, "role" | "timestamp"> & { timestamp?: number },
+	): PythonExecutionMessage {
+		const message: PythonExecutionMessage = {
+			role: "pythonExecution",
+			...result,
+			timestamp: result.timestamp ?? Date.now(),
 		};
 		if (this.#host.isStreaming()) {
 			this.#pendingMessages.push(message);
 		} else {
 			this.#host.appendSessionMessage(message);
 		}
+		return message;
 	}
 
-	/** Cancels every running Python execution. */
+	/** Cancels every running eval execution. Reserved for session disposal and owner cleanup. */
 	abort(): void {
-		for (const abortController of this.#abortControllers) abortController.abort();
+		for (const { controller } of this.#executions.values()) controller.abort();
 	}
 
-	/** Whether a Python execution is currently running. */
+	/** Whether an eval execution is currently running. */
 	get isRunning(): boolean {
-		return this.#abortControllers.size > 0;
+		return this.#executions.size > 0;
 	}
 
 	/** Whether Python results are waiting for a safe persistence boundary. */
 	get hasPendingMessages(): boolean {
 		return this.#pendingMessages.length > 0;
+	}
+
+	/** Read-only snapshot of completed evals awaiting the next safe transcript boundary. */
+	pendingMessages(): readonly PythonExecutionMessage[] {
+		return this.#pendingMessages.slice();
 	}
 
 	/** Returns the stable owner shared by eval and session-owned tools. */
@@ -189,16 +218,26 @@ export class EvalRunner {
 		if (errors.length > 0) throw new AggregateError(errors, "Failed to dispose one or more eval kernels");
 	}
 
+	#allocateExecutionId(): string {
+		this.#nextExecutionId += 1;
+		return `session-eval-${this.#nextExecutionId}`;
+	}
+
+	#deleteExecution(executionId: string, execution: Promise<unknown>): void {
+		const active = this.#executions.get(executionId);
+		if (active?.execution === execution) this.#executions.delete(executionId);
+	}
+
 	async #waitForExecutionsToSettle(timeoutMs: number): Promise<boolean> {
 		const deadline = Date.now() + timeoutMs;
-		while (this.#activeExecutions.size > 0) {
+		while (this.#executions.size > 0) {
 			const remainingMs = deadline - Date.now();
 			if (remainingMs <= 0) return false;
 			const settled = await Promise.race([
-				Promise.allSettled(Array.from(this.#activeExecutions)).then(() => true),
+				Promise.allSettled(Array.from(this.#executions.values(), active => active.execution)).then(() => true),
 				Bun.sleep(remainingMs).then(() => false),
 			]);
-			if (!settled && this.#activeExecutions.size > 0) return false;
+			if (!settled && this.#executions.size > 0) return false;
 		}
 		return true;
 	}

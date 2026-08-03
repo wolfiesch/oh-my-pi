@@ -162,6 +162,8 @@ export interface AgentSessionConfig {
 	memoryTaskDepth?: number;
 	/** Creates built-in memory tools for the current backend. */
 	createMemoryTools?: () => Promise<AgentTool[]>;
+	/** Creates a session-bound eval tool for host-controlled execution even when eval is not model-active. */
+	createEvalTool?: () => unknown;
 	/** Creates the built-in `computer` tool for session-scoped runtime enablement (see {@link AgentSession.setComputerToolEnabled}). */
 	createComputerTool?: () => Promise<AgentTool | null>;
 	/** Creates the private `think` scratchpad tool for runtime setting changes. */

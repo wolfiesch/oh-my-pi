@@ -39,6 +39,10 @@ import type {
 	RpcCommandOutputFrame,
 	RpcConfigUpdateFrame,
 	RpcDeleteSessionResult,
+	RpcEvalCompleteFrame,
+	RpcEvalHistoryEntry,
+	RpcEvalLanguage,
+	RpcEvalOutputFrame,
 	RpcExtensionErrorFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
@@ -122,6 +126,8 @@ export type RpcSubagentLifecycleListener = (payload: RpcSubagentLifecycleFrame["
 export type RpcSubagentProgressListener = (payload: RpcSubagentProgressFrame["payload"]) => void;
 export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"]) => void;
 export type RpcAvailableCommandsUpdateListener = (commands: RpcAvailableSlashCommand[]) => void;
+export type RpcEvalOutputListener = (frame: RpcEvalOutputFrame) => void;
+export type RpcEvalCompleteListener = (frame: RpcEvalCompleteFrame) => void;
 export type RpcToolInventoryUpdateListener = (frame: RpcToolInventoryUpdateFrame) => void;
 export type RpcRawFrameListener = (frame: Readonly<Record<string, unknown>>) => void;
 export type RpcPromptResultListener = (frame: RpcPromptResultFrame) => void;
@@ -293,6 +299,30 @@ function isRpcAvailableCommandsUpdateFrame(value: unknown): value is RpcAvailabl
 }
 function isRpcToolInventoryUpdateFrame(value: unknown): value is RpcToolInventoryUpdateFrame {
 	return isRecord(value) && value.type === "tool_inventory_update";
+}
+function isRpcEvalOutputFrame(value: unknown): value is RpcEvalOutputFrame {
+	return (
+		isRecord(value) &&
+		value.type === "eval_output" &&
+		typeof value.operationId === "string" &&
+		typeof value.sequence === "number" &&
+		typeof value.chunk === "string" &&
+		typeof value.truncated === "boolean"
+	);
+}
+
+function isRpcEvalCompleteFrame(value: unknown): value is RpcEvalCompleteFrame {
+	if (!isRecord(value) || value.type !== "eval_complete" || typeof value.operationId !== "string") return false;
+	const result = value.result;
+	return (
+		isRecord(result) &&
+		(result.language === "py" || result.language === "js" || result.language === "rb" || result.language === "jl") &&
+		typeof result.code === "string" &&
+		typeof result.output === "string" &&
+		typeof result.cancelled === "boolean" &&
+		typeof result.truncated === "boolean" &&
+		typeof result.timestamp === "number"
+	);
 }
 
 function isRpcPromptResultFrame(value: unknown): value is RpcPromptResultFrame {
@@ -580,6 +610,8 @@ export class RpcClient {
 	#toolInventoryUpdateListeners = new Set<RpcToolInventoryUpdateListener>();
 	#rawFrameListeners = new Set<RpcRawFrameListener>();
 	#promptResultListeners = new Set<RpcPromptResultListener>();
+	#evalOutputListeners = new Set<RpcEvalOutputListener>();
+	#evalCompleteListeners = new Set<RpcEvalCompleteListener>();
 	#operationTerminalListeners = new Set<RpcOperationTerminalListener>();
 	#operationStartedListeners = new Set<RpcOperationStartedListener>();
 	#planStateUpdateListeners = new Set<RpcPlanStateUpdateListener>();
@@ -959,6 +991,17 @@ export class RpcClient {
 		this.#planApprovalSettledListeners.add(listener);
 		return () => this.#planApprovalSettledListeners.delete(listener);
 	}
+	/** Subscribe to bounded monotonic output chunks for RPC eval operations. */
+	onEvalOutput(listener: RpcEvalOutputListener): () => void {
+		this.#evalOutputListeners.add(listener);
+		return () => this.#evalOutputListeners.delete(listener);
+	}
+
+	/** Subscribe to successful RPC eval completion payloads. */
+	onEvalComplete(listener: RpcEvalCompleteListener): () => void {
+		this.#evalCompleteListeners.add(listener);
+		return () => this.#evalCompleteListeners.delete(listener);
+	}
 	/** Subscribe to text produced by extension commands. */
 	onCommandOutput(listener: RpcCommandOutputListener): () => void {
 		this.#commandOutputListeners.add(listener);
@@ -1159,6 +1202,32 @@ export class RpcClient {
 		const accepted = response.success && "data" in response ? parseRpcOperationAccepted(response.data) : undefined;
 		this.#registerAcceptedOperation(accepted);
 		return accepted;
+	}
+
+	/**
+	 * Accept a confirmed eval operation. The server emits a correlated confirm
+	 * request before executing any code; use onExtensionUIRequest/respondToExtensionUI.
+	 */
+	async evalExecute(options: {
+		language: RpcEvalLanguage;
+		code: string;
+		title?: string;
+		timeout?: number;
+		reset?: boolean;
+		excludeFromContext?: boolean;
+	}): Promise<RpcOperationAccepted> {
+		const response = await this.#send({ type: "eval_execute", ...options });
+		const accepted = response.success && "data" in response ? parseRpcOperationAccepted(response.data) : undefined;
+		if (!accepted) throw new Error("eval_execute response did not contain an operation ID");
+		this.#registerAcceptedOperation(accepted);
+		return accepted;
+	}
+
+	/** Read bounded user-eval entries from the authoritative session transcript. */
+	async getEvalHistory(limit?: number): Promise<RpcEvalHistoryEntry[]> {
+		const response = await this.#send({ type: "get_eval_history", limit });
+		const data = this.#getData<{ entries: RpcEvalHistoryEntry[] }>(response);
+		return data.entries;
 	}
 
 	/** Cancel one accepted operation without cancelling unrelated work. */
@@ -1943,6 +2012,14 @@ export class RpcClient {
 			return;
 		}
 
+		if (isRpcEvalOutputFrame(data)) {
+			for (const listener of this.#evalOutputListeners) listener(data);
+			return;
+		}
+		if (isRpcEvalCompleteFrame(data)) {
+			for (const listener of this.#evalCompleteListeners) listener(data);
+			return;
+		}
 		if (isRpcAvailableCommandsUpdateFrame(data)) {
 			for (const listener of this.#availableCommandsUpdateListeners) {
 				listener(data.commands);

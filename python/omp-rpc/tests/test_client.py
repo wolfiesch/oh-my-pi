@@ -284,7 +284,15 @@ FAKE_SERVER = textwrap.dedent(
         request_id = command.get("id")
 
         if command_type == "extension_ui_response":
-            emit_prompt_turn("ui acknowledged")
+            if command["id"] == "ui-privileged":
+                text = (
+                    "ui correlated"
+                    if command.get("operationId") == "operation-eval"
+                    else "ui correlation missing"
+                )
+                emit_prompt_turn(text)
+            else:
+                emit_prompt_turn("ui acknowledged")
             continue
 
         if command_type == "get_capabilities":
@@ -536,6 +544,22 @@ FAKE_SERVER = textwrap.dedent(
                 continue
             if message == "needs confirm":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-2", "method": "confirm", "title": "Confirm", "message": "Continue?"}), flush=True)
+                continue
+            if message == "needs privileged confirm":
+                print(
+                    json.dumps(
+                        {
+                            "type": "extension_ui_request",
+                            "id": "ui-privileged",
+                            "method": "confirm",
+                            "title": "Run eval code?",
+                            "message": "display(2 + 2)",
+                            "operationId": "operation-eval",
+                            "command": "eval_execute",
+                        }
+                    ),
+                    flush=True,
+                )
                 continue
             if message == "needs cancel":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-3", "method": "editor", "title": "Edit", "placeholder": "value"}), flush=True)
@@ -1777,6 +1801,13 @@ class RpcClientTests(unittest.TestCase):
             client.prompt_and_wait("needs ui", timeout=2.0)
 
         self.assertEqual(seen_methods, ["input"])
+
+    def test_install_headless_ui_preserves_privileged_correlation(self) -> None:
+        with self.make_client() as client:
+            client.install_headless_ui(confirm=True)
+            turn = client.prompt_and_wait("needs privileged confirm", timeout=2.0)
+
+        self.assertEqual(turn.require_assistant_text(), "ui correlated")
 
     def test_ready_and_typed_event_listeners(self) -> None:
         ready_types: list[str] = []

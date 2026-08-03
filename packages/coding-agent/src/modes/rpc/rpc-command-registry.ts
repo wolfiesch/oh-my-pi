@@ -8,6 +8,7 @@ import {
 	type RpcCapabilityDisabledReason,
 	type RpcCapabilityManifest,
 	type RpcCommand,
+	type RpcCommandCapability,
 	type RpcCommandConcurrencyClass,
 	type RpcCommandConfirmation,
 	type RpcCommandExecution,
@@ -42,6 +43,7 @@ interface RpcCommandMetadata {
 	confirmation: RpcCommandConfirmation;
 	requiredFeatures: readonly string[];
 	availability(context: RpcCapabilityContext): RpcCommandAvailabilityResult;
+	outputSchema?: RpcInputSchema;
 }
 
 interface RpcCommandDefinition<TCommand extends RpcCommand = RpcCommand> extends RpcCommandMetadata {
@@ -71,18 +73,23 @@ function optional(
 }
 
 const stringField = required("a string", value => typeof value === "string", { type: "string" });
-const optionalStringField = optional("a string", value => typeof value === "string", {
-	type: ["string", "null"],
-});
+const booleanField = required("a boolean", value => typeof value === "boolean", { type: "boolean" });
+const boundedStringField = (name: string, maxLength: number): RpcFieldDefinition =>
+	required(name, value => typeof value === "string" && value.length <= maxLength, {
+		type: "string",
+		maxLength,
+	});
 const optionalBoundedStringField = (name: string, maxLength: number): RpcFieldDefinition =>
 	optional(name, value => typeof value === "string" && value.length <= maxLength, {
 		type: ["string", "null"],
 		maxLength,
 	});
+const optionalStringField = optional("a string", value => typeof value === "string", {
+	type: ["string", "null"],
+});
 const optionalBooleanField = optional("a boolean", value => typeof value === "boolean", {
 	type: ["boolean", "null"],
 });
-const booleanField = required("a boolean", value => typeof value === "boolean", { type: "boolean" });
 const optionalObjectArrayField = optional(
 	"an array of objects",
 	value => Array.isArray(value) && value.every(item => isRecord(item)),
@@ -100,6 +107,12 @@ const positiveIntegerField = optional("a positive integer", value => Number.isSa
 const optionalIntegerField = optional("an integer", value => Number.isSafeInteger(value), {
 	type: ["integer", "null"],
 });
+const optionalBoundedPositiveIntegerField = (maximum: number): RpcFieldDefinition =>
+	optional(
+		`a positive integer no greater than ${maximum}`,
+		value => Number.isSafeInteger(value) && Number(value) > 0 && Number(value) <= maximum,
+		{ type: ["integer", "null"], minimum: 1, maximum },
+	);
 
 const MAX_OPAQUE_ID_BYTES = 256;
 const opaqueIdField = required(
@@ -216,7 +229,10 @@ function requiresFeature(feature: string): Pick<RpcCommandMetadata, "requiredFea
 }
 
 type RpcCommandMetadataOverrides = Partial<
-	Pick<RpcCommandMetadata, "version" | "execution" | "confirmation" | "requiredFeatures" | "availability">
+	Pick<
+		RpcCommandMetadata,
+		"version" | "execution" | "confirmation" | "requiredFeatures" | "availability" | "outputSchema"
+	>
 >;
 
 function classifiedCommand<TCommand extends RpcCommand>(
@@ -234,6 +250,7 @@ function classifiedCommand<TCommand extends RpcCommand>(
 		confirmation: metadata.confirmation ?? "none",
 		requiredFeatures: metadata.requiredFeatures ?? [],
 		availability: metadata.availability ?? (() => AVAILABLE),
+		outputSchema: metadata.outputSchema,
 		scheduling,
 		fields,
 		example,
@@ -305,6 +322,64 @@ export const RPC_COMMAND_DEFINITIONS = {
 		{ type: "cancel_operation", operationId: "operation-1" },
 		{ operationId: stringField },
 		"control",
+	),
+	eval_execute: sessionCommand(
+		{ type: "eval_execute", language: "py", code: "print('hello')" },
+		{
+			language: enumField("py", "js", "rb", "jl"),
+			code: boundedStringField("code no longer than 262144 characters", 262_144),
+			title: optionalBoundedStringField("a title no longer than 512 characters", 512),
+			timeout: optionalBoundedPositiveIntegerField(3_600),
+			reset: optionalBooleanField,
+			excludeFromContext: optionalBooleanField,
+		},
+		"concurrent",
+		{
+			execution: "operation",
+			confirmation: "required",
+			outputSchema: {
+				type: "object",
+				properties: {
+					operationId: { type: "string", maxLength: 128 },
+					accepted: { const: true },
+				},
+				required: ["operationId", "accepted"],
+				additionalProperties: false,
+			},
+		},
+	),
+	get_eval_history: sessionCommand(
+		{ type: "get_eval_history" },
+		{ limit: optionalBoundedPositiveIntegerField(100) },
+		"concurrent",
+		{
+			outputSchema: {
+				type: "object",
+				properties: {
+					entries: {
+						type: "array",
+						maxItems: 100,
+						items: {
+							type: "object",
+							properties: {
+								language: { enum: ["py", "js", "rb", "jl"] },
+								code: { type: "string", maxLength: 262_144 },
+								output: { type: "string", maxLength: 262_144 },
+								exitCode: { type: "integer" },
+								cancelled: { type: "boolean" },
+								truncated: { type: "boolean" },
+								timestamp: { type: "number" },
+								excludeFromContext: { type: "boolean" },
+							},
+							required: ["language", "code", "output", "cancelled", "truncated", "timestamp"],
+							additionalProperties: false,
+						},
+					},
+				},
+				required: ["entries"],
+				additionalProperties: false,
+			},
+		},
 	),
 	set_mode: sessionCommand(
 		{ type: "set_mode", mode: "plan" },
@@ -542,7 +617,7 @@ function inputSchemaFor(name: RpcCommandType, definition: RpcCommandDefinition):
 export function getRpcCapabilityManifest(context: RpcCapabilityContext = {}): RpcCapabilityManifest {
 	return {
 		applicationApiVersion: RPC_APPLICATION_API_VERSION,
-		commands: Object.entries(RPC_COMMAND_DEFINITIONS).map(([name, definition]) => {
+		commands: Object.entries(RPC_COMMAND_DEFINITIONS).map(([name, definition]): RpcCommandCapability => {
 			const availability = definition.availability(context);
 			const descriptor = {
 				id: `rpc.command.${name}`,
@@ -551,13 +626,15 @@ export function getRpcCapabilityManifest(context: RpcCapabilityContext = {}): Rp
 				scope: definition.scope,
 				execution: definition.execution,
 				inputSchema: inputSchemaFor(name as RpcCommandType, definition),
-				concurrencyClass: definition.concurrencyClass,
+				...(definition.concurrencyClass === undefined ? {} : { concurrencyClass: definition.concurrencyClass }),
 				confirmation: definition.confirmation,
 				requiredFeatures: [...definition.requiredFeatures],
+				...(definition.outputSchema === undefined ? {} : { outputSchema: definition.outputSchema }),
 			};
-			return availability.availability === "unavailable"
-				? { ...descriptor, availability: "unavailable" as const, disabledReason: availability.disabledReason }
-				: { ...descriptor, availability: availability.availability };
+			if (availability.availability === "unavailable") {
+				return { ...descriptor, availability: "unavailable", disabledReason: availability.disabledReason };
+			}
+			return { ...descriptor, availability: availability.availability };
 		}),
 		events: [...RPC_EVENT_TYPES],
 		extensionUiMethods: [...RPC_EXTENSION_UI_METHODS],
