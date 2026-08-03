@@ -1234,6 +1234,118 @@ class RpcClientTests(unittest.TestCase):
 
             self.assertLess(time.monotonic() - started_at, 1.0)
 
+    def test_session_catalog_methods_parse_results_and_preserve_scope(self) -> None:
+        session = {
+            "path": "/sessions/session.jsonl",
+            "id": "session-1",
+            "cwd": "/workspace",
+            "title": "Investigation",
+            "createdAt": "2026-08-01T00:00:00.000Z",
+            "updatedAt": "2026-08-01T01:00:00.000Z",
+            "messageCount": 4,
+            "size": 512,
+            "status": "complete",
+        }
+        responses: dict[str, JsonObject] = {
+            "list_sessions": {
+                "sessions": [session],
+                "total": 1,
+                "nextCursor": "cursor-2",
+            },
+            "get_session_info": {
+                "session": session,
+                "workspace": {"cwd": "/workspace", "directories": ["/workspace"]},
+                "active": False,
+            },
+            "list_workspace_roots": {
+                "roots": [
+                    {
+                        "cwd": "/workspace",
+                        "count": 1,
+                        "latest": "2026-08-01T01:00:00.000Z",
+                        "exists": True,
+                    }
+                ]
+            },
+            "resume_session": {
+                "cancelled": False,
+                "cwd": "/workspace",
+                "cwdChanged": True,
+            },
+            "fork_session": {
+                "cancelled": False,
+                "sessionFile": "/sessions/fork.jsonl",
+            },
+            "rename_session": {"renamed": True, "active": False},
+            "delete_session": {
+                "deleted": False,
+                "cancelled": False,
+                "wasActive": True,
+                "newSessionStarted": True,
+                "deleteError": {
+                    "code": "delete_failed",
+                    "message": "permission denied",
+                },
+            },
+        }
+
+        class CatalogClient(RpcClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls: list[tuple[str, dict[str, JsonValue]]] = []
+
+            def _request(self, command_type: str, **payload: JsonValue) -> JsonObject:
+                self.calls.append((command_type, payload))
+                return responses[command_type]
+
+        client = CatalogClient()
+        page = client.list_sessions(
+            scope="all",
+            cwd="/workspace",
+            cursor="cursor-1",
+            limit=25,
+            search="bug",
+        )
+        info = client.get_session_info("session-1", scope="cwd", cwd="/workspace")
+        roots = client.list_workspace_roots()
+        resumed = client.resume_session(
+            "/sessions/session.jsonl", scope="all", cwd="/workspace"
+        )
+        forked = client.fork_session()
+        renamed = client.rename_session(
+            "session-1", "Renamed", scope="cwd", cwd="/workspace"
+        )
+        deleted = client.delete_session("session-1", scope="cwd", cwd="/workspace")
+
+        self.assertEqual(page.sessions[0].title, "Investigation")
+        self.assertEqual(page.next_cursor, "cursor-2")
+        self.assertFalse(hasattr(page.sessions[0], "first_message"))
+        self.assertEqual(info.workspace.directories, ("/workspace",))
+        self.assertFalse(info.active)
+        self.assertTrue(roots[0].exists)
+        self.assertTrue(resumed.cwd_changed)
+        self.assertIsNone(resumed.session_file)
+        self.assertEqual(forked.session_file, "/sessions/fork.jsonl")
+        self.assertTrue(renamed.renamed)
+        self.assertFalse(deleted.deleted)
+        self.assertTrue(deleted.new_session_started)
+        self.assertEqual(
+            deleted.delete_error.code if deleted.delete_error else None, "delete_failed"
+        )
+        self.assertEqual(
+            client.calls[0],
+            (
+                "list_sessions",
+                {
+                    "scope": "all",
+                    "cwd": "/workspace",
+                    "cursor": "cursor-1",
+                    "limit": 25,
+                    "search": "bug",
+                },
+            ),
+        )
+
     def test_prompt_operations_settle_without_guessing_from_agent_end(self) -> None:
         terminal_types: list[str] = []
         with self.make_client(OPERATION_SERVER) as client:

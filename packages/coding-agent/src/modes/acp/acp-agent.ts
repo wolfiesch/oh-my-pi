@@ -64,6 +64,7 @@ import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } fro
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
+import { listCatalogSessionInfo, listCatalogSessionInfoPage, SessionCatalogError } from "../../session/session-catalog";
 import type { UsageStatistics } from "../../session/session-entries";
 import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
@@ -580,14 +581,22 @@ export class AcpAgent implements Agent {
 		for (const record of this.#sessions.values()) {
 			await record.session.sessionManager.flush();
 		}
-		const sessions = await this.#listStoredSessions(params.cwd ?? undefined);
-		const offset = this.#parseCursor(params.cursor ?? undefined);
-		const paged = sessions.slice(offset, offset + SESSION_PAGE_SIZE);
-		const nextOffset = offset + paged.length;
-		return {
-			sessions: paged.map(session => this.#toSessionInfo(session)),
-			nextCursor: nextOffset < sessions.length ? String(nextOffset) : undefined,
-		};
+		try {
+			const page = await listCatalogSessionInfoPage({
+				scope: params.cwd ? "cwd" : "all",
+				cwd: params.cwd ?? undefined,
+				cursor: params.cursor ?? undefined,
+				limit: SESSION_PAGE_SIZE,
+			});
+			return {
+				sessions: page.sessions.map(session => this.#toSessionInfo(session)),
+				nextCursor: page.nextCursor,
+			};
+		} catch (error) {
+			if (error instanceof SessionCatalogError && error.code === "invalid_cursor")
+				throw new Error(`Invalid ACP session cursor: ${params.cursor}`);
+			throw error;
+		}
 	}
 
 	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -1096,6 +1105,19 @@ export class AcpAgent implements Agent {
 
 	async #forkManagedSession(params: ForkSessionRequest): Promise<ManagedSessionRecord> {
 		const sourcePath = await this.#resolveForkSourceSessionPath(params.sessionId);
+		const loaded = this.#sessions.get(params.sessionId);
+		if (loaded) {
+			this.#assertMatchingCwd(loaded.session, params.cwd);
+		} else {
+			const stored = await this.#findStoredSessionById(params.sessionId);
+			if (!stored) throw new Error(`ACP session not found: ${params.sessionId}`);
+			const requestedCwd = path.resolve(params.cwd);
+			if (path.resolve(stored.cwd) !== requestedCwd) {
+				throw new Error(
+					`ACP session ${params.sessionId} belongs to ${path.resolve(stored.cwd)}, not ${requestedCwd}`,
+				);
+			}
+		}
 		const session = await this.#createSession(path.resolve(params.cwd));
 		try {
 			const success = await session.switchSession(sourcePath);
@@ -2015,8 +2037,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async #listStoredSessions(cwd?: string): Promise<StoredSessionInfo[]> {
-		const sessions = cwd ? await SessionManager.list(cwd) : await SessionManager.listAll();
-		return sessions.sort((left, right) => right.modified.getTime() - left.modified.getTime());
+		return listCatalogSessionInfo(cwd ? { scope: "cwd", cwd } : { scope: "all" });
 	}
 
 	async #findStoredSession(sessionId: string, cwd: string): Promise<StoredSessionInfo | undefined> {
@@ -2036,17 +2057,6 @@ export class AcpAgent implements Agent {
 	async #findStoredSessionById(sessionId: string): Promise<StoredSessionInfo | undefined> {
 		const sessions = await this.#listStoredSessions();
 		return sessions.find(session => session.id === sessionId);
-	}
-
-	#parseCursor(cursor: string | undefined): number {
-		if (!cursor) {
-			return 0;
-		}
-		const parsed = Number.parseInt(cursor, 10);
-		if (!Number.isFinite(parsed) || parsed < 0) {
-			throw new Error(`Invalid ACP session cursor: ${cursor}`);
-		}
-		return parsed;
 	}
 
 	async #replaySessionHistory(record: ManagedSessionRecord): Promise<void> {

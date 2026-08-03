@@ -573,6 +573,14 @@ describe("ACP agent", () => {
 		firstSession?.sessionManager.appendMessage({ role: "user", content: "fork me", timestamp: Date.now() });
 		await firstSession?.sessionManager.flush();
 
+		await expect(
+			harness.agent.unstable_forkSession({
+				sessionId: first.sessionId,
+				cwd: harness.cwdB,
+				mcpServers: [],
+			}),
+		).rejects.toThrow(`already loaded for ${harness.cwdA}, not ${harness.cwdB}`);
+
 		const forked = await harness.agent.unstable_forkSession({
 			sessionId: first.sessionId,
 			cwd: harness.cwdA,

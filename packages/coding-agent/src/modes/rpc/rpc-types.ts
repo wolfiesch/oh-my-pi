@@ -10,7 +10,14 @@ import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type {
+	SessionCatalogEntry,
+	SessionCatalogPage,
+	SessionCatalogScope,
+	SessionWorkspaceRoot,
+} from "../../session/session-catalog";
 import type { FileEntry } from "../../session/session-entries";
+import type { SessionWorkspace } from "../../session/session-workspace";
 import type { AvailableSlashCommandSource } from "../../slash-commands/available-commands";
 import type {
 	AgentProgress,
@@ -85,6 +92,21 @@ export type RpcCommand =
 	| { id?: string; type: "get_branch_messages" }
 	| { id?: string; type: "get_last_assistant_text" }
 	| { id?: string; type: "set_session_name"; name: string }
+	| {
+			id?: string;
+			type: "list_sessions";
+			scope?: SessionCatalogScope;
+			cwd?: string;
+			cursor?: string;
+			limit?: number;
+			search?: string;
+	  }
+	| { id?: string; type: "get_session_info"; session: string; scope?: SessionCatalogScope; cwd?: string }
+	| { id?: string; type: "list_workspace_roots" }
+	| { id?: string; type: "resume_session"; session: string; scope?: SessionCatalogScope; cwd?: string }
+	| { id?: string; type: "fork_session" }
+	| { id?: string; type: "rename_session"; session: string; name: string; scope?: SessionCatalogScope; cwd?: string }
+	| { id?: string; type: "delete_session"; session: string; scope?: SessionCatalogScope; cwd?: string }
 	| { id?: string; type: "handoff"; customInstructions?: string }
 
 	// Messages
@@ -237,6 +259,7 @@ export interface RpcExtensionErrorFrame {
 export type RpcCommandSchedulingClass = "serial" | "concurrent" | "control";
 export type RpcCommandScope = "host" | "session" | "turn" | "agent";
 export type RpcCommandExecution = "sync" | "operation" | "host-only" | "unavailable";
+export type RpcCommandConfirmation = "none" | "required";
 export type RpcCommandAvailability = "available" | "conditional" | "unavailable";
 export type RpcCommandConcurrencyClass = RpcCommandSchedulingClass;
 
@@ -262,6 +285,7 @@ interface RpcCommandCapabilityBase {
 	inputSchema?: RpcInputSchema;
 	outputSchema?: Record<string, unknown>;
 	concurrencyClass?: RpcCommandConcurrencyClass;
+	confirmation: RpcCommandConfirmation;
 	requiredFeatures: string[];
 }
 
@@ -300,6 +324,37 @@ export interface RpcChunkFrame {
 
 export interface RpcHandoffResult {
 	savedPath?: string;
+}
+
+export interface RpcSessionInfoResult {
+	session: SessionCatalogEntry;
+	workspace: SessionWorkspace;
+	active: boolean;
+}
+
+export interface RpcResumeSessionResult {
+	cancelled: boolean;
+	sessionFile?: string;
+	cwd: string;
+	cwdChanged: boolean;
+}
+
+export interface RpcForkSessionResult {
+	cancelled: boolean;
+	sessionFile?: string;
+}
+
+export interface RpcRenameSessionResult {
+	renamed: boolean;
+	active: boolean;
+}
+
+export interface RpcDeleteSessionResult {
+	deleted: boolean;
+	cancelled: boolean;
+	wasActive: boolean;
+	newSessionStarted: boolean;
+	deleteError?: { code: "delete_failed"; message: string };
 }
 
 export type RpcSubagentSubscriptionLevel = "off" | "progress" | "events";
@@ -460,6 +515,19 @@ export type RpcResponse =
 	// Session
 	| { id?: string; type: "response"; command: "get_session_stats"; success: true; data: SessionStats }
 	| { id?: string; type: "response"; command: "export_html"; success: true; data: { path: string } }
+	| { id?: string; type: "response"; command: "list_sessions"; success: true; data: SessionCatalogPage }
+	| { id?: string; type: "response"; command: "get_session_info"; success: true; data: RpcSessionInfoResult }
+	| {
+			id?: string;
+			type: "response";
+			command: "list_workspace_roots";
+			success: true;
+			data: { roots: SessionWorkspaceRoot[] };
+	  }
+	| { id?: string; type: "response"; command: "resume_session"; success: true; data: RpcResumeSessionResult }
+	| { id?: string; type: "response"; command: "fork_session"; success: true; data: RpcForkSessionResult }
+	| { id?: string; type: "response"; command: "rename_session"; success: true; data: RpcRenameSessionResult }
+	| { id?: string; type: "response"; command: "delete_session"; success: true; data: RpcDeleteSessionResult }
 	| { id?: string; type: "response"; command: "switch_session"; success: true; data: { cancelled: boolean } }
 	| { id?: string; type: "response"; command: "branch"; success: true; data: { text: string; cancelled: boolean } }
 	| {
@@ -526,7 +594,17 @@ export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame;
 /** Emitted when an extension needs user input */
 export type RpcExtensionUIRequest =
 	| { type: "extension_ui_request"; id: string; method: "select"; title: string; options: string[]; timeout?: number }
-	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }
+	| {
+			type: "extension_ui_request";
+			id: string;
+			method: "confirm";
+			title: string;
+			message: string;
+			timeout?: number;
+			/** Server-issued correlation for privileged RPC mutations. */
+			operationId?: string;
+			command?: "delete_session";
+	  }
 	| {
 			type: "extension_ui_request";
 			id: string;
@@ -689,7 +767,7 @@ export interface RpcHostUriResult {
 /** Response to an extension UI request */
 export type RpcExtensionUIResponse =
 	| { type: "extension_ui_response"; id: string; value: string }
-	| { type: "extension_ui_response"; id: string; confirmed: boolean }
+	| { type: "extension_ui_response"; id: string; confirmed: boolean; operationId?: string }
 	| { type: "extension_ui_response"; id: string; cancelled: true; timedOut?: boolean };
 
 type RpcManifestEvent =

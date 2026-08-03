@@ -62,6 +62,7 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
           "additionalProperties": false
         },
         "concurrencyClass": "serial",
+        "confirmation": "none",
         "requiredFeatures": []
       }
     ],
@@ -83,8 +84,9 @@ command can run. An unavailable command includes a machine-readable
 `requiredFeatures` without pretending that a runtime prerequisite is always met.
 `inputSchema` is derived from the same field definitions used for
 wire validation. `outputSchema` and `concurrencyClass` are omitted when the
-server cannot advertise them truthfully. Command versions are assigned per
-registry entry.
+server cannot advertise them truthfully. `confirmation` is `"required"` for
+commands that only proceed after the host confirms an `extension_ui_request`,
+and `"none"` otherwise. Command versions are assigned per registry entry.
 
 Clients that support protocol v2 SHOULD immediately send:
 
@@ -244,6 +246,25 @@ clients MUST correlate responses by `id`, not emission order.
 - `{ id?, type: "get_last_assistant_text" }`
 - `{ id?, type: "set_session_name", name: string }`
 - `{ id?, type: "handoff", customInstructions?: string }`
+
+### Session catalog
+
+- `{ id?, type: "list_sessions", scope?: "cwd" | "all", cwd?: string, cursor?: string, limit?: number, search?: string }`
+- `{ id?, type: "get_session_info", session: string, scope?: "cwd" | "all", cwd?: string }`
+- `{ id?, type: "list_workspace_roots" }`
+- `{ id?, type: "rename_session", session: string, name: string, scope?: "cwd" | "all", cwd?: string }`
+- `{ id?, type: "resume_session", session: string, scope?: "cwd" | "all", cwd?: string }`
+- `{ id?, type: "fork_session" }`
+- `{ id?, type: "delete_session", session: string, scope?: "cwd" | "all", cwd?: string }`
+
+These commands share one catalog with the interactive session picker. `scope`
+defaults to `"cwd"` and resolves against `cwd`, which defaults to the active
+session's working directory. `list_sessions` returns a page with an opaque
+`nextCursor`; cursors expire and are bounded per connection. `session` accepts a
+session ID prefix or a path, and an ambiguous reference fails with
+`session_ambiguous` rather than picking a match. `delete_session` is
+confirmation-gated and answers `confirmation_required` unless the host echoes
+the server-issued `operationId` with `confirmed: true`.
 
 ### Messages
 
@@ -715,15 +736,39 @@ Example:
 }
 ```
 
+Privileged commands add a server-issued `operationId` and the `command` being
+confirmed:
+
+```json
+{
+  "type": "extension_ui_request",
+  "id": "124",
+  "method": "confirm",
+  "title": "Delete session?",
+  "message": "Permanently delete session \"Investigation\" and its artifacts?",
+  "timeout": 30000,
+  "operationId": "01901234",
+  "command": "delete_session"
+}
+```
+
 ### Inbound response
 
 `RpcExtensionUIResponse` (`type: "extension_ui_response"`):
 
 - `{ type: "extension_ui_response", id: string, value: string }`
-- `{ type: "extension_ui_response", id: string, confirmed: boolean }`
+- `{ type: "extension_ui_response", id: string, confirmed: boolean, operationId?: string }`
 - `{ type: "extension_ui_response", id: string, cancelled: true, timedOut?: boolean }`
 
 If a dialog has a timeout, RPC mode resolves to a default value when timeout/abort fires.
+
+A privileged confirmation only counts when the response echoes the exact
+`operationId` from the request. A missing, stale, or mismatched `operationId`,
+a declined dialog, an expiry, and a disconnect all fail closed, and the
+originating command answers with the `confirmation_required` error code. The
+capability manifest marks these commands with `confirmation: "required"` so
+hosts can present the prompt before the round trip instead of discovering the
+requirement from an error.
 
 ## Host Tool Sub-Protocol
 

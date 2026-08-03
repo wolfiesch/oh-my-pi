@@ -11,11 +11,12 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 import { once } from "node:events";
+import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { serviceTierFamily } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { $env, isRecord, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, isEnoent, isRecord, Snowflake } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -30,6 +31,14 @@ import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
+import {
+	inspectPersistedSessionWorkspace,
+	listSessionCatalog,
+	listSessionWorkspaceRoots,
+	resolveSessionCatalogReference,
+	SessionCatalogError,
+} from "../../session/session-catalog";
+import { FileSessionStorage } from "../../session/session-storage";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
@@ -47,8 +56,10 @@ import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents"
 import type {
 	RpcCancelOperationResult,
 	RpcCommand,
+	RpcDeleteSessionResult,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcForkSessionResult,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
 	RpcHostToolDefinition,
@@ -57,7 +68,10 @@ import type {
 	RpcHostUriCancelRequest,
 	RpcHostUriRequest,
 	RpcHostUriResult,
+	RpcRenameSessionResult,
 	RpcResponse,
+	RpcResumeSessionResult,
+	RpcSessionInfoResult,
 	RpcSessionState,
 	RpcSubagentSubscriptionLevel,
 } from "./rpc-types";
@@ -729,6 +743,27 @@ export function requestRpcDialog<T>(
 	output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
 	return promise;
 }
+
+/** Requests host confirmation for a privileged RPC command, bound to a server-issued operation id. */
+export function requestRpcPrivilegedConfirmation(
+	pendingRequests: Map<string, PendingExtensionRequest>,
+	output: RpcOutput,
+	command: "delete_session",
+	title: string,
+	message: string,
+	options: { operationId?: string; signal?: AbortSignal; timeout?: number } = {},
+): Promise<boolean> {
+	const operationId = options.operationId ?? (Snowflake.next() as string);
+	const timeout = options.timeout ?? 30_000;
+	return requestRpcDialog(
+		pendingRequests,
+		output,
+		{ signal: options.signal, timeout },
+		false,
+		{ method: "confirm", title, message, timeout, operationId, command },
+		response => "confirmed" in response && response.confirmed === true && response.operationId === operationId,
+	);
+}
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
@@ -799,6 +834,10 @@ export async function runRpcMode(
 	const error = (id: string | undefined, command: string, message: string, code?: string): RpcResponse => {
 		return { id, type: "response", command, success: false, error: message, ...(code ? { code } : {}) };
 	};
+	const catalogError = (id: string | undefined, command: string, cause: unknown): RpcResponse =>
+		cause instanceof SessionCatalogError
+			? error(id, command, cause.message, cause.code)
+			: error(id, command, cause instanceof Error ? cause.message : String(cause));
 	const operationOwnership = new RpcOperationMessageOwnership(session);
 	const operationManager = new RpcOperationManager(frame => {
 		if (frame.type === "operation_completed") operationOwnership.settle(frame.operationId);
@@ -811,6 +850,7 @@ export async function runRpcMode(
 	const hostToolBridge = new RpcHostToolBridge(output);
 	const hostUriBridge = new RpcHostUriBridge(output);
 	const subagentRegistry = eventBus ? new RpcSubagentRegistry(eventBus, output) : undefined;
+	const sessionStorage = new FileSessionStorage();
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
@@ -1060,6 +1100,18 @@ export async function runRpcMode(
 	});
 	await emitAvailableCommandsUpdate();
 
+	const completeSessionTransition = async (
+		id: string | undefined,
+		command: RpcCommand["type"],
+		data: { cancelled: boolean } & object,
+	): Promise<RpcResponse> => {
+		if (!data.cancelled) {
+			operationManager.cancelAll("session_transition", "session_changed");
+			await emitAvailableCommandsUpdate();
+		}
+		return success(id, command, data);
+	};
+
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
@@ -1233,15 +1285,45 @@ export async function runRpcMode(
 				return success(id, "cancel_operation", cancellation);
 			}
 
+			case "resume_session": {
+				if (session.isStreaming || session.isCompacting)
+					return error(
+						id,
+						"resume_session",
+						"Session mutation is unavailable while the session is busy",
+						"session_busy",
+					);
+				try {
+					const previousCwd = session.sessionManager.getCwd();
+					const resolved = await resolveSessionCatalogReference(
+						command.session,
+						{ scope: command.scope ?? (command.cwd ? "cwd" : "all"), cwd: command.cwd },
+						sessionStorage,
+					);
+					const switched = await handleRpcSessionChange(
+						session,
+						{ type: "switch_session", sessionPath: resolved.entry.path },
+						subagentRegistry,
+					);
+					const cwd = session.sessionManager.getCwd();
+					const sessionFile = session.sessionManager.getSessionFile();
+					const data: RpcResumeSessionResult = {
+						cancelled: switched.data.cancelled,
+						...(sessionFile ? { sessionFile } : {}),
+						cwd,
+						cwdChanged: !switched.data.cancelled && path.resolve(cwd) !== path.resolve(previousCwd),
+					};
+					return completeSessionTransition(id, "resume_session", data);
+				} catch (cause) {
+					return catalogError(id, "resume_session", cause);
+				}
+			}
+
 			case "new_session":
 			case "switch_session":
 			case "branch": {
 				const result = await handleRpcSessionChange(session, command, subagentRegistry);
-				if (!result.data.cancelled) {
-					operationManager.cancelAll("session_transition", "session_changed");
-					await emitAvailableCommandsUpdate();
-				}
-				return success(id, result.type, result.data);
+				return completeSessionTransition(id, result.type, result.data);
 			}
 
 			// =================================================================
@@ -1486,6 +1568,210 @@ export async function runRpcMode(
 			case "export_html": {
 				const path = await session.exportToHtml(command.outputPath);
 				return success(id, "export_html", { path });
+			}
+
+			case "list_sessions": {
+				try {
+					await session.sessionManager.flush();
+					return success(
+						id,
+						"list_sessions",
+						await listSessionCatalog(
+							{
+								scope: command.scope ?? "cwd",
+								cwd: command.cwd ?? session.sessionManager.getCwd(),
+								cursor: command.cursor,
+								limit: command.limit,
+								search: command.search,
+							},
+							sessionStorage,
+						),
+					);
+				} catch (cause) {
+					return catalogError(id, "list_sessions", cause);
+				}
+			}
+
+			case "get_session_info": {
+				try {
+					await session.sessionManager.flush();
+					const resolved = await resolveSessionCatalogReference(
+						command.session,
+						{ scope: command.scope ?? (command.cwd ? "cwd" : "all"), cwd: command.cwd },
+						sessionStorage,
+					);
+					const activePath = session.sessionManager.getSessionFile();
+					const active = activePath !== undefined && path.resolve(activePath) === resolved.entry.path;
+					const workspace = active
+						? {
+								cwd: session.sessionManager.getCwd(),
+								directories: [
+									session.sessionManager.getCwd(),
+									...session.sessionManager.getAdditionalDirectories(),
+								],
+							}
+						: await inspectPersistedSessionWorkspace(resolved.entry.path, resolved.entry.cwd, sessionStorage);
+					const data: RpcSessionInfoResult = { session: resolved.entry, workspace, active };
+					return success(id, "get_session_info", data);
+				} catch (cause) {
+					return catalogError(id, "get_session_info", cause);
+				}
+			}
+
+			case "list_workspace_roots": {
+				try {
+					await session.sessionManager.flush();
+					return success(id, "list_workspace_roots", { roots: await listSessionWorkspaceRoots(sessionStorage) });
+				} catch (cause) {
+					return catalogError(id, "list_workspace_roots", cause);
+				}
+			}
+
+			case "fork_session": {
+				if (session.isStreaming || session.isCompacting)
+					return error(
+						id,
+						"fork_session",
+						"Session mutation is unavailable while the session is busy",
+						"session_busy",
+					);
+				if (!session.sessionManager.getSessionFile())
+					return error(id, "fork_session", "The active session has not been persisted", "session_not_persisted");
+				try {
+					const forked = await session.fork();
+					const data: RpcForkSessionResult = {
+						cancelled: !forked,
+						...(forked && session.sessionManager.getSessionFile()
+							? { sessionFile: session.sessionManager.getSessionFile() }
+							: {}),
+					};
+					if (forked) subagentRegistry?.clear();
+					return completeSessionTransition(id, "fork_session", data);
+				} catch (cause) {
+					return catalogError(id, "fork_session", cause);
+				}
+			}
+
+			case "rename_session": {
+				if (session.isStreaming || session.isCompacting)
+					return error(
+						id,
+						"rename_session",
+						"Session mutation is unavailable while the session is busy",
+						"session_busy",
+					);
+				const name = command.name
+					.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+					.replace(/ +/g, " ")
+					.trim();
+				if (!name) return error(id, "rename_session", "Session name cannot be empty");
+				try {
+					const resolved = await resolveSessionCatalogReference(
+						command.session,
+						{ scope: command.scope ?? (command.cwd ? "cwd" : "all"), cwd: command.cwd },
+						sessionStorage,
+					);
+					const activePath = session.sessionManager.getSessionFile();
+					const active = activePath !== undefined && path.resolve(activePath) === resolved.entry.path;
+					if (active) {
+						const renamed = await session.setSessionName(name, "user");
+						const data: RpcRenameSessionResult = { renamed, active: true };
+						return success(id, "rename_session", data);
+					}
+					await sessionStorage.updateSessionTitle(resolved.entry.path, {
+						title: name,
+						source: "user",
+						updatedAt: new Date().toISOString(),
+					});
+					const data: RpcRenameSessionResult = { renamed: true, active: false };
+					return success(id, "rename_session", data);
+				} catch (cause) {
+					return catalogError(id, "rename_session", cause);
+				}
+			}
+
+			case "delete_session": {
+				if (session.isStreaming || session.isCompacting)
+					return error(
+						id,
+						"delete_session",
+						"Session mutation is unavailable while the session is busy",
+						"session_busy",
+					);
+				try {
+					const resolved = await resolveSessionCatalogReference(
+						command.session,
+						{ scope: command.scope ?? (command.cwd ? "cwd" : "all"), cwd: command.cwd },
+						sessionStorage,
+					);
+					const confirmed = await requestRpcPrivilegedConfirmation(
+						pendingExtensionRequests,
+						output,
+						"delete_session",
+						"Delete session?",
+						`Permanently delete session "${resolved.entry.title ?? resolved.entry.id}" and its artifacts?`,
+					);
+					if (!confirmed) {
+						return error(id, "delete_session", "Session deletion was not confirmed", "confirmation_required");
+					}
+					const activePath = session.sessionManager.getSessionFile();
+					const wasActive = activePath !== undefined && path.resolve(activePath) === resolved.entry.path;
+					if (wasActive) {
+						const started = await session.newSession();
+						if (!started) {
+							const cancelled: RpcDeleteSessionResult = {
+								deleted: false,
+								cancelled: true,
+								wasActive: true,
+								newSessionStarted: false,
+							};
+							return success(id, "delete_session", cancelled);
+						}
+						subagentRegistry?.clear();
+						try {
+							await session.sessionManager.dropSession(resolved.entry.path);
+						} catch (cause) {
+							const failed: RpcDeleteSessionResult = {
+								deleted: false,
+								cancelled: false,
+								wasActive: true,
+								newSessionStarted: true,
+								deleteError: {
+									code: "delete_failed",
+									message: cause instanceof Error ? cause.message : String(cause),
+								},
+							};
+							return completeSessionTransition(id, "delete_session", failed);
+						}
+						const deleted: RpcDeleteSessionResult = {
+							deleted: true,
+							cancelled: false,
+							wasActive: true,
+							newSessionStarted: true,
+						};
+						return completeSessionTransition(id, "delete_session", deleted);
+					}
+					try {
+						await sessionStorage.deleteSessionWithArtifacts(resolved.entry.path);
+					} catch (cause) {
+						if (!isEnoent(cause))
+							return error(
+								id,
+								"delete_session",
+								cause instanceof Error ? cause.message : String(cause),
+								"delete_failed",
+							);
+					}
+					const deleted: RpcDeleteSessionResult = {
+						deleted: true,
+						cancelled: false,
+						wasActive: false,
+						newSessionStarted: false,
+					};
+					return success(id, "delete_session", deleted);
+				} catch (cause) {
+					return catalogError(id, "delete_session", cause);
+				}
 			}
 
 			case "get_branch_messages": {

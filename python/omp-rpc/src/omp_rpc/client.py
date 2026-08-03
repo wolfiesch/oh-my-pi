@@ -31,9 +31,11 @@ from .protocol import (
     CancellationResult,
     CancelOperationResult,
     CompactionResult,
+    DeleteSessionResult,
     ExtensionError,
     ExtensionUiRequest,
     FastModeResult,
+    ForkSessionResult,
     ImageContent,
     InterruptMode,
     JsonObject,
@@ -50,15 +52,21 @@ from .protocol import (
     OperationsSnapshot,
     OperationStartedEvent,
     ReadyEvent,
-    RpcCapabilityManifest,
+    RenameSessionResult,
+    ResumeSessionResult,
     RetryFallbackAppliedEvent,
     RetryFallbackSucceededEvent,
     RpcAgentEvent,
+    RpcCapabilityManifest,
     RpcNotification,
     RpcOperationCommand,
     RpcOperationTerminalEvent,
+    SessionCatalogPage,
+    SessionCatalogScope,
+    SessionInfoResult,
     SessionState,
     SessionStats,
+    SessionWorkspaceRoot,
     SteeringMode,
     StreamingBehavior,
     ThinkingLevel,
@@ -82,13 +90,20 @@ from .protocol import (
     parse_branch_result,
     parse_cancellation_result,
     parse_compaction_result,
+    parse_delete_session_result,
     parse_fast_mode_result,
+    parse_fork_session_result,
     parse_model_cycle_result,
     parse_model_info,
     parse_notification,
+    parse_rename_session_result,
+    parse_resume_session_result,
     parse_rpc_capability_manifest,
+    parse_session_catalog_page,
+    parse_session_info_result,
     parse_session_state,
     parse_session_stats,
+    parse_session_workspace_roots,
     parse_thinking_level_cycle_result,
     parse_todo_phases,
 )
@@ -1041,6 +1056,98 @@ class RpcClient:
     def switch_session(self, session_path: str | Path) -> CancellationResult:
         return parse_cancellation_result(
             self._request("switch_session", sessionPath=str(session_path))
+        )
+
+    def list_sessions(
+        self,
+        *,
+        scope: SessionCatalogScope | None = None,
+        cwd: str | Path | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+        search: str | None = None,
+    ) -> SessionCatalogPage:
+        return parse_session_catalog_page(
+            self._request(
+                "list_sessions",
+                scope=scope,
+                cwd=str(cwd) if cwd is not None else None,
+                cursor=cursor,
+                limit=limit,
+                search=search,
+            )
+        )
+
+    def get_session_info(
+        self,
+        session: str | Path,
+        *,
+        scope: SessionCatalogScope | None = None,
+        cwd: str | Path | None = None,
+    ) -> SessionInfoResult:
+        return parse_session_info_result(
+            self._request(
+                "get_session_info",
+                session=str(session),
+                scope=scope,
+                cwd=str(cwd) if cwd is not None else None,
+            )
+        )
+
+    def list_workspace_roots(self) -> tuple[SessionWorkspaceRoot, ...]:
+        return parse_session_workspace_roots(self._request("list_workspace_roots"))
+
+    def resume_session(
+        self,
+        session: str | Path,
+        *,
+        scope: SessionCatalogScope | None = None,
+        cwd: str | Path | None = None,
+    ) -> ResumeSessionResult:
+        return parse_resume_session_result(
+            self._request(
+                "resume_session",
+                session=str(session),
+                scope=scope,
+                cwd=str(cwd) if cwd is not None else None,
+            )
+        )
+
+    def fork_session(self) -> ForkSessionResult:
+        return parse_fork_session_result(self._request("fork_session"))
+
+    def rename_session(
+        self,
+        session: str | Path,
+        name: str,
+        *,
+        scope: SessionCatalogScope | None = None,
+        cwd: str | Path | None = None,
+    ) -> RenameSessionResult:
+        return parse_rename_session_result(
+            self._request(
+                "rename_session",
+                session=str(session),
+                name=name,
+                scope=scope,
+                cwd=str(cwd) if cwd is not None else None,
+            )
+        )
+
+    def delete_session(
+        self,
+        session: str | Path,
+        *,
+        scope: SessionCatalogScope | None = None,
+        cwd: str | Path | None = None,
+    ) -> DeleteSessionResult:
+        return parse_delete_session_result(
+            self._request(
+                "delete_session",
+                session=str(session),
+                scope=scope,
+                cwd=str(cwd) if cwd is not None else None,
+            )
         )
 
     def branch(self, entry_id: str) -> BranchResult:

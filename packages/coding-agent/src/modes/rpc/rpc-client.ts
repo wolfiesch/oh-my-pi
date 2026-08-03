@@ -12,6 +12,12 @@ import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type {
+	SessionCatalogPage,
+	SessionCatalogQuery,
+	SessionCatalogScope,
+	SessionWorkspaceRoot,
+} from "../../session/session-catalog";
 import type { TodoPhase } from "../../tools/todo";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
 import {
@@ -28,9 +34,11 @@ import type {
 	RpcCommand,
 	RpcCommandOutputFrame,
 	RpcConfigUpdateFrame,
+	RpcDeleteSessionResult,
 	RpcExtensionErrorFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcForkSessionResult,
 	RpcHandoffResult,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
@@ -46,7 +54,10 @@ import type {
 	RpcOperationsSnapshot,
 	RpcOperationTerminalFrame,
 	RpcPromptResultFrame,
+	RpcRenameSessionResult,
 	RpcResponse,
+	RpcResumeSessionResult,
+	RpcSessionInfoResult,
 	RpcSessionInfoUpdateFrame,
 	RpcSessionState,
 	RpcSubagentEventFrame,
@@ -1198,6 +1209,61 @@ export class RpcClient {
 	async switchSession(sessionPath: string): Promise<{ cancelled: boolean }> {
 		const response = await this.#send({ type: "switch_session", sessionPath });
 		return this.#getData(response);
+	}
+
+	/** List persisted sessions without exposing transcript text. */
+	async listSessions(options: SessionCatalogQuery = {}): Promise<SessionCatalogPage> {
+		const response = await this.#send({ type: "list_sessions", ...options });
+		return this.#getData<SessionCatalogPage>(response);
+	}
+
+	/** Inspect one cataloged session by id, id prefix, or cataloged absolute path. */
+	async getSessionInfo(
+		session: string,
+		options: { scope?: SessionCatalogScope; cwd?: string } = {},
+	): Promise<RpcSessionInfoResult> {
+		const response = await this.#send({ type: "get_session_info", session, ...options });
+		return this.#getData<RpcSessionInfoResult>(response);
+	}
+
+	/** List distinct persisted workspace roots. */
+	async listWorkspaceRoots(): Promise<SessionWorkspaceRoot[]> {
+		const response = await this.#send({ type: "list_workspace_roots" });
+		return this.#getData<{ roots: SessionWorkspaceRoot[] }>(response).roots;
+	}
+
+	/** Resume a cataloged session by id, id prefix, or absolute path. */
+	async resumeSession(
+		session: string,
+		options: { scope?: SessionCatalogScope; cwd?: string } = {},
+	): Promise<RpcResumeSessionResult> {
+		const response = await this.#send({ type: "resume_session", session, ...options });
+		return this.#getData<RpcResumeSessionResult>(response);
+	}
+
+	/** Fork the active persisted session. */
+	async forkSession(): Promise<RpcForkSessionResult> {
+		const response = await this.#send({ type: "fork_session" });
+		return this.#getData<RpcForkSessionResult>(response);
+	}
+
+	/** Rename a cataloged active or inactive session. */
+	async renameSession(
+		session: string,
+		name: string,
+		options: { scope?: SessionCatalogScope; cwd?: string } = {},
+	): Promise<RpcRenameSessionResult> {
+		const response = await this.#send({ type: "rename_session", session, name, ...options });
+		return this.#getData<RpcRenameSessionResult>(response);
+	}
+
+	/** Delete a cataloged session without leaving an active writer attached. */
+	async deleteSession(
+		session: string,
+		options: { scope?: SessionCatalogScope; cwd?: string } = {},
+	): Promise<RpcDeleteSessionResult> {
+		const response = await this.#send({ type: "delete_session", session, ...options });
+		return this.#getData<RpcDeleteSessionResult>(response);
 	}
 
 	/**

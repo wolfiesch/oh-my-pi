@@ -19,6 +19,7 @@ StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
 SessionActivityPhase: TypeAlias = Literal["provider", "maintenance", "idle"]
+SessionCatalogScope: TypeAlias = Literal["cwd", "all"]
 RpcOperationCommand: TypeAlias = Literal["prompt", "abort_and_prompt"]
 RpcOperationCancellationReason: TypeAlias = Literal[
     "user", "replaced", "session_transition", "client_disconnected"
@@ -33,6 +34,7 @@ RpcCommandScope: TypeAlias = str
 RpcCommandExecution: TypeAlias = str
 RpcCommandAvailability: TypeAlias = str
 RpcCommandConcurrencyClass: TypeAlias = str
+RpcCommandConfirmation: TypeAlias = Literal["none", "required"]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
 WidgetPlacement: TypeAlias = Literal["aboveEditor", "belowEditor"]
@@ -920,6 +922,83 @@ class SessionStats:
 
 
 @dataclass(slots=True, frozen=True)
+class SessionCatalogEntry:
+    path: str
+    id: str
+    cwd: str
+    created_at: str
+    updated_at: str
+    message_count: int
+    size: int
+    title: str | None = None
+    parent_session_path: str | None = None
+    status: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SessionCatalogPage:
+    sessions: tuple[SessionCatalogEntry, ...]
+    total: int
+    next_cursor: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SessionWorkspace:
+    cwd: str
+    directories: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class SessionInfoResult:
+    session: SessionCatalogEntry
+    workspace: SessionWorkspace
+    active: bool
+
+
+@dataclass(slots=True, frozen=True)
+class SessionWorkspaceRoot:
+    cwd: str
+    count: int
+    latest: str
+    exists: bool
+
+
+@dataclass(slots=True, frozen=True)
+class ResumeSessionResult:
+    cancelled: bool
+    session_file: str | None
+    cwd: str
+    cwd_changed: bool
+
+
+@dataclass(slots=True, frozen=True)
+class ForkSessionResult:
+    cancelled: bool
+    session_file: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class RenameSessionResult:
+    renamed: bool
+    active: bool
+
+
+@dataclass(slots=True, frozen=True)
+class DeleteSessionError:
+    code: Literal["delete_failed"]
+    message: str
+
+
+@dataclass(slots=True, frozen=True)
+class DeleteSessionResult:
+    deleted: bool
+    cancelled: bool
+    was_active: bool
+    new_session_started: bool
+    delete_error: DeleteSessionError | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class RpcCapabilityDisabledReason:
     code: str
     message: str
@@ -933,6 +1012,7 @@ class RpcCommandCapability:
     scope: RpcCommandScope
     execution: RpcCommandExecution
     availability: RpcCommandAvailability
+    confirmation: RpcCommandConfirmation
     required_features: tuple[str, ...]
     input_schema: JsonObject | None = None
     output_schema: JsonObject | None = None
@@ -1610,6 +1690,14 @@ def parse_rpc_capability_manifest(payload: JsonObject) -> RpcCapabilityManifest:
                 scope=_require_str(command, "scope"),
                 execution=_require_str(command, "execution"),
                 availability=_require_str(command, "availability"),
+                confirmation=cast(
+                    RpcCommandConfirmation,
+                    _require_literal(
+                        command.get("confirmation", "none"),
+                        frozenset({"none", "required"}),
+                        field=f"{field}.confirmation",
+                    ),
+                ),
                 required_features=string_tuple(
                     command.get("requiredFeatures"),
                     field=f"{field}.requiredFeatures",
@@ -1723,6 +1811,129 @@ def parse_session_stats(payload: JsonObject) -> SessionStats:
         ),
         premium_requests=int(payload.get("premiumRequests", 0)),
         cost=float(payload.get("cost", 0.0)),
+    )
+
+
+def parse_session_catalog_entry(payload: JsonObject) -> SessionCatalogEntry:
+    return SessionCatalogEntry(
+        path=_require_str(payload, "path"),
+        id=_require_str(payload, "id"),
+        cwd=_require_str(payload, "cwd"),
+        title=_optional_str(payload, "title"),
+        parent_session_path=_optional_str(payload, "parentSessionPath"),
+        created_at=_require_str(payload, "createdAt"),
+        updated_at=_require_str(payload, "updatedAt"),
+        message_count=int(payload.get("messageCount", 0)),
+        size=int(payload.get("size", 0)),
+        status=_optional_str(payload, "status"),
+    )
+
+
+def parse_session_catalog_page(payload: JsonObject) -> SessionCatalogPage:
+    raw_sessions = payload.get("sessions")
+    if not isinstance(raw_sessions, list):
+        raise ValueError("sessions must be an array")
+    raw_total = payload.get("total")
+    if not isinstance(raw_total, int) or isinstance(raw_total, bool) or raw_total < 0:
+        raise ValueError("total must be a non-negative integer")
+    return SessionCatalogPage(
+        sessions=tuple(
+            parse_session_catalog_entry(cast(JsonObject, item))
+            for item in raw_sessions
+            if isinstance(item, dict)
+        ),
+        total=raw_total,
+        next_cursor=_optional_str(payload, "nextCursor"),
+    )
+
+
+def parse_session_info_result(payload: JsonObject) -> SessionInfoResult:
+    raw_session = payload.get("session")
+    raw_workspace = payload.get("workspace")
+    if not isinstance(raw_session, dict) or not isinstance(raw_workspace, dict):
+        raise ValueError(
+            "session info response must contain session and workspace objects"
+        )
+    raw_directories = raw_workspace.get("directories")
+    if not isinstance(raw_directories, list) or not all(
+        isinstance(item, str) for item in raw_directories
+    ):
+        raise ValueError("workspace.directories must be an array of strings")
+    return SessionInfoResult(
+        session=parse_session_catalog_entry(cast(JsonObject, raw_session)),
+        workspace=SessionWorkspace(
+            cwd=_require_str(cast(JsonObject, raw_workspace), "cwd"),
+            directories=tuple(cast(list[str], raw_directories)),
+        ),
+        active=_require_bool(payload, "active"),
+    )
+
+
+def parse_session_workspace_roots(
+    payload: JsonObject,
+) -> tuple[SessionWorkspaceRoot, ...]:
+    raw_roots = payload.get("roots")
+    if not isinstance(raw_roots, list):
+        raise ValueError("roots must be an array")
+    roots: list[SessionWorkspaceRoot] = []
+    for item in raw_roots:
+        if not isinstance(item, dict):
+            raise ValueError("roots[] must be an object")
+        root = cast(JsonObject, item)
+        roots.append(
+            SessionWorkspaceRoot(
+                cwd=_require_str(root, "cwd"),
+                count=int(root.get("count", 0)),
+                latest=_require_str(root, "latest"),
+                exists=_require_bool(root, "exists"),
+            )
+        )
+    return tuple(roots)
+
+
+def parse_resume_session_result(payload: JsonObject) -> ResumeSessionResult:
+    return ResumeSessionResult(
+        cancelled=_require_bool(payload, "cancelled"),
+        session_file=_optional_str(payload, "sessionFile"),
+        cwd=_require_str(payload, "cwd"),
+        cwd_changed=_require_bool(payload, "cwdChanged"),
+    )
+
+
+def parse_fork_session_result(payload: JsonObject) -> ForkSessionResult:
+    return ForkSessionResult(
+        cancelled=_require_bool(payload, "cancelled"),
+        session_file=_optional_str(payload, "sessionFile"),
+    )
+
+
+def parse_rename_session_result(payload: JsonObject) -> RenameSessionResult:
+    return RenameSessionResult(
+        renamed=_require_bool(payload, "renamed"),
+        active=_require_bool(payload, "active"),
+    )
+
+
+def parse_delete_session_result(payload: JsonObject) -> DeleteSessionResult:
+    raw_error = payload.get("deleteError")
+    delete_error: DeleteSessionError | None = None
+    if raw_error is not None:
+        if not isinstance(raw_error, dict):
+            raise ValueError("deleteError must be an object")
+        error = cast(JsonObject, raw_error)
+        code = _require_literal(
+            error.get("code"), frozenset({"delete_failed"}), field="deleteError.code"
+        )
+        delete_error = DeleteSessionError(
+            code=cast(Literal["delete_failed"], code),
+            message=_require_str(error, "message"),
+        )
+    return DeleteSessionResult(
+        deleted=_require_bool(payload, "deleted"),
+        cancelled=_require_bool(payload, "cancelled"),
+        was_active=_require_bool(payload, "wasActive"),
+        new_session_started=_require_bool(payload, "newSessionStarted"),
+        delete_error=delete_error,
     )
 
 

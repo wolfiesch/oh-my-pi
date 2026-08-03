@@ -8,6 +8,7 @@ import {
 	type RpcCapabilityManifest,
 	type RpcCommand,
 	type RpcCommandConcurrencyClass,
+	type RpcCommandConfirmation,
 	type RpcCommandExecution,
 	type RpcCommandSchedulingClass,
 	type RpcCommandScope,
@@ -37,6 +38,7 @@ interface RpcCommandMetadata {
 	scope: RpcCommandScope;
 	execution: RpcCommandExecution;
 	concurrencyClass?: RpcCommandConcurrencyClass;
+	confirmation: RpcCommandConfirmation;
 	requiredFeatures: readonly string[];
 	availability(context: RpcCapabilityContext): RpcCommandAvailabilityResult;
 }
@@ -86,6 +88,9 @@ const positiveIntegerField = optional("a positive integer", value => Number.isSa
 	type: ["integer", "null"],
 	minimum: 1,
 });
+const optionalIntegerField = optional("an integer", value => Number.isSafeInteger(value), {
+	type: ["integer", "null"],
+});
 
 function enumField<const TValue extends string>(...values: readonly TValue[]): RpcFieldDefinition {
 	return required(values.map(value => JSON.stringify(value)).join(" or "), value => values.includes(value as TValue), {
@@ -113,7 +118,7 @@ function requiresFeature(feature: string): Pick<RpcCommandMetadata, "requiredFea
 }
 
 type RpcCommandMetadataOverrides = Partial<
-	Pick<RpcCommandMetadata, "version" | "execution" | "requiredFeatures" | "availability">
+	Pick<RpcCommandMetadata, "version" | "execution" | "confirmation" | "requiredFeatures" | "availability">
 >;
 
 function classifiedCommand<TCommand extends RpcCommand>(
@@ -128,6 +133,7 @@ function classifiedCommand<TCommand extends RpcCommand>(
 		scope,
 		execution: metadata.execution ?? "sync",
 		concurrencyClass: scheduling,
+		confirmation: metadata.confirmation ?? "none",
 		requiredFeatures: metadata.requiredFeatures ?? [],
 		availability: metadata.availability ?? (() => AVAILABLE),
 		scheduling,
@@ -303,6 +309,38 @@ export const RPC_COMMAND_DEFINITIONS = {
 		{ type: "switch_session", sessionPath: "/tmp/session.jsonl" },
 		{ sessionPath: stringField },
 	),
+	list_sessions: hostCommand(
+		{ type: "list_sessions", scope: "cwd", cwd: "/workspace", limit: 50 },
+		{
+			scope: optionalEnumField("cwd", "all"),
+			cwd: optionalStringField,
+			cursor: optionalStringField,
+			limit: optionalIntegerField,
+			search: optionalStringField,
+		},
+		"concurrent",
+	),
+	get_session_info: hostCommand(
+		{ type: "get_session_info", session: "01901234" },
+		{ session: stringField, scope: optionalEnumField("cwd", "all"), cwd: optionalStringField },
+		"concurrent",
+	),
+	list_workspace_roots: hostCommand({ type: "list_workspace_roots" }, {}, "concurrent"),
+	resume_session: sessionCommand(
+		{ type: "resume_session", session: "01901234" },
+		{ session: stringField, scope: optionalEnumField("cwd", "all"), cwd: optionalStringField },
+	),
+	fork_session: sessionCommand({ type: "fork_session" }),
+	rename_session: hostCommand(
+		{ type: "rename_session", session: "01901234", name: "Investigation" },
+		{ session: stringField, name: stringField, scope: optionalEnumField("cwd", "all"), cwd: optionalStringField },
+	),
+	delete_session: hostCommand(
+		{ type: "delete_session", session: "01901234" },
+		{ session: stringField, scope: optionalEnumField("cwd", "all"), cwd: optionalStringField },
+		"serial",
+		{ confirmation: "required" },
+	),
 	branch: sessionCommand({ type: "branch", entryId: "entry-1" }, { entryId: stringField }),
 	get_branch_messages: sessionCommand({ type: "get_branch_messages" }),
 	get_last_assistant_text: sessionCommand({ type: "get_last_assistant_text" }),
@@ -344,6 +382,7 @@ export function getRpcCapabilityManifest(context: RpcCapabilityContext = {}): Rp
 				execution: definition.execution,
 				inputSchema: inputSchemaFor(name as RpcCommandType, definition),
 				concurrencyClass: definition.concurrencyClass,
+				confirmation: definition.confirmation,
 				requiredFeatures: [...definition.requiredFeatures],
 			};
 			return availability.availability === "unavailable"

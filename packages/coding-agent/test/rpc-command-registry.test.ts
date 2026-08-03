@@ -28,6 +28,7 @@ describe("RPC command registry", () => {
 			expect(capability?.scope).toBe(definition.scope);
 			expect(capability?.execution).toBe(definition.execution);
 			expect(capability?.concurrencyClass).toBe(definition.concurrencyClass);
+			expect(capability?.confirmation).toBe(definition.confirmation);
 			expect(capability?.requiredFeatures).toEqual([...definition.requiredFeatures]);
 			expect(capability?.inputSchema?.properties.type).toEqual({ const: name });
 			expect(capability?.inputSchema?.additionalProperties).toBe(false);
@@ -90,5 +91,32 @@ describe("RPC command registry", () => {
 			type: ["string", "null"],
 			enum: ["steer", "followUp", null],
 		});
+	});
+
+	test("advertises the complete session catalog surface with truthful concurrency", () => {
+		const manifest = getRpcCapabilityManifest();
+		const expected = {
+			list_sessions: ["host", "concurrent"],
+			get_session_info: ["host", "concurrent"],
+			list_workspace_roots: ["host", "concurrent"],
+			resume_session: ["session", "serial"],
+			fork_session: ["session", "serial"],
+			rename_session: ["host", "serial"],
+			delete_session: ["host", "serial"],
+		} as const;
+
+		for (const [name, [scope, concurrencyClass]] of Object.entries(expected)) {
+			const command = manifest.commands.find(candidate => candidate.name === name);
+			expect(command).toMatchObject({
+				availability: "available",
+				execution: "sync",
+				scope,
+				concurrencyClass,
+			});
+		}
+
+		const deleteSession = manifest.commands.find(candidate => candidate.name === "delete_session");
+		expect(deleteSession?.confirmation).toBe("required");
+		expect(manifest.commands.find(candidate => candidate.name === "rename_session")?.confirmation).toBe("none");
 	});
 });

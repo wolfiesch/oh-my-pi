@@ -100,6 +100,7 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertEqual(capability.execution, "sync")
         self.assertEqual(capability.availability, "available")
         self.assertEqual(capability.concurrency_class, "serial")
+        self.assertEqual(capability.confirmation, "none")
         self.assertEqual(capability.required_features, ())
         self.assertEqual(capability.input_schema["type"], "object")
         self.assertIn("future_event", notification.capabilities.events)
@@ -132,6 +133,26 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertEqual(parsed.execution, "future-execution")
         self.assertEqual(parsed.availability, "future-availability")
         self.assertEqual(parsed.concurrency_class, "future-concurrency")
+
+    def test_parse_ready_requires_a_known_confirmation_requirement(self) -> None:
+        manifest = json.loads(
+            (
+                Path(__file__).parent / "fixtures" / "rpc-capability-manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        manifest["commands"][0]["confirmation"] = "required"
+        notification = parse_notification(
+            {"type": "ready", "protocolVersion": 1, "capabilities": manifest}
+        )
+        assert isinstance(notification, ReadyEvent)
+        assert notification.capabilities is not None
+        self.assertEqual(notification.capabilities.commands[0].confirmation, "required")
+
+        manifest["commands"][0]["confirmation"] = "future-confirmation"
+        with self.assertRaises(ValueError):
+            parse_notification(
+                {"type": "ready", "protocolVersion": 1, "capabilities": manifest}
+            )
 
     def test_parse_session_state(self) -> None:
         state = parse_session_state(
