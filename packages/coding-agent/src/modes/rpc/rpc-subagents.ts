@@ -106,6 +106,7 @@ export async function readRpcSubagentTranscript(sessionFile: string, fromByte = 
 
 export class RpcSubagentRegistry {
 	#subagents = new Map<string, RpcSubagentSnapshot>();
+	#terminalSubagents = new Map<string, RpcSubagentSnapshot>();
 	#transcriptSessionFilesBySubagentId = new Map<string, string>();
 	#staleSubagentIds = new Set<string>();
 	#unsubscribers: Array<() => void> = [];
@@ -131,18 +132,20 @@ export class RpcSubagentRegistry {
 		for (const unsubscribe of this.#unsubscribers) unsubscribe();
 		this.#unsubscribers = [];
 		this.#subagents.clear();
+		this.#terminalSubagents.clear();
 		this.#transcriptSessionFilesBySubagentId.clear();
 		this.#staleSubagentIds.clear();
 	}
 
 	clear(): void {
-		for (const subagentId of this.#subagents.keys()) {
+		for (const subagentId of [...this.#subagents.keys(), ...this.#terminalSubagents.keys()]) {
 			addPruned(this.#staleSubagentIds, subagentId, MAX_RETAINED_TRANSCRIPT_REFERENCES);
 		}
 		for (const subagentId of this.#transcriptSessionFilesBySubagentId.keys()) {
 			addPruned(this.#staleSubagentIds, subagentId, MAX_RETAINED_TRANSCRIPT_REFERENCES);
 		}
 		this.#subagents.clear();
+		this.#terminalSubagents.clear();
 		this.#transcriptSessionFilesBySubagentId.clear();
 	}
 
@@ -155,7 +158,9 @@ export class RpcSubagentRegistry {
 	}
 
 	getSubagents(): RpcSubagentSnapshot[] {
-		return [...this.#subagents.values()].sort((a, b) => a.index - b.index || a.id.localeCompare(b.id));
+		return [...this.#subagents.values(), ...this.#terminalSubagents.values()].sort(
+			(a, b) => a.index - b.index || a.id.localeCompare(b.id),
+		);
 	}
 
 	#rememberTranscriptSession(subagentId: string, sessionFile: string | undefined): void {
@@ -169,8 +174,18 @@ export class RpcSubagentRegistry {
 		}
 	}
 
+	#rememberTerminalSnapshot(snapshot: RpcSubagentSnapshot): void {
+		this.#terminalSubagents.delete(snapshot.id);
+		this.#terminalSubagents.set(snapshot.id, snapshot);
+		while (this.#terminalSubagents.size > MAX_RETAINED_TRANSCRIPT_REFERENCES) {
+			const oldest = this.#terminalSubagents.keys().next();
+			if (oldest.done) break;
+			this.#terminalSubagents.delete(oldest.value);
+		}
+	}
+
 	#hasTranscriptSessionFile(sessionFile: string): boolean {
-		for (const snapshot of this.#subagents.values()) {
+		for (const snapshot of [...this.#subagents.values(), ...this.#terminalSubagents.values()]) {
 			if (snapshot.sessionFile === sessionFile) return true;
 		}
 		for (const transcriptSessionFile of this.#transcriptSessionFilesBySubagentId.values()) {
@@ -180,11 +195,12 @@ export class RpcSubagentRegistry {
 	}
 
 	handleLifecycle(payload: SubagentLifecyclePayload): void {
-		const existing = this.#subagents.get(payload.id);
+		const existing = this.#subagents.get(payload.id) ?? this.#terminalSubagents.get(payload.id);
 		if (existing && !hasSameOwner(payload, existing)) return;
 		if (!existing && payload.status !== "started") return;
 		if (payload.status === "started") {
 			this.#staleSubagentIds.delete(payload.id);
+			this.#terminalSubagents.delete(payload.id);
 		}
 		const sessionFile = payload.sessionFile ?? existing?.sessionFile;
 		const snapshot: RpcSubagentSnapshot = {
@@ -200,10 +216,12 @@ export class RpcSubagentRegistry {
 			parentToolCallId: payload.parentToolCallId ?? existing?.parentToolCallId,
 			lastUpdate: Date.now(),
 			progress: existing?.progress,
+			terminal: isTerminalLifecycleStatus(payload.status),
 		};
 		this.#rememberTranscriptSession(payload.id, sessionFile);
-		if (isTerminalLifecycleStatus(payload.status)) {
+		if (snapshot.terminal) {
 			this.#subagents.delete(payload.id);
+			this.#rememberTerminalSnapshot(snapshot);
 		} else {
 			this.#subagents.set(payload.id, snapshot);
 		}
@@ -215,12 +233,11 @@ export class RpcSubagentRegistry {
 	handleProgress(payload: SubagentProgressPayload): void {
 		const progress = payload.progress;
 		if (this.#staleSubagentIds.has(progress.id)) return;
-		const existing = this.#subagents.get(progress.id);
-		if (!existing) return;
-		if (!hasSameOwner(payload, existing)) return;
+		const existing = this.#subagents.get(progress.id) ?? this.#terminalSubagents.get(progress.id);
+		if (existing && !hasSameOwner(payload, existing)) return;
 		const sessionFile = payload.sessionFile ?? existing?.sessionFile;
 		this.#rememberTranscriptSession(progress.id, sessionFile);
-		this.#subagents.set(progress.id, {
+		const snapshot: RpcSubagentSnapshot = {
 			id: progress.id,
 			index: payload.index,
 			agent: payload.agent,
@@ -233,7 +250,15 @@ export class RpcSubagentRegistry {
 			lastUpdate: Date.now(),
 			parentToolCallId: payload.parentToolCallId ?? existing?.parentToolCallId,
 			progress,
-		});
+			terminal: progress.status === "completed" || progress.status === "failed" || progress.status === "aborted",
+		};
+		if (snapshot.terminal) {
+			this.#subagents.delete(progress.id);
+			this.#rememberTerminalSnapshot(snapshot);
+		} else {
+			this.#terminalSubagents.delete(progress.id);
+			this.#subagents.set(progress.id, snapshot);
+		}
 		if (this.#subscriptionLevel !== "off") {
 			this.#output({ type: "subagent_progress", payload });
 		}
@@ -247,7 +272,7 @@ export class RpcSubagentRegistry {
 
 	resolveSessionFile(selector: RpcSubagentTranscriptSelector): string {
 		if (selector.subagentId) {
-			const snapshot = this.#subagents.get(selector.subagentId);
+			const snapshot = this.#subagents.get(selector.subagentId) ?? this.#terminalSubagents.get(selector.subagentId);
 			const sessionFile = snapshot?.sessionFile ?? this.#transcriptSessionFilesBySubagentId.get(selector.subagentId);
 			if (!sessionFile) {
 				throw new Error(`Unknown subagent or session file unavailable: ${selector.subagentId}`);

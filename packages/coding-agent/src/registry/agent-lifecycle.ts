@@ -314,34 +314,44 @@ export class AgentLifecycleManager {
 	 * Never returns a session that is mid-dispose: an in-flight park is either
 	 * cancelled (session still live) or awaited to completion before revive.
 	 */
-	async ensureLive(id: string): Promise<AgentSession> {
+	async ensureLive(id: string, expected?: AgentRef): Promise<AgentSession> {
+		const expectedRef = expected ?? this.#registry.get(id);
+		if (!expectedRef) {
+			throw new Error(
+				`Unknown agent "${id}" — it was never registered or has been released. If a transcript exists, read history://${id}.`,
+			);
+		}
+		const currentRef = (): AgentRef => {
+			const current = this.#registry.get(id);
+			if (current !== expectedRef) {
+				throw new Error(`Agent "${id}" changed during the lifecycle operation.`);
+			}
+			return current;
+		};
+
 		const park = this.#parks.get(id);
-		if (park) {
-			const parked = this.#registry.get(id);
+		if (park?.ref === expectedRef) {
+			const parked = currentRef();
 			// Cancel if the live session is still attached — keep it instead of
 			// thrashing dispose + revive.
-			if (parked?.session && !park.detached && park.cancel()) {
+			if (parked.session && !park.detached && park.cancel()) {
 				await park.promise;
-				const kept = this.#registry.get(id)?.session;
-				if (kept) {
+				const keptRef = currentRef();
+				if (keptRef.session) {
 					// Park cleared the idle timer; re-arm so TTL park still works.
 					const adopted = this.#adopted.get(id);
-					if (adopted && adopted.ref === parked && parked.status === "idle") this.#armTimer(id, adopted);
-					return kept;
+					if (adopted && adopted.ref === keptRef && keptRef.status === "idle") this.#armTimer(id, adopted);
+					return keptRef.session;
 				}
 			} else {
 				// Already committed to detach (or no live session): wait for park,
 				// then fall through to the revive path.
 				await park.promise;
+				currentRef();
 			}
 		}
 
-		const ref = this.#registry.get(id);
-		if (!ref) {
-			throw new Error(
-				`Unknown agent "${id}" — it was never registered or has been released. If a transcript exists, read history://${id}.`,
-			);
-		}
+		const ref = currentRef();
 		if (ref.session) return ref.session;
 		const inflight = this.#revivals.get(id);
 		if (inflight?.ref === ref) return inflight.promise;

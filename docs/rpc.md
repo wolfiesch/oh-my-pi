@@ -251,6 +251,28 @@ confirmation is bound to the issued `operationId`, output streams as
 the model-visible active tool set, so running code never mutates tool
 activation. `get_eval_history` replays recorded entries newest last.
 
+### Subagents
+
+- `{ id?, type: "list_agents", includeAdvisors?: boolean }`
+- `{ id?, type: "get_agent", agentId: string }`
+- `{ id?, type: "get_agent_result", agentId: string }`
+- `{ id?, type: "send_agent_message", agentId: string, message: string, replyTo?: string }`
+- `{ id?, type: "park_agent", agentId: string }`
+- `{ id?, type: "resume_agent", agentId: string }`
+- `{ id?, type: "release_agent", agentId: string, tombstone?: boolean }`
+- `{ id?, type: "cancel_agent", agentId: string }`
+
+These commands require the `agent-control` feature. `list_agents` and `get_agent`
+project live and parked delegated agents with identity, status, and progress, and
+`get_agent_result` returns the recorded result once a run finishes.
+`send_agent_message` delivers steering to a running agent. `park_agent` parks a
+live agent so its transcript survives, `resume_agent` revives a parked one, and
+`release_agent` unregisters it, optionally leaving a tombstone. `release_agent`
+and `cancel_agent` are confirmation-gated because both end a delegated run.
+Lifecycle and progress arrive as `subagent_lifecycle`, `subagent_progress`,
+`subagent_event`, and `agent_registry_update` frames correlated to registry
+entries.
+
 ### Model
 
 - `{ id?, type: "set_model", provider: string, modelId: string }`

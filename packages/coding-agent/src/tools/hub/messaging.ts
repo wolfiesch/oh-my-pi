@@ -16,7 +16,7 @@ import type { Settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { IrcBus, type IrcDeliveryReceipt, type IrcMessage } from "../../irc/bus";
 import type { Theme } from "../../modes/theme/theme";
-import { type AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
+import { type AgentRef, type AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import { registerPersistedSubagents } from "../../registry/persisted-agents";
 import { canSpawnAtDepth } from "../../task/types";
 import { Ellipsis, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
@@ -143,7 +143,7 @@ export interface HubSendParams {
 }
 
 export async function executeSend(
-	deps: { registry: AgentRegistry; senderId: string; settings: Settings },
+	deps: { registry: AgentRegistry; senderId: string; settings: Settings; expectedTarget?: AgentRef },
 	params: HubSendParams,
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<CoordinationDetails>> {
@@ -212,10 +212,11 @@ export async function executeSend(
 			targets.map(target =>
 				bus.send(
 					{ from: senderId, to: target, body: message, replyTo: params.replyTo },
-					// Awaited sends mark the sender as blocked on an answer so a
-					// busy recipient that cannot reach a step boundary (async
-					// disabled) auto-replies instead of stranding the sender.
-					{ expectsReply: params.await || undefined, suppressRelay: suppressRelay || undefined },
+					{
+						expectsReply: params.await || undefined,
+						suppressRelay: suppressRelay || undefined,
+						expectedRef: !isBroadcast && target === to ? deps.expectedTarget : undefined,
+					},
 				),
 			),
 		);

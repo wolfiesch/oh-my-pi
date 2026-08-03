@@ -90,6 +90,25 @@ const optionalStringField = optional("a string", value => typeof value === "stri
 const optionalBooleanField = optional("a boolean", value => typeof value === "boolean", {
 	type: ["boolean", "null"],
 });
+const releaseTombstoneField = optional("a boolean (defaults to false)", value => typeof value === "boolean", {
+	type: ["boolean", "null"],
+	default: false,
+});
+const agentIdField = required(
+	"a non-empty agent id of at most 256 UTF-8 bytes",
+	value => typeof value === "string" && value.trim().length > 0 && Buffer.byteLength(value, "utf8") <= 256,
+	{ type: "string", minLength: 1, maxLength: 256, "x-maxUtf8Bytes": 256 },
+);
+const optionalAgentIdField = optional(
+	"a non-empty agent or message id of at most 256 UTF-8 bytes",
+	value => typeof value === "string" && value.trim().length > 0 && Buffer.byteLength(value, "utf8") <= 256,
+	{ type: ["string", "null"], minLength: 1, maxLength: 256, "x-maxUtf8Bytes": 256 },
+);
+const agentMessageField = required(
+	"a non-empty message of at most 65536 UTF-8 bytes",
+	value => typeof value === "string" && value.trim().length > 0 && Buffer.byteLength(value, "utf8") <= 65_536,
+	{ type: "string", minLength: 1, maxLength: 65_536, "x-maxUtf8Bytes": 65_536 },
+);
 const optionalObjectArrayField = optional(
 	"an array of objects",
 	value => Array.isArray(value) && value.every(item => isRecord(item)),
@@ -520,6 +539,52 @@ export const RPC_COMMAND_DEFINITIONS = {
 		},
 		"serial",
 		requiresFeature("subagent-event-bus"),
+	),
+	list_agents: agentCommand(
+		{ type: "list_agents" },
+		{ includeAdvisors: optionalBooleanField },
+		"concurrent",
+		requiresFeature("agent-control"),
+	),
+	get_agent: agentCommand(
+		{ type: "get_agent", agentId: "SubagentA" },
+		{ agentId: agentIdField },
+		"concurrent",
+		requiresFeature("agent-control"),
+	),
+	get_agent_result: agentCommand(
+		{ type: "get_agent_result", agentId: "SubagentA" },
+		{ agentId: agentIdField },
+		"concurrent",
+		requiresFeature("agent-control"),
+	),
+	send_agent_message: agentCommand(
+		{ type: "send_agent_message", agentId: "SubagentA", message: "continue" },
+		{ agentId: agentIdField, message: agentMessageField, replyTo: optionalAgentIdField },
+		"control",
+		requiresFeature("agent-control"),
+	),
+	park_agent: agentCommand(
+		{ type: "park_agent", agentId: "SubagentA" },
+		{ agentId: agentIdField },
+		"control",
+		requiresFeature("agent-control"),
+	),
+	resume_agent: agentCommand(
+		{ type: "resume_agent", agentId: "SubagentA" },
+		{ agentId: agentIdField },
+		"control",
+		requiresFeature("agent-control"),
+	),
+	cancel_agent: agentCommand({ type: "cancel_agent", agentId: "SubagentA" }, { agentId: agentIdField }, "control", {
+		...requiresFeature("agent-control"),
+		confirmation: "required",
+	}),
+	release_agent: agentCommand(
+		{ type: "release_agent", agentId: "SubagentA" },
+		{ agentId: agentIdField, tombstone: releaseTombstoneField },
+		"control",
+		{ ...requiresFeature("agent-control"), confirmation: "required" },
 	),
 	set_model: sessionCommand(
 		{ type: "set_model", provider: "anthropic", modelId: "claude" },

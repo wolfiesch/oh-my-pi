@@ -41,8 +41,19 @@ RpcCommandExecution: TypeAlias = str
 RpcCommandAvailability: TypeAlias = str
 RpcCommandConcurrencyClass: TypeAlias = str
 RpcCommandConfirmation: TypeAlias = Literal["none", "required"]
+AgentKind: TypeAlias = Literal["main", "sub", "advisor"]
+AgentStatus: TypeAlias = Literal["running", "idle", "parked", "aborted"]
+AgentJobStatus: TypeAlias = Literal["running", "completed", "failed", "cancelled"]
+CancelAgentStatus: TypeAlias = Literal["cancelled", "not_found", "already_completed"]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
+AgentSource: TypeAlias = Literal["bundled", "user", "project"]
+SubagentLifecycleStatus: TypeAlias = Literal[
+    "started", "completed", "failed", "aborted"
+]
+SubagentProgressStatus: TypeAlias = Literal[
+    "pending", "running", "completed", "failed", "aborted"
+]
 WidgetPlacement: TypeAlias = Literal["aboveEditor", "belowEditor"]
 TodoStatus: TypeAlias = Literal[
     "pending", "in_progress", "completed", "abandoned", "blocked"
@@ -935,6 +946,116 @@ class ModeChangeResult:
 
 
 @dataclass(slots=True, frozen=True)
+class SubagentLifecycle:
+    id: str
+    agent: str
+    agent_source: AgentSource
+    status: SubagentLifecycleStatus
+    index: int
+    description: str | None = None
+    session_file: str | None = None
+    parent_tool_call_id: str | None = None
+    detached: bool | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AgentRecentTool:
+    tool: str
+    args: str
+    end_ms: float
+
+
+@dataclass(slots=True, frozen=True)
+class AgentProgress:
+    index: int
+    id: str
+    agent: str
+    agent_source: AgentSource
+    status: SubagentProgressStatus
+    task: str
+    recent_tools: tuple[AgentRecentTool, ...]
+    recent_output: tuple[str, ...]
+    tool_count: int
+    requests: int
+    tokens: int
+    cost: float
+    duration_ms: float
+    assignment: str | None = None
+    description: str | None = None
+    last_intent: str | None = None
+    current_tool: str | None = None
+    current_tool_args: str | None = None
+    current_tool_start_ms: float | None = None
+    context_tokens: int | None = None
+    context_window: int | None = None
+    resolved_model: str | None = None
+    resolved_model_is_fallback: bool | None = None
+    retry_state: JsonObject | None = None
+    retry_failure: JsonObject | None = None
+    inflight_task_details: JsonObject | None = None
+    model_override: str | tuple[str, ...] | None = None
+    extracted_tool_data: JsonObject | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SubagentProgress:
+    index: int
+    agent: str
+    agent_source: AgentSource
+    task: str
+    progress: AgentProgress
+    parent_tool_call_id: str | None = None
+    assignment: str | None = None
+    session_file: str | None = None
+    detached: bool | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AgentSnapshot:
+    id: str
+    display_name: str
+    kind: AgentKind
+    status: AgentStatus
+    session_file: str | None
+    created_at: int
+    last_activity: int
+    has_live_session: bool
+    parent_id: str | None = None
+    activity: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AgentResult:
+    agent_id: str
+    source: Literal["registry", "job"]
+    agent_status: AgentStatus
+    truncated: bool
+    job_status: AgentJobStatus | None = None
+    result_text: str | None = None
+    error_text: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AgentSendResult:
+    delivered: bool
+    outcome: Literal["injected", "woken", "revived", "failed"] | None = None
+    error: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AgentReleaseResult:
+    released: bool
+    tombstone: bool
+
+
+@dataclass(slots=True, frozen=True)
+class CancelAgentResult:
+    id: str
+    status: CancelAgentStatus
+    message: str
+
+
+@dataclass(slots=True, frozen=True)
 class SessionState:
     model: ModelInfo | None
     thinking_level: ThinkingLevel | None
@@ -1369,7 +1490,14 @@ class ExtensionUiRequest:
     prompt_style: bool | None = None
     target_id: str | None = None
     command: (
-        Literal["eval_execute", "delete_session", "remove_provider_auth"] | None
+        Literal[
+            "cancel_agent",
+            "release_agent",
+            "eval_execute",
+            "delete_session",
+            "remove_provider_auth",
+        ]
+        | None
     ) = None
     notify_type: NotifyType | None = None
     status_key: str | None = None
@@ -1550,6 +1678,25 @@ class ToolInventoryUpdateEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class SubagentLifecycleEvent:
+    payload: SubagentLifecycle
+    type: Literal["subagent_lifecycle"] = "subagent_lifecycle"
+
+
+@dataclass(slots=True, frozen=True)
+class SubagentProgressEvent:
+    payload: SubagentProgress
+    type: Literal["subagent_progress"] = "subagent_progress"
+
+
+@dataclass(slots=True, frozen=True)
+class SubagentEvent:
+    id: str
+    event: RpcNotification
+    type: Literal["subagent_event"] = "subagent_event"
+
+
+@dataclass(slots=True, frozen=True)
 class PlanStateUpdateEvent:
     state: PlanState
     type: Literal["plan_state_update"] = "plan_state_update"
@@ -1569,6 +1716,13 @@ class PlanApprovalSettledEvent:
     approval_id: str
     result: PlanApprovalResult
     type: Literal["plan_approval_settled"] = "plan_approval_settled"
+
+
+@dataclass(slots=True, frozen=True)
+class AgentRegistryUpdateEvent:
+    change: Literal["registered", "status_changed", "removed"]
+    agent: AgentSnapshot
+    type: Literal["agent_registry_update"] = "agent_registry_update"
 
 
 @dataclass(slots=True, frozen=True)
@@ -1611,6 +1765,10 @@ RpcNotification: TypeAlias = (
     | ExtensionError
     | SettingsUpdateEvent
     | ToolInventoryUpdateEvent
+    | SubagentLifecycleEvent
+    | SubagentProgressEvent
+    | SubagentEvent
+    | AgentRegistryUpdateEvent
     | RpcAgentEvent
     | PlanStateUpdateEvent
     | PlanApprovalRequestEvent
@@ -2032,6 +2190,97 @@ def parse_plan_state(payload: JsonObject) -> PlanState:
         else None,
         available_plan_files=files,
         content=_optional_str(payload, "content"),
+    )
+
+
+def parse_agent_snapshot(payload: JsonObject) -> AgentSnapshot:
+    kind = _require_literal(
+        payload.get("kind"), frozenset({"main", "sub", "advisor"}), field="agent.kind"
+    )
+    status = _require_literal(
+        payload.get("status"),
+        frozenset({"running", "idle", "parked", "aborted"}),
+        field="agent.status",
+    )
+    created_at = payload.get("createdAt")
+    last_activity = payload.get("lastActivity")
+    if isinstance(created_at, bool) or not isinstance(created_at, int):
+        raise ValueError("agent.createdAt must be an integer")
+    if isinstance(last_activity, bool) or not isinstance(last_activity, int):
+        raise ValueError("agent.lastActivity must be an integer")
+    return AgentSnapshot(
+        id=_require_str(payload, "id"),
+        display_name=_require_str(payload, "displayName"),
+        kind=cast(AgentKind, kind),
+        status=cast(AgentStatus, status),
+        session_file=_optional_str(payload, "sessionFile"),
+        created_at=created_at,
+        last_activity=last_activity,
+        has_live_session=_require_bool(payload, "hasLiveSession"),
+        parent_id=_optional_str(payload, "parentId"),
+        activity=_optional_str(payload, "activity"),
+    )
+
+
+def parse_agent_result(payload: JsonObject) -> AgentResult:
+    source = _require_literal(
+        payload.get("source"),
+        frozenset({"registry", "job"}),
+        field="agentResult.source",
+    )
+    agent_status = _require_literal(
+        payload.get("agentStatus"),
+        frozenset({"running", "idle", "parked", "aborted"}),
+        field="agentResult.agentStatus",
+    )
+    raw_job_status = _optional_literal(
+        payload.get("jobStatus"),
+        frozenset({"running", "completed", "failed", "cancelled"}),
+        field="agentResult.jobStatus",
+    )
+    return AgentResult(
+        agent_id=_require_str(payload, "agentId"),
+        source=cast(Literal["registry", "job"], source),
+        agent_status=cast(AgentStatus, agent_status),
+        truncated=_require_bool(payload, "truncated"),
+        job_status=cast(AgentJobStatus | None, raw_job_status),
+        result_text=_optional_str(payload, "resultText"),
+        error_text=_optional_str(payload, "errorText"),
+    )
+
+
+def parse_agent_send_result(payload: JsonObject) -> AgentSendResult:
+    raw_outcome = _optional_literal(
+        payload.get("outcome"),
+        frozenset({"injected", "woken", "revived", "failed"}),
+        field="agentSend.outcome",
+    )
+    return AgentSendResult(
+        delivered=_require_bool(payload, "delivered"),
+        outcome=cast(
+            Literal["injected", "woken", "revived", "failed"] | None, raw_outcome
+        ),
+        error=_optional_str(payload, "error"),
+    )
+
+
+def parse_agent_release_result(payload: JsonObject) -> AgentReleaseResult:
+    return AgentReleaseResult(
+        released=_require_bool(payload, "released"),
+        tombstone=_require_bool(payload, "tombstone"),
+    )
+
+
+def parse_cancel_agent_result(payload: JsonObject) -> CancelAgentResult:
+    status = _require_literal(
+        payload.get("status"),
+        frozenset({"cancelled", "not_found", "already_completed"}),
+        field="cancelAgent.status",
+    )
+    return CancelAgentResult(
+        id=_require_str(payload, "id"),
+        status=cast(CancelAgentStatus, status),
+        message=_require_str(payload, "message"),
     )
 
 
@@ -2550,10 +2799,25 @@ def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
         prompt_style=_optional_bool(payload, "promptStyle"),
         target_id=_optional_str(payload, "targetId"),
         command=cast(
-            Literal["eval_execute", "delete_session", "remove_provider_auth"] | None,
+            Literal[
+                "cancel_agent",
+                "release_agent",
+                "eval_execute",
+                "delete_session",
+                "remove_provider_auth",
+            ]
+            | None,
             _optional_literal(
                 payload.get("command"),
-                frozenset({"eval_execute", "delete_session", "remove_provider_auth"}),
+                frozenset(
+                    {
+                        "cancel_agent",
+                        "release_agent",
+                        "eval_execute",
+                        "delete_session",
+                        "remove_provider_auth",
+                    }
+                ),
                 field="extension_ui_request.command",
             ),
         ),
@@ -2620,6 +2884,97 @@ def parse_eval_history_entry(payload: JsonObject) -> EvalHistoryEntry:
     )
 
 
+def _require_int_value(payload: JsonObject, field: str) -> int:
+    value = _optional_int(payload, field)
+    if value is None:
+        raise ValueError(f"{field} must be an integer")
+    return value
+
+
+def _require_number_value(payload: JsonObject, field: str) -> float:
+    value = _optional_float(payload, field)
+    if value is None:
+        raise ValueError(f"{field} must be a number")
+    return value
+
+
+def _parse_agent_progress(payload: object, *, field: str) -> AgentProgress:
+    progress = _clone_json_object(payload, field=field)
+    source = _require_literal(
+        progress.get("agentSource"),
+        frozenset({"bundled", "user", "project"}),
+        field=f"{field}.agentSource",
+    )
+    status = _require_literal(
+        progress.get("status"),
+        frozenset({"pending", "running", "completed", "failed", "aborted"}),
+        field=f"{field}.status",
+    )
+    raw_model_override = progress.get("modelOverride")
+    model_override: str | tuple[str, ...] | None
+    if raw_model_override is None or isinstance(raw_model_override, str):
+        model_override = raw_model_override
+    elif isinstance(raw_model_override, list) and all(
+        isinstance(model, str) for model in raw_model_override
+    ):
+        model_override = tuple(raw_model_override)
+    else:
+        raise ValueError(f"{field}.modelOverride must be a string or array of strings")
+    raw_recent_tools = progress.get("recentTools")
+    if not isinstance(raw_recent_tools, list):
+        raise ValueError(f"{field}.recentTools must be an array")
+    recent_tools: list[AgentRecentTool] = []
+    for index, item in enumerate(raw_recent_tools):
+        tool = _clone_json_object(item, field=f"{field}.recentTools[{index}]")
+        recent_tools.append(
+            AgentRecentTool(
+                tool=_require_str(tool, "tool"),
+                args=_require_str(tool, "args"),
+                end_ms=_require_number_value(tool, "endMs"),
+            )
+        )
+    return AgentProgress(
+        index=_require_int_value(progress, "index"),
+        id=_require_str(progress, "id"),
+        agent=_require_str(progress, "agent"),
+        agent_source=cast(AgentSource, source),
+        status=cast(SubagentProgressStatus, status),
+        task=_require_str(progress, "task"),
+        assignment=_optional_str(progress, "assignment"),
+        description=_optional_str(progress, "description"),
+        last_intent=_optional_str(progress, "lastIntent"),
+        current_tool=_optional_str(progress, "currentTool"),
+        current_tool_args=_optional_str(progress, "currentToolArgs"),
+        current_tool_start_ms=_optional_float(progress, "currentToolStartMs"),
+        recent_tools=tuple(recent_tools),
+        recent_output=_required_string_tuple(
+            progress.get("recentOutput"), field=f"{field}.recentOutput"
+        ),
+        tool_count=_require_int_value(progress, "toolCount"),
+        requests=_require_int_value(progress, "requests"),
+        tokens=_require_int_value(progress, "tokens"),
+        context_tokens=_optional_int(progress, "contextTokens"),
+        context_window=_optional_int(progress, "contextWindow"),
+        cost=_require_number_value(progress, "cost"),
+        duration_ms=_require_number_value(progress, "durationMs"),
+        resolved_model=_optional_str(progress, "resolvedModel"),
+        resolved_model_is_fallback=_optional_bool(progress, "resolvedModelIsFallback"),
+        retry_state=_optional_json_object(
+            progress.get("retryState"), field=f"{field}.retryState"
+        ),
+        retry_failure=_optional_json_object(
+            progress.get("retryFailure"), field=f"{field}.retryFailure"
+        ),
+        inflight_task_details=_optional_json_object(
+            progress.get("inflightTaskDetails"), field=f"{field}.inflightTaskDetails"
+        ),
+        model_override=model_override,
+        extracted_tool_data=_optional_json_object(
+            progress.get("extractedToolData"), field=f"{field}.extractedToolData"
+        ),
+    )
+
+
 def parse_notification(payload: JsonObject) -> RpcNotification:
     event_type = payload.get("type")
     if event_type == "ready":
@@ -2675,6 +3030,69 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         return SettingsUpdateEvent()
     if event_type == "tool_inventory_update":
         return ToolInventoryUpdateEvent()
+    if event_type == "subagent_lifecycle":
+        lifecycle = _clone_json_object(
+            payload.get("payload"), field="subagent_lifecycle.payload"
+        )
+        source = _require_literal(
+            lifecycle.get("agentSource"),
+            frozenset({"bundled", "user", "project"}),
+            field="subagent_lifecycle.payload.agentSource",
+        )
+        status = _require_literal(
+            lifecycle.get("status"),
+            frozenset({"started", "completed", "failed", "aborted"}),
+            field="subagent_lifecycle.payload.status",
+        )
+        return SubagentLifecycleEvent(
+            payload=SubagentLifecycle(
+                id=_require_str(lifecycle, "id"),
+                agent=_require_str(lifecycle, "agent"),
+                agent_source=cast(AgentSource, source),
+                status=cast(SubagentLifecycleStatus, status),
+                index=_require_int_value(lifecycle, "index"),
+                description=_optional_str(lifecycle, "description"),
+                session_file=_optional_str(lifecycle, "sessionFile"),
+                parent_tool_call_id=_optional_str(lifecycle, "parentToolCallId"),
+                detached=_optional_bool(lifecycle, "detached"),
+            )
+        )
+    if event_type == "subagent_progress":
+        progress_payload = _clone_json_object(
+            payload.get("payload"), field="subagent_progress.payload"
+        )
+        source = _require_literal(
+            progress_payload.get("agentSource"),
+            frozenset({"bundled", "user", "project"}),
+            field="subagent_progress.payload.agentSource",
+        )
+        return SubagentProgressEvent(
+            payload=SubagentProgress(
+                index=_require_int_value(progress_payload, "index"),
+                agent=_require_str(progress_payload, "agent"),
+                agent_source=cast(AgentSource, source),
+                task=_require_str(progress_payload, "task"),
+                progress=_parse_agent_progress(
+                    progress_payload.get("progress"),
+                    field="subagent_progress.payload.progress",
+                ),
+                parent_tool_call_id=_optional_str(progress_payload, "parentToolCallId"),
+                assignment=_optional_str(progress_payload, "assignment"),
+                session_file=_optional_str(progress_payload, "sessionFile"),
+                detached=_optional_bool(progress_payload, "detached"),
+            )
+        )
+    if event_type == "subagent_event":
+        subagent_payload = _clone_json_object(
+            payload.get("payload"), field="subagent_event.payload"
+        )
+        nested_event = _clone_json_object(
+            subagent_payload.get("event"), field="subagent_event.payload.event"
+        )
+        return SubagentEvent(
+            id=_require_str(subagent_payload, "id"),
+            event=parse_notification(nested_event),
+        )
     if event_type == "plan_state_update":
         return PlanStateUpdateEvent(
             state=parse_plan_state(
@@ -2736,6 +3154,19 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         return EvalCompleteEvent(
             operation_id=_require_str(payload, "operationId"),
             result=parse_eval_history_entry(result),
+        )
+    if event_type == "agent_registry_update":
+        change = _require_literal(
+            payload.get("change"),
+            frozenset({"registered", "status_changed", "removed"}),
+            field="agent_registry_update.change",
+        )
+        raw_agent = payload.get("agent")
+        if not isinstance(raw_agent, dict):
+            raise ValueError("agent_registry_update.agent must be an object")
+        return AgentRegistryUpdateEvent(
+            change=cast(Literal["registered", "status_changed", "removed"], change),
+            agent=parse_agent_snapshot(cast(JsonObject, raw_agent)),
         )
     if event_type in {
         "operation_started",

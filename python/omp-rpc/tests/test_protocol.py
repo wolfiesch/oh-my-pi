@@ -6,6 +6,8 @@ from pathlib import Path
 
 from omp_rpc import (
     AgentEndEvent,
+    assistant_text,
+    assistant_text_with_thinking,
     AutoCompactionEndEvent,
     AutoCompactionStartEvent,
     ExtensionUiRequest,
@@ -14,6 +16,12 @@ from omp_rpc import (
     OperationCompletedEvent,
     OperationFailedEvent,
     OperationStartedEvent,
+    parse_advisor_state,
+    parse_mode_change_result,
+    parse_notification,
+    parse_session_state,
+    parse_tool_activation_result,
+    parse_tool_inventory,
     PlanApprovalRequestEvent,
     PlanApprovalSettledEvent,
     PlanStateUpdateEvent,
@@ -21,17 +29,12 @@ from omp_rpc import (
     ProviderAuthUpdate,
     ReadyEvent,
     SessionState,
+    SubagentEvent,
+    SubagentLifecycleEvent,
+    SubagentProgressEvent,
     TodoReminderEvent,
     ToolActivationResult,
     ToolInventoryUpdateEvent,
-    assistant_text,
-    assistant_text_with_thinking,
-    parse_advisor_state,
-    parse_mode_change_result,
-    parse_notification,
-    parse_session_state,
-    parse_tool_activation_result,
-    parse_tool_inventory,
 )
 
 
@@ -1034,6 +1037,85 @@ class ProtocolParsingTests(unittest.TestCase):
         )
         self.assertFalse(unavailable.inventory_available)
         self.assertIsNone(unavailable.inventory)
+
+    def test_parse_advertised_notifications_into_typed_events(self) -> None:
+        events = [
+            parse_notification(
+                {
+                    "type": "subagent_lifecycle",
+                    "payload": {
+                        "id": "AgentA",
+                        "agent": "reviewer",
+                        "agentSource": "bundled",
+                        "status": "started",
+                        "index": 0,
+                        "sessionFile": "/tmp/agent.jsonl",
+                    },
+                }
+            ),
+            parse_notification(
+                {
+                    "type": "subagent_progress",
+                    "payload": {
+                        "index": 0,
+                        "agent": "reviewer",
+                        "agentSource": "bundled",
+                        "task": "Review",
+                        "progress": {
+                            "index": 0,
+                            "id": "AgentA",
+                            "agent": "reviewer",
+                            "agentSource": "bundled",
+                            "status": "running",
+                            "task": "Review",
+                            "recentTools": [
+                                {"tool": "read", "args": "protocol.py", "endMs": 5}
+                            ],
+                            "recentOutput": ["Checking parser"],
+                            "toolCount": 1,
+                            "requests": 1,
+                            "tokens": 100,
+                            "cost": 0.01,
+                            "durationMs": 10,
+                            "modelOverride": ["anthropic/claude-sonnet-4-6", "auto"],
+                            "extractedToolData": {
+                                "read": [{"path": "protocol.py", "line": 1083}]
+                            },
+                        },
+                    },
+                }
+            ),
+            parse_notification(
+                {
+                    "type": "subagent_event",
+                    "payload": {
+                        "id": "AgentA",
+                        "event": {
+                            "type": "notice",
+                            "level": "info",
+                            "message": "working",
+                        },
+                    },
+                }
+            ),
+        ]
+
+        expected_types = (
+            SubagentLifecycleEvent,
+            SubagentProgressEvent,
+            SubagentEvent,
+        )
+        for event, expected_type in zip(events, expected_types, strict=True):
+            self.assertIsInstance(event, expected_type)
+        self.assertEqual(events[1].payload.progress.recent_tools[0].end_ms, 5.0)
+        self.assertEqual(
+            events[1].payload.progress.model_override,
+            ("anthropic/claude-sonnet-4-6", "auto"),
+        )
+        self.assertEqual(
+            events[1].payload.progress.extracted_tool_data,
+            {"read": [{"path": "protocol.py", "line": 1083}]},
+        )
 
 
 if __name__ == "__main__":

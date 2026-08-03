@@ -20,6 +20,11 @@ from .protocol import (
     AdvisorState,
     AgentEndEvent,
     AgentMessage,
+    AgentRegistryUpdateEvent,
+    AgentReleaseResult,
+    AgentResult,
+    AgentSendResult,
+    AgentSnapshot,
     AgentStartEvent,
     AssistantMessage,
     AutoCompactionEndEvent,
@@ -29,6 +34,7 @@ from .protocol import (
     BashResult,
     BranchMessage,
     BranchResult,
+    CancelAgentResult,
     CancellationResult,
     CancelOperationResult,
     CompactionResult,
@@ -82,6 +88,9 @@ from .protocol import (
     SettingsUpdateEvent,
     SteeringMode,
     StreamingBehavior,
+    SubagentEvent,
+    SubagentLifecycleEvent,
+    SubagentProgressEvent,
     ThinkingLevel,
     ThinkingLevelCycleResult,
     TodoAutoClearEvent,
@@ -102,9 +111,14 @@ from .protocol import (
     assistant_text,
     parse_advisor_state,
     parse_agent_messages,
+    parse_agent_release_result,
+    parse_agent_result,
+    parse_agent_send_result,
+    parse_agent_snapshot,
     parse_bash_result,
     parse_branch_messages,
     parse_branch_result,
+    parse_cancel_agent_result,
     parse_cancellation_result,
     parse_compaction_result,
     parse_delete_session_result,
@@ -144,6 +158,10 @@ ToolInventoryUpdateListener = Callable[[ToolInventoryUpdateEvent], None]
 OperationTerminalListener = Callable[[RpcOperationTerminalEvent], None]
 EvalOutputListener = Callable[[EvalOutputEvent], None]
 EvalCompleteListener = Callable[[EvalCompleteEvent], None]
+AgentRegistryUpdateListener = Callable[[AgentRegistryUpdateEvent], None]
+SubagentLifecycleListener = Callable[[SubagentLifecycleEvent], None]
+SubagentProgressListener = Callable[[SubagentProgressEvent], None]
+SubagentEventListener = Callable[[SubagentEvent], None]
 AgentStartListener = Callable[[AgentStartEvent], None]
 AgentEndListener = Callable[[AgentEndEvent], None]
 TurnStartListener = Callable[[TurnStartEvent], None]
@@ -937,6 +955,24 @@ class RpcClient:
     def on_eval_complete(self, listener: EvalCompleteListener) -> Callable[[], None]:
         return self._add_typed_notification_listener("eval_complete", listener)
 
+    def on_agent_registry_update(
+        self, listener: AgentRegistryUpdateListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("agent_registry_update", listener)
+
+    def on_subagent_lifecycle(
+        self, listener: SubagentLifecycleListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("subagent_lifecycle", listener)
+
+    def on_subagent_progress(
+        self, listener: SubagentProgressListener
+    ) -> Callable[[], None]:
+        return self._add_typed_notification_listener("subagent_progress", listener)
+
+    def on_subagent_event(self, listener: SubagentEventListener) -> Callable[[], None]:
+        return self._add_typed_notification_listener("subagent_event", listener)
+
     def install_headless_ui(
         self,
         *,
@@ -1166,6 +1202,62 @@ class RpcClient:
             fields["deactivate"] = list(deactivate)
         return parse_tool_activation_result(
             self._request("set_tool_activation", **fields)
+        )
+
+    def list_agents(
+        self, *, include_advisors: bool = False
+    ) -> tuple[AgentSnapshot, ...]:
+        payload = self._request("list_agents", includeAdvisors=include_advisors)
+        raw_agents = payload.get("agents")
+        if not isinstance(raw_agents, list):
+            raise ValueError("agents must be a list")
+        agents: list[AgentSnapshot] = []
+        for index, item in enumerate(raw_agents):
+            if not isinstance(item, dict):
+                raise ValueError(f"agents[{index}] must be an object")
+            agents.append(parse_agent_snapshot(cast(JsonObject, item)))
+        return tuple(agents)
+
+    def get_agent(self, agent_id: str) -> AgentSnapshot:
+        payload = self._request("get_agent", agentId=agent_id)
+        raw_agent = payload.get("agent")
+        if not isinstance(raw_agent, dict):
+            raise ValueError("agent must be an object")
+        return parse_agent_snapshot(cast(JsonObject, raw_agent))
+
+    def get_agent_result(self, agent_id: str) -> AgentResult:
+        return parse_agent_result(self._request("get_agent_result", agentId=agent_id))
+
+    def send_agent_message(
+        self, agent_id: str, message: str, *, reply_to: str | None = None
+    ) -> AgentSendResult:
+        return parse_agent_send_result(
+            self._request(
+                "send_agent_message",
+                agentId=agent_id,
+                message=message,
+                replyTo=reply_to,
+            )
+        )
+
+    def park_agent(self, agent_id: str) -> AgentSnapshot:
+        payload = self._request("park_agent", agentId=agent_id)
+        return parse_agent_snapshot(cast(JsonObject, payload["agent"]))
+
+    def resume_agent(self, agent_id: str) -> AgentSnapshot:
+        payload = self._request("resume_agent", agentId=agent_id)
+        return parse_agent_snapshot(cast(JsonObject, payload["agent"]))
+
+    def cancel_agent(self, agent_id: str) -> CancelAgentResult:
+        return parse_cancel_agent_result(
+            self._request("cancel_agent", agentId=agent_id)
+        )
+
+    def release_agent(
+        self, agent_id: str, *, tombstone: bool = False
+    ) -> AgentReleaseResult:
+        return parse_agent_release_result(
+            self._request("release_agent", agentId=agent_id, tombstone=tombstone)
         )
 
     def set_model(self, provider: str, model_id: str) -> ModelInfo:

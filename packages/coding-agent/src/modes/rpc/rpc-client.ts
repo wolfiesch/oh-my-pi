@@ -31,6 +31,11 @@ import {
 } from "./rpc-messages";
 import type {
 	RpcAdvisorState,
+	RpcAgentRegistryUpdateFrame,
+	RpcAgentReleaseResult,
+	RpcAgentResult,
+	RpcAgentSendResult,
+	RpcAgentSnapshot,
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
 	RpcCancelOperationResult,
@@ -125,6 +130,7 @@ export type RpcSessionEventListener = (event: AgentSessionEvent) => void;
 export type RpcSubagentLifecycleListener = (payload: RpcSubagentLifecycleFrame["payload"]) => void;
 export type RpcSubagentProgressListener = (payload: RpcSubagentProgressFrame["payload"]) => void;
 export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"]) => void;
+export type RpcAgentRegistryUpdateListener = (frame: RpcAgentRegistryUpdateFrame) => void;
 export type RpcAvailableCommandsUpdateListener = (commands: RpcAvailableSlashCommand[]) => void;
 export type RpcEvalOutputListener = (frame: RpcEvalOutputFrame) => void;
 export type RpcEvalCompleteListener = (frame: RpcEvalCompleteFrame) => void;
@@ -291,6 +297,10 @@ function isRpcSubagentProgressFrame(value: unknown): value is RpcSubagentProgres
 function isRpcSubagentEventFrame(value: unknown): value is RpcSubagentEventFrame {
 	if (!isRecord(value)) return false;
 	return value.type === "subagent_event" && isRecord(value.payload);
+}
+
+function isRpcAgentRegistryUpdateFrame(value: unknown): value is RpcAgentRegistryUpdateFrame {
+	return isRecord(value) && value.type === "agent_registry_update" && isRecord(value.agent);
 }
 
 function isRpcAvailableCommandsUpdateFrame(value: unknown): value is RpcAvailableCommandsUpdateFrame {
@@ -606,6 +616,7 @@ export class RpcClient {
 	#subagentLifecycleListeners = new Set<RpcSubagentLifecycleListener>();
 	#subagentProgressListeners = new Set<RpcSubagentProgressListener>();
 	#subagentEventListeners = new Set<RpcSubagentEventListener>();
+	#agentRegistryUpdateListeners = new Set<RpcAgentRegistryUpdateListener>();
 	#availableCommandsUpdateListeners = new Set<RpcAvailableCommandsUpdateListener>();
 	#toolInventoryUpdateListeners = new Set<RpcToolInventoryUpdateListener>();
 	#rawFrameListeners = new Set<RpcRawFrameListener>();
@@ -937,6 +948,11 @@ export class RpcClient {
 		return () => this.#subagentEventListeners.delete(listener);
 	}
 
+	onAgentRegistryUpdate(listener: RpcAgentRegistryUpdateListener): () => void {
+		this.#agentRegistryUpdateListeners.add(listener);
+		return () => this.#agentRegistryUpdateListeners.delete(listener);
+	}
+
 	/**
 	 * Subscribe to slash-command availability updates emitted by the RPC server.
 	 */
@@ -1049,9 +1065,9 @@ export class RpcClient {
 		return () => this.#providerAuthUpdateListeners.delete(listener);
 	}
 
-	/** Respond to a confirmation request from an extension. */
-	sendUiConfirmation(id: string, confirmed: boolean): void {
-		this.#writeFrame({ type: "extension_ui_response", id, confirmed });
+	/** Respond to a confirmation request. Privileged mutations require the server-issued operation id. */
+	sendUiConfirmation(id: string, confirmed: boolean, operationId?: string): void {
+		this.#writeFrame({ type: "extension_ui_response", id, confirmed, operationId });
 	}
 
 	/** Respond to a select, input, or editor request from an extension. */
@@ -1429,6 +1445,44 @@ export class RpcClient {
 			fromByte: selector.fromByte,
 		});
 		return this.#getData<RpcSubagentMessagesResult>(response);
+	}
+
+	async listAgents(options: { includeAdvisors?: boolean } = {}): Promise<RpcAgentSnapshot[]> {
+		const response = await this.#send({ type: "list_agents", includeAdvisors: options.includeAdvisors });
+		return this.#getData<{ agents: RpcAgentSnapshot[] }>(response).agents;
+	}
+
+	async getAgent(agentId: string): Promise<RpcAgentSnapshot> {
+		const response = await this.#send({ type: "get_agent", agentId });
+		return this.#getData<{ agent: RpcAgentSnapshot }>(response).agent;
+	}
+
+	async getAgentResult(agentId: string): Promise<RpcAgentResult> {
+		return this.#getData(await this.#send({ type: "get_agent_result", agentId }));
+	}
+
+	async sendAgentMessage(agentId: string, message: string, replyTo?: string): Promise<RpcAgentSendResult> {
+		return this.#getData(await this.#send({ type: "send_agent_message", agentId, message, replyTo }));
+	}
+
+	async parkAgent(agentId: string): Promise<RpcAgentSnapshot> {
+		const response = await this.#send({ type: "park_agent", agentId });
+		return this.#getData<{ agent: RpcAgentSnapshot }>(response).agent;
+	}
+
+	async resumeAgent(agentId: string): Promise<RpcAgentSnapshot> {
+		const response = await this.#send({ type: "resume_agent", agentId });
+		return this.#getData<{ agent: RpcAgentSnapshot }>(response).agent;
+	}
+
+	async cancelAgent(
+		agentId: string,
+	): Promise<{ id: string; status: "cancelled" | "not_found" | "already_completed"; message: string }> {
+		return this.#getData(await this.#send({ type: "cancel_agent", agentId }));
+	}
+
+	async releaseAgent(agentId: string, tombstone = false): Promise<RpcAgentReleaseResult> {
+		return this.#getData(await this.#send({ type: "release_agent", agentId, tombstone }));
 	}
 
 	/**
@@ -2018,6 +2072,10 @@ export class RpcClient {
 		}
 		if (isRpcEvalCompleteFrame(data)) {
 			for (const listener of this.#evalCompleteListeners) listener(data);
+			return;
+		}
+		if (isRpcAgentRegistryUpdateFrame(data)) {
+			for (const listener of this.#agentRegistryUpdateListeners) listener(data);
 			return;
 		}
 		if (isRpcAvailableCommandsUpdateFrame(data)) {

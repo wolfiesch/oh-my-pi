@@ -12,6 +12,7 @@ import { settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
 import type { Theme } from "../../modes/theme/theme";
+import type { AgentRef } from "../../registry/agent-registry";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
 import type { ToolSession } from "..";
@@ -371,13 +372,18 @@ export async function executeCancel(
  * cross-agent kills stay impossible; a bare test/SDK caller (no owner id) may
  * target any sub. Never touches Main, the caller, or advisor transcripts.
  */
-async function cancelAgentRegistration(
-	session: ToolSession,
+export async function cancelAgentRegistration(
+	session: Pick<ToolSession, "agentRegistry" | "agentLifecycle">,
 	ownerId: string | undefined,
 	id: string,
+	expected?: AgentRef,
+	options: { allowTransitiveOwnership?: boolean } = {},
 ): Promise<CancelOutcome> {
 	const registry = session.agentRegistry;
 	const ref = registry?.get(id);
+	if (expected && ref !== expected) {
+		return { id, status: "not_found", message: `Agent ${id} changed before it could be cancelled.` };
+	}
 	if (ref?.kind !== "sub") {
 		return { id, status: "not_found", message: `Background job not found: ${id}` };
 	}
@@ -385,7 +391,15 @@ async function cancelAgentRegistration(
 		return { id, status: "not_found", message: `Cannot cancel yourself (${id}).` };
 	}
 	if (ownerId && ref.parentId !== ownerId) {
-		return { id, status: "not_found", message: `Agent ${id} was not spawned by you and cannot be cancelled.` };
+		let parentId = ref.parentId;
+		const visited = new Set<string>();
+		while (options.allowTransitiveOwnership && parentId && !visited.has(parentId) && parentId !== ownerId) {
+			visited.add(parentId);
+			parentId = registry?.get(parentId)?.parentId;
+		}
+		if (parentId !== ownerId) {
+			return { id, status: "not_found", message: `Agent ${id} was not spawned by you and cannot be cancelled.` };
+		}
 	}
 	const lifecycle = session.agentLifecycle?.();
 	try {
@@ -393,10 +407,10 @@ async function cancelAgentRegistration(
 			await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
 		}
 		if (lifecycle) {
-			await lifecycle.release(id);
+			await lifecycle.release(id, ref);
 		} else {
 			await ref.session?.dispose();
-			registry?.unregister(id);
+			registry?.unregister(id, ref);
 		}
 	} catch (error) {
 		return {

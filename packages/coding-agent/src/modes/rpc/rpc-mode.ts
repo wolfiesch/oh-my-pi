@@ -29,6 +29,9 @@ import {
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
+import { AgentControlService } from "../../registry/agent-control";
+import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
+import { AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { AgentSession } from "../../session/agent-session";
 import { type PythonExecutionMessage, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import {
@@ -768,6 +771,35 @@ export function requestRpcDialog<T>(
 	return promise;
 }
 
+export function requestRpcAgentMutationConfirmation(
+	pendingRequests: Map<string, PendingExtensionRequest>,
+	output: RpcOutput,
+	command: "cancel_agent" | "release_agent",
+	agentId: string,
+	tombstone = false,
+	timeout = 30_000,
+): Promise<boolean> {
+	const operationId = Snowflake.next() as string;
+	return requestRpcDialog(
+		pendingRequests,
+		output,
+		{ timeout },
+		false,
+		{
+			method: "confirm",
+			title: command === "cancel_agent" ? "Cancel agent" : "Release agent",
+			message:
+				command === "cancel_agent"
+					? `Cancel agent ${agentId}?`
+					: `Release agent ${agentId} (tombstone: ${tombstone})?`,
+			timeout,
+			operationId,
+			command,
+		},
+		response => "confirmed" in response && response.confirmed === true && response.operationId === operationId,
+	);
+}
+
 /** Requests host confirmation for a privileged RPC command, bound to a server-issued operation id. */
 export function requestRpcPrivilegedConfirmation(
 	pendingRequests: Map<string, PendingExtensionRequest>,
@@ -882,6 +914,7 @@ export async function runRpcMode(
 	const getCapabilityManifest = () => {
 		const features = new Set<string>();
 		if (eventBus) features.add("subagent-event-bus");
+		features.add("agent-control");
 		if (session.model && serviceTierFamily(session.model)) features.add("model.fast-mode");
 		return getRpcCapabilityManifest({ features });
 	};
@@ -983,6 +1016,28 @@ export async function runRpcMode(
 				response => ("value" in response ? response.value : undefined),
 			),
 	);
+	const agentSenderId = session.getAgentId?.() ?? MAIN_AGENT_ID;
+	const agentRegistry = AgentRegistry.global();
+	const agentLifecycle = AgentLifecycleManager.global();
+	const agentControl = new AgentControlService({
+		session: { agentRegistry, agentLifecycle: () => agentLifecycle },
+		registry: agentRegistry,
+		lifecycle: agentLifecycle,
+		senderId: agentSenderId,
+		settings: session.settings,
+		projectResult: agentId => {
+			const job = session.asyncJobManager?.getJob(agentId);
+			if (!job || (job.ownerId !== undefined && job.ownerId !== agentSenderId)) return undefined;
+			return {
+				status: job.status,
+				resultText: job.resultText,
+				errorText: job.errorText,
+			};
+		},
+	});
+	const unsubscribeAgentRegistry = agentControl.onRegistryUpdate(update => {
+		output({ type: "agent_registry_update", ...update });
+	});
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
@@ -1274,6 +1329,12 @@ export async function runRpcMode(
 		return success(id, command, data);
 	};
 	let toolActivationInFlight = false;
+	const confirmAgentMutation = (
+		command: "cancel_agent" | "release_agent",
+		agentId: string,
+		tombstone = false,
+	): Promise<boolean> =>
+		requestRpcAgentMutationConfirmation(pendingExtensionRequests, output, command, agentId, tombstone);
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
@@ -1918,6 +1979,75 @@ export async function runRpcMode(
 				}
 			}
 
+			case "list_agents":
+				return success(id, "list_agents", {
+					agents: agentControl.list({ includeAdvisors: command.includeAdvisors }),
+				});
+
+			case "get_agent":
+				try {
+					return success(id, "get_agent", { agent: agentControl.get(command.agentId) });
+				} catch (cause) {
+					return error(id, "get_agent", cause instanceof Error ? cause.message : String(cause), "not_found");
+				}
+
+			case "get_agent_result":
+				try {
+					return success(id, "get_agent_result", agentControl.getResult(command.agentId));
+				} catch (cause) {
+					return error(
+						id,
+						"get_agent_result",
+						cause instanceof Error ? cause.message : String(cause),
+						"not_found",
+					);
+				}
+
+			case "send_agent_message":
+			case "park_agent":
+			case "resume_agent":
+				try {
+					if (command.type === "send_agent_message") {
+						return success(
+							id,
+							command.type,
+							await agentControl.send(command.agentId, command.message, command.replyTo),
+						);
+					}
+					const agent =
+						command.type === "park_agent"
+							? await agentControl.park(command.agentId)
+							: await agentControl.resume(command.agentId);
+					return success(id, command.type, { agent });
+				} catch (cause) {
+					return error(
+						id,
+						command.type,
+						cause instanceof Error ? cause.message : String(cause),
+						"agent_control_failed",
+					);
+				}
+
+			case "cancel_agent":
+			case "release_agent":
+				try {
+					const expected = agentControl.captureMutationTarget(command.agentId);
+					const tombstone = command.type === "release_agent" && command.tombstone === true;
+					if (!(await confirmAgentMutation(command.type, command.agentId, tombstone))) {
+						return error(id, command.type, "Agent mutation was not confirmed.", "confirmation_required");
+					}
+					return command.type === "cancel_agent"
+						? success(id, command.type, await agentControl.cancel(command.agentId, expected))
+						: success(id, command.type, await agentControl.release(command.agentId, { tombstone }, expected));
+				} catch (cause) {
+					return error(
+						id,
+						command.type,
+						cause instanceof Error ? cause.message : String(cause),
+						"agent_control_failed",
+					);
+				}
+
 			// =================================================================
 			// Model
 			// =================================================================
@@ -2494,6 +2624,7 @@ export async function runRpcMode(
 	const rpcEvalsToAbort = Array.from(rpcEvalOperationIds);
 	operationManager.cancelAll("client_disconnected", "client_disconnected", protectedOperations);
 	for (const operationId of rpcEvalsToAbort) session.abortEvalExecution(operationId);
+	unsubscribeAgentRegistry();
 	subagentRegistry?.dispose();
 	// Dispose the main session before exiting so the browser reaper and other
 	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a

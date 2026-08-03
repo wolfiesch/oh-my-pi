@@ -12,6 +12,13 @@ import type { SettingTab } from "../../config/settings-schema";
 import type { SettingsSnapshot } from "../../config/settings-snapshot";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
+import type {
+	AgentControlRegistryUpdate,
+	AgentControlReleaseResult,
+	AgentControlResult,
+	AgentControlSendResult,
+	AgentControlSnapshot,
+} from "../../registry/agent-control";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type {
 	SessionCatalogEntry,
@@ -116,6 +123,14 @@ export type RpcCommand =
 	| { id?: string; type: "set_subagent_subscription"; level: RpcSubagentSubscriptionLevel }
 	| { id?: string; type: "get_subagents" }
 	| { id?: string; type: "get_subagent_messages"; subagentId?: string; sessionFile?: string; fromByte?: number }
+	| { id?: string; type: "list_agents"; includeAdvisors?: boolean }
+	| { id?: string; type: "get_agent"; agentId: string }
+	| { id?: string; type: "get_agent_result"; agentId: string }
+	| { id?: string; type: "send_agent_message"; agentId: string; message: string; replyTo?: string }
+	| { id?: string; type: "park_agent"; agentId: string }
+	| { id?: string; type: "resume_agent"; agentId: string }
+	| { id?: string; type: "cancel_agent"; agentId: string }
+	| { id?: string; type: "release_agent"; agentId: string; tombstone?: boolean }
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
@@ -589,6 +604,8 @@ export interface RpcSubagentSnapshot {
 	lastUpdate: number;
 	progress?: AgentProgress;
 	parentToolCallId?: string;
+	/** True once the projected lifecycle is terminal; terminal rows remain queryable in a bounded ring. */
+	terminal: boolean;
 }
 
 export interface RpcSubagentMessagesResult {
@@ -598,6 +615,15 @@ export interface RpcSubagentMessagesResult {
 	reset: boolean;
 	entries: FileEntry[];
 	messages: AgentMessage[];
+}
+
+export type RpcAgentSnapshot = AgentControlSnapshot;
+export type RpcAgentResult = AgentControlResult;
+export type RpcAgentSendResult = AgentControlSendResult;
+export type RpcAgentReleaseResult = AgentControlReleaseResult;
+
+export interface RpcAgentRegistryUpdateFrame extends AgentControlRegistryUpdate {
+	type: "agent_registry_update";
 }
 
 // ============================================================================
@@ -747,6 +773,55 @@ export type RpcResponse =
 			success: true;
 			data: RpcSubagentMessagesResult;
 	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "list_agents";
+			success: true;
+			data: { agents: RpcAgentSnapshot[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_agent";
+			success: true;
+			data: { agent: RpcAgentSnapshot };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_agent_result";
+			success: true;
+			data: RpcAgentResult;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "send_agent_message";
+			success: true;
+			data: RpcAgentSendResult;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "park_agent" | "resume_agent";
+			success: true;
+			data: { agent: RpcAgentSnapshot };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "cancel_agent";
+			success: true;
+			data: { id: string; status: "cancelled" | "not_found" | "already_completed"; message: string };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "release_agent";
+			success: true;
+			data: RpcAgentReleaseResult;
+	  }
 
 	// Model
 	| {
@@ -875,7 +950,7 @@ export interface RpcSubagentEventFrame {
 
 export type RpcSubagentFrame = RpcSubagentLifecycleFrame | RpcSubagentProgressFrame | RpcSubagentEventFrame;
 
-export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame;
+export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame | RpcAgentRegistryUpdateFrame;
 
 // ============================================================================
 // Extension UI Events (stdout)
@@ -893,7 +968,7 @@ export type RpcExtensionUIRequest =
 			timeout?: number;
 			/** Server-issued correlation for privileged RPC mutations. */
 			operationId?: string;
-			command?: "eval_execute" | "delete_session" | "remove_provider_auth";
+			command?: "cancel_agent" | "release_agent" | "eval_execute" | "delete_session" | "remove_provider_auth";
 	  }
 	| {
 			type: "extension_ui_request";
@@ -1068,6 +1143,7 @@ type RpcManifestEvent =
 	| RpcReadyFrame
 	| RpcPromptResultFrame
 	| RpcAvailableCommandsUpdateFrame
+	| RpcAgentRegistryUpdateFrame
 	| RpcToolInventoryUpdateFrame
 	| RpcEvalOutputFrame
 	| RpcEvalCompleteFrame
@@ -1119,6 +1195,7 @@ export const RPC_EVENT_TYPES = eventInventory([
 	"host_uri_request",
 	"host_uri_cancel",
 	"subagent_lifecycle",
+	"agent_registry_update",
 	"subagent_progress",
 	"subagent_event",
 	"agent_start",
