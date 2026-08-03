@@ -211,6 +211,18 @@ effectively active, and gives every advisor a `running`, `paused`,
 `get_state` carries the same configured/active pair so a host can render advisor
 availability without a second round trip.
 
+### Tools
+
+- `{ id?, type: "get_tool_inventory" }`
+- `{ id?, type: "set_tool_activation", activate?: string[], deactivate?: string[] }`
+
+`get_tool_inventory` reports every known tool with its enabled, active, and
+mounted state, including tools mounted by extensions and MCP servers.
+`set_tool_activation` reconciles the session's enabled set atomically: unknown
+tool names fail with `invalid_request` and change nothing, and a session that is
+streaming, compacting, or running an operation answers `session_busy` rather
+than mutating tools underneath in-flight work.
+
 ### Model
 
 - `{ id?, type: "set_model", provider: string, modelId: string }`

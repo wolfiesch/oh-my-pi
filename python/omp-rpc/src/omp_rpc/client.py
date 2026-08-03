@@ -80,9 +80,12 @@ from .protocol import (
     TodoPhase,
     TodoReminderEvent,
     TodoStatus,
+    ToolActivationResult,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
+    ToolInventory,
+    ToolInventoryUpdateEvent,
     TtsrTriggeredEvent,
     TurnEndEvent,
     TurnStartEvent,
@@ -112,6 +115,8 @@ from .protocol import (
     parse_settings_snapshot,
     parse_thinking_level_cycle_result,
     parse_todo_phases,
+    parse_tool_activation_result,
+    parse_tool_inventory,
 )
 
 AgentEventListener = Callable[[RpcAgentEvent], None]
@@ -122,6 +127,7 @@ ReadyListener = Callable[[ReadyEvent], None]
 UnknownNotificationListener = Callable[[UnknownNotification], None]
 OperationStartedListener = Callable[[OperationStartedEvent], None]
 SettingsUpdateListener = Callable[[SettingsUpdateEvent], None]
+ToolInventoryUpdateListener = Callable[[ToolInventoryUpdateEvent], None]
 OperationTerminalListener = Callable[[RpcOperationTerminalEvent], None]
 AgentStartListener = Callable[[AgentStartEvent], None]
 AgentEndListener = Callable[[AgentEndEvent], None]
@@ -585,6 +591,7 @@ class RpcClient:
         self._typed_notification_listeners: dict[str, list[NotificationListener]] = {}
         self._ready_listeners: list[ReadyListener] = []
         self._unknown_notification_listeners: list[UnknownNotificationListener] = []
+        self._tool_inventory_update_listeners: list[ToolInventoryUpdateListener] = []
         self._operation_terminal_listeners: list[OperationTerminalListener] = []
         self._ui_request_listeners: list[UiRequestListener] = []
         self._extension_error_listeners: list[ExtensionErrorListener] = []
@@ -788,6 +795,14 @@ class RpcClient:
     ) -> Callable[[], None]:
         self._settings_update_listeners.append(listener)
         return lambda: self._remove_listener(self._settings_update_listeners, listener)
+
+    def on_tool_inventory_update(
+        self, listener: ToolInventoryUpdateListener
+    ) -> Callable[[], None]:
+        self._tool_inventory_update_listeners.append(listener)
+        return lambda: self._remove_listener(
+            self._tool_inventory_update_listeners, listener
+        )
 
     def on_agent_start(self, listener: AgentStartListener) -> Callable[[], None]:
         return self._add_typed_event_listener("agent_start", listener)
@@ -1023,6 +1038,24 @@ class RpcClient:
             {"path": change.path, "value": change.value} for change in changes
         ]
         return parse_settings_snapshot(self._request("set_settings", changes=payload))
+
+    def get_tool_inventory(self) -> ToolInventory:
+        return parse_tool_inventory(self._request("get_tool_inventory"))
+
+    def set_tool_activation(
+        self,
+        *,
+        activate: Sequence[str] | None = None,
+        deactivate: Sequence[str] | None = None,
+    ) -> ToolActivationResult:
+        fields: dict[str, JsonValue] = {}
+        if activate is not None:
+            fields["activate"] = list(activate)
+        if deactivate is not None:
+            fields["deactivate"] = list(deactivate)
+        return parse_tool_activation_result(
+            self._request("set_tool_activation", **fields)
+        )
 
     def set_model(self, provider: str, model_id: str) -> ModelInfo:
         payload = self._request("set_model", provider=provider, modelId=model_id)
@@ -2486,6 +2519,15 @@ class RpcClient:
                         "settings_update",
                         notification.type,
                         self._settings_update_listeners,
+                        notification,
+                    )
+                    continue
+
+                if isinstance(notification, ToolInventoryUpdateEvent):
+                    self._dispatch_listeners(
+                        "tool_inventory_update",
+                        notification.type,
+                        self._tool_inventory_update_listeners,
                         notification,
                     )
                     continue

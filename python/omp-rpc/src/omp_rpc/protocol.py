@@ -303,6 +303,17 @@ def _tuple_of_strings(values: object, *, field: str) -> tuple[str, ...] | None:
     return tuple(result) or None
 
 
+def _required_string_tuple(values: object, *, field: str) -> tuple[str, ...]:
+    if not isinstance(values, list):
+        raise ValueError(f"{field} must be a list")
+    result: list[str] = []
+    for index, item in enumerate(values):
+        if not isinstance(item, str):
+            raise ValueError(f"{field}[{index}] must be a string")
+        result.append(item)
+    return tuple(result)
+
+
 def _parse_agent_message(payload: JsonObject, *, field: str) -> AgentMessage:
     _require_literal(
         payload.get("role"), _AGENT_MESSAGE_ROLE_VALUES, field=f"{field}.role"
@@ -794,6 +805,54 @@ class ToolDescriptor:
     name: str
     description: str
     parameters: JsonValue
+
+
+@dataclass(slots=True, frozen=True)
+class ToolSource:
+    kind: str
+    server_name: str | None = None
+    remote_name: str | None = None
+    extension_path: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ToolInventoryEntry:
+    name: str
+    label: str
+    description: str
+    parameters: JsonValue
+    presentation: str
+    load_mode: str
+    source: ToolSource
+    summary: str | None = None
+    hidden: bool | None = None
+    deferrable: bool | None = None
+    strict: bool | None = None
+    custom_wire_name: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ToolInventoryXdev:
+    prefix: str
+    mounted_count: int
+
+
+@dataclass(slots=True, frozen=True)
+class ToolInventory:
+    application_api_version: int
+    tools: tuple[ToolInventoryEntry, ...]
+    xdev: ToolInventoryXdev
+
+
+@dataclass(slots=True, frozen=True)
+class ToolActivationResult:
+    enabled_tool_names: tuple[str, ...]
+    active_tool_names: tuple[str, ...]
+    mounted_tool_names: tuple[str, ...]
+    activated: tuple[str, ...]
+    deactivated: tuple[str, ...]
+    inventory_available: bool
+    inventory: ToolInventory | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -1360,6 +1419,11 @@ class TodoAutoClearEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class ToolInventoryUpdateEvent:
+    type: Literal["tool_inventory_update"] = "tool_inventory_update"
+
+
+@dataclass(slots=True, frozen=True)
 class UnknownNotification:
     payload: JsonObject
     type: Literal["unknown"] = "unknown"
@@ -1394,6 +1458,7 @@ RpcNotification: TypeAlias = (
     | ExtensionUiRequest
     | ExtensionError
     | SettingsUpdateEvent
+    | ToolInventoryUpdateEvent
     | RpcAgentEvent
     | UnknownNotification
 )
@@ -1559,6 +1624,117 @@ def parse_tool_descriptor(payload: JsonObject) -> ToolDescriptor:
         parameters=_clone_json_value(
             payload.get("parameters"), field="tool.parameters"
         ),
+    )
+
+
+_TOOL_PRESENTATION_VALUES: Final[frozenset[str]] = frozenset(
+    {"active", "mounted", "registered"}
+)
+_TOOL_LOAD_MODE_VALUES: Final[frozenset[str]] = frozenset({"essential", "discoverable"})
+
+
+def parse_tool_inventory(payload: JsonObject) -> ToolInventory:
+    raw_api_version = payload.get("applicationApiVersion")
+    if not isinstance(raw_api_version, int) or isinstance(raw_api_version, bool):
+        raise ValueError("tool_inventory.applicationApiVersion must be an integer")
+
+    raw_xdev = _clone_json_object(payload.get("xdev"), field="tool_inventory.xdev")
+    raw_mounted_count = raw_xdev.get("mountedCount")
+    if (
+        not isinstance(raw_mounted_count, int)
+        or isinstance(raw_mounted_count, bool)
+        or raw_mounted_count < 0
+    ):
+        raise ValueError(
+            "tool_inventory.xdev.mountedCount must be a non-negative integer"
+        )
+
+    entries: list[ToolInventoryEntry] = []
+    for index, raw_entry in enumerate(
+        _clone_json_objects(payload.get("tools"), field="tool_inventory.tools")
+    ):
+        raw_source = _clone_json_object(
+            raw_entry.get("source"),
+            field=f"tool_inventory.tools[{index}].source",
+        )
+        entries.append(
+            ToolInventoryEntry(
+                name=_require_str(raw_entry, "name"),
+                label=_require_str(raw_entry, "label"),
+                description=_require_str(raw_entry, "description"),
+                parameters=_clone_json_value(
+                    raw_entry.get("parameters"),
+                    field=f"tool_inventory.tools[{index}].parameters",
+                ),
+                presentation=_require_literal(
+                    raw_entry.get("presentation"),
+                    _TOOL_PRESENTATION_VALUES,
+                    field=f"tool_inventory.tools[{index}].presentation",
+                ),
+                load_mode=_require_literal(
+                    raw_entry.get("loadMode"),
+                    _TOOL_LOAD_MODE_VALUES,
+                    field=f"tool_inventory.tools[{index}].loadMode",
+                ),
+                source=ToolSource(
+                    # Source kinds are intentionally open for forward compatibility.
+                    kind=_require_str(raw_source, "kind"),
+                    server_name=_optional_str(raw_source, "serverName"),
+                    remote_name=_optional_str(raw_source, "remoteName"),
+                    extension_path=_optional_str(raw_source, "extensionPath"),
+                ),
+                summary=_optional_str(raw_entry, "summary"),
+                hidden=_optional_bool(raw_entry, "hidden"),
+                deferrable=_optional_bool(raw_entry, "deferrable"),
+                strict=_optional_bool(raw_entry, "strict"),
+                custom_wire_name=_optional_str(raw_entry, "customWireName"),
+            )
+        )
+
+    return ToolInventory(
+        application_api_version=raw_api_version,
+        tools=tuple(entries),
+        xdev=ToolInventoryXdev(
+            prefix=_require_str(raw_xdev, "prefix"),
+            mounted_count=raw_mounted_count,
+        ),
+    )
+
+
+def parse_tool_activation_result(payload: JsonObject) -> ToolActivationResult:
+    inventory_available = _require_bool(payload, "inventoryAvailable")
+    raw_inventory = payload.get("inventory")
+    if inventory_available:
+        inventory = parse_tool_inventory(
+            _clone_json_object(raw_inventory, field="tool_activation.inventory")
+        )
+    else:
+        if raw_inventory is not None:
+            raise ValueError(
+                "tool_activation.inventory must be absent when inventoryAvailable is false"
+            )
+        inventory = None
+    return ToolActivationResult(
+        enabled_tool_names=_required_string_tuple(
+            payload.get("enabledToolNames"),
+            field="tool_activation.enabledToolNames",
+        ),
+        active_tool_names=_required_string_tuple(
+            payload.get("activeToolNames"),
+            field="tool_activation.activeToolNames",
+        ),
+        mounted_tool_names=_required_string_tuple(
+            payload.get("mountedToolNames"),
+            field="tool_activation.mountedToolNames",
+        ),
+        activated=_required_string_tuple(
+            payload.get("activated"), field="tool_activation.activated"
+        ),
+        deactivated=_required_string_tuple(
+            payload.get("deactivated"), field="tool_activation.deactivated"
+        ),
+        inventory_available=inventory_available,
+        inventory=inventory,
     )
 
 
@@ -2182,6 +2358,8 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         return parse_extension_error(payload)
     if event_type == "settings_update":
         return SettingsUpdateEvent()
+    if event_type == "tool_inventory_update":
+        return ToolInventoryUpdateEvent()
     if event_type in {
         "operation_started",
         "operation_completed",

@@ -1,6 +1,7 @@
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { isTodoPhase } from "../../tools/todo";
+import { sanitizeExternalToolText } from "../../tools/xdev";
 import {
 	RPC_EVENT_TYPES,
 	RPC_EXTENSION_UI_METHODS,
@@ -91,6 +92,88 @@ const positiveIntegerField = optional("a positive integer", value => Number.isSa
 const optionalIntegerField = optional("an integer", value => Number.isSafeInteger(value), {
 	type: ["integer", "null"],
 });
+
+const MAX_TOOL_ACTIVATION_NAMES = 2048;
+const MAX_TOOL_ACTIVATION_NAME_BYTES = 256;
+const optionalToolNameArrayField: RpcFieldDefinition = {
+	optional: true,
+	expected: `an array of at most ${MAX_TOOL_ACTIVATION_NAMES} safe tool names`,
+	schema: {
+		type: "array",
+		items: {
+			type: "string",
+			minLength: 1,
+			maxLength: MAX_TOOL_ACTIVATION_NAME_BYTES,
+			"x-maxUtf8Bytes": MAX_TOOL_ACTIVATION_NAME_BYTES,
+		},
+		maxItems: MAX_TOOL_ACTIVATION_NAMES,
+	},
+	validate: value =>
+		Array.isArray(value) &&
+		value.length <= MAX_TOOL_ACTIVATION_NAMES &&
+		value.every(
+			name =>
+				typeof name === "string" &&
+				name.length > 0 &&
+				Buffer.byteLength(name, "utf8") <= MAX_TOOL_ACTIVATION_NAME_BYTES &&
+				sanitizeExternalToolText(name) === name,
+		),
+};
+export class RpcToolActivationValidationError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "RpcToolActivationValidationError";
+	}
+}
+
+export function validateRpcToolActivationBatch(
+	command: Extract<RpcCommand, { type: "set_tool_activation" }>,
+	allToolNames: readonly string[],
+): { activate: string[]; deactivate: string[] } {
+	const activate = command.activate ?? [];
+	const deactivate = command.deactivate ?? [];
+	const validName = (name: unknown): name is string =>
+		typeof name === "string" &&
+		name.length > 0 &&
+		Buffer.byteLength(name, "utf8") <= MAX_TOOL_ACTIVATION_NAME_BYTES &&
+		sanitizeExternalToolText(name) === name;
+	if (
+		activate.length > MAX_TOOL_ACTIVATION_NAMES ||
+		deactivate.length > MAX_TOOL_ACTIVATION_NAMES ||
+		!activate.every(validName) ||
+		!deactivate.every(validName)
+	) {
+		throw new RpcToolActivationValidationError(
+			`Tool activation lists must contain at most ${MAX_TOOL_ACTIVATION_NAMES} safe names of at most ${MAX_TOOL_ACTIVATION_NAME_BYTES} bytes`,
+		);
+	}
+	if (activate.length === 0 && deactivate.length === 0) {
+		throw new RpcToolActivationValidationError(
+			"Tool activation request must activate or deactivate at least one tool",
+		);
+	}
+	if (new Set(activate).size !== activate.length) {
+		throw new RpcToolActivationValidationError("Tool activation request contains duplicate activate names");
+	}
+	if (new Set(deactivate).size !== deactivate.length) {
+		throw new RpcToolActivationValidationError("Tool activation request contains duplicate deactivate names");
+	}
+	const deactivateSet = new Set(deactivate);
+	const overlap = activate.filter(name => deactivateSet.has(name));
+	if (overlap.length > 0) {
+		throw new RpcToolActivationValidationError(
+			`Tool activation request names cannot be both activated and deactivated: ${overlap.join(", ")}`,
+		);
+	}
+	const registered = new Set(allToolNames);
+	const unknown = [...activate, ...deactivate].filter(name => !registered.has(name));
+	if (unknown.length > 0) {
+		throw new RpcToolActivationValidationError(
+			`Tool activation request contains unregistered names: ${unknown.join(", ")}`,
+		);
+	}
+	return { activate: [...activate], deactivate: [...deactivate] };
+}
 
 function enumField<const TValue extends string>(...values: readonly TValue[]): RpcFieldDefinition {
 	return required(values.map(value => JSON.stringify(value)).join(" or "), value => values.includes(value as TValue), {
@@ -213,6 +296,11 @@ export const RPC_COMMAND_DEFINITIONS = {
 	get_operations: sessionCommand({ type: "get_operations" }, {}, "concurrent"),
 	get_advisor_state: sessionCommand({ type: "get_advisor_state" }, {}, "concurrent"),
 	set_advisor_enabled: sessionCommand({ type: "set_advisor_enabled", enabled: false }, { enabled: booleanField }),
+	get_tool_inventory: sessionCommand({ type: "get_tool_inventory" }),
+	set_tool_activation: sessionCommand(
+		{ type: "set_tool_activation", activate: ["read"], deactivate: ["bash"] },
+		{ activate: optionalToolNameArrayField, deactivate: optionalToolNameArrayField },
+	),
 	set_fast_mode: sessionCommand(
 		{ type: "set_fast_mode", enabled: false },
 		{ enabled: booleanField },

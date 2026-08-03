@@ -3,6 +3,7 @@
  */
 
 export type { SlashCommandInfo, SlashCommandLocation, SlashCommandSource } from "../slash-commands";
+export * from "./inline-path";
 export {
 	discoverAndLoadExtensions,
 	discoverExtensionPaths,

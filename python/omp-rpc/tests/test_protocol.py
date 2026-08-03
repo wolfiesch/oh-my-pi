@@ -16,11 +16,15 @@ from omp_rpc import (
     ReadyEvent,
     SessionState,
     TodoReminderEvent,
+    ToolActivationResult,
+    ToolInventoryUpdateEvent,
     assistant_text,
     assistant_text_with_thinking,
     parse_advisor_state,
     parse_notification,
     parse_session_state,
+    parse_tool_activation_result,
+    parse_tool_inventory,
 )
 
 
@@ -94,7 +98,7 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertIsNotNone(notification.capabilities)
         assert notification.capabilities is not None
         capability = notification.capabilities.commands[0]
-        self.assertEqual(notification.capabilities.application_api_version, 1)
+        self.assertEqual(notification.capabilities.application_api_version, 2)
         self.assertEqual(capability.id, "rpc.command.get_capabilities")
         self.assertEqual(capability.name, "get_capabilities")
         self.assertEqual(capability.scope, "host")
@@ -105,6 +109,14 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertEqual(capability.required_features, ())
         self.assertEqual(capability.input_schema["type"], "object")
         self.assertIn("future_event", notification.capabilities.events)
+        activation = next(
+            command
+            for command in notification.capabilities.commands
+            if command.name == "set_tool_activation"
+        )
+        self.assertEqual(activation.scope, "session")
+        self.assertEqual(activation.execution, "sync")
+        self.assertEqual(activation.concurrency_class, "serial")
 
     def test_parse_ready_preserves_future_capability_classifiers(self) -> None:
         manifest = json.loads(
@@ -706,6 +718,143 @@ class ProtocolParsingTests(unittest.TestCase):
 
         self.assertIsInstance(notification, AgentEndEvent)
         self.assertEqual(notification.messages[0]["content"][0]["text"], "hello")
+
+    def test_parse_tool_inventory_full_and_future_safe(self) -> None:
+        parameters = {"type": "object", "properties": {"query": {"type": "string"}}}
+        payload = {
+            "applicationApiVersion": 2,
+            "tools": [
+                {
+                    "name": "mcp__server_search",
+                    "label": "Search",
+                    "description": "Search remotely",
+                    "summary": "Remote search",
+                    "parameters": parameters,
+                    "presentation": "mounted",
+                    "loadMode": "discoverable",
+                    "hidden": False,
+                    "deferrable": True,
+                    "strict": False,
+                    "customWireName": "remote_search",
+                    "source": {
+                        "kind": "mcp",
+                        "serverName": "server",
+                        "remoteName": "search",
+                        "futureSourceField": "ignored",
+                    },
+                    "futureToolField": "ignored",
+                }
+            ],
+            "xdev": {"prefix": "xd://", "mountedCount": 1, "futureXdevField": True},
+            "futureTopLevelField": True,
+        }
+        inventory = parse_tool_inventory(payload)
+        parameters["properties"]["query"]["type"] = "integer"
+
+        self.assertEqual(inventory.application_api_version, 2)
+        self.assertEqual(inventory.xdev.prefix, "xd://")
+        self.assertEqual(inventory.xdev.mounted_count, 1)
+        entry = inventory.tools[0]
+        self.assertEqual(entry.presentation, "mounted")
+        self.assertEqual(entry.load_mode, "discoverable")
+        self.assertEqual(entry.custom_wire_name, "remote_search")
+        self.assertEqual(entry.source.kind, "mcp")
+        self.assertEqual(entry.source.server_name, "server")
+        self.assertEqual(entry.source.remote_name, "search")
+        self.assertEqual(entry.parameters["properties"]["query"]["type"], "string")
+
+    def test_parse_tool_inventory_minimal_and_open_source_kind(self) -> None:
+        inventory = parse_tool_inventory(
+            {
+                "applicationApiVersion": 3,
+                "tools": [
+                    {
+                        "name": "future",
+                        "label": "Future",
+                        "description": "",
+                        "parameters": {},
+                        "presentation": "registered",
+                        "loadMode": "essential",
+                        "source": {"kind": "future_kind"},
+                    }
+                ],
+                "xdev": {"prefix": "xd://", "mountedCount": 0},
+            }
+        )
+        entry = inventory.tools[0]
+        self.assertEqual(entry.source.kind, "future_kind")
+        self.assertIsNone(entry.summary)
+        self.assertIsNone(entry.hidden)
+        self.assertIsNone(entry.deferrable)
+        self.assertIsNone(entry.strict)
+        self.assertIsNone(entry.custom_wire_name)
+
+    def test_parse_tool_inventory_rejects_invalid_counts_and_enums(self) -> None:
+        base = {
+            "applicationApiVersion": 2,
+            "tools": [],
+            "xdev": {"prefix": "xd://", "mountedCount": 0},
+        }
+        with self.assertRaisesRegex(ValueError, "applicationApiVersion"):
+            parse_tool_inventory({**base, "applicationApiVersion": True})
+        with self.assertRaisesRegex(ValueError, "mountedCount"):
+            parse_tool_inventory(
+                {**base, "xdev": {"prefix": "xd://", "mountedCount": True}}
+            )
+        invalid_entry = {
+            "name": "bad",
+            "label": "Bad",
+            "description": "",
+            "parameters": {},
+            "presentation": "future",
+            "loadMode": "essential",
+            "source": {"kind": "custom"},
+        }
+        with self.assertRaisesRegex(ValueError, "presentation"):
+            parse_tool_inventory({**base, "tools": [invalid_entry]})
+
+    def test_parse_tool_inventory_update_notification(self) -> None:
+        event = parse_notification({"type": "tool_inventory_update", "future": True})
+        self.assertIsInstance(event, ToolInventoryUpdateEvent)
+
+    def test_parse_tool_activation_result_available_and_unavailable(self) -> None:
+        available = parse_tool_activation_result(
+            {
+                "enabledToolNames": ["read", "mcp__server_tool"],
+                "activeToolNames": ["read"],
+                "mountedToolNames": ["mcp__server_tool"],
+                "activated": ["mcp__server_tool"],
+                "deactivated": [],
+                "inventoryAvailable": True,
+                "inventory": {
+                    "applicationApiVersion": 2,
+                    "tools": [],
+                    "xdev": {"prefix": "xd://", "mountedCount": 1},
+                    "futureInventoryField": True,
+                },
+                "futureResultField": {"safeToIgnore": True},
+            }
+        )
+        self.assertIsInstance(available, ToolActivationResult)
+        self.assertEqual(available.enabled_tool_names, ("read", "mcp__server_tool"))
+        self.assertEqual(available.mounted_tool_names, ("mcp__server_tool",))
+        self.assertEqual(available.activated, ("mcp__server_tool",))
+        self.assertEqual(available.deactivated, ())
+        self.assertEqual(available.inventory.application_api_version, 2)
+
+        unavailable = parse_tool_activation_result(
+            {
+                "enabledToolNames": ["read"],
+                "activeToolNames": ["read"],
+                "mountedToolNames": [],
+                "activated": [],
+                "deactivated": ["mcp__server_tool"],
+                "inventoryAvailable": False,
+                "futureResultField": True,
+            }
+        )
+        self.assertFalse(unavailable.inventory_available)
+        self.assertIsNone(unavailable.inventory)
 
 
 if __name__ == "__main__":

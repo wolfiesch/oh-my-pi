@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import type { Agent, AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
+import { type Tool as AiTool, type Model, toolWireSchema } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, prompt, stringProperty, untilAborted } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../capability";
 import type { ModelRegistry } from "../config/model-registry";
@@ -8,7 +9,8 @@ import { formatModelString } from "../config/model-resolver";
 import type { Settings, SkillsSettings } from "../config/settings";
 import type { CustomTool, CustomToolContext } from "../extensibility/custom-tools/types";
 import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
-import type { ExtensionRunner, SourceInfo, ToolInfo } from "../extensibility/extensions";
+import type { ExtensionRunner, RegisteredTool, SourceInfo, ToolInfo } from "../extensibility/extensions";
+import { isInlineExtensionPath } from "../extensibility/extensions/inline-path";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
 import { type LocalProtocolOptions, XD_URL_PREFIX } from "../internal-urls";
@@ -20,10 +22,19 @@ import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with 
 import { usesCodexTaskPrompt } from "../task/prompt-policy";
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
 import { computerExposureMode } from "../tools/computer/exposure";
+import { defaultLoadModeForToolName } from "../tools/essential-tools";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { supportsExternalThinking } from "../tools/think";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
-import { isMountableUnderXdev, listXdevTools, type XdevState, xdevDocsFor, xdevEntries } from "../tools/xdev";
+import {
+	isMountableUnderXdev,
+	listXdevTools,
+	sanitizeExternalToolText,
+	XDEV_EXTERNAL_DESCRIPTION_CAP,
+	type XdevState,
+	xdevDocsFor,
+	xdevEntries,
+} from "../tools/xdev";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { type InspectImageMode, isInspectImageToolActive } from "../utils/inspect-image-mode";
 import {
@@ -57,6 +68,7 @@ export interface SessionToolsHost {
 	captureMemoryPromotionSnapshot(prompt: string[]): void;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
 	notifyCommandMetadataChanged(): void;
+	notifyToolInventoryChanged(): void;
 	localProtocolOptions(): LocalProtocolOptions;
 	/** Session-scoped `/vision` override; undefined means "follow the persisted setting". */
 	getInspectImageModeOverride(): InspectImageMode | undefined;
@@ -89,6 +101,256 @@ interface SessionToolsOptions {
 	skillWarnings?: SkillWarning[];
 	skillsSettings?: SkillsSettings;
 	skillsReloadable?: boolean;
+}
+export type ToolInventoryPresentation = "active" | "mounted" | "registered";
+
+export type ToolInventorySource =
+	| { kind: "rpc_host" }
+	| { kind: "mcp"; serverName?: string; remoteName?: string }
+	| { kind: "builtin" }
+	| { kind: "extension"; extensionPath: string }
+	| { kind: "inline" }
+	| { kind: "custom" };
+
+export interface ToolInventoryEntry {
+	name: string;
+	label: string;
+	description: string;
+	summary?: string;
+	parameters: unknown;
+	presentation: ToolInventoryPresentation;
+	loadMode: "essential" | "discoverable";
+	hidden?: boolean;
+	deferrable?: boolean;
+	strict?: boolean;
+	customWireName?: string;
+	source: ToolInventorySource;
+}
+
+export interface ToolInventory {
+	applicationApiVersion: number;
+	tools: ToolInventoryEntry[];
+	xdev: {
+		prefix: string;
+		mountedCount: number;
+	};
+}
+export type ToolInventoryChangedListener = () => void | Promise<void>;
+
+interface ToolInventoryProjectionOptions {
+	applicationApiVersion: number;
+	registry: ReadonlyMap<string, AgentTool>;
+	activeNames: ReadonlySet<string>;
+	mountedNames: ReadonlySet<string>;
+	builtInNames: ReadonlySet<string>;
+	rpcHostNames: ReadonlySet<string>;
+	registeredTools: readonly RegisteredTool[];
+}
+
+const MAX_TOOL_INVENTORY_TOOLS = 2048;
+const MAX_TOOL_INVENTORY_BYTES = 768 * 1024;
+const MAX_TOOL_SCHEMA_BYTES = 64 * 1024;
+const MAX_TOOL_SCHEMA_DEPTH = 16;
+const MAX_TOOL_SCHEMA_KEYS = 256;
+const MAX_TOOL_SCHEMA_NODES = 4096;
+const MAX_TOOL_SCHEMA_ARRAY_ITEMS = 256;
+const MAX_TOOL_SCHEMA_STRING_BYTES = 8192;
+const TOOL_INVENTORY_UNAVAILABLE_MESSAGE = "Authoritative tool inventory exceeds safe representation limits";
+
+export class ToolInventoryUnavailableError extends Error {
+	constructor() {
+		super(TOOL_INVENTORY_UNAVAILABLE_MESSAGE);
+		this.name = "ToolInventoryUnavailableError";
+	}
+}
+
+type CommittedToolInventory =
+	| { available: true; inventory: ToolInventory; signature: string }
+	| { available: false; signature: string };
+const MAX_TOOL_NAME_BYTES = 256;
+const MAX_TOOL_SOURCE_BYTES = 512;
+const MAX_BUILTIN_DESCRIPTION_BYTES = 4096;
+
+function safeToolField(tool: AgentTool, key: PropertyKey): unknown {
+	try {
+		return Reflect.get(tool, key);
+	} catch {
+		return undefined;
+	}
+}
+
+function inventoryIdentity(value: string, maxBytes: number, field: string): string {
+	if (Buffer.byteLength(value, "utf8") > maxBytes || sanitizeExternalToolText(value) !== value) {
+		throw new Error(`${field} is unsafe or exceeds inventory limits`);
+	}
+	return value;
+}
+
+function boundedJsonValue(
+	value: unknown,
+	depth: number,
+	ancestors: ReadonlySet<object>,
+	budget: { remaining: number },
+): null | boolean | number | string | Array<unknown> | Record<string, unknown> {
+	budget.remaining--;
+	if (budget.remaining < 0) throw new Error("oversized JSON tree");
+	if (value === null || typeof value === "boolean") return value;
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) throw new Error("non-finite number");
+		return value;
+	}
+	if (typeof value === "string") {
+		if (Buffer.byteLength(value, "utf8") > MAX_TOOL_SCHEMA_STRING_BYTES) throw new Error("oversized JSON string");
+		return value;
+	}
+	if (typeof value !== "object") throw new Error("non-JSON value");
+	if (depth >= MAX_TOOL_SCHEMA_DEPTH || ancestors.has(value)) throw new Error("unsafe JSON nesting");
+	const nextAncestors = new Set(ancestors);
+	nextAncestors.add(value);
+	if (Array.isArray(value)) {
+		if (value.length > MAX_TOOL_SCHEMA_ARRAY_ITEMS) throw new Error("oversized JSON array");
+		return value.map(item => boundedJsonValue(item, depth + 1, nextAncestors, budget));
+	}
+	let entries: Array<[string, unknown]>;
+	try {
+		entries = Object.entries(value);
+	} catch {
+		throw new Error("unreadable JSON object");
+	}
+	if (entries.length > MAX_TOOL_SCHEMA_KEYS) throw new Error("oversized JSON object");
+	const result: Record<string, unknown> = {};
+	for (const [key, item] of entries) {
+		if (Buffer.byteLength(key, "utf8") > MAX_TOOL_NAME_BYTES || key in result) {
+			throw new Error("unsafe JSON key");
+		}
+		result[key] = boundedJsonValue(item, depth + 1, nextAncestors, budget);
+	}
+	return result;
+}
+function boundedToolSchema(tool: AgentTool): unknown {
+	const schema = boundedJsonValue(toolWireSchema(tool as AiTool), 0, new Set(), {
+		remaining: MAX_TOOL_SCHEMA_NODES,
+	});
+	const serialized = JSON.stringify(schema);
+	if (Buffer.byteLength(serialized, "utf8") > MAX_TOOL_SCHEMA_BYTES) {
+		throw new Error(`Tool schema exceeds ${MAX_TOOL_SCHEMA_BYTES} serialized bytes`);
+	}
+	return schema;
+}
+
+function serializedInventoryBytes(inventory: ToolInventory): number {
+	try {
+		return Buffer.byteLength(JSON.stringify(inventory), "utf8");
+	} catch {
+		return Number.POSITIVE_INFINITY;
+	}
+}
+
+function inventorySource(
+	name: string,
+	tool: AgentTool,
+	builtInNames: ReadonlySet<string>,
+	rpcHostNames: ReadonlySet<string>,
+	registeredByName: ReadonlyMap<string, RegisteredTool>,
+): ToolInventorySource {
+	if (rpcHostNames.has(name)) return { kind: "rpc_host" };
+	if (isMCPToolName(name)) {
+		const serverName = safeToolField(tool, "mcpServerName");
+		const remoteName = safeToolField(tool, "mcpToolName");
+		return {
+			kind: "mcp",
+			...(typeof serverName === "string"
+				? { serverName: inventoryIdentity(serverName, MAX_TOOL_SOURCE_BYTES, "MCP server name") }
+				: {}),
+			...(typeof remoteName === "string"
+				? { remoteName: inventoryIdentity(remoteName, MAX_TOOL_SOURCE_BYTES, "MCP remote name") }
+				: {}),
+		};
+	}
+	if (builtInNames.has(name)) return { kind: "builtin" };
+	const registered = registeredByName.get(name);
+	if (registered) {
+		let extensionPath: string | undefined;
+		try {
+			extensionPath = registered.extensionPath;
+		} catch {
+			return { kind: "custom" };
+		}
+		if (typeof extensionPath !== "string") return { kind: "custom" };
+		if (isInlineExtensionPath(extensionPath)) return { kind: "inline" };
+		return {
+			kind: "extension",
+			extensionPath: inventoryIdentity(extensionPath, MAX_TOOL_SOURCE_BYTES, "extension path"),
+		};
+	}
+	return { kind: "custom" };
+}
+
+/** Project an authoritative registry snapshot without altering executable schema or identity semantics. */
+export function projectToolInventory(options: ToolInventoryProjectionOptions): ToolInventory {
+	if (options.registry.size > MAX_TOOL_INVENTORY_TOOLS) {
+		throw new Error(`Tool inventory exceeds ${MAX_TOOL_INVENTORY_TOOLS} tools`);
+	}
+	const registeredByName = new Map<string, RegisteredTool>();
+	for (const registered of options.registeredTools) {
+		try {
+			const name = registered.definition.name;
+			if (typeof name === "string") registeredByName.set(name, registered);
+		} catch {
+			// Ignore malformed third-party registration metadata; the registry entry remains custom.
+		}
+	}
+	const tools: ToolInventoryEntry[] = [];
+	for (const [rawName, tool] of options.registry) {
+		const name = inventoryIdentity(rawName, MAX_TOOL_NAME_BYTES, "tool name");
+		const source = inventorySource(rawName, tool, options.builtInNames, options.rpcHostNames, registeredByName);
+		const external = source.kind !== "builtin";
+		const descriptionCap = external ? XDEV_EXTERNAL_DESCRIPTION_CAP : MAX_BUILTIN_DESCRIPTION_BYTES;
+		const rawLabel = safeToolField(tool, "label");
+		const rawDescription = safeToolField(tool, "description");
+		const rawSummary = safeToolField(tool, "summary");
+		const rawLoadMode = safeToolField(tool, "loadMode");
+		const hidden = safeToolField(tool, "hidden");
+		const deferrable = safeToolField(tool, "deferrable");
+		const strict = safeToolField(tool, "strict");
+		const customWireName = safeToolField(tool, "customWireName");
+		const parameters = boundedToolSchema(tool);
+		tools.push({
+			name,
+			label: sanitizeExternalToolText(typeof rawLabel === "string" ? rawLabel : rawName, MAX_TOOL_NAME_BYTES),
+			description: sanitizeExternalToolText(
+				typeof rawDescription === "string" ? rawDescription : "",
+				descriptionCap,
+			),
+			...(typeof rawSummary === "string" ? { summary: sanitizeExternalToolText(rawSummary, descriptionCap) } : {}),
+			parameters,
+			presentation: options.mountedNames.has(rawName)
+				? "mounted"
+				: options.activeNames.has(rawName)
+					? "active"
+					: "registered",
+			loadMode: defaultLoadModeForToolName(
+				rawName,
+				rawLoadMode === "essential" || rawLoadMode === "discoverable" ? rawLoadMode : undefined,
+			),
+			...(typeof hidden === "boolean" ? { hidden } : {}),
+			...(typeof deferrable === "boolean" ? { deferrable } : {}),
+			...(typeof strict === "boolean" ? { strict } : {}),
+			...(typeof customWireName === "string"
+				? { customWireName: inventoryIdentity(customWireName, MAX_TOOL_NAME_BYTES, "custom wire name") }
+				: {}),
+			source,
+		});
+	}
+	const inventory: ToolInventory = {
+		applicationApiVersion: Number.isSafeInteger(options.applicationApiVersion) ? options.applicationApiVersion : 0,
+		tools,
+		xdev: { prefix: XD_URL_PREFIX, mountedCount: options.mountedNames.size },
+	};
+	if (serializedInventoryBytes(inventory) > MAX_TOOL_INVENTORY_BYTES) {
+		throw new Error(`Tool inventory exceeds ${MAX_TOOL_INVENTORY_BYTES} serialized bytes`);
+	}
+	return inventory;
 }
 
 export interface MountedMCPToolRouteSource {
@@ -215,6 +477,9 @@ export class SessionTools {
 	 */
 	#turnSystemPromptOverride: string[] | undefined;
 	#lastAppliedToolSignature: string | undefined;
+	#committedToolInventory: CommittedToolInventory;
+	#toolInventoryObjectIds = new WeakMap<object, number>();
+	#nextToolInventoryObjectId = 1;
 	/**
 	 * `xd://` device names the current base system prompt renders in its catalog
 	 * (the last rebuild's {@link BuildSystemPromptResult.xdevCatalogNames}). Consulted
@@ -272,6 +537,7 @@ export class SessionTools {
 		this.#skillsSettings = options.skillsSettings;
 		this.#skillsReloadable = options.skillsReloadable ?? true;
 		this.#promptModelKey = this.#currentPromptModelKey();
+		this.#committedToolInventory = this.#captureToolInventory(this.#host.agent.state.tools);
 	}
 
 	/** Mutable registry shared with controller hosts that inspect available tools. */
@@ -456,6 +722,93 @@ export class SessionTools {
 	/** Names of every registered tool. */
 	getAllToolNames(): string[] {
 		return Array.from(this.#toolRegistry.keys());
+	}
+	/** Return the last inventory snapshot committed with successful active-set reconciliation. */
+	getToolInventory(applicationApiVersion: number): ToolInventory {
+		const committed = this.#committedToolInventory;
+		if (!committed.available) throw new ToolInventoryUnavailableError();
+		const inventory = structuredClone(committed.inventory);
+		inventory.applicationApiVersion = applicationApiVersion;
+		return inventory;
+	}
+
+	#getRegisteredTools(): readonly RegisteredTool[] {
+		try {
+			return this.#host.extensionRunner()?.getAllRegisteredTools() ?? [];
+		} catch {
+			return [];
+		}
+	}
+
+	#projectToolInventory(
+		applicationApiVersion: number,
+		activeTools: readonly AgentTool[],
+		registeredTools: readonly RegisteredTool[],
+	): ToolInventory {
+		const activeNames = new Set<string>();
+		for (const tool of activeTools) {
+			const name = safeToolField(tool, "name");
+			if (typeof name === "string") activeNames.add(name);
+		}
+		return projectToolInventory({
+			applicationApiVersion,
+			registry: this.#toolRegistry,
+			activeNames,
+			mountedNames: new Set(this.getMountedXdevToolNames()),
+			builtInNames: this.#builtInToolNames,
+			rpcHostNames: this.#rpcHostToolNames,
+			registeredTools,
+		});
+	}
+
+	#toolInventoryFingerprint(activeTools: readonly AgentTool[], registeredTools: readonly RegisteredTool[]): string {
+		const hash = createHash("sha256");
+		for (const [name, tool] of this.#toolRegistry) {
+			let id = this.#toolInventoryObjectIds.get(tool);
+			if (id === undefined) {
+				id = this.#nextToolInventoryObjectId++;
+				this.#toolInventoryObjectIds.set(tool, id);
+			}
+			hash.update("registry\0").update(name).update("\0").update(String(id)).update("\0");
+		}
+		for (const tool of activeTools) {
+			const name = safeToolField(tool, "name");
+			if (typeof name === "string") hash.update("active\0").update(name).update("\0");
+		}
+		for (const name of this.getMountedXdevToolNames()) hash.update("mounted\0").update(name).update("\0");
+		for (const name of this.#rpcHostToolNames) hash.update("rpc-host\0").update(name).update("\0");
+		for (const registered of registeredTools) {
+			try {
+				hash
+					.update("extension\0")
+					.update(registered.definition.name)
+					.update("\0")
+					.update(registered.extensionPath)
+					.update("\0");
+			} catch {
+				hash.update("extension-unreadable\0");
+			}
+		}
+		return hash.digest("hex");
+	}
+
+	#captureToolInventory(activeTools: readonly AgentTool[]): CommittedToolInventory {
+		const registeredTools = this.#getRegisteredTools();
+		try {
+			const inventory = this.#projectToolInventory(0, activeTools, registeredTools);
+			return { available: true, inventory, signature: `available:${JSON.stringify(inventory)}` };
+		} catch {
+			return {
+				available: false,
+				signature: `unavailable:${this.#toolInventoryFingerprint(activeTools, registeredTools)}`,
+			};
+		}
+	}
+
+	#commitToolInventory(committed: CommittedToolInventory): void {
+		if (committed.signature === this.#committedToolInventory.signature) return;
+		this.#committedToolInventory = committed;
+		this.#host.notifyToolInventoryChanged();
 	}
 
 	/**
@@ -730,18 +1083,28 @@ export class SessionTools {
 	}
 
 	/** Applies an enabled tool set and reconciles its `xd://` partition. */
-	applyActiveToolsByName(toolNames: string[], forcePromptRefresh = false, signal?: AbortSignal): Promise<void> {
+	applyActiveToolsByName(
+		toolNames: string[],
+		forcePromptRefresh = false,
+		signal?: AbortSignal,
+		allowToolRegistration = true,
+	): Promise<void> {
 		return this.runToolRegistryMutation(
-			() => this.#applyActiveToolsByName(toolNames, forcePromptRefresh, signal),
+			() => this.#applyActiveToolsByName(toolNames, forcePromptRefresh, signal, allowToolRegistration),
 			signal,
 		);
 	}
 
-	async #applyActiveToolsByName(toolNames: string[], forcePromptRefresh = false, signal?: AbortSignal): Promise<void> {
+	async #applyActiveToolsByName(
+		toolNames: string[],
+		forcePromptRefresh = false,
+		signal?: AbortSignal,
+		allowToolRegistration = true,
+	): Promise<void> {
 		signal?.throwIfAborted();
 		toolNames = normalizeToolNames(toolNames);
 		let builtInWriteAvailable = this.#builtInToolNames.has("write");
-		if (toolNames.includes("write") && !builtInWriteAvailable) {
+		if (allowToolRegistration && toolNames.includes("write") && !builtInWriteAvailable) {
 			const writeRegistration = this.#ensureWriteRegistered?.();
 			builtInWriteAvailable = writeRegistration ? (await untilAborted(signal, writeRegistration)) === true : false;
 			if (builtInWriteAvailable) this.#builtInToolNames.add("write");
@@ -774,7 +1137,7 @@ export class SessionTools {
 		const pinnedWrite = isPresentationPinned("write");
 		const activeDeferrableTool = tools.some(tool => tool.deferrable === true);
 		const transportNeeded = mountNames.size > 0 || activeDeferrableTool || this.#host.planModeEnabled();
-		if (transportNeeded && !builtInWriteAvailable) {
+		if (allowToolRegistration && transportNeeded && !builtInWriteAvailable) {
 			const writeRegistration = this.#ensureWriteRegistered?.();
 			builtInWriteAvailable = writeRegistration ? (await untilAborted(signal, writeRegistration)) === true : false;
 			if (builtInWriteAvailable) this.#builtInToolNames.add("write");
@@ -837,6 +1200,7 @@ export class SessionTools {
 			this.#promptModelKey = this.#currentPromptModelKey();
 			this.#basePromptXdevNames = new Set(rebuiltXdevCatalogNames);
 		}
+		this.#commitToolInventory(this.#captureToolInventory(tools));
 	}
 
 	#setMountedNames(names: Iterable<string>): void {
@@ -1025,7 +1389,7 @@ export class SessionTools {
 	}
 
 	/** Selects enabled tools, ignoring names absent from the registry. */
-	setActiveToolsByName(toolNames: string[]): Promise<void> {
+	setActiveToolsByName(toolNames: string[], allowToolRegistration = true): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
 			const normalized = normalizeToolNames(toolNames);
 			// Transport-write eligibility keys off the *current* active set: an ordinary
@@ -1034,6 +1398,9 @@ export class SessionTools {
 				normalized,
 				this.#xdev?.mountedNames ?? new Set(),
 				this.getActiveToolNames().includes("write"),
+				false,
+				undefined,
+				allowToolRegistration,
 			);
 		});
 	}
@@ -1086,6 +1453,7 @@ export class SessionTools {
 		writeSelected: boolean,
 		forcePromptRefresh = false,
 		signal?: AbortSignal,
+		allowToolRegistration = true,
 	): Promise<void> {
 		const transportWriteActive =
 			writeSelected &&
@@ -1098,7 +1466,7 @@ export class SessionTools {
 			normalized.filter(name => !mounted.has(name) && !(name === "write" && transportWriteActive)),
 		);
 		try {
-			await this.#applyActiveToolsByName(normalized, forcePromptRefresh, signal);
+			await this.#applyActiveToolsByName(normalized, forcePromptRefresh, signal, allowToolRegistration);
 		} catch (error) {
 			this.#runtimeSelectedToolNames = previousRuntimeSelectedToolNames;
 			throw error;

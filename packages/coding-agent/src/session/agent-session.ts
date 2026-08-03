@@ -336,7 +336,12 @@ import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
-import { SessionTools, type SessionToolsHost } from "./session-tools";
+import {
+	SessionTools,
+	type SessionToolsHost,
+	type ToolInventory,
+	type ToolInventoryChangedListener,
+} from "./session-tools";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { skillPromptTitleInput } from "./skill-title-input";
 import { ToolChoiceQueue } from "./tool-choice-queue";
@@ -497,6 +502,7 @@ export class AgentSession {
 	#commandMetadataChangedListeners: CommandMetadataChangedListener[] = [];
 	#sessionChangeCallbacks = new Set<() => void>();
 	#observedSessionId: string | undefined;
+	#toolInventoryChangedListeners: ToolInventoryChangedListener[] = [];
 
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: CustomMessage[] = [];
@@ -1363,6 +1369,7 @@ export class AgentSession {
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			notifyCommandMetadataChanged: () => this.#notifyCommandMetadataChanged(),
+			notifyToolInventoryChanged: () => this.#notifyToolInventoryChanged(),
 			localProtocolOptions: () => this.#localProtocolOptions(),
 			getInspectImageModeOverride: () => this.#inspectImageModeOverride,
 			setInspectImageModeOverride: mode => {
@@ -3801,6 +3808,26 @@ export class AgentSession {
 			}
 		}
 	}
+	subscribeToolInventoryChanged(listener: ToolInventoryChangedListener): () => void {
+		this.#toolInventoryChangedListeners.push(listener);
+		return () => {
+			const index = this.#toolInventoryChangedListeners.indexOf(listener);
+			if (index !== -1) this.#toolInventoryChangedListeners.splice(index, 1);
+		};
+	}
+
+	#notifyToolInventoryChanged(): void {
+		const listeners = [...this.#toolInventoryChangedListeners];
+		for (const listener of listeners) {
+			try {
+				void Promise.resolve(listener()).catch(err => {
+					logger.error("Tool inventory listener rejected", { err });
+				});
+			} catch (err) {
+				logger.error("Tool inventory listener threw", { err });
+			}
+		}
+	}
 
 	/**
 	 * Temporarily disconnect from agent events.
@@ -4631,6 +4658,10 @@ export class AgentSession {
 	getAllToolNames(): string[] {
 		return this.#tools.getAllToolNames();
 	}
+	/** Current authoritative tool registry projected for remote clients. */
+	getToolInventory(applicationApiVersion: number): ToolInventory {
+		return this.#tools.getToolInventory(applicationApiVersion);
+	}
 
 	/** Full metadata for every registered tool, including source provenance (backs `getAllTools()`). */
 	getAllToolInfos(): ToolInfo[] {
@@ -4675,8 +4706,8 @@ export class AgentSession {
 	}
 
 	/** Selects enabled tools, ignoring names absent from the registry. */
-	setActiveToolsByName(toolNames: string[]): Promise<void> {
-		return this.#tools.setActiveToolsByName(toolNames);
+	setActiveToolsByName(toolNames: string[], allowToolRegistration = true): Promise<void> {
+		return this.#tools.setActiveToolsByName(toolNames, allowToolRegistration);
 	}
 
 	/** Restores an exact top-level versus `xd://` tool partition. */
