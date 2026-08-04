@@ -144,6 +144,24 @@ describe("AgentSession unexpected stop guard", () => {
 		expect(reminderMessages(session.agent.state.messages)).toHaveLength(0);
 	});
 
+	it("does not classify or continue a terminal question awaiting the user", async () => {
+		const spy = vi.spyOn(unexpectedStopClassifier, "classifyUnexpectedStop").mockResolvedValue(true);
+		const { session, mock } = await createHarness(
+			[unexpectedStop("Want me to fix the sentinel issue, or start the RPC restack?")],
+			{
+				"features.unexpectedStopDetection": true,
+				"providers.unexpectedStopModel": "online",
+			},
+		);
+
+		await session.prompt("review my pull requests");
+		await session.waitForIdle();
+
+		expect(spy).not.toHaveBeenCalled();
+		expect(mock.calls).toHaveLength(1);
+		expect(reminderMessages(session.agent.state.messages)).toHaveLength(0);
+	});
+
 	it("schedules a continuation when the classifier returns true", async () => {
 		let calls = 0;
 		const spy = vi.spyOn(unexpectedStopClassifier, "classifyUnexpectedStop").mockImplementation(async () => {

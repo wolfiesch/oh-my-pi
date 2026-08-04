@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Prevented unexpected-stop recovery from continuing after an assistant explicitly asks the user for a response.
+
 ## [17.2.7] - 2026-08-03
 
 ### Changed

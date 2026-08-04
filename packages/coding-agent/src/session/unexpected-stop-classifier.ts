@@ -7,6 +7,7 @@ import type { Settings } from "../config/settings";
 import unexpectedStopClassifierPrompt from "../prompts/system/unexpected-stop-classifier.md" with { type: "text" };
 import { isTinyMemoryLocalModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
+import { isAwaitingUserAnswer } from "./assistant-response";
 
 const CLASSIFIER_SYSTEM_PROMPT = prompt.render(unexpectedStopClassifierPrompt);
 
@@ -34,6 +35,7 @@ export interface ClassifyUnexpectedStopDeps {
 
 export function isUnexpectedStopCandidate(message: AssistantMessage): boolean {
 	if (message.stopReason !== "stop") return false;
+	if (isAwaitingUserAnswer(message)) return false;
 	let hasText = false;
 	for (const content of message.content) {
 		if (content.type === "toolCall") return false;

@@ -36,6 +36,22 @@ describe("isUnexpectedStopCandidate", () => {
 		expect(isUnexpectedStopCandidate(message)).toBe(true);
 	});
 
+	it("returns false for a terminal question awaiting the user", () => {
+		const questions = [
+			"Should I do that for you?",
+			"Want me to fix #7521's sentinel issue, or start the RPC restack?",
+			"Which trade-off should I optimize?",
+		];
+
+		for (const text of questions) {
+			const message = makeAssistantMessage({
+				stopReason: "stop",
+				content: [{ type: "text", text }],
+			});
+			expect(isUnexpectedStopCandidate(message)).toBe(false);
+		}
+	});
+
 	it("returns false when stopReason is not stop", () => {
 		const length = makeAssistantMessage({
 			stopReason: "length",

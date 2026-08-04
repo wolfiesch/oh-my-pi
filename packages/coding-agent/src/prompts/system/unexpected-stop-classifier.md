@@ -4,10 +4,10 @@ Examples of unexpected stops:
 - "I should do the same for the JS eval worker. Doing that now."
 - "Let me run the tests next."
 - "I'll fix that now."
-- "Should I do that for you?"
 
 Not an unexpected stop:
 - "I've completed the task."
+- "Should I do that for you?"
 - "Is there anything else I can help with?"
 - "The fix is done and tests pass."
 
