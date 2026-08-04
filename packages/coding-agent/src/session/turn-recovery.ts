@@ -12,6 +12,7 @@ import type {
 	AssistantRetryRecoveryKind,
 	CodexCompactionContext,
 	Effort,
+	Message,
 	Model,
 	TextContent,
 	ToolChoice,
@@ -631,12 +632,14 @@ export class TurnRecovery {
 			return false;
 		}
 
-		this.#host.agent.appendMessage({
+		const reminderMessage: Message = {
 			role: "developer",
 			content: [{ type: "text", text: this.#unexpectedStopRetryReminder() }],
 			attribution: "agent",
 			timestamp: Date.now(),
-		});
+		};
+		this.#host.agent.appendMessage(reminderMessage);
+		this.#host.sessionManager.appendMessage(reminderMessage);
 		this.#host.scheduleAgentContinue({ generation: this.#host.promptGeneration() });
 		return true;
 	}

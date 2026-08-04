@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved unexpected-stop recovery reminders in restored sessions so automatic continuation retains its cause.
+
 ## [17.2.7] - 2026-08-03
 
 ### Changed

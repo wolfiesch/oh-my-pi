@@ -16,6 +16,7 @@ const recordToolSchema = z.object({ value: z.string() });
 
 type Harness = {
 	session: AgentSession;
+	sessionManager: SessionManager;
 	authStorage: AuthStorage;
 	tempDir: TempDir;
 };
@@ -91,7 +92,7 @@ async function createHarness(
 		modelRegistry,
 		toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 	});
-	const harness = { session, authStorage, tempDir };
+	const harness = { session, sessionManager, authStorage, tempDir };
 	activeHarnesses.push(harness);
 	return { ...harness, mock };
 }
@@ -168,6 +169,31 @@ describe("AgentSession unexpected stop guard", () => {
 		expect(mock.calls).toHaveLength(2);
 		expect(assistantText(session.agent.state.messages)).toContain("done now");
 		expect(reminderMessages(session.agent.state.messages)).toHaveLength(1);
+	});
+
+	it("persists the continuation reminder in reconstructed session context", async () => {
+		let calls = 0;
+		vi.spyOn(unexpectedStopClassifier, "classifyUnexpectedStop").mockImplementation(async () => {
+			calls++;
+			return calls === 1;
+		});
+		const { session, sessionManager } = await createHarness(
+			[
+				unexpectedStop("I should apply the same fix to the JS eval worker. Doing that now."),
+				{ content: ["done now"], stopReason: "stop" },
+			],
+			{
+				"features.unexpectedStopDetection": true,
+				"providers.unexpectedStopModel": "online",
+			},
+		);
+
+		await session.prompt("do the thing");
+		await session.waitForIdle();
+
+		const reconstructed = sessionManager.buildSessionContext().messages;
+		expect(reminderMessages(reconstructed)).toHaveLength(1);
+		expect(reconstructed.map(message => message.role)).toEqual(["user", "assistant", "developer", "assistant"]);
 	});
 
 	it("does not continue when the classifier returns false", async () => {
