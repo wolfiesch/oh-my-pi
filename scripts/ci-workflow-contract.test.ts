@@ -116,12 +116,18 @@ describe("CI workflow product release contract", () => {
 
 	it("builds native artifacts through the upstream Bazel pipeline", () => {
 		const build = String(step("native_addons", "Build native addons once").run);
+		expect(job("native_addons").needs).toContain("release_metadata");
+		expect(build).toContain("github.repository == 'can1357/oh-my-pi'");
+		expect(build).toContain("needs.release_metadata.outputs.is-release == 'true'");
 		expect(build).toContain("natives-linux-x64-baseline");
 		expect(build).toContain("natives-linux-x64-modern");
 		expect(build).toContain("natives-win32-x64-baseline");
 		const upload = config(step("native_addons", "Upload native addon artifacts").with, "native upload inputs");
 		expect(upload.name).toBe("native-addons");
 		expect(upload.path).toBe("bazel-bin/natives-*/*.node");
+		const cacheSave = config(step("native_addons", "Save bazel disk cache").with, "native cache save inputs");
+		expect(cacheSave.key).toBe(`\${{ steps.cache.outputs.cache-key }}`);
+		expect(String(cacheSave.path)).toContain("~/.cache/omp-bazel-disk");
 		for (const consumer of [
 			"test_workspace",
 			"test_coding_agent_singleton",
