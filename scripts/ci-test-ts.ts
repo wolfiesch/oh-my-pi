@@ -22,6 +22,7 @@ interface TestCommand {
 	label: string;
 	cwd: string;
 	command: string[];
+	env?: Record<string, string>;
 }
 
 type CodingAgentTestPartition = Record<CodingAgentBucket, string[]>;
@@ -227,6 +228,7 @@ function workspaceTestCommand(pkg: string, parallel: number, options: { extraArg
 		label: pkg,
 		cwd: pkg,
 		command: ["bun", "test", `--parallel=${parallel}`, ...extraArgs],
+		env: pkg === "packages/tui" ? { PI_TUI_SCROLLBACK_REBUILD: "1" } : undefined,
 	};
 }
 
@@ -442,7 +444,7 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 		return;
 	}
 
-	const env = buildChildEnv();
+	const env = { ...buildChildEnv(), ...testCommand.env };
 	const proc = Bun.spawn(testCommand.command, {
 		cwd,
 		env,
@@ -456,10 +458,10 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 		throw new Error(`${testCommand.label} failed with exit code ${exitCode}: ${renderedCommand}`);
 	}
 }
-
 // Child env shared by every spawned test process: the parent env with all CI
-// credential / cloud-config variables scrubbed (see SCRUBBED_ENV_* above) and
-// GITHUB_ACTIONS cleared so suites resolve only against their own fixtures.
+// credential / cloud-config variables scrubbed (see SCRUBBED_ENV_* above),
+// GitHub Actions cleared, and host multiplexer signals removed so terminal
+// behavior tests exercise the direct-terminal contract.
 //
 // GC knobs (both needed — they gate different JSC mechanisms):
 // - `BUN_JSC_useConcurrentGC=0` stops the collector from marking concurrently
@@ -476,6 +478,9 @@ function buildChildEnv(): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {
 		...Bun.env,
 		GITHUB_ACTIONS: "",
+		CMUX_WORKSPACE_ID: "",
+		CMUX_SURFACE_ID: "",
+		CMUX_REMOTE_TRANSPORT: "",
 		BUN_JSC_useConcurrentGC: "0",
 		BUN_JSC_numberOfGCMarkers: "1",
 	};
@@ -743,7 +748,7 @@ export async function runTestCommandsInParallel(commands: TestCommand[], concurr
 			const startedAt = performance.now();
 			const proc = Bun.spawn(testCommand.command, {
 				cwd: path.join(repoRoot, testCommand.cwd),
-				env,
+				env: { ...env, ...testCommand.env },
 				stdout: "pipe",
 				stderr: "pipe",
 			});
