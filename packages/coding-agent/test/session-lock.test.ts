@@ -247,7 +247,7 @@ describe("session lock", () => {
 			processStartMarker: "marker-b",
 			hostname: "claim-host",
 			createdAt: 20_000,
-			sessionFile: path.resolve(session),
+			sessionFile: path.join(fs.realpathSync(path.dirname(session)), path.basename(session)),
 		};
 		expect(__internalsForTesting.writeClaim(claimPath, claim as never)).toBe(true);
 		expect(__internalsForTesting.parseClaim(fs.readFileSync(claimPath, "utf8"), session)).not.toBeNull();
@@ -266,7 +266,7 @@ describe("session lock", () => {
 			processStartMarker: "marker-b",
 			hostname: "local",
 			createdAt: 0,
-			sessionFile: path.resolve(session),
+			sessionFile: path.join(fs.realpathSync(path.dirname(session)), path.basename(session)),
 		};
 		const rt = {
 			now: () => 20_001,

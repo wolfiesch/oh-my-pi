@@ -1,7 +1,8 @@
 import type { Agent } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
-import { IrcBus, type IrcMessage } from "../irc/bus";
+import type { IrcBus, IrcMessage } from "../irc/bus";
 import parentIrcSteerTemplate from "../prompts/steering/parent-irc.md" with { type: "text" };
 import ircAutoReplyTemplate from "../prompts/system/irc-autoreply.md" with { type: "text" };
 import ircIncomingTemplate from "../prompts/system/irc-incoming.md" with { type: "text" };
@@ -15,12 +16,15 @@ export interface IrcBridgeHost {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
-	isDisposed(): boolean;
 	isStreaming(): boolean;
+	isDisposed(): boolean;
 	planModeEnabled(): boolean;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	wakeForIrc(records: CustomMessage[]): void;
-	runEphemeralTurn(args: { promptText: string }): Promise<{ replyText: string }>;
+	runEphemeralTurn(options: {
+		promptText: string;
+	}): Promise<{ replyText: string; assistantMessage: AssistantMessage }>;
+	ircBus: IrcBus;
 }
 
 /** Owns incoming IRC queues, injection, and side-channel auto-replies. */
@@ -192,7 +196,7 @@ export class IrcBridge {
 			};
 			void this.#host.emitSessionEvent({ type: "irc_message", message: record });
 			this.#asides.push(record);
-			const receipt = await IrcBus.global().send({ from: msg.to, to: msg.from, body, replyTo: msg.id });
+			const receipt = await this.#host.ircBus.send({ from: msg.to, to: msg.from, body, replyTo: msg.id });
 			if (receipt.outcome === "failed") {
 				logger.warn("IRC auto-reply delivery failed", { to: msg.from, error: receipt.error });
 			}

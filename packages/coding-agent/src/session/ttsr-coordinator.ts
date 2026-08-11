@@ -47,6 +47,8 @@ export class TtsrCoordinator {
 	#retryToken = 0;
 	#resumePromise: Promise<void> | undefined;
 	#resumeResolve: (() => void) | undefined;
+	readonly #astCompletedToolCalls = new Set<string>();
+	readonly #astCompletionTasks = new Map<string, Promise<void>>();
 
 	constructor(host: TtsrCoordinatorHost, manager: TtsrManager | undefined) {
 		this.#host = host;
@@ -71,6 +73,8 @@ export class TtsrCoordinator {
 	/** Resets stream buffers at turn start. */
 	onTurnStart(): void {
 		this.#manager?.resetBuffer();
+		this.#astCompletedToolCalls.clear();
+		this.#astCompletionTasks.clear();
 	}
 
 	/** Advances repeat-after-gap tracking at turn end. */
@@ -82,6 +86,21 @@ export class TtsrCoordinator {
 	async checkMessageUpdate(event: AgentEvent): Promise<boolean> {
 		if (event.type !== "message_update" || !this.#manager?.hasRules()) return false;
 		const assistantEvent = event.assistantMessageEvent;
+		if (assistantEvent.type === "toolcall_end") {
+			if (!this.#manager.hasAstRules()) return false;
+			const completionKey =
+				assistantEvent.toolCall.id || `${assistantEvent.toolCall.name}:${assistantEvent.contentIndex}`;
+			if (this.#astCompletedToolCalls.has(completionKey)) return false;
+			this.#astCompletedToolCalls.add(completionKey);
+			const matchContext = this.#getToolMatchContext(assistantEvent.toolCall, assistantEvent.contentIndex);
+			const targetTimestamp = event.message.role === "assistant" ? event.message.timestamp : undefined;
+			const task = this.#checkAstStream(matchContext, assistantEvent.toolCall).then(astMatches => {
+				if (astMatches.length > 0) this.#handleMatches(astMatches, matchContext, targetTimestamp);
+			});
+			this.#astCompletionTasks.set(completionKey, task);
+			return false;
+		}
+
 		let matchContext: TtsrMatchContext | undefined;
 		let streamingToolCall: ToolCall | undefined;
 		if (assistantEvent.type === "text_delta") {
@@ -95,15 +114,7 @@ export class TtsrCoordinator {
 		if (!matchContext || !("delta" in assistantEvent)) return false;
 		const targetMessageTimestamp = event.message.role === "assistant" ? event.message.timestamp : undefined;
 		const matches = this.#checkStream(assistantEvent.delta, matchContext, streamingToolCall);
-		if (matches.length > 0 && this.#handleMatches(matches, matchContext, targetMessageTimestamp)) return true;
-		// AST rules use the reconstructed edit/write snapshot and are awaited so
-		// the manager self-throttles native matching.
-		if (matchContext.source === "tool" && this.#manager.hasAstRules()) {
-			const astMatches = await this.#checkAstStream(matchContext, streamingToolCall);
-			if (astMatches.length > 0 && this.#handleMatches(astMatches, matchContext, targetMessageTimestamp))
-				return true;
-		}
-		return false;
+		return matches.length > 0 && this.#handleMatches(matches, matchContext, targetMessageTimestamp);
 	}
 
 	/** Settles the previous resume gate and queues any deferred injection. */
@@ -121,8 +132,13 @@ export class TtsrCoordinator {
 		this.#markInjected(rules.filter((ruleName): ruleName is string => typeof ruleName === "string"));
 	}
 
-	/** Folds per-tool reminders into the matched tool's result. */
-	afterToolCall(ctx: AfterToolCallContext): AfterToolCallResult | undefined {
+	/** Waits for completed-call AST matching, then folds per-tool reminders into the matched tool's result. */
+	async afterToolCall(ctx: AfterToolCallContext): Promise<AfterToolCallResult | undefined> {
+		const astCompletion = this.#astCompletionTasks.get(ctx.toolCall.id);
+		if (astCompletion) {
+			await astCompletion;
+			this.#astCompletionTasks.delete(ctx.toolCall.id);
+		}
 		const rules = this.#perToolInjections.get(ctx.toolCall.id);
 		if (!rules || rules.length === 0) return undefined;
 		this.#perToolInjections.delete(ctx.toolCall.id);

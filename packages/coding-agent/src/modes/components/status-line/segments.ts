@@ -1,8 +1,9 @@
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
-import { formatDuration, formatNumber, getProjectDir, pathIsWithin, relativePathWithinRoot } from "@oh-my-pi/pi-utils";
+import { formatDuration, formatNumber, getProjectDir, relativePathWithinRoot } from "@oh-my-pi/pi-utils";
 import { type ThemeColor, theme } from "../../../modes/theme/theme";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../../tools/render-utils";
 import { fileHyperlink } from "../../../tui/hyperlink";
@@ -38,9 +39,23 @@ function thinkingGlyph(display: string): string {
 	return space === -1 ? display : display.slice(0, space);
 }
 
+function canonicalProjectPath(candidate: string): string {
+	const resolved = path.resolve(candidate);
+	try {
+		return fs.realpathSync(resolved);
+	} catch {
+		try {
+			return path.join(fs.realpathSync(path.dirname(resolved)), path.basename(resolved));
+		} catch {
+			return resolved;
+		}
+	}
+}
+
 function stripDisplayRoot(pwd: string): string {
+	const canonical = canonicalProjectPath(pwd);
 	for (const root of [path.join(os.homedir(), "Projects"), "/work"]) {
-		const relative = relativePathWithinRoot(root, pwd);
+		const relative = relativePathWithinRoot(canonicalProjectPath(root), canonical);
 		if (relative) return relative;
 	}
 	return pwd;
@@ -69,9 +84,17 @@ const SCRATCH_ROOTS: readonly string[] = (() => {
 })();
 
 function classifyProjectDir(pwd: string): { scratch: boolean; relative: string | null } {
+	const canonical = canonicalProjectPath(pwd);
+	const projectsRoot = canonicalProjectPath(path.join(os.homedir(), "Projects"));
+	const projectsRelative = relativePathWithinRoot(projectsRoot, canonical);
+	if (projectsRelative !== null) {
+		return { scratch: false, relative: projectsRelative };
+	}
 	for (const root of SCRATCH_ROOTS) {
-		if (pathIsWithin(root, pwd)) {
-			return { scratch: true, relative: relativePathWithinRoot(root, pwd) };
+		const canonicalRoot = canonicalProjectPath(root);
+		const relative = relativePathWithinRoot(canonicalRoot, canonical);
+		if (relative !== null) {
+			return { scratch: true, relative };
 		}
 	}
 	return { scratch: false, relative: null };
