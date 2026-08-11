@@ -118,7 +118,6 @@ const localOnlyWorkspacePackages = ["packages/mnemopi", "python/robomp/web"];
 // native build orchestration, and published type resolution covered there.
 const ciRepoScriptTests = [
 	"scripts/ci-concurrency.test.ts",
-	"scripts/ci-build-native.test.ts",
 	"scripts/ci-release-metadata.test.ts",
 	"scripts/ci-release-notes.test.ts",
 	"scripts/ci-workflow-contract.test.ts",

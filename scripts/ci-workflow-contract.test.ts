@@ -1,6 +1,5 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { computeNativeSourceHash, nativeBuildRecipe, nativeHashInputs } from "./ci-native-source-hash";
 
 type Config = Record<string, unknown>;
 
@@ -9,7 +8,6 @@ const workflowPath = path.join(repoRoot, ".github", "workflows", "ci.yml");
 const ciTestPlanPath = path.join(repoRoot, "scripts", "ci-test-ts.ts");
 const appserverManifestPath = path.join(repoRoot, "packages", "appserver", "package.json");
 const workflow = Bun.YAML.parse(await Bun.file(workflowPath).text()) as Config;
-const gha = (expression: string): string => `\${{ ${expression} }}`;
 
 function config(value: unknown, label: string): Config {
 	if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -28,6 +26,16 @@ function step(jobName: string, stepName: string): Config {
 	const found = steps.find(candidate => config(candidate, `jobs.${jobName}.step`).name === stepName);
 	if (!found) throw new Error(`jobs.${jobName} has no step named ${stepName}`);
 	return config(found, `jobs.${jobName}.steps.${stepName}`);
+}
+
+function matrixAssets(jobName: string): Array<{ targetId: unknown; binaryPath: unknown }> {
+	const strategy = config(job(jobName).strategy, `${jobName}.strategy`);
+	const matrix = config(strategy.matrix, `${jobName}.strategy.matrix`);
+	if (!Array.isArray(matrix.include)) throw new Error(`${jobName}.strategy.matrix.include is not a list`);
+	return matrix.include.map((rawAsset, index) => {
+		const asset = config(rawAsset, `${jobName}.strategy.matrix.include.${index}`);
+		return { targetId: asset.target_id, binaryPath: asset.binary_path };
+	});
 }
 
 describe("CI workflow product release contract", () => {
@@ -52,70 +60,43 @@ describe("CI workflow product release contract", () => {
 	});
 
 	it("publishes binaries and GitHub releases for either release kind", () => {
-		for (const name of ["release_binary", "release_github", "release_github_verify"]) {
-			const condition = job(name).if;
+		for (const name of ["release_binary", "release_binary_darwin", "release_github", "release_github_verify"]) {
+			const condition = String(job(name).if);
 			expect(condition).toContain("is-release == 'true'");
 			expect(condition).not.toContain("release-kind == 'upstream'");
 		}
 	});
 
-	it("publishes the five supported product binaries and provenance-bound native addons", () => {
-		const strategy = config(job("release_binary").strategy, "release_binary.strategy");
-		const matrix = config(strategy.matrix, "release_binary.strategy.matrix");
-		if (!Array.isArray(matrix.include)) throw new Error("release_binary.strategy.matrix.include is not a list");
-		const assets = matrix.include.map((rawAsset, index) => {
-			const asset = config(rawAsset, `release_binary.strategy.matrix.include.${index}`);
-			return { targetId: asset.target_id, binaryPath: asset.binary_path };
-		});
-		expect(assets).toEqual([
+	it("publishes every supported product binary with checksums", () => {
+		expect([...matrixAssets("release_binary"), ...matrixAssets("release_binary_darwin")]).toEqual([
 			{ targetId: "linux-x64", binaryPath: "packages/coding-agent/binaries/omp-linux-x64" },
+			{ targetId: "linux-musl-x64", binaryPath: "packages/coding-agent/binaries/omp-linux-musl-x64" },
 			{ targetId: "linux-arm64", binaryPath: "packages/coding-agent/binaries/omp-linux-arm64" },
+			{ targetId: "linux-musl-arm64", binaryPath: "packages/coding-agent/binaries/omp-linux-musl-arm64" },
+			{ targetId: "win32-x64", binaryPath: "packages/coding-agent/binaries/omp-windows-x64.exe" },
 			{ targetId: "darwin-x64", binaryPath: "packages/coding-agent/binaries/omp-darwin-x64" },
 			{ targetId: "darwin-arm64", binaryPath: "packages/coding-agent/binaries/omp-darwin-arm64" },
-			{ targetId: "win32-x64", binaryPath: "packages/coding-agent/binaries/omp-windows-x64.exe" },
 		]);
-
-		const artifactUpload = config(
-			step("release_binary", "Upload release binary artifact").with,
-			"binary upload inputs",
-		);
-		expect(artifactUpload.path).toBe(`\${{ matrix.binary_path }}`);
-		const artifactDownload = config(
-			step("release_github", "Download release binaries").with,
-			"binary download inputs",
-		);
-		expect(artifactDownload.pattern).toBe("omp-binary-*");
-		const nativeDownload = config(
-			step("release_github", "Download Linux x64 native addons").with,
-			"native addon download inputs",
-		);
-		expect(nativeDownload.pattern).toBe(
-			`pi-natives-linux-x64-*-h\${{ needs.native_artifact_lookup.outputs.source-hash }}`,
-		);
-		expect(nativeDownload["run-id"]).toBe(`\${{ steps.native-source.outputs.artifact-run-id }}`);
-		const manifestCommand = step("release_github", "Generate native addon provenance manifest").run;
-		expect(manifestCommand).toContain('--commit "$GITHUB_SHA"');
-		expect(manifestCommand).toContain(`--source-hash "\${{ needs.native_artifact_lookup.outputs.source-hash }}"`);
+		for (const jobName of ["release_binary", "release_binary_darwin"]) {
+			const upload = config(step(jobName, "Upload release binary artifact").with, `${jobName} upload inputs`);
+			expect(upload.path).toBe(`\${{ matrix.binary_path }}`);
+		}
 		const releaseUpload = config(step("release_github", "Create GitHub Release").with, "GitHub release inputs");
-		expect(String(releaseUpload.files).trim().split(/\r?\n/u)).toEqual([
-			"packages/coding-agent/binaries/omp-*",
-			"packages/natives/native/pi_natives.linux-x64-*.node",
-			"omp-native-addons.json",
-		]);
+		expect(String(releaseUpload.files)).toContain("packages/coding-agent/binaries/omp-*");
+		expect(String(releaseUpload.files)).toContain("SHA256SUMS.txt");
+		expect(step("release_github", "Generate checksums").run).toContain("packages/coding-agent/binaries/omp-*");
 	});
 
-	it("keeps every npm mutation and Homebrew update upstream-only", () => {
-		for (const name of ["release_npm", "release_brew"]) {
-			expect(job(name).if).toContain("release-kind == 'upstream'");
-			expect(job(name).if).toContain("github.repository == 'can1357/oh-my-pi'");
+	it("keeps npm mutations and Homebrew updates upstream-only", () => {
+		for (const name of ["release_native_leaves", "release_npm", "release_brew"]) {
+			const condition = String(job(name).if);
+			expect(condition).toContain("release-kind == 'upstream'");
+			expect(condition).toContain("github.repository == 'can1357/oh-my-pi'");
 		}
-		const nativePublishCondition = step("release_binary", "Publish native addon package").if;
-		expect(nativePublishCondition).toContain("release-kind == 'upstream'");
-		expect(nativePublishCondition).toContain("github.repository == 'can1357/oh-my-pi'");
 	});
 
 	it("feeds plain semver to notes and includes Unreleased entries for the T4 product", () => {
-		const command = step("release_github", "Generate release notes from CHANGELOGs").run;
+		const command = String(step("release_github", "Generate release notes from CHANGELOGs").run);
 		expect(command).toContain("release-version");
 		expect(command).toContain('release-kind }}" = "t4code"');
 		expect(command).toContain("--include-unreleased");
@@ -131,101 +112,37 @@ describe("CI workflow product release contract", () => {
 			expect(runsOn).toContain("ubuntu-22.04");
 		}
 		expect(upstreamOnlyRunnerJobs).toBeGreaterThan(0);
-
-		const crossRunner = job("native_cross_platform_kata")["runs-on"];
-		expect(crossRunner).toContain("github.repository != 'can1357/oh-my-pi'");
-		expect(crossRunner).toContain("ubuntu-22.04");
-		expect(crossRunner).toContain("matrix.os");
 	});
 
-	it("reuses only hash-identical native artifacts from the trusted owning branch", () => {
-		const lookup = String(step("native_artifact_lookup", "Find trusted build with matching native artifacts").run);
-		expect(lookup).toContain("refs/heads/t4code/main|refs/tags/t4code-*");
-		expect(lookup).toContain('cache_branch="$PR_BASE_REF"');
-		expect(lookup).toContain("actions/artifacts?name=$linux_canary");
-		expect(lookup).toContain(".conclusion, .event, .head_branch, .path");
-		expect(lookup).toContain(`"\${linux_required[@]}" "\${cross_platform_required[@]}"`);
-		expect(lookup).toContain(`hash="${gha("steps.compute.outputs.source-hash")}"`);
-
-		const linuxCondition = String(job("native_linux_x64").if);
-		expect(linuxCondition).toContain("linux-x64-run-id == ''");
-		expect(linuxCondition).not.toContain("is-release == 'true'");
-		for (const name of ["native_cross_platform_kata", "native_cross_platform_macos"]) {
-			const condition = String(job(name).if);
-			expect(condition).toContain("cross-platform-run-id == ''");
-			expect(condition).toContain("github.ref == 'refs/heads/t4code/main'");
-		}
-
-		const release = job("release_binary");
-		expect(String(release.if)).toContain("native_artifact_lookup.outputs.linux-x64-run-id != ''");
-		expect(String(release.if)).toContain("native_artifact_lookup.outputs.cross-platform-run-id != ''");
-		const resolver = String(step("release_binary", "Resolve native artifact run").run);
-		expect(resolver).toContain('artifact_run_id="$GITHUB_RUN_ID"');
-		expect(resolver).toContain('artifact_run_id="$cached_run_id"');
-		const download = config(step("release_binary", "Download native addon(s)").with, "native download inputs");
-		expect(download["run-id"]).toBe(gha("steps.native-source.outputs.artifact-run-id"));
-		expect(download["github-token"]).toBe(gha("secrets.GITHUB_TOKEN"));
-	});
-
-	it("hashes the complete native build recipe and keeps it aligned with the workflow", async () => {
-		for (const required of [
-			"package.json",
-			"bun.lock",
-			".github/actions/build-native/action.yml",
-			".github/actions/ensure-rust-toolchain/action.yml",
+	it("builds native artifacts through the upstream Bazel pipeline", () => {
+		const build = String(step("native_addons", "Build native addons once").run);
+		expect(build).toContain("natives-linux-x64-baseline");
+		expect(build).toContain("natives-linux-x64-modern");
+		expect(build).toContain("natives-win32-x64-baseline");
+		const upload = config(step("native_addons", "Upload native addon artifacts").with, "native upload inputs");
+		expect(upload.name).toBe("native-addons");
+		expect(upload.path).toBe("bazel-bin/natives-*/*.node");
+		for (const consumer of [
+			"test_workspace",
+			"test_coding_agent_singleton",
+			"test_ts_native",
+			"test_coding_agent_ui",
+			"test_coding_agent_runtime",
+			"test_coding_agent_native",
+			"test_smoke",
+			"install_methods",
 		]) {
-			expect(nativeHashInputs).toContain(required);
+			const uses = (job(consumer).steps as Config[]).map(candidate => candidate.uses);
+			expect(uses).toContain("./.github/actions/native-artifacts");
 		}
-		expect(await computeNativeSourceHash()).toMatch(/^[0-9a-f]{16}$/);
-		expect(workflow.env).toMatchObject({ GLIBC_FLOOR: nativeBuildRecipe.glibcFloor });
-		expect(job("native_linux_x64")["runs-on"]).toContain(nativeBuildRecipe.runners.kata);
-		expect(job("native_linux_x64")["runs-on"]).toContain(nativeBuildRecipe.runners.linuxFallback);
-
-		const linuxMatrix = config(config(job("native_linux_x64").strategy, "linux strategy").matrix, "linux matrix");
-		expect(linuxMatrix.include).toEqual(nativeBuildRecipe.linuxX64);
-		const kataMatrix = config(
-			config(job("native_cross_platform_kata").strategy, "kata strategy").matrix,
-			"kata matrix",
-		);
-		expect(kataMatrix.include).toEqual(nativeBuildRecipe.crossKata);
-		const macMatrix = config(
-			config(job("native_cross_platform_macos").strategy, "mac strategy").matrix,
-			"mac matrix",
-		);
-		expect(macMatrix.include).toEqual(nativeBuildRecipe.crossMacos);
-		const macBuild = config((job("native_cross_platform_macos").steps as Config[])[1].with, "mac build inputs");
-		expect(macBuild.rust_tests).toBe("false");
 	});
 
-	it("runs Rust validation once in parallel with native artifact production", () => {
-		const validation = job("rust_validation");
+	it("validates Rust through the upstream Bazel checks", () => {
+		const validation = job("rust_validate");
 		expect(validation.needs).toBeUndefined();
-		const validationMatrix = config(config(validation.strategy, "validation strategy").matrix, "validation matrix");
-		expect(validationMatrix.phase).toEqual(["check", "test"]);
-		expect(step("rust_validation", "Validate Rust workspace").run).toBe(
-			`bun run ${gha("matrix.phase == 'check' && 'check:rs' || 'test:rs'")}`,
-		);
-
-		const native = job("native_linux_x64");
-		const matrix = config(config(native.strategy, "native strategy").matrix, "native matrix");
-		expect(matrix.include).toEqual([{ variant: "baseline" }, { variant: "modern" }]);
-		const build = config((native.steps as Config[])[1].with, "native build inputs");
-		expect(build.rust_checks).toBe("false");
-		expect(build.rust_tests).toBe("false");
-		expect(job("release_binary").if).toContain("needs.rust_validation.result == 'success'");
-		expect(job("release_binary").needs).toContain("rust_validation");
-	});
-
-	it("resolves cached native artifacts for every release consumer", () => {
-		const npmResolver = String(step("release_npm", "Resolve Linux x64 native artifact run").run);
-		expect(npmResolver).toContain('artifact_run_id="$GITHUB_RUN_ID"');
-		expect(npmResolver).toContain("native_artifact_lookup.outputs.linux-x64-run-id");
-		const npmDownload = config(step("release_npm", "Download native addons").with, "npm native download");
-		expect(npmDownload["run-id"]).toBe(gha("steps.native-source.outputs.artifact-run-id"));
-		expect(npmDownload["github-token"]).toBe(gha("secrets.GITHUB_TOKEN"));
-		expect(job("release_npm").needs).toContain("native_linux_x64");
-		expect(config(job("release_binary").permissions, "release binary permissions").actions).toBe("read");
-		expect(config(job("release_npm").permissions, "release npm permissions").actions).toBe("read");
+		expect(step("rust_validate", "Rust tests").run).toContain("bazelisk");
+		expect(step("rust_validate", "Rustfmt").run).toContain("--config=rustfmt");
+		expect(job("release_gate").if).toContain("needs.rust_validate.result == 'success'");
 	});
 
 	it("gates appserver types and runtime tests before publishing product binaries", async () => {
@@ -239,6 +156,7 @@ describe("CI workflow product release contract", () => {
 		});
 		expect(dryRun.exitCode).toBe(0);
 		expect(dryRun.stdout.toString()).toContain("==> packages/appserver");
-		expect(job("release_binary").if).toContain("needs.test_ts_native.result == 'success'");
+		expect(job("release_github").needs).toContain("release_gate");
+		expect(job("release_gate").if).toContain("needs.test_ts_native.result == 'success'");
 	});
 });
