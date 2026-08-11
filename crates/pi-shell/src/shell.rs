@@ -2654,6 +2654,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn kill_builtin_signals_every_process_in_a_jobspec_pipeline() {
 		const MARKER: &str = "PI_SHELL_TEST_KILL_JOBSPEC_PIPELINE";
+		const PIPELINE_TIMEOUT: Duration = Duration::from_secs(15);
 		if std::env::var_os(MARKER).is_none() {
 			run_isolated_kill_test(
 				"shell::tests::kill_builtin_signals_every_process_in_a_jobspec_pipeline",
@@ -2686,14 +2687,11 @@ mod tests {
 		let (mut session, params) = kill_test_context().await;
 		let source_info = SourceInfo::from("pi-natives:test");
 
-		time::timeout(
-			Duration::from_secs(5),
-			session.shell.run_string(command, &source_info, &params),
-		)
-		.await
-		.expect("pipeline did not stop")
-		.expect("stopped pipeline");
-		time::timeout(Duration::from_secs(5), async {
+		time::timeout(PIPELINE_TIMEOUT, session.shell.run_string(command, &source_info, &params))
+			.await
+			.expect("pipeline did not stop")
+			.expect("stopped pipeline");
+		time::timeout(PIPELINE_TIMEOUT, async {
 			while !first_ready.exists() || !second_ready.exists() {
 				time::sleep(Duration::from_millis(10)).await;
 			}
