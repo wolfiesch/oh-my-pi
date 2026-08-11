@@ -7,9 +7,9 @@ RPC mode runs the coding agent as a newline-delimited JSON protocol over stdio.
 
 Primary implementation:
 
-- `src/modes/rpc/rpc-mode.ts`
-- `src/modes/rpc/rpc-types.ts`
-- `src/session/agent-session.ts`
+- `packages/coding-agent/src/modes/rpc/rpc-mode.ts`
+- `packages/coding-agent/src/modes/rpc/rpc-types.ts`
+- `packages/coding-agent/src/session/agent-session.ts`
 - `packages/agent/src/agent.ts`
 - `packages/agent/src/agent-loop.ts`
 
@@ -23,17 +23,50 @@ Behavior notes:
 
 - `@file` CLI arguments are rejected in RPC mode.
 - RPC mode disables automatic session title generation by default to avoid an extra model call.
-- RPC mode resets workflow-altering `todo.*`, `task.*`, `memory.backend`/`memories.enabled`, `advisor.*`, `async.*`, and `bash.autoBackground.*` settings to their built-in defaults instead of inheriting user overrides.
-- The process reads stdin as JSONL (`readJsonl(Bun.stdin.stream())`).
-- At startup it writes `{ "type": "ready" }` before processing commands.
-- When stdin closes, pending host-tool calls and host-URI requests are rejected and the process exits with code `0`.
+- RPC/ACP host defaults cover task isolation/execution, memory, advisor, tier, async-job, and bash auto-background settings. They are applied only when a path is not explicitly configured; project/global config, `--config`, and isolated settings remain authoritative. Todo settings are not host-defaulted.
+- The process claims stdin before extension discovery, then parses it one non-empty JSONL line at a time. Malformed JSON emits a recoverable `command: "parse"` failure and does not terminate the loop.
+- At startup it writes a `ready` frame before processing commands. The frame advertises supported protocol versions and transport limits.
+- When stdin closes, pending extension UI, host-tool, and host-URI requests are rejected; accepted commands are drained, the session is disposed, and the process exits with code `0`.
 - Responses/events are written as one JSON object per line.
 
 ## Transport and Framing
 
-Each frame is a single JSON object followed by `\n`.
+Protocol v1 stdout frames are a single JSON object followed by `\n`. The server caps each physical stdout frame at 1 MiB. Inbound commands are always one unchunked JSONL object; clients SHOULD keep them within the advertised physical-frame limit.
 
-There is no envelope beyond the object shape itself.
+The initial ready frame uses protocol v1 and advertises the opt-in lossless transport:
+
+```json
+{
+  "type": "ready",
+  "protocolVersion": 1,
+  "supportedProtocolVersions": [1, 2],
+  "maxFrameBytes": 1048576,
+  "maxReassembledFrameBytes": 67108864
+}
+```
+
+Clients that support protocol v2 SHOULD immediately send:
+
+```json
+{ "id": "protocol-1", "type": "negotiate_protocol", "protocolVersion": 2 }
+```
+
+After the success response, oversized stdout objects are emitted losslessly as an uninterrupted sequence of `rpc_chunk` frames. Each chunk carries a base64 segment of the original UTF-8 JSON object:
+
+```json
+{
+  "type": "rpc_chunk",
+  "chunkId": "rpc-1",
+  "index": 0,
+  "count": 7,
+  "byteLength": 1600042,
+  "data": "eyJ0eXBlIjoicmVzcG9uc2UiLC4uLn0="
+}
+```
+
+Clients MUST validate `chunkId`, `index`, `count`, and `byteLength`, reject interleaved or interrupted sequences, enforce the advertised reassembly limit, concatenate decoded bytes in index order, decode them as strict UTF-8, and parse the result as one JSON object. The TypeScript `RpcFrameDecoder`, exported from `@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame`, implements this validation. The bundled TypeScript and Python `RpcClient` implementations negotiate v2 automatically when the ready frame advertises it.
+
+Legacy clients may ignore the added ready fields and remain on v1. V1 retains its bounded fallback behavior for oversized output. Frames above the v2 reassembly ceiling still fail explicitly; large history APIs should use pagination rather than depending on arbitrarily large logical frames.
 
 ### Outbound frame categories (stdout)
 
@@ -45,11 +78,9 @@ There is no envelope beyond the object shape itself.
 6. Host URI requests/cancellations (`host_uri_request`, `host_uri_cancel`)
 7. Extension errors (`{ type: "extension_error", extensionPath, event, error }`)
 8. Available-commands updates (`{ type: "available_commands_update", commands }`), emitted at startup and whenever command metadata changes
-9. Prompt lifecycle hints for accepted prompts that later resolve locally (`{ type: "prompt_result", id?, agentInvoked }`) or fail (`{ type: "prompt_result", id?, error }`)
+9. Prompt lifecycle hints (`{ type: "prompt_result", id?, agentInvoked }`) for scheduled prompts that later resolve without invoking the agent
 10. Subagent frames (`subagent_lifecycle`, `subagent_progress`, `subagent_event`), gated by `set_subagent_subscription`
 11. Builtin slash-command side channels (`command_output`, `session_info_update`, `config_update`)
-
-12. Managed durable session-entry notifications (`session_entry`), gated by `OMP_APP_RPC_SESSION_ENTRIES=1`
 
 ### Inbound frame categories (stdin)
 
@@ -57,29 +88,6 @@ There is no envelope beyond the object shape itself.
 2. `RpcExtensionUIResponse` (`{ type: "extension_ui_response", ... }`)
 3. Host tool updates/results (`host_tool_update`, `host_tool_result`)
 4. Host URI results (`host_uri_result`)
-
-### Managed durable session-entry notifications
-
-The local appserver opts its managed RPC children into durable-entry notifications with `OMP_APP_RPC_SESSION_ENTRIES=1`. Standard RPC mode does not emit these additive frames. When enabled, each exact durable append is emitted once on stdout:
-
-```json
-{
-  "type": "session_entry",
-  "entry": {
-    "type": "message",
-    "id": "entry-id",
-    "parentId": "parent-entry-id",
-    "timestamp": "2026-07-11T12:00:00.000Z",
-    "message": { "role": "user", "content": "..." }
-  }
-}
-```
-
-`entry` is the typed `SessionEntry` object, including its exact `id`, `parentId`, and `timestamp`. The JSONL session transcript remains the durable authority for replay and recovery. `session_entry` is a live notification only, not a replacement for reading JSONL.
-
-The appserver also sets `OMP_APP_RPC_INLINE_IMAGE_DATA=omit`. In that internal transport only, image-block payloads and standalone image data URLs are omitted recursively from stdout frames and the frame receives `inlineImageDataOmitted: true`. Valid transcript images carry an `appImageSha256` digest so the appserver can resolve the persisted blob without copying base64 through the control channel. The managed transport projects other oversized or structurally unsafe fields to app-wire limits as well. It never resizes, rewrites, or removes the image persisted in the session or sent to the model.
-
-This frame is additive: older RPC consumers may ignore unknown outbound `type` values and continue handling existing responses/events unchanged.
 
 ## Request/Response Correlation
 
@@ -91,14 +99,14 @@ All commands accept optional `id?: string`.
 Important edge behavior from runtime:
 
 - Unknown command responses are emitted with `id: undefined` (even if the request had an `id`).
-- Parse/handler exceptions in the input loop emit `command: "parse"` with `id: undefined`.
-- Every command emits at most one `response` for its id. A `prompt` or `abort_and_prompt` failure before acceptance uses that response. After a success acknowledgement, an asynchronous failure is emitted as `prompt_result` with the original id and an `error` string, never as a second response.
+- Malformed JSON and synchronous dispatch failures emit `command: "parse"` with `id: undefined`. Exceptions while handling a recognized command emit a failure with that command's `type` and `id`.
+- `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails.
 - `prompt` success responses may include `data.agentInvoked`. `false` means the prompt completed locally without an agent turn; `true` means the prompt produced agent lifecycle events; omitted means the host must rely on session events for completion.
-- `abort_and_prompt` does not emit `data.agentInvoked`; hosts should treat it as the legacy abort-then-schedule path and rely on session events or a `prompt_result` error.
+- `abort_and_prompt` does not currently emit `data.agentInvoked` or `prompt_result`; hosts should treat it as the legacy abort-then-schedule path and rely on session events or same-id scheduling errors.
 
 ## Command Schema (canonical)
 
-`RpcCommand` is defined in `src/modes/rpc/rpc-types.ts`:
+`RpcCommand` is defined in `packages/coding-agent/src/modes/rpc/rpc-types.ts`:
 
 ### Prompting
 
@@ -109,29 +117,21 @@ Important edge behavior from runtime:
 - `{ id?, type: "abort_and_prompt", message: string, images?: ImageContent[] }`
 - `{ id?, type: "new_session", parentSession?: string }`
 
+### Protocol
+
+- `{ id?, type: "negotiate_protocol", protocolVersion: 2 }`
+
 ### State
 
 - `{ id?, type: "get_state" }`
+- `{ id?, type: "set_fast_mode", enabled: boolean }`
 - `{ id?, type: "get_available_commands" }`
 - `{ id?, type: "set_todos", phases: TodoPhase[] }`
 - `{ id?, type: "set_host_tools", tools: RpcHostToolDefinition[] }`
 - `{ id?, type: "set_host_uri_schemes", schemes: RpcHostUriSchemeDefinition[] }`
 - `{ id?, type: "set_subagent_subscription", level: "off" | "progress" | "events" }`
 - `{ id?, type: "get_subagents" }`
-- `{ id?, type: "get_subagent_messages", subagentId?: string, sessionFile?: string, fromByte?: number, maxBytes?: number, includeMessages?: boolean }`
-
-Subagent transcript reads use byte cursors. `maxBytes` must be an integer from 1
-through 393,216 and defaults to 393,216. A response contains complete JSONL
-records only, with at most 256 physical records per call. It can stop earlier
-to keep the RPC response inside the app-wire structural limits. Continue from
-`nextByte` until it no longer advances.
-
-`includeMessages` defaults to `true` for compatibility. Set it to `false` when
-the `entries` array is sufficient; this avoids returning the same message data
-twice. An incomplete final JSONL record does not advance `nextByte`. If the file
-was truncated or `fromByte` is not on a record boundary, the response sets
-`reset: true` and restarts at byte zero. A single record that exceeds the byte
-or structural limit returns an error instead of skipping data.
+- `{ id?, type: "get_subagent_messages", subagentId?: string, sessionFile?: string, fromByte?: number }`
 
 ### Model
 
@@ -186,6 +186,11 @@ correlate it via `id`. Ordering across concurrent commands is not guaranteed
 ### Messages
 
 - `{ id?, type: "get_messages" }`
+- `{ id?, type: "get_messages_page", cursor?: string, limit?: number }`
+
+`get_messages_page` returns a stable chronological page with `messages`, `totalMessages`, and an opaque `nextCursor` when more messages remain. Cursors are bound to the session ID, durable leaf, and message count. The server rejects stale cursors if the session changes between requests, and refuses to start a paging walk while the session is streaming or compacting. Failed page requests carry a machine-readable `code` on the error response — `session_busy` (session is streaming or compacting) or `stale_cursor` (the snapshot behind the cursor changed, e.g. a background bash appended a message between pages) — so clients can react without matching error-message text. Pages contain at most 256 messages and normally stay below the v1 physical-frame ceiling. A v1 caller can page ordinary histories, but an individual message whose response exceeds that ceiling produces an overflow error; retrieving it losslessly requires negotiated v2 framing.
+
+The bundled TypeScript `RpcClient.getMessages()` and Python `RpcClient.get_messages()` drain this paged endpoint automatically after negotiating v2. They retain the legacy monolithic command when connected to a v1 server, and on either `session_busy` or `stale_cursor` they discard partial pages and fall back to the legacy best-effort snapshot. Direct `getMessagesPage()` and `get_messages_page()` calls remain strict so incremental hosts never mix snapshots silently.
 
 ### Login
 
@@ -197,7 +202,7 @@ correlate it via `id`. Ordering across concurrent commands is not guaranteed
 All command results use `RpcResponse`:
 
 - Success: `{ id?, type: "response", command: <command>, success: true, data?: ... }`
-- Failure: `{ id?, type: "response", command: string, success: false, error: string }`
+- Failure: `{ id?, type: "response", command: string, success: false, error: string, code?: string }`
 
 Data payloads are command-specific and defined in `rpc-types.ts`.
 
@@ -223,17 +228,22 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 { "type": "prompt_result", "id": "req_1", "agentInvoked": false }
 ```
 
-If that accepted prompt later rejects, the same asynchronous channel carries the failure. It is not a second command response:
-
-```json
-{ "type": "prompt_result", "id": "req_1", "error": "No API key found for provider" }
-```
-
-Hosts that track prompt lifecycles must assign a unique `id` to each prompt and settle only the unresolved lifecycle whose ID exactly matches `prompt_result.id`. A missing, unmatched, or stale ID may still be shown as non-terminal diagnostic output, but it must not settle another prompt or close its active turn.
-
 Local-only slash commands may emit `command_output` frames before completing via `data.agentInvoked: false` or a later `prompt_result`. They do not emit `agent_end`.
 
 ### `get_state` payload
+
+`tokensPerSecond` is a number when output throughput is available and `null`
+otherwise. `fastModeEnabled` reports the session setting, while
+`fastModeActive` reports the actual computed active state. For Fireworks,
+`providers.fireworksTier: priority` is a provider-level setting independent of
+the `/fast` family setting, so `fastModeActive` may remain `true` for an
+unsupported Fireworks model.
+
+For direct Anthropic, a provider rejection of `speed: "fast"` uses a sticky
+fallback scoped by the resolved endpoint and exact model: `fastModeEnabled` may
+remain `true` while `fastModeActive` is `false`. An explicit `set_fast_mode`
+enable expresses retry intent and clears that fallback so the provider attempt
+is re-armed.
 
 ```json
 {
@@ -247,6 +257,9 @@ Local-only slash commands may emit `command_output` frames before completing via
   "sessionFile": "...",
   "sessionId": "...",
   "sessionName": "...",
+  "fastModeEnabled": false,
+  "tokensPerSecond": null,
+  "fastModeActive": false,
   "autoCompactionEnabled": true,
   "messageCount": 0,
   "queuedMessageCount": 0,
@@ -276,6 +289,73 @@ Local-only slash commands may emit `command_output` frames before completing via
     "contextWindow": 200000,
     "percent": 0.55
   }
+}
+```
+
+### `set_fast_mode` payload
+
+`set_fast_mode` changes whether fast mode is enabled for the session. The
+request is:
+
+```json
+{ "id": "req_fast_on", "type": "set_fast_mode", "enabled": true }
+```
+
+On success, `data` always contains both `enabled` and `active`. These are the
+actual computed values: `enabled` reports the session setting, and `active`
+reports the resulting active state, including any provider-level Fireworks
+priority setting:
+
+For direct Anthropic, an explicit enable also re-arms a provider attempt after
+the sticky rejection fallback, even when fast mode was already enabled.
+
+```json
+{
+  "id": "req_fast_on",
+  "type": "response",
+  "command": "set_fast_mode",
+  "success": true,
+  "data": { "enabled": true, "active": true }
+}
+```
+
+Enabling fast mode on a model without a service-tier family fails with the
+exact error below:
+
+```json
+{
+  "id": "req_fast_on",
+  "type": "response",
+  "command": "set_fast_mode",
+  "success": false,
+  "error": "Fast mode is unavailable for the current model."
+}
+```
+
+Disabling fast mode is idempotent, including on an unsupported model. It
+succeeds as an off/no-op result, but disabling `/fast` does not override
+provider-level settings, so a successful disable does not guarantee
+`active: false`. For example, with an unsupported
+`fireworks/deepseek-v4-flash` model and `providers.fireworksTier: priority`,
+the response reports the session setting as disabled while the provider
+priority keeps the computed active state true:
+
+```json
+{
+  "id": "req_fast_off",
+  "type": "response",
+  "command": "set_fast_mode",
+  "success": true,
+  "data": { "enabled": false, "active": true }
+}
+```
+
+The corresponding `get_state` result reports the same computed state:
+
+```json
+{
+  "fastModeEnabled": false,
+  "fastModeActive": true
 }
 ```
 
@@ -348,6 +428,11 @@ The response payload is:
 These tools are added to the active session tool registry before the next model
 call. Re-sending `set_host_tools` replaces the previous host-owned set.
 
+Definitions also accept `hidden?: boolean` and
+`loadMode?: "essential" | "discoverable"`. An explicit mode wins. When omitted,
+known essential built-in names remain `"essential"`; other host tools default
+to `"discoverable"`. `toolNames` in the response lists the registered names.
+
 ### `set_host_uri_schemes` payload
 
 Replaces the current set of host-owned URL schemes the RPC server should
@@ -380,6 +465,9 @@ Schemes are case-insensitive on the wire and normalized to lowercase before
 the response is sent. Re-sending `set_host_uri_schemes` replaces the entire
 previous set — schemes missing from the new list are unregistered.
 
+`security://` is reserved for OMP's producer-neutral software-security resource
+store. RPC hosts cannot register or shadow that scheme.
+
 ## Event Stream Schema
 
 RPC mode forwards `AgentSessionEvent` objects from `AgentSession.subscribe(...)`.
@@ -392,9 +480,11 @@ Common event types:
 - `tool_execution_start`, `tool_execution_update`, `tool_execution_end`
 - `auto_compaction_start`, `auto_compaction_end`
 - `auto_retry_start`, `auto_retry_end`
+- `retry_fallback_applied`, `retry_fallback_succeeded`
+- `model_changed`, `thinking_level_changed`
 - `ttsr_triggered`
-- `todo_reminder`
-- `todo_auto_clear`
+- `todo_reminder`, `todo_auto_clear`
+- `irc_message`, `notice`, `goal_updated`
 
 Extension runner errors are emitted separately as:
 
@@ -409,21 +499,42 @@ Extension runner errors are emitted separately as:
 
 `message_update` includes streaming deltas in `assistantMessageEvent` (text/thinking/toolcall deltas).
 
-`agent_end` aggregates remain below the host's 1 MiB line ceiling and satisfy
-the app-wire bounded-JSON structural limits for depth, collection size, and
-total nodes. When an aggregate would exceed any of those limits,
-`messages` contains the newest contiguous suffix that fits and the event adds
-the original `messageCount` plus a terminal `status` of `completed`, `failed`,
-or `cancelled`. Managed appserver children additionally project every stdout
-frame to those transport limits. When `OMP_APP_RPC_SESSION_ENTRIES=1`, durable
-messages arrive individually as `session_entry` frames before the terminal
-event.
+`agent_end` has this session-level shape (in addition to optional telemetry fields):
 
-When an appserver RPC child crashes, the session is projected as `closed` with
-`liveState.runtimeCrashed: true` while that child is being reaped. Only after it
-exits does the projection become restartable `idle`; the next prompt can then
-spawn a fresh child, and successful activity clears the crash marker. An
-explicit `session.close` remains `closed` and does not become restartable.
+```ts
+{
+  type: "agent_end";
+  messages: AgentMessage[];
+  isTerminal?: boolean;
+}
+```
+
+`isTerminal: false` means maintenance or async delivery has scheduled more work,
+so the session will resume before its true final settle. Treat an `agent_end` as
+run completion only when `isTerminal !== false`; the field is optional so frames
+from older runtimes, where it is absent, remain terminal-compatible.
+
+### Available commands
+
+`get_available_commands` returns `{ commands }`, and the same array is pushed
+in `available_commands_update` frames at startup and after command metadata
+changes. Each command has `name`, `source`, and optional `aliases`,
+`description`, `input.hint`, and `subcommands`.
+
+### Subagent subscriptions
+
+Subagent forwarding defaults to `"off"`. `set_subagent_subscription` selects:
+
+- `"off"`: no forwarded subagent frames
+- `"progress"`: lifecycle and progress frames
+- `"events"`: lifecycle, progress, and full subagent event frames
+
+`get_subagents` returns the registry snapshot sorted by subagent index and id.
+`get_subagent_messages` selects a transcript by `subagentId` or `sessionFile`;
+`fromByte` supports incremental reads. Its result contains `sessionFile`,
+`fromByte`, `nextByte`, `reset`, raw transcript `entries`, and converted
+`messages`. If `fromByte` exceeds the current file size, reading restarts at
+byte zero and reports `reset: true`.
 
 ## Prompt/Queue Concurrency and Ordering
 
@@ -431,7 +542,7 @@ This is the most important operational behavior.
 
 ### Immediate ack vs completion
 
-`prompt` and `abort_and_prompt` acknowledge accepted work without waiting for run completion. A failure before acceptance uses the command's single failure response. A successful acknowledgement has this shape:
+`prompt` and `abort_and_prompt` are **acknowledged immediately**:
 
 ```json
 { "id": "req_1", "type": "response", "command": "prompt", "success": true }
@@ -440,10 +551,8 @@ This is the most important operational behavior.
 That means:
 
 - command acceptance != run completion
-- `turn_end` closes one agent-loop iteration and may be followed by another `turn_start`; it is not prompt completion or an idle boundary
-- agent-backed prompts complete via the final `agent_end`
+- agent turns complete only on `agent_end` frames where `isTerminal !== false`
 - local-only prompts complete via `data.agentInvoked: false` on the response or via a later `prompt_result`
-- late prompt failures complete via `prompt_result.error`, never a second `response` with the settled command id
 
 ### While streaming
 
@@ -645,6 +754,10 @@ a message or fall back to `content` for textual error surfacing:
 - Schemes are global to the process; `set_host_uri_schemes` replaces the
   previous set, unregistering anything not in the new list.
 - Schemes are normalized to lowercase before registration.
+- Successful reads require `content`. `contentType` defaults to `text/plain`
+  and, when supplied, is `"text/plain"`, `"text/markdown"`, or
+  `"application/json"`. A result-level `immutable` overrides the registered
+  scheme's value for that read.
 
 ## Error Model and Recoverability
 
@@ -686,7 +799,7 @@ stdout sequence (typical):
 { "id": "req_1", "type": "response", "command": "prompt", "success": true }
 { "type": "agent_start" }
 { "type": "message_update", "assistantMessageEvent": { "type": "text_delta", "delta": "..." }, "message": { "role": "assistant", "content": [] } }
-{ "type": "agent_end", "messages": [] }
+{ "type": "agent_end", "messages": [], "isTerminal": true }
 ```
 
 ### 2) Prompt during streaming with explicit queue policy
@@ -732,9 +845,11 @@ stdin:
 { "type": "extension_ui_response", "id": "ui_7", "value": "feature/rpc-host" }
 ```
 
-## Notes on `RpcClient` helper
+## Client libraries
 
-`src/modes/rpc/rpc-client.ts` is a convenience wrapper, not the protocol definition.
+### TypeScript helper
+
+`packages/coding-agent/src/modes/rpc/rpc-client.ts` is a convenience wrapper, not the protocol definition.
 
 Current helper characteristics:
 
@@ -744,4 +859,17 @@ Current helper characteristics:
 - Supports host-owned custom tools via `setCustomTools()` and automatic handling of `host_tool_call` / `host_tool_cancel`
 - Wraps common protocol commands including OAuth `getLoginProviders()` / `login(...)`; use raw protocol frames for any surface not wrapped by the helper.
 
-Use raw protocol frames if you need complete surface coverage.
+### Python package
+
+The bundled [`omp-rpc`](../python/omp-rpc/pyproject.toml) distribution provides the process-backed Python client. Its import package is `omp_rpc`; the package API, typed commands and events, host-tool/host-URI helpers, and orchestration examples are maintained in the [`omp-rpc` README](../python/omp-rpc/README.md).
+
+```python
+from omp_rpc import RpcClient
+
+with RpcClient(provider="anthropic", model="claude-sonnet-4-5") as client:
+    state = client.get_state()
+    turn = client.prompt_and_wait("Reply with just the word hello")
+    print(turn.require_assistant_text())
+```
+
+By default, `RpcClient` starts `omp --mode rpc`; pass `command=[...]` to own the exact child command. It handles request correlation, typed notifications, v2 negotiation and chunk reassembly, message pagination, extension UI, and host-owned tools and URI schemes. The Python package owns that client API and process lifecycle; this document and `rpc-types.ts` remain the canonical wire contract. Use raw protocol frames when a client library does not wrap the surface you need.

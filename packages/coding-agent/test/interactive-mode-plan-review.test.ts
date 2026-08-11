@@ -10,9 +10,13 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
 import type { HookSelectorSlider } from "@oh-my-pi/pi-coding-agent/modes/components/hook-selector";
-import { PlanReviewOverlay } from "@oh-my-pi/pi-coding-agent/modes/components/plan-review-overlay";
+import {
+	type PlanReviewAnnotationState,
+	PlanReviewOverlay,
+} from "@oh-my-pi/pi-coding-agent/modes/components/plan-review-overlay";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SILENT_ABORT_MARKER, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -236,6 +240,127 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(review.mock.calls[1]?.[0]).not.toContain("First plan");
 	});
 
+	it("restores dismissed annotations only when reopening the same plan", async () => {
+		const firstPlanFilePath = "local://first-plan.md";
+		const secondPlanFilePath = "local://second-plan.md";
+		const localOptions = {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		};
+		await Bun.write(resolveLocalUrlToPath(firstPlanFilePath, localOptions), "# First plan\n\nbody");
+		await Bun.write(resolveLocalUrlToPath(secondPlanFilePath, localOptions), "# Second plan\n\nbody");
+
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = firstPlanFilePath;
+		const annotationState: PlanReviewAnnotationState = {
+			annotations: [
+				{
+					section: { index: 0, title: "First plan" },
+					target: { kind: "line", row: 2, context: "body" },
+					note: "Add the rollback path.",
+				},
+			],
+		};
+		const restoredStates: Array<PlanReviewAnnotationState | undefined> = [];
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, _options, dialogOptions) => {
+			restoredStates.push(dialogOptions?.annotationState);
+			if (restoredStates.length === 1) dialogOptions?.onAnnotationStateChange?.(annotationState);
+			return undefined;
+		});
+
+		await mode.handlePlanApproval({ planFilePath: firstPlanFilePath, planExists: true, title: "FIRST" });
+		await mode.handlePlanApproval({ planFilePath: firstPlanFilePath, planExists: true, title: "FIRST" });
+		await mode.handlePlanApproval({ planFilePath: secondPlanFilePath, planExists: true, title: "SECOND" });
+
+		expect(restoredStates).toEqual([undefined, annotationState, undefined]);
+	});
+
+	it("consumes annotations after Refine dispatches their feedback", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nbody");
+
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		const annotationState: PlanReviewAnnotationState = {
+			annotations: [
+				{
+					section: { index: 0, title: "Plan" },
+					target: { kind: "line", row: 2, context: "body" },
+					note: "Clarify the rollback path.",
+				},
+			],
+		};
+		const feedback = "Refinement feedback on the plan:\n\n> Line: body\n- Clarify the rollback path.\n";
+		let reviewCount = 0;
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, _options, dialogOptions) => {
+			reviewCount++;
+			if (reviewCount === 1) {
+				dialogOptions?.onAnnotationStateChange?.(annotationState);
+				dialogOptions?.onFeedbackChange?.(feedback);
+				return "Refine plan";
+			}
+			expect(dialogOptions?.annotationState).toBeUndefined();
+			return undefined;
+		});
+		const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		expect(promptSpy).toHaveBeenCalledWith(feedback);
+	});
+
+	it("retains queued Refine annotations until the pending submission starts", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nbody");
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		const annotationState: PlanReviewAnnotationState = {
+			annotations: [
+				{
+					section: { index: 0, title: "Plan" },
+					target: { kind: "line", row: 2, context: "body" },
+					note: "Clarify the rollback path.",
+				},
+			],
+		};
+		const feedback = "Refinement feedback on the plan:\n\n> Line: body\n- Clarify the rollback path.\n";
+		const restoredStates: Array<PlanReviewAnnotationState | undefined> = [];
+		let reviewCount = 0;
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, _options, dialogOptions) => {
+			reviewCount++;
+			restoredStates.push(dialogOptions?.annotationState);
+			if (reviewCount === 1) dialogOptions?.onAnnotationStateChange?.(annotationState);
+			if (reviewCount <= 2) {
+				dialogOptions?.onFeedbackChange?.(feedback);
+				return "Refine plan";
+			}
+			return undefined;
+		});
+		const submissions: SubmittedUserInput[] = [];
+		mode.onInputCallback = input => submissions.push(input);
+		const promptSpy = vi.spyOn(session, "prompt");
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+		expect(mode.cancelPendingSubmission()).toBe(true);
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+		expect(mode.markPendingSubmissionStarted(submissions[1]!)).toBe(true);
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		expect(restoredStates).toEqual([undefined, annotationState, undefined]);
+		expect(promptSpy).not.toHaveBeenCalled();
+	});
+
 	it("re-prompts the model with annotation feedback when Refine is chosen", async () => {
 		const planFilePath = "local://PLAN.md";
 		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
@@ -267,6 +392,34 @@ describe("InteractiveMode plan review rendering", () => {
 
 		expect(startSpy).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining("needs detail") }));
 		expect(onInput).toHaveBeenCalledTimes(1);
+	});
+
+	it("promotes the reviewed plan path into plan-mode state before refining", async () => {
+		const resolve = (url: string) =>
+			resolveLocalUrlToPath(url, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			});
+		const oldPlanPath = "local://old-plan.md";
+		const newPlanPath = "local://new-draft-plan.md";
+		await Bun.write(resolve(oldPlanPath), "# Old\n\nold body");
+		await Bun.write(resolve(newPlanPath), "# New\n\nnew body");
+
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = oldPlanPath;
+		// State still points at the previously reviewed (older) plan.
+		session.setPlanModeState({ enabled: true, planFilePath: oldPlanPath, workflow: "parallel", reentry: true });
+
+		const feedback = "Refinement feedback:\n- add more detail\n";
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, _options, dialogOptions) => {
+			dialogOptions?.onFeedbackChange?.(feedback);
+			return "Refine plan";
+		});
+		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+		await mode.handlePlanApproval({ planFilePath: newPlanPath, planExists: true, title: "NEW" });
+
+		expect(session.getPlanModeState()?.planFilePath).toBe(newPlanPath);
 	});
 
 	it("opens the annotation external editor from the real plan review overlay", async () => {
@@ -352,6 +505,20 @@ describe("InteractiveMode plan review rendering", () => {
 
 		expect(capturedOptions).toMatchObject({ fullscreen: true, mouseTracking: false });
 		capturedOverlay?.handleInput("\x1b");
+		await expect(choice).resolves.toBeUndefined();
+	});
+
+	it("dismisses Plan Review and restores input when a provider error is pinned", async () => {
+		mode.ui.setFocus(mode.editor);
+		const choice = mode.showPlanReview("# Plan\n\nReady for approval.", "Plan mode - next step", ["Approve"]);
+
+		expect(mode.ui.hasOverlay()).toBe(true);
+
+		mode.showPinnedError("Codex rate limit reached");
+
+		expect(mode.ui.hasOverlay()).toBe(false);
+		expect(mode.ui.getFocused()).toBe(mode.editor);
+		expect(mode.errorBannerContainer.render(80).join("\n")).toContain("Codex rate limit reached");
 		await expect(choice).resolves.toBeUndefined();
 	});
 
@@ -1555,6 +1722,47 @@ describe("InteractiveMode plan review rendering", () => {
 		// with the plan in its first turn.
 		expect(markSentSpy).not.toHaveBeenCalled();
 		// And — the contract — the plan-approved synthetic prompt was NOT dispatched.
+		expect(promptSpy.mock.calls.some(isPlanApprovedCall)).toBe(false);
+	});
+
+	it("Approve and compact context retains annotations when compaction cancels before dispatch", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nCancel mid-compact.");
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		const annotationState: PlanReviewAnnotationState = {
+			annotations: [
+				{
+					section: { index: 0, title: "Plan" },
+					target: { kind: "line", row: 2, context: "Cancel mid-compact." },
+					note: "Keep the rollback path.",
+				},
+			],
+		};
+		const restoredStates: Array<PlanReviewAnnotationState | undefined> = [];
+		let reviewCount = 0;
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, _options, dialogOptions) => {
+			reviewCount++;
+			restoredStates.push(dialogOptions?.annotationState);
+			if (reviewCount === 1) {
+				dialogOptions?.onAnnotationStateChange?.(annotationState);
+				return "Approve and compact context";
+			}
+			return undefined;
+		});
+		vi.spyOn(mode, "handleCompactCommand").mockResolvedValue("cancelled");
+		const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		expect(restoredStates).toEqual([undefined, annotationState]);
 		expect(promptSpy.mock.calls.some(isPlanApprovedCall)).toBe(false);
 	});
 

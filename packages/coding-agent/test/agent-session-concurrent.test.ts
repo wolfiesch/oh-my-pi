@@ -7,6 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
+import { type } from "@oh-my-pi/omptype";
 import { Agent, AgentBusyError, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Message, ToolCall } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -27,7 +28,6 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import * as piNatives from "@oh-my-pi/pi-natives";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 // Mock stream that mimics AssistantMessageEventStream
@@ -348,6 +348,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			convertToLlm,
 		});
 		const stopEvents: Array<{
+			messages: AgentMessage[];
 			stop_hook_active: boolean;
 			session_id: string;
 			turn_id: number;
@@ -403,6 +404,14 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(stopEvents.map(event => event.turn_id)).toEqual([0, 0]);
 		expect(stopEvents[0]?.session_id).toBe(session.sessionId);
 		expect(stopEvents[0]?.last_assistant_message?.role).toBe("assistant");
+		expect(
+			stopEvents[1]?.messages.some(
+				message =>
+					message.role === "user" &&
+					Array.isArray(message.content) &&
+					message.content.some(block => block.type === "text" && block.text === "First message"),
+			),
+		).toBe(true);
 	});
 
 	it("uses non-empty session_stop reason when additional context is empty", async () => {
@@ -457,7 +466,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		).toBe(true);
 	});
 
-	it("does not continue session_stop feedback after aborting a slow hook", async () => {
+	it("does not emit session_stop when abort starts before the settle pass", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
 			handler: () => ({ content: ["Done"] }),
@@ -468,8 +477,9 @@ describe("AgentSession concurrent prompt guard", () => {
 			streamFn: mock.stream,
 			convertToLlm,
 		});
-		const stopHook = Promise.withResolvers<{ continue: true; additionalContext: string }>();
-		const emitSessionStop = vi.fn(() => (emitSessionStop.mock.calls.length === 1 ? stopHook.promise : undefined));
+		const settleGate = Promise.withResolvers<void>();
+		const settleReached = Promise.withResolvers<void>();
+		const emitSessionStop = vi.fn().mockResolvedValue(undefined);
 		const extensionRunner = {
 			emit: vi.fn().mockResolvedValue(undefined),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
@@ -484,16 +494,90 @@ describe("AgentSession concurrent prompt guard", () => {
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
 		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+		vi.spyOn(session.goalRuntime, "onAgentEnd").mockImplementation(() => {
+			settleReached.resolve();
+			return settleGate.promise;
+		});
 
 		const promptPromise = session.prompt("First message");
-		await waitFor(() => emitSessionStop.mock.calls.length === 1);
+		await settleReached.promise;
 		const abortPromise = session.abort();
+		settleGate.resolve();
+
+		await abortPromise;
+		await promptPromise;
+		await session.waitForIdle();
+
+		expect(emitSessionStop).not.toHaveBeenCalled();
+	});
+
+	it("cancels an active session_stop pass without applying stale continuation feedback", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({
+			handler: () => ({ content: ["Done"] }),
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		const stopStarted = Promise.withResolvers<void>();
+		const stopHook = Promise.withResolvers<{ continue: true; additionalContext: string }>();
+		let firstStopSignal: AbortSignal | undefined;
+		let stopCount = 0;
+		const extensionRuntime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("session_stop", event => {
+					stopCount++;
+					if (stopCount !== 1) return;
+					firstStopSignal = event.signal;
+					stopStarted.resolve();
+					return stopHook.promise;
+				});
+			},
+			tempDir,
+			new EventBus(),
+			extensionRuntime,
+			"slow-session-stop",
+		);
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const extensionRunner = new ExtensionRunner(
+			[extension],
+			extensionRuntime,
+			tempDir,
+			sessionManager,
+			modelRegistry,
+		);
+		const extensionErrors: string[] = [];
+		extensionRunner.onError(error => extensionErrors.push(error.error));
+
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+
+		const promptPromise = session.prompt("First message");
+		await stopStarted.promise;
+		let abortSettled = false;
+		const abortPromise = session.abort().then(() => {
+			abortSettled = true;
+		});
+		await scheduler.yield();
+		const abortSettledBeforeHandler = abortSettled;
+		const signalWasCancelled = firstStopSignal?.aborted;
 		stopHook.resolve({ continue: true, additionalContext: "Should not run after abort." });
 
 		await abortPromise;
 		await promptPromise;
 		await session.waitForIdle();
 
+		expect(abortSettledBeforeHandler).toBe(true);
+		expect(signalWasCancelled).toBe(true);
+		expect(extensionErrors).toEqual([]);
 		expect(mock.calls).toHaveLength(1);
 		expect(session.queuedMessageCount).toBe(0);
 
@@ -825,6 +909,43 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(reentrantPromptResults).toEqual(["resolved"]);
 	});
 
+	it("does not let extension notifications block public agent_end", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+		});
+		const { promise: extensionGate, resolve: releaseExtension } = Promise.withResolvers<void>();
+		const extensionRunner = {
+			emit: vi.fn((event: { type: string }) =>
+				event.type === "agent_end" ? extensionGate : Promise.resolve(undefined),
+			),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			hasHandlers: vi.fn().mockReturnValue(false),
+		} as unknown as ExtensionRunner;
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+
+		const { promise: publicAgentEnd, resolve: onPublicAgentEnd } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "agent_end") onPublicAgentEnd();
+		});
+
+		await session.prompt("First message");
+		await publicAgentEnd;
+		expect(extensionRunner.emit).toHaveBeenCalledWith({ type: "agent_end", messages: expect.any(Array) });
+
+		releaseExtension();
+		await session.waitForIdle();
+	});
+
 	it("queues idle ACP client-triggered custom messages instead of starting an ownerless turn", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
@@ -918,19 +1039,6 @@ describe("AgentSession concurrent prompt guard", () => {
 		const asyncJobManager = new AsyncJobManager({
 			maxRunningJobs: 2,
 			retentionMs: 1_000,
-			onJobComplete: async () => {
-				deliveryStarted = true;
-				await deliveryGate.promise;
-				await session.sendCustomMessage(
-					{
-						customType: "async-result",
-						content: "Background result",
-						display: true,
-						attribution: "agent",
-					},
-					{ deliverAs: "followUp", triggerTurn: true },
-				);
-			},
 		});
 		AsyncJobManager.setInstance(asyncJobManager);
 
@@ -945,6 +1053,21 @@ describe("AgentSession concurrent prompt guard", () => {
 		session.setClientBridge({
 			capabilities: {},
 			deferAgentInitiatedTurns: true,
+		});
+		// Override the session's self-registered sink: the test gates delivery
+		// and reproduces the ACP follow-up injection explicitly.
+		asyncJobManager.registerDeliverySink(ownerId, async () => {
+			deliveryStarted = true;
+			await deliveryGate.promise;
+			await session.sendCustomMessage(
+				{
+					customType: "async-result",
+					content: "Background result",
+					display: true,
+					attribution: "agent",
+				},
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
 		});
 
 		await session.prompt("First message");
@@ -995,13 +1118,6 @@ describe("AgentSession concurrent prompt guard", () => {
 		const asyncJobManager = new AsyncJobManager({
 			maxRunningJobs: 3,
 			retentionMs: 1_000,
-			onJobComplete: async jobId => {
-				started.add(jobId);
-				if (jobId === "job-a") {
-					await deliveryGate.promise;
-				}
-				delivered.push(jobId);
-			},
 		});
 		AsyncJobManager.setInstance(asyncJobManager);
 
@@ -1030,6 +1146,19 @@ describe("AgentSession concurrent prompt guard", () => {
 			modelRegistry,
 			agentId: "acp-session-a",
 			ownedAsyncJobManager: asyncJobManager,
+		});
+		// Override both sessions' self-registered sinks so the test controls
+		// delivery timing and records routing order.
+		asyncJobManager.registerDeliverySink("acp-session-a", async jobId => {
+			started.add(jobId);
+			if (jobId === "job-a") {
+				await deliveryGate.promise;
+			}
+			delivered.push(jobId);
+		});
+		asyncJobManager.registerDeliverySink("acp-session-b", async jobId => {
+			started.add(jobId);
+			delivered.push(jobId);
 		});
 
 		try {
@@ -2197,12 +2326,28 @@ describe("AgentSession TTSR resume gate", () => {
 		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-promo.db"));
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("openai-codex", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		// The bundled catalog has no codex model whose promotion target carries a
+		// strictly larger window (gpt-5.5's bundled target gpt-5.4 is same-window),
+		// so pin gpt-5.5 (272k) -> gpt-5.6-sol (372k) via modelOverrides.
+		const modelsConfigPath = path.join(tempDir, "models-promo.json");
+		await Bun.write(
+			modelsConfigPath,
+			JSON.stringify({
+				providers: {
+					"openai-codex": {
+						modelOverrides: {
+							"gpt-5.5": { contextPromotionTarget: "openai-codex/gpt-5.6-sol" },
+						},
+					},
+				},
+			}),
+		);
+		const modelRegistry = new ModelRegistry(authStorage, modelsConfigPath);
 
-		const sparkModel = modelRegistry.find("openai-codex", "gpt-5.3-codex-spark");
-		const codexModel = modelRegistry.find("openai-codex", "gpt-5.5");
-		if (!sparkModel || !codexModel) {
-			throw new Error("Expected codex spark and codex models to exist");
+		const smallModel = modelRegistry.find("openai-codex", "gpt-5.5");
+		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-sol");
+		if (!smallModel || !largeModel) {
+			throw new Error("Expected small and large codex models to exist");
 		}
 
 		let streamCallCount = 0;
@@ -2211,9 +2356,9 @@ describe("AgentSession TTSR resume gate", () => {
 		const makeOverflowMessage = (): AssistantMessage => ({
 			role: "assistant",
 			content: [{ type: "text", text: "" }],
-			api: sparkModel.api,
-			provider: sparkModel.provider,
-			model: sparkModel.id,
+			api: smallModel.api,
+			provider: smallModel.provider,
+			model: smallModel.id,
 			usage: {
 				input: 0,
 				output: 0,
@@ -2230,9 +2375,9 @@ describe("AgentSession TTSR resume gate", () => {
 		const makeSuccessMessage = (): AssistantMessage => ({
 			role: "assistant",
 			content: [{ type: "text", text: "Recovered after promotion" }],
-			api: codexModel.api,
-			provider: codexModel.provider,
-			model: codexModel.id,
+			api: largeModel.api,
+			provider: largeModel.provider,
+			model: largeModel.id,
 			usage: {
 				input: 0,
 				output: 0,
@@ -2247,7 +2392,7 @@ describe("AgentSession TTSR resume gate", () => {
 
 		const agent = new Agent({
 			getApiKey: () => "test-key",
-			initialState: { model: sparkModel, systemPrompt: ["Test"], tools: [] },
+			initialState: { model: smallModel, systemPrompt: ["Test"], tools: [] },
 			streamFn: () => {
 				streamCallCount++;
 				const stream = new AssistantMessageEventStream();
@@ -2288,7 +2433,7 @@ describe("AgentSession TTSR resume gate", () => {
 
 		expect(continuationCompleted).toBe(true);
 		expect(streamCallCount).toBeGreaterThanOrEqual(2);
-		expect(session.model?.id).toBe(codexModel.id);
+		expect(session.model?.id).toBe(largeModel.id);
 		expect(session.isStreaming).toBe(false);
 		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
 	});

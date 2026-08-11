@@ -9,6 +9,7 @@ const packageDir = path.join(import.meta.dir, "..");
 const outDir = path.join(packageDir, "dist");
 const cliPath = path.join(outDir, "cli.js");
 const shebang = "#!/usr/bin/env bun\n";
+const legacyHtmlExportAssetPattern = /^(?:template-[^.]+\.(?:css|html|js)|tool-views\.generated-[^.]+\.js)$/;
 
 // Native / optional / platform-specific deps are loaded from installed files.
 // `omp-legacy-pi-modules` exists only in compiled binaries via the build plugin;
@@ -29,17 +30,7 @@ const ALWAYS_EXTERNAL = [
 // import would load the unpatched npm package in users' installs (currently
 // @ark/schema is patched, so it — and arktype, which pulls @ark/schema — stay
 // bundled).
-const RUNTIME_EXTERNAL = [
-	"puppeteer-core",
-	"@puppeteer/browsers",
-	"@babel/parser",
-	"@xterm/headless",
-	"turndown",
-	"turndown-plugin-gfm",
-	"@mozilla/readability",
-	"linkedom",
-	"@agentclientprotocol/sdk",
-];
+const RUNTIME_EXTERNAL = ["puppeteer-core", "@babel/parser"];
 
 async function runCommand(command: string[]): Promise<void> {
 	const proc = Bun.spawn(command, {
@@ -64,8 +55,8 @@ function formatBytes(bytes: number): string {
 }
 
 async function cleanBundleOutputs(): Promise<void> {
-	// dist/ is shared with the dev binary (dist/omp); only remove this
-	// script's own outputs (entry bundle + copied native assets).
+	// dist/ is shared with the dev binary (dist/omp); only remove assets
+	// emitted by this script.
 	let entries: string[];
 	try {
 		entries = await fs.readdir(outDir);
@@ -75,7 +66,14 @@ async function cleanBundleOutputs(): Promise<void> {
 	}
 	await Promise.all(
 		entries
-			.filter(entry => entry === "cli.js" || entry.endsWith(".node") || entry.endsWith(".js.map"))
+			.filter(
+				entry =>
+					entry === "cli.js" ||
+					entry.endsWith(".node") ||
+					entry.endsWith(".js.map") ||
+					(entry.startsWith("CHANGELOG-") && entry.endsWith(".md")) ||
+					legacyHtmlExportAssetPattern.test(entry),
+			)
 			.map(entry => fs.rm(path.join(outDir, entry), { force: true })),
 	);
 }

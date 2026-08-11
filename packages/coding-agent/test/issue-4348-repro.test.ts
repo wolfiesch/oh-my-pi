@@ -59,6 +59,7 @@ function makeRenderCtx(transcript: SessionContext): { ctx: InteractiveModeContex
 		pendingMessagesContainer: new Container(),
 		pendingBashComponents: [],
 		pendingPythonComponents: [],
+		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
 		statusLine: { invalidate: vi.fn() },
 		updateEditorBorderColor: vi.fn(),
@@ -73,6 +74,7 @@ function makeRenderCtx(transcript: SessionContext): { ctx: InteractiveModeContex
 		viewSession: {
 			buildTranscriptSessionContext: () => transcript,
 			getToolByName: () => undefined,
+			hasBuiltInTool: () => true,
 			extensionRunner: undefined,
 			sessionManager: {
 				getEntries: vi.fn(() => []),

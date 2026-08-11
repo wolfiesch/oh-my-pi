@@ -1,7 +1,7 @@
+import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, ToolExample } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 import { jsBackend, juliaBackend, pythonBackend, rubyBackend } from "../eval";
 import type { ExecutorBackend, ExecutorBackendResult } from "../eval/backend";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../eval/bridge-timeout";
@@ -215,10 +215,6 @@ function detailsNotice(cells: ResolvedEvalCell[]): string | undefined {
 		...new Set(cells.map(cell => cell.resolved.notice).filter((notice): notice is string => Boolean(notice))),
 	];
 	return notices.length > 0 ? notices.join(" ") : undefined;
-}
-
-function timeoutSecondsFromMs(timeoutMs: number): number {
-	return clampTimeout("eval", timeoutMs / 1000);
 }
 
 async function resolveBackend(session: ToolSession, language: EvalLanguage): Promise<ResolvedBackend> {
@@ -538,7 +534,10 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					// ordinary tool calls all count against the budget. The watchdog drives
 					// `combinedSignal`; we pass no wall-clock deadline downstream so the
 					// backends never arm a competing fixed timer.
-					const idleTimeoutMs = cell.timeoutMs === 0 ? undefined : timeoutSecondsFromMs(cell.timeoutMs) * 1000;
+					const idleTimeoutMs =
+						cell.timeoutMs === 0
+							? undefined
+							: clampTimeout("eval", cell.timeoutMs / 1000, session.settings.get("tools.maxTimeout")) * 1000;
 					const idle = idleTimeoutMs === undefined ? undefined : new IdleTimeout(idleTimeoutMs);
 					const combinedSignal =
 						signal && idle

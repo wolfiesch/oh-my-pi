@@ -5,7 +5,9 @@ import {
 	PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS,
 	runPrintMode,
 } from "@oh-my-pi/pi-coding-agent/modes/print-mode";
+import type { PlanModeState } from "@oh-my-pi/pi-coding-agent/plan-mode/state";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { type PlanProposalHandler, PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-coding-agent/tools/resolve";
 
 function makeAssistantMessage(text: string): AssistantMessage {
 	const timestamp = Date.now();
@@ -33,23 +35,87 @@ interface DelayedSession {
 	session: AgentSession;
 	promptStarted: Promise<void>;
 	resolvePrompt: () => void;
+	getPlanModeAtPrompt: () => PlanModeState | undefined;
+	getTextOutputCommitted: () => boolean;
+	getModeChanges: () => Array<{ mode: string; data?: Record<string, unknown> }>;
+	getPlanProposalHandler: () => PlanProposalHandler | undefined;
+	getCurrentPlanMode: () => PlanModeState | undefined;
+	emit: (event: AgentSessionEvent) => void;
+	getAbortCalls: () => number;
 }
 
-function createDelayedSession(finalMessage: AssistantMessage): DelayedSession {
+function createDelayedSession(
+	finalMessage: AssistantMessage,
+	options: { defaultPlanMode?: boolean } = {},
+): DelayedSession {
 	const messages: AssistantMessage[] = [];
 	const { promise: promptStarted, resolve: markPromptStarted } = Promise.withResolvers<void>();
 	const { promise: promptReleased, resolve: resolvePrompt } = Promise.withResolvers<void>();
 	let advisorDrainPrepared = false;
+	let planModeState: PlanModeState | undefined;
+	let planModeAtPrompt: PlanModeState | undefined;
+	let enabledToolNames = ["read"];
+	const modeChanges: Array<{ mode: string; data?: Record<string, unknown> }> = [];
+	let planProposalHandler: PlanProposalHandler | undefined;
+	let subscriber: ((event: AgentSessionEvent) => void) | undefined;
+	let textOutputCommitted = true;
+	let abortCalls = 0;
 
 	const session = {
 		state: { messages },
 		getLastAssistantMessage: () => messages.findLast(message => message.role === "assistant"),
 		sessionManager: {
 			getHeader: () => undefined,
+			buildSessionContext: () => ({ messages: [] }),
+			getEntries: () => [],
+			appendModeChange: (mode: string, data?: Record<string, unknown>) => {
+				modeChanges.push({ mode, data });
+				return "mode-change";
+			},
 		},
+		settings: {
+			get: (key: string) =>
+				key === "plan.enabled" || (key === "plan.defaultOnStartup" && options.defaultPlanMode === true),
+		},
+		model: undefined,
+		isStreaming: false,
+		getPlanReferencePath: () => "",
+		getEnabledToolNames: () => enabledToolNames,
+		hasBuiltInTool: (name: string) => name === "write",
+		setActiveToolsByName: async (names: string[]) => {
+			enabledToolNames = names;
+		},
+		getPlanModeState: () => planModeState,
+		setPlanModeState: (state: PlanModeState | undefined) => {
+			planModeState = state;
+		},
+		preparePlanForReview: async (title: string) => {
+			const details = { planFilePath: `local://${title}-plan.md`, title, planExists: true };
+			return { content: [{ type: "text" as const, text: "Plan ready for review." }], details };
+		},
+		setPlanProposalHandler: (handler: PlanProposalHandler | null) => {
+			planProposalHandler = handler ?? undefined;
+		},
+		resolveRoleModelWithThinking: () => ({
+			model: undefined,
+			thinkingLevel: undefined,
+			explicitThinkingLevel: false,
+		}),
 		extensionRunner: undefined,
-		subscribe: () => () => {},
+		markPlanInternalAbortPending: () => {},
+		clearPlanInternalAbortPending: () => {},
+		abort: async () => {
+			abortCalls++;
+		},
+		setTextOutputCommitted: (committed: boolean) => {
+			textOutputCommitted = committed;
+		},
+		subscribe: (listener: (event: AgentSessionEvent) => void) => {
+			subscriber = listener;
+			return () => {};
+		},
 		prompt: async () => {
+			planModeAtPrompt = planModeState;
 			if (advisorDrainPrepared) throw new Error("headless advisor delivery armed before prompt completion");
 			markPromptStarted();
 			await promptReleased;
@@ -65,7 +131,18 @@ function createDelayedSession(finalMessage: AssistantMessage): DelayedSession {
 		dispose: async () => {},
 	} as unknown as AgentSession;
 
-	return { session, promptStarted, resolvePrompt };
+	return {
+		session,
+		promptStarted,
+		resolvePrompt,
+		getPlanModeAtPrompt: () => planModeAtPrompt,
+		getModeChanges: () => modeChanges,
+		getPlanProposalHandler: () => planProposalHandler,
+		getTextOutputCommitted: () => textOutputCommitted,
+		getCurrentPlanMode: () => planModeState,
+		emit: event => subscriber?.(event),
+		getAbortCalls: () => abortCalls,
+	};
 }
 
 describe("print mode working indicator", () => {
@@ -100,6 +177,53 @@ describe("print mode working indicator", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("enters default plan mode before submitting the initial prompt", async () => {
+		const delayed = createDelayedSession(makeAssistantMessage("plan ready"), { defaultPlanMode: true });
+		const run = runPrintMode(delayed.session, { mode: "text", initialMessage: "/plan hello" });
+
+		await delayed.promptStarted;
+		try {
+			expect(delayed.getPlanModeAtPrompt()).toMatchObject({
+				enabled: true,
+				planFilePath: "local://PLAN.md",
+			});
+			expect(delayed.getModeChanges()).toEqual([{ mode: "plan", data: { planFilePath: "local://PLAN.md" } }]);
+			const handler = delayed.getPlanProposalHandler();
+			if (!handler) throw new Error("Expected print plan proposal handler");
+			const proposal = await handler("hello");
+			expect(proposal).toMatchObject({
+				content: [{ type: "text", text: "Plan ready for review." }],
+				details: { planFilePath: "local://hello-plan.md", title: "hello", planExists: true },
+			});
+			expect(delayed.getCurrentPlanMode()).toMatchObject({ planFilePath: "local://hello-plan.md" });
+			expect(delayed.getModeChanges()).toEqual([
+				{ mode: "plan", data: { planFilePath: "local://PLAN.md" } },
+				{ mode: "plan", data: { planFilePath: "local://hello-plan.md" } },
+			]);
+			delayed.emit({
+				type: "tool_execution_end",
+				toolCallId: "proposal",
+				toolName: "write",
+				result: {
+					content: proposal.content,
+					details: {
+						xdev: {
+							tool: PROPOSE_DEVICE_NAME,
+							mode: "execute",
+							args: { title: "hello" },
+							inner: proposal.details,
+						},
+					},
+				},
+			});
+			await Promise.resolve();
+			expect(delayed.getAbortCalls()).toBe(1);
+		} finally {
+			delayed.resolvePrompt();
+			await run;
+		}
+	});
+
 	it("writes a text-mode working indicator before the prompt resolves and prints the final answer afterward", async () => {
 		const delayed = createDelayedSession(makeAssistantMessage("final answer"));
 		const run = runPrintMode(delayed.session, { mode: "text", initialMessage: "hello" });
@@ -108,12 +232,14 @@ describe("print mode working indicator", () => {
 		try {
 			expect(stderrOutput.join("")).toContain("Working");
 			expect(stdoutOutput.join("")).toBe("");
+			expect(delayed.getTextOutputCommitted()).toBe(false);
 		} finally {
 			delayed.resolvePrompt();
 			await run;
 		}
 
 		expect(stdoutOutput.join("")).toBe("final answer\n");
+		expect(delayed.getTextOutputCommitted()).toBe(true);
 	});
 
 	it("does not write the text-mode working indicator in JSON mode while the prompt is pending", async () => {
@@ -123,6 +249,7 @@ describe("print mode working indicator", () => {
 		await delayed.promptStarted;
 		try {
 			expect(stderrOutput.join("")).toBe("");
+			expect(delayed.getTextOutputCommitted()).toBe(true);
 		} finally {
 			delayed.resolvePrompt();
 			await run;
@@ -155,7 +282,12 @@ describe("print mode working indicator", () => {
 		const session = {
 			state: { messages },
 			getLastAssistantMessage: () => messages.findLast(message => message.role === "assistant"),
-			sessionManager: { getHeader: () => undefined },
+			sessionManager: {
+				getHeader: () => undefined,
+				buildSessionContext: () => ({ messages: [] }),
+				getEntries: () => [],
+			},
+			settings: { get: () => false },
 			extensionRunner: undefined,
 			subscribe: (listener: (event: AgentSessionEvent) => void) => {
 				subscriber = listener;
@@ -216,13 +348,19 @@ describe("print mode working indicator", () => {
 		const session = {
 			state: { messages },
 			getLastAssistantMessage: () => messages.findLast(message => message.role === "assistant"),
-			sessionManager: { getHeader: () => undefined },
+			sessionManager: {
+				getHeader: () => undefined,
+				buildSessionContext: () => ({ messages: [] }),
+				getEntries: () => [],
+			},
+			settings: { get: () => false },
 			extensionRunner: undefined,
 			subscribe: () => () => {},
 			prompt: async () => {
 				messages.push(message);
 				return true;
 			},
+			setTextOutputCommitted: () => {},
 			prepareForHeadlessAdvisorDrain: () => {},
 			waitForAdvisorCatchup: async (timeoutMs: number) => {
 				catchupTimeoutMs = timeoutMs;

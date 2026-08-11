@@ -8,7 +8,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
-import { resolveAgentModelPatterns } from "../config/model-resolver";
+import { resolveAgentModelPatterns, resolveAgentModelSource, resolveExplicitModelRole } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
@@ -16,9 +16,11 @@ import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
+import type { TaskEffort } from "../thinking";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../tools/hub";
 import { buildOutputValidator } from "../tools/output-schema-validator";
+import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { type ExecutorOptions, runSubprocess } from "./executor";
 import {
@@ -87,6 +89,8 @@ export interface StructuredSubagentRequest {
 	/** Presence, rather than truthiness, makes this the highest-priority schema. */
 	outputSchema?: unknown;
 	schemaMode?: StructuredSubagentSchemaMode;
+	/** Per-spawn thinking effort mapped onto the resolved model's supported range; overrides the agent's default selector. */
+	effort?: TaskEffort;
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;
@@ -119,6 +123,8 @@ export interface EffectiveSubagentPolicy {
 	agent: AgentDefinition;
 	effectiveAgent: AgentDefinition;
 	modelOverride?: string | string[];
+	/** Explicit pre-expansion model role alias selected for this run. */
+	modelRole?: string;
 	parentActiveModelPattern?: string;
 	schema: StructuredSubagentSchemaResolution;
 	planMode: boolean;
@@ -274,13 +280,18 @@ export async function resolveEffectiveSubagentPolicy(
 	}
 	const agentModelOverrides = request.session.settings.get("task.agentModelOverrides");
 	const parentActiveModelPattern = request.session.getActiveModelString?.();
-	const modelOverride = resolveAgentModelPatterns({
-		settingsOverride: request.model ?? agentModelOverrides[agentName],
+	const modelResolution = {
+		requestModel: request.model,
+		settingsOverride: agentModelOverrides[agentName],
 		agentModel: effectiveAgent.model,
 		settings: request.session.settings,
 		activeModelPattern: parentActiveModelPattern,
 		fallbackModelPattern: request.session.getModelString?.(),
-	});
+	};
+	// Keep role identity from the same effective non-empty source that supplies
+	// model selection: caller request, settings override, then agent definition.
+	const modelRole = resolveExplicitModelRole(resolveAgentModelSource(modelResolution), request.session.settings);
+	const modelOverride = resolveAgentModelPatterns(modelResolution);
 	const isolationMode = request.session.settings.get("task.isolation.mode");
 	const isIsolated = request.isolation?.requested === true;
 	if (isIsolated && isolationMode === "none") {
@@ -295,12 +306,15 @@ export async function resolveEffectiveSubagentPolicy(
 		agent,
 		effectiveAgent,
 		modelOverride,
+		modelRole,
 		parentActiveModelPattern,
 		schema,
 		planMode,
 		isIsolated,
 		mergeMode: request.isolation?.merge ?? request.session.settings.get("task.isolation.merge"),
-		applyChanges: request.isolation?.apply !== false,
+		applyChanges:
+			request.isolation?.apply ??
+			(request.invocationKind === "task" ? request.session.settings.get("task.isolation.apply") : true),
 		enableLsp:
 			!planMode &&
 			(request.enableLsp ?? ((request.session.enableLsp ?? true) && request.session.settings.get("task.enableLsp"))),
@@ -368,9 +382,12 @@ function buildExecutorOptions(
 		getArtifactsDir: session.getArtifactsDir ?? (() => null),
 		getSessionId: session.getSessionId ?? (() => null),
 	};
-	const enableMCP = !policy.planMode && (session.enableMCP ?? true);
+	const restrictToolNames = policy.planMode || session.restrictToolNames === true;
+	const enableMCP = !restrictToolNames && (session.enableMCP ?? true);
 	return {
 		cwd: session.cwd,
+		additionalDirectories: session.additionalDirectories,
+		getApiKey: session.getApiKey,
 		agent: policy.effectiveAgent,
 		task: renderSubagentPrompt(request.assignment),
 		assignment: request.assignment.trim(),
@@ -385,8 +402,10 @@ function buildExecutorOptions(
 		invokedAt: request.invokedAt,
 		acquiredAt: request.acquiredAt,
 		modelOverride: policy.modelOverride,
+		modelRole: policy.modelRole,
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
+		effort: request.effort,
 		...(policy.schema.source === "none"
 			? {}
 			: {
@@ -401,7 +420,7 @@ function buildExecutorOptions(
 		enableLsp: policy.enableLsp,
 		enableIrc: policy.enableIrc,
 		maxRuntimeMs: request.maxRuntimeMs,
-		restrictToolNames: policy.planMode,
+		restrictToolNames,
 		keepAlive: request.keepAlive,
 		signal: request.signal,
 		eventBus: session.eventBus,
@@ -417,8 +436,8 @@ function buildExecutorOptions(
 		workspaceTree: session.workspaceTree,
 		promptTemplates: session.promptTemplates,
 		rules: session.rules,
-		preloadedExtensionPaths: policy.planMode ? [] : session.extensionPaths,
-		preloadedCustomToolPaths: policy.planMode ? [] : session.customToolPaths,
+		preloadedExtensionPaths: restrictToolNames ? [] : session.extensionPaths,
+		preloadedCustomToolPaths: restrictToolNames ? [] : session.customToolPaths,
 		localProtocolOptions,
 		parentArtifactManager: session.getArtifactManager?.() ?? undefined,
 		parentHindsightSessionState: session.getHindsightSessionState?.(),
@@ -466,6 +485,7 @@ function buildFailureResult(
 			tokens: 0,
 			requests: 0,
 			modelOverride: policy.modelOverride,
+			modelRole: policy.modelRole,
 			error: message,
 		};
 	};
@@ -531,12 +551,16 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 	let mergeSummary = "";
 	let requiresRecoveryArtifacts = false;
 	let completedSuccessfully = false;
+	let deferredCleanup: Promise<void> | undefined;
 	try {
 		const id = await reserveStructuredSubagentId(request.session, {
 			...request.identity,
 			label: request.identity?.label ?? (request.invocationKind === "eval" ? "EvalAgent" : undefined),
 		});
 		const baseOptions = buildExecutorOptions(request, policy, lease, id);
+		baseOptions.onCleanupDeferred = completion => {
+			deferredCleanup = completion;
+		};
 		baseOptions.planReference = await loadPlanReference(request, policy);
 		let isolationContext: IsolationContext | null = null;
 		if (policy.isIsolated) {
@@ -630,8 +654,18 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
 		const shouldCleanup = lease.temporary && !shouldRetainArtifacts;
 		if (shouldCleanup) {
-			await fs.rm(lease.artifactsDir, { recursive: true, force: true });
-			lease.unregister?.();
+			const cleanupArtifacts = async (): Promise<void> => {
+				await fs.rm(lease.artifactsDir, { recursive: true, force: true });
+				lease.unregister?.();
+			};
+			if (deferredCleanup) {
+				trackLateCleanup(deferredCleanup.then(cleanupArtifacts), {
+					resource: "artifacts",
+					artifactsDir: lease.artifactsDir,
+				});
+			} else {
+				await cleanupArtifacts();
+			}
 		}
 	}
 }

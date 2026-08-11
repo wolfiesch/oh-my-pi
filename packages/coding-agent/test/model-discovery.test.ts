@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,9 +7,16 @@ import { Effort, type FetchImpl, type Model } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
-import type { OpenAICompat } from "@oh-my-pi/pi-catalog/types";
-import { applyLlamaCppQwenThinking } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { resolveOllamaModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
+import type { ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
+import {
+	applyLlamaCppQwenThinking,
+	discoverOllamaModels,
+	discoveryProbeTimeoutMs,
+} from "@oh-my-pi/pi-coding-agent/config/model-discovery";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { ProviderDiscoverySchema } from "@oh-my-pi/pi-coding-agent/config/models-config-schema";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -72,7 +80,7 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	function writeCachedOllamaModels(models: Model<"openai-completions">[], updatedAt = Date.now()) {
-		writeModelCache("ollama", updatedAt, models, true, "", cacheDbPath);
+		writeModelCache(resolveOllamaModelCacheProviderId("ollama"), updatedAt, models, true, "", cacheDbPath);
 	}
 
 	function getModelsForProvider(registry: ModelRegistry, provider: string) {
@@ -151,7 +159,7 @@ describe("ModelRegistry runtime discovery", () => {
 		const endpointPrefix = "https://api.anthropic.com/";
 		return async (input, init) => {
 			const url = String(input);
-			if (url === "https://models.dev/api.json") {
+			if (url === "https://catalog.stencil.so/models.json.zstd") {
 				return Response.json({});
 			}
 			if (url.startsWith(endpointPrefix) && url.endsWith("/models")) {
@@ -327,6 +335,71 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(registry.find("openai-codex", "gpt-5.4-nano")).toBeUndefined();
 	});
 
+	test("Codex discovery falls back to a resolved non-OAuth token when no OAuth accounts exist", async () => {
+		authStorage.setRuntimeApiKey("openai-codex", "runtime-openai-codex");
+		let modelListCalls = 0;
+		const fetchMock: FetchImpl = async (input, init) => {
+			const url = String(input);
+			if (url.startsWith("https://chatgpt.com/backend-api") && url.includes("/models")) {
+				modelListCalls++;
+				expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer runtime-openai-codex");
+				return Response.json({
+					models: [
+						{
+							slug: "runtime-codex-model",
+							display_name: "Runtime Codex Model",
+							context_window: 128_000,
+							supported_in_api: true,
+							input_modalities: ["text"],
+						},
+					],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+		await registry.refreshProvider("openai-codex", "online");
+
+		expect(modelListCalls).toBe(1);
+		expect(registry.find("openai-codex", "runtime-codex-model")).toBeDefined();
+	});
+
+	test("Codex discovery aborts (keeps bundled models) when any account credential fails to refresh", async () => {
+		// Two configured Codex accounts: the fresh one resolves, the expired one's
+		// refresh throws so getOAuthAccesses reports ok:false. A partial union would
+		// be cached as the authoritative catalog and hide the failed account's
+		// models, so discovery must abort and keep bundled models.
+		authStorage.close();
+		authStorage = await AuthStorage.create(":memory:", {
+			refreshOAuthCredential: async (_provider, _credentialId, credential): Promise<OAuthCredentials> => {
+				if (credential.access.includes("expired")) {
+					throw new Error("simulated transient refresh failure");
+				}
+				return { ...credential, expires: Date.now() + 3_600_000 };
+			},
+		});
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", access: "fresh-codex", refresh: "refresh-fresh", expires: Date.now() + 3_600_000 },
+			{ type: "oauth", access: "expired-codex", refresh: "refresh-expired", expires: Date.now() - 60_000 },
+		]);
+		let modelListCalls = 0;
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url.startsWith("https://chatgpt.com/backend-api") && url.includes("/models")) {
+				modelListCalls++;
+				return Response.json({ models: [] });
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+		await registry.refreshProvider("openai-codex", "online");
+
+		expect(modelListCalls).toBe(0);
+		expect(getModelsForProvider(registry, "openai-codex").length).toBeGreaterThan(0);
+	});
+
 	test("configured discovery suppresses built-in special OAuth discovery", async () => {
 		await authStorage.set("google-gemini-cli", {
 			type: "oauth",
@@ -474,6 +547,41 @@ describe("ModelRegistry runtime discovery", () => {
 
 		const model = registry.find("ollama", "phi4-mini");
 		expect(model?.baseUrl).toBe("http://omp-ollama.example:2222/v1");
+	});
+
+	test("refreshes implicit Ollama discovery when the configured endpoint changes", async () => {
+		const requested: string[] = [];
+		{
+			using _baseUrl = withEnv("OLLAMA_BASE_URL", "http://old-ollama.example:11434/v1/");
+			const fetchOld = mockOllamaDiscovery(["old-model"], "http://old-ollama.example:11434");
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+				fetch: async (input, init) => {
+					requested.push(String(input));
+					return fetchOld(input, init);
+				},
+			});
+			await registry.refresh();
+			expect(registry.find("ollama", "old-model")).toBeDefined();
+		}
+
+		{
+			using _baseUrl = withEnv("OLLAMA_BASE_URL", "http://new-ollama.example:11434");
+			const fetchNew = mockOllamaDiscovery(["new-model"], "http://new-ollama.example:11434");
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+				fetch: async (input, init) => {
+					requested.push(String(input));
+					return fetchNew(input, init);
+				},
+			});
+			// The old endpoint has a fresh cache row, but default refresh must
+			// miss that namespace and discover against the new endpoint.
+			await registry.refresh();
+			expect(registry.find("ollama", "old-model")).toBeUndefined();
+			expect(registry.find("ollama", "new-model")?.baseUrl).toBe("http://new-ollama.example:11434/v1");
+		}
+
+		expect(requested).toContain("http://old-ollama.example:11434/api/tags");
+		expect(requested).toContain("http://new-ollama.example:11434/api/tags");
 	});
 
 	test("uses OLLAMA_CONTEXT_LENGTH for implicit ollama context accounting", async () => {
@@ -1057,6 +1165,82 @@ describe("ModelRegistry runtime discovery", () => {
 		expect((plain?.compat as DialectFields | undefined)?.reasoningDisableMode).not.toBe("qwen-template-false");
 	});
 
+	test("discovery timeout rejects even when fetch ignores abort", async () => {
+		vi.useFakeTimers();
+		try {
+			const pending = Promise.withResolvers<Response>();
+			let outcome: string | undefined;
+			void discoverOllamaModels(
+				{
+					provider: "ollama",
+					api: "openai-responses",
+					baseUrl: "http://127.0.0.1:11434",
+					discovery: { type: "ollama", timeoutMs: 25 },
+					optional: true,
+				},
+				{
+					fetch: () => pending.promise,
+					getBearerApiKeyResolver: async () => undefined,
+				},
+			).then(
+				() => {
+					outcome = "resolved";
+				},
+				error => {
+					outcome = error instanceof DOMException ? error.name : String(error);
+				},
+			);
+
+			vi.advanceTimersByTime(25);
+			for (let flush = 0; flush < 5; flush++) await Promise.resolve();
+
+			expect(outcome).toBe("TimeoutError");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("configured provider discovery accepts timeoutMs and passes it to probes", async () => {
+		const customConfigPath = path.join(tempDir, "models.yml");
+		fs.writeFileSync(
+			customConfigPath,
+			`
+providers:
+  custom-remote:
+    baseUrl: "http://127.0.0.1:8080"
+    api: "openai-completions"
+    auth: "none"
+    discovery:
+      type: "llama.cpp"
+      timeoutMs: 45000
+`,
+			"utf-8",
+		);
+
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:8080/models") {
+				return new Response(JSON.stringify({ data: [{ id: "remote-model-1" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return new Response(JSON.stringify({ default_generation_settings: { n_ctx: 32768 } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+
+		const registry = new ModelRegistry(authStorage, customConfigPath, { fetch: fetchMock });
+		await registry.refresh();
+		const state = registry.getProviderDiscoveryState("custom-remote");
+		expect(state?.status).toBe("ok");
+		const models = getModelsForProvider(registry, "custom-remote");
+		expect(models.map(m => m.id)).toEqual(["remote-model-1"]);
+	});
 	test("configured llama.cpp Qwen model keeps its /v1 runtime URL despite a native-root baseUrl override", async () => {
 		writeRawModelsJson({
 			"llama.cpp": {
@@ -1136,6 +1320,53 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(requested).not.toContain("http://127.0.0.1:8080/v1/models");
 	});
 
+	test("discoveryProbeTimeoutMs keeps loopback fast but gives non-loopback hosts a larger budget", () => {
+		// Regression: the loopback-tuned probe timeout was applied to every host,
+		// so a remote/LAN LLAMA_CPP_BASE_URL with normal round-trip latency timed
+		// out and the model list came back empty (#7087). Loopback keeps the tight
+		// budget; anything reached over the network gets a strictly larger one.
+		const loopbackMs = 250;
+		for (const host of [
+			"http://127.0.0.1:8080",
+			"http://127.5.6.7:8080",
+			"http://localhost:8080",
+			"http://[::1]:8080",
+			"http://0.0.0.0:8080",
+		]) {
+			expect(discoveryProbeTimeoutMs(host, loopbackMs)).toBe(loopbackMs);
+		}
+		const remoteBudgets = [
+			"http://remote-llama.test:8080",
+			"http://192.168.1.50:8080",
+			"http://172.18.0.3:8080",
+			"http://10.0.0.4:8080",
+			"http://box.local:8080",
+		].map(host => discoveryProbeTimeoutMs(host, loopbackMs));
+		for (const budget of remoteBudgets) {
+			expect(budget).toBeGreaterThan(loopbackMs);
+		}
+		// A consistent budget for every non-loopback host, independent of the tight cap.
+		expect(new Set(remoteBudgets).size).toBe(1);
+		expect(discoveryProbeTimeoutMs("http://remote-llama.test:8080", 150)).toBe(remoteBudgets[0]);
+	});
+
+	test("discoveryProbeTimeoutMs uses explicit customTimeoutMs when provided", () => {
+		expect(discoveryProbeTimeoutMs("http://127.0.0.1:8080", 250, 30_000)).toBe(30_000);
+		expect(discoveryProbeTimeoutMs("http://remote-llama.test:8080", 250, 30_000)).toBe(30_000);
+		expect(discoveryProbeTimeoutMs("http://127.0.0.1:8080", 250, 5_000)).toBe(5_000);
+		// Invalid custom timeouts fall back to standard loopback/remote resolution
+		expect(discoveryProbeTimeoutMs("http://127.0.0.1:8080", 250, -100)).toBe(250);
+		expect(discoveryProbeTimeoutMs("http://127.0.0.1:8080", 250, 0)).toBe(250);
+	});
+
+	test("ProviderDiscoverySchema validates timeoutMs", () => {
+		expect(ProviderDiscoverySchema.allows({ type: "llama.cpp", timeoutMs: 30_000 })).toBe(true);
+		expect(ProviderDiscoverySchema.allows({ type: "ollama", timeoutMs: 5_000 })).toBe(true);
+		expect(ProviderDiscoverySchema.allows({ type: "llama.cpp", timeoutMs: -500 })).toBe(false);
+		expect(ProviderDiscoverySchema.allows({ type: "llama.cpp", timeoutMs: 0 })).toBe(false);
+		expect(ProviderDiscoverySchema.allows({ type: "llama.cpp", timeoutMs: Number.NaN })).toBe(false);
+		expect(ProviderDiscoverySchema.allows({ type: "llama.cpp", timeoutMs: "30000" as any })).toBe(false);
+	});
 	test("llama.cpp discovery marks per-model architecture image modalities as vision-capable", async () => {
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
@@ -1399,6 +1630,44 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(refreshed.contextWindow).toBe(16384);
 		expect(refreshed.maxTokens).toBe(16384);
 		expect(registry.find("llama.cpp", "cold-preset")?.contextWindow).toBe(16384);
+
+		await authStorage.set("projection-provider", {
+			type: "oauth",
+			access: "access-token",
+			refresh: "refresh-token",
+			expires: Date.now() + 60_000,
+		});
+		try {
+			registry.registerProvider(
+				"projection-provider",
+				{
+					api: "anthropic-messages",
+					baseUrl: "https://example.invalid/",
+					models: [
+						{
+							id: "projection-model",
+							name: "Projection Model",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 8192,
+						},
+					],
+					oauth: {
+						name: "Projection OAuth",
+						login: async () => ({ access: "a", refresh: "r", expires: Date.now() + 60_000 }),
+						refreshToken: async credentials => credentials,
+						getApiKey: credentials => credentials.access,
+						modifyModels: models => models,
+					},
+				},
+				"ext://metadata-projection",
+			);
+			expect(registry.find("llama.cpp", "cold-preset")?.contextWindow).toBe(16384);
+		} finally {
+			registry.clearSourceRegistrations("ext://metadata-projection");
+		}
 	});
 
 	test("llama.cpp selected model refresh patches newly loaded meta n_ctx and unlimited output limit", async () => {
@@ -1699,6 +1968,9 @@ describe("ModelRegistry runtime discovery", () => {
 
 	test("llama.cpp selected model refresh does not resolve command api keys", async () => {
 		const commandLogPath = path.join(tempDir, "llama-cpp-key-command.log");
+		// Pre-create so the before/after comparison works whether or not
+		// registry construction happens to invoke the key command itself.
+		fs.writeFileSync(commandLogPath, "");
 		writeRawModelsJson({
 			"llama.cpp": {
 				baseUrl: "http://127.0.0.1:8080",
@@ -1900,6 +2172,80 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(unknown?.reasoning).toBe(false);
 	});
 
+	test("openai-models-list discovery reads server-advertised input modalities for ids absent from the catalog", async () => {
+		writeRawModelsJson({
+			"openai-test": {
+				baseUrl: "http://127.0.0.1:9996",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9996/v1/models") {
+				// Custom virtual tier ids that are absent from the bundled
+				// catalog: their vision support can only come from the server row.
+				return new Response(
+					JSON.stringify({
+						data: [
+							{ id: "high", object: "model", input: ["text", "image"] },
+							{ id: "leftover", object: "model", architecture: { input_modalities: ["text", "image"] } },
+							{ id: "synthetic-tier", object: "model", input_modalities: ["text", "image"] },
+							{ id: "low", object: "model", input: ["text"] },
+							{ id: "medium", object: "model" },
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		// Direct `input`, top-level `input_modalities`, and OpenRouter-style
+		// `architecture.input_modalities` all surface vision support.
+		expect(registry.find("openai-test", "high")?.input).toEqual(["text", "image"]);
+		expect(registry.find("openai-test", "leftover")?.input).toEqual(["text", "image"]);
+		expect(registry.find("openai-test", "synthetic-tier")?.input).toEqual(["text", "image"]);
+		// Server explicitly reports text-only; no image support invented.
+		expect(registry.find("openai-test", "low")?.input).toEqual(["text"]);
+		// Silent server → default text-only fallback.
+		expect(registry.find("openai-test", "medium")?.input).toEqual(["text"]);
+	});
+
+	test("lm-studio discovery keeps native VLM modalities over a thin OpenAI row", async () => {
+		writeRawModelsJson({
+			"lm-studio-test": {
+				baseUrl: "http://127.0.0.1:9995",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "lm-studio" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9995/v1/models") {
+				return new Response(JSON.stringify({ data: [{ id: "local-vlm", object: "model", input: ["text"] }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "http://127.0.0.1:9995/api/v0/models") {
+				return new Response(
+					JSON.stringify({
+						data: [{ id: "local-vlm", type: "vlm", capabilities: ["vision"], state: "loaded" }],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		expect(registry.find("lm-studio-test", "local-vlm")?.input).toEqual(["text", "image"]);
+	});
+
 	test("proxy discovery honors API-reported context_length and endpoint routing", async () => {
 		writeRawModelsJson({
 			"proxy-test": {
@@ -1937,6 +2283,73 @@ describe("ModelRegistry runtime discovery", () => {
 		// never pinning the model at a broken `0` window.
 		const zeroCtx = registry.getAll().find(m => m.provider === "proxy-test" && m.id === "zero-context-model");
 		expect(zeroCtx?.contextWindow).toBe(128000);
+	});
+
+	test("proxy discovery uses proxy-reported name over bundled placeholder", async () => {
+		writeRawModelsJson({
+			"proxy-test": {
+				baseUrl: "http://127.0.0.1:9998",
+				auth: "none",
+				discovery: { type: "proxy" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9998/v1/models") {
+				return new Response(
+					JSON.stringify({
+						data: [
+							{
+								id: "act_two",
+								name: "Act Two",
+								supported_endpoint_types: ["openai"],
+								context_length: 65536,
+							},
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		const model = registry.find("proxy-test", "act_two");
+		expect(model).toBeDefined();
+		expect(model?.name).toBe("Act Two");
+	});
+
+	test("proxy discovery falls back to bundled name when proxy reports none", async () => {
+		writeRawModelsJson({
+			"proxy-test": {
+				baseUrl: "http://127.0.0.1:9998",
+				auth: "none",
+				discovery: { type: "proxy" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9998/v1/models") {
+				return new Response(
+					JSON.stringify({
+						data: [
+							{
+								id: "gpt-5",
+								supported_endpoint_types: ["openai"],
+								context_length: 128000,
+							},
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		const model = registry.find("proxy-test", "gpt-5");
+		expect(model).toBeDefined();
+		expect(model?.name).toBe("GPT-5");
 	});
 
 	test("litellm discovery maps rich model metadata and keeps runtime /v1 baseUrl", async () => {
@@ -2132,5 +2545,57 @@ describe("ModelRegistry runtime discovery", () => {
 
 		expect(registry.find("litellm-test", "team-gpt")?.contextWindow).toBe(200_000);
 		expect(registry.find("litellm-test", "deployment-id")).toBeUndefined();
+	});
+
+	test("startup restores a legacy stale-marked Copilot -1m variant via requestModelId", () => {
+		// Regression for #6037/#6284: a synthesized Copilot `-1m` long-context
+		// variant keeps the base model's transport headers via `requestModelId`.
+		// The v10 cache omits headers, and legacy rows written by the old id-only
+		// writer flag the variant unrestorable (its base is a different id). The
+		// startup loader must still recover the headers from the bundled base and
+		// keep the model selectable instead of dropping it.
+		const bundledBase = getBundledModel("github-copilot", "gpt-5.6-sol");
+		if (!bundledBase?.headers) {
+			throw new Error("Expected bundled Copilot base to carry transport headers");
+		}
+		const cachedVariant = buildModel({
+			...(bundledBase as ModelSpec<"openai-responses">),
+			id: "gpt-5.6-sol-1m",
+			name: "GPT-5.6 Sol (1M)",
+			requestModelId: "gpt-5.6-sol",
+			contextWindow: 1_050_000,
+		});
+		// Emulate a legacy write: the variant has no same-id static header source,
+		// so it is flagged unrestorable even though its base carries the headers.
+		writeModelCache("github-copilot", Date.now(), [cachedVariant], true, "", cacheDbPath);
+		const db = new Database(cacheDbPath);
+		db.run("UPDATE model_cache SET header_restore_version = 0 WHERE provider_id = ?", ["github-copilot"]);
+		db.close();
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+		const restored = registry.find("github-copilot", "gpt-5.6-sol-1m");
+		expect(restored).toBeDefined();
+		expect(restored?.headers).toEqual(bundledBase.headers);
+	});
+
+	test("startup drops a current Copilot alias whose headers differ from its bundled base", () => {
+		const bundledBase = getBundledModel("github-copilot", "gpt-5.6-sol");
+		if (!bundledBase?.headers) {
+			throw new Error("Expected bundled Copilot base to carry transport headers");
+		}
+		const cachedAlias = buildModel({
+			...(bundledBase as ModelSpec<"openai-responses">),
+			id: "gpt-5.6-sol-custom",
+			name: "GPT-5.6 Sol Custom Route",
+			requestModelId: "gpt-5.6-sol",
+			headers: { "X-Tenant-Route": "tenant-a" },
+		});
+		writeModelCache("github-copilot", Date.now(), [cachedAlias], true, "", cacheDbPath, [bundledBase]);
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+		expect(registry.find("github-copilot", cachedAlias.id)).toBeUndefined();
+		expect(registry.find("github-copilot", bundledBase.id)?.headers).toEqual(bundledBase.headers);
 	});
 });

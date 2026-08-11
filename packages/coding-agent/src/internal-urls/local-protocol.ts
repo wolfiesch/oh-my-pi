@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { AgentRegistry } from "../registry/agent-registry";
+import { isMarkdownPath } from "../utils/lang-from-path";
 import { buildDirectoryResource } from "./filesystem-resource";
 import { parseInternalUrl } from "./parse";
 import { validateRelativePath } from "./skill-protocol";
@@ -43,8 +44,8 @@ function shortLocalRoot(options: LocalProtocolOptions): string {
 }
 
 function getContentType(filePath: string): InternalResource["contentType"] {
+	if (isMarkdownPath(filePath)) return "text/markdown";
 	const ext = path.extname(filePath).toLowerCase();
-	if (ext === ".md") return "text/markdown";
 	if (ext === ".json") return "application/json";
 	return "text/plain";
 }
@@ -389,8 +390,9 @@ export class LocalProtocolHandler implements ProtocolHandler {
 
 	/**
 	 * Install a process-global override that wins over the AgentRegistry-based
-	 * derivation. Used by SDK consumers that wire `localProtocolOptions` on
-	 * `createAgentSession` and by subagents that share their parent's root.
+	 * derivation. Used by top-level SDK consumers that wire
+	 * `localProtocolOptions` on `createAgentSession`; subagents keep their
+	 * inherited mapping session-bound.
 	 */
 	static setOverride(value: LocalProtocolOptions | undefined): void {
 		LocalProtocolHandler.#override = value;

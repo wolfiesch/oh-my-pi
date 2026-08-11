@@ -12,7 +12,7 @@ import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/componen
 import * as themeModule from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { Text, type TUI, visibleWidth } from "@oh-my-pi/pi-tui";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
-import chalk from "chalk";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 
 beforeAll(async () => {
 	resetSettingsForTest();
@@ -46,8 +46,7 @@ describe("editToolRenderer", () => {
 		const uiTheme = await getUiTheme();
 		const component = editToolRenderer.renderCall(
 			{
-				edits: [{}],
-				__partialJson: '{"edits":[{"path":"packages/coding-agent/src/edit/renderer.ts","old_text":"before',
+				__partialJson: '{"path":"packages/coding-agent/src/edit/renderer.ts","old_string":"before',
 			},
 			{ expanded: false, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "replace" } },
 			uiTheme,
@@ -111,7 +110,7 @@ describe("editToolRenderer", () => {
 		const uiTheme = await getUiTheme();
 		const component = editToolRenderer.renderCall(
 			{
-				input: "[packages/coding-agent/src/edit/renderer.ts]\nINS.TAIL:\n+// preview",
+				input: "[packages/coding-agent/src/edit/renderer.ts]\nPUT >$:\n+// preview",
 			},
 			{ expanded: false, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
 			uiTheme,
@@ -132,7 +131,7 @@ describe("editToolRenderer", () => {
 				input: [
 					"*** Begin Patch",
 					"[crates/pi-natives/src/shell.rs]",
-					"INS.TAIL:",
+					"PUT >$:",
 					"+pub fn streaming_preview() {",
 				].join("\n"),
 			},
@@ -143,7 +142,7 @@ describe("editToolRenderer", () => {
 
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
 		expect(rendered).toContain("crates/pi-natives/src/shell.rs");
-		expect(rendered).not.toContain("INS.TAIL:");
+		expect(rendered).not.toContain("PUT >$:");
 		expect(rendered).not.toContain("+pub fn streaming_preview() {");
 		expect(rendered).not.toContain("*** Begin Patch");
 	});
@@ -152,7 +151,7 @@ describe("editToolRenderer", () => {
 		const uiTheme = await getUiTheme();
 		const compactComponent = editToolRenderer.renderCall(
 			{
-				input: "[foo bar.ts]\nINS.HEAD:\n+// preview",
+				input: "[foo bar.ts]\nPUT <1:\n+// preview",
 			},
 			{ expanded: true, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
 			uiTheme,
@@ -160,7 +159,7 @@ describe("editToolRenderer", () => {
 
 		const quotedComponent = editToolRenderer.renderCall(
 			{
-				input: "['baz qux.ts']\nINS.HEAD:\n+// preview",
+				input: "['baz qux.ts']\nPUT <1:\n+// preview",
 			},
 			{ expanded: false, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
 			uiTheme,
@@ -179,7 +178,7 @@ describe("editToolRenderer", () => {
 		// renderer keeps the title clean.
 		const canonical = editToolRenderer.renderCall(
 			{
-				input: "[packages/coding-agent/src/slash-commands/builtin-registry.ts]\nINS.HEAD:\n+// preview",
+				input: "[packages/coding-agent/src/slash-commands/builtin-registry.ts]\nPUT <1:\n+// preview",
 			},
 			{ expanded: true, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
 			uiTheme,
@@ -187,7 +186,7 @@ describe("editToolRenderer", () => {
 
 		// While streaming, the closing bracket may not have arrived yet.
 		const partial = editToolRenderer.renderCall(
-			{ input: "[a/b/c.ts\nINS.HEAD:\n+// preview" },
+			{ input: "[a/b/c.ts\nPUT <1:\n+// preview" },
 			{ expanded: true, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
 			uiTheme,
 		);
@@ -214,7 +213,7 @@ describe("editToolRenderer", () => {
 			{ expanded: false, isPartial: false, renderContext: { editMode: "hashline" } },
 			uiTheme,
 			{
-				input: "[packages/coding-agent/src/edit/renderer.ts]\nINS.TAIL:\n+// preview",
+				input: "[packages/coding-agent/src/edit/renderer.ts]\nPUT >$:\n+// preview",
 			},
 		);
 
@@ -301,7 +300,7 @@ describe("editToolRenderer", () => {
 			// The trailing payload line carries no newline — the common shape for a
 			// single-line edit. The streaming pass trims that in-flight line, so the
 			// preview only becomes computable once args are marked complete.
-			const input = `[memory.ts#${tag}]\nSWAP 2.=2:\n+export const b = 22;`;
+			const input = `[memory.ts#${tag}]\nPUT 2-2:\n+export const b = 22;`;
 			const component = new ToolExecutionComponent("edit", { input }, { snapshots }, hashlineTool, uiStub, tmpDir);
 
 			component.setArgsComplete();
@@ -328,7 +327,7 @@ describe("editToolRenderer", () => {
 
 			const snapshots = new InMemorySnapshotStore();
 			const tag = snapshots.record(filePath, content);
-			const input = `[memory.ts#${tag}]\nSWAP 2.=2:\n+export const b = 22;\n`;
+			const input = `[memory.ts#${tag}]\nPUT 2-2:\n+export const b = 22;\n`;
 			const component = new ToolExecutionComponent(
 				"edit",
 				{ __partialJson: input },
@@ -600,6 +599,16 @@ describe("editToolRenderer diff line wrapping", () => {
 		for (const row of tailRows) expect(row).toMatch(/^│\s+│/);
 		// Every body row stays inside a code-frame gutter (`-42│`, `   +│`, `    │`).
 		for (const row of rows.slice(1, -1)) expect(row).toMatch(/^│\s*[+-]?\s*\d*│/);
+	});
+
+	it("renders ill-formed UTF-16 replacements natively", async () => {
+		// Native word diffs operate directly over UTF-16 code units, so lone
+		// surrogates render and highlight without throwing mid-render.
+		const rows = (await renderSingleLineReplacement("alpha \ud800 beta", "alpha \ud801 beta", 100)).map(row =>
+			Bun.stripANSI(row),
+		);
+		expect(rows.some(row => row.includes("-42"))).toBe(true);
+		expect(rows.some(row => row.includes("+"))).toBe(true);
 	});
 
 	it("closes inverse video at every wrapped row end so frame padding stays uninverted", async () => {

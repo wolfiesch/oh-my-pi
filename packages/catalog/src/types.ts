@@ -103,6 +103,8 @@ export interface Usage {
 	cacheWrite: number;
 	/** Sum of input + output + cacheRead + cacheWrite plus provider-side orchestration tokens when reported. */
 	totalTokens: number;
+	/** Provider-reported occupied context tokens when the value is authoritative but not a billable input/output bucket. */
+	contextTokens?: number;
 	/** Provider-side orchestration tokens, billed but not part of the conversation prompt/cache buckets. */
 	orchestration?: {
 		/** Non-cached orchestration input tokens. */
@@ -306,6 +308,14 @@ export interface OpenAICompat {
 	promptCacheSessionHeader?: "x-grok-conv-id";
 	/** Whether chat-completions payloads should include provider-specific prompt-cache markers. */
 	cacheControlFormat?: "anthropic" | undefined;
+	/**
+	 * Whether this endpoint/model accepts OpenAI's explicit
+	 * `prompt_cache_breakpoint` content markers and `prompt_cache_options`.
+	 * Defaults to the exact first-party model generation allowlist.
+	 */
+	supportsPromptCacheBreakpoints?: boolean;
+	/** The only currently supported minimum lifetime for explicit OpenAI cache breakpoints. */
+	promptCacheBreakpointTtl?: "30m";
 	/** Whether the provider supports the `strict` field in tool definitions. Default: auto-detected per provider/baseUrl (conservative for unknown providers). */
 	supportsStrictMode?: boolean;
 	/**
@@ -333,6 +343,12 @@ export interface OpenAICompat {
 	 * to opt a host out.
 	 */
 	toolSchemaFlavor?: "moonshot-mfjs" | "grammar" | "none";
+	/**
+	 * Stream-watchdog first-event timeout in ms.
+	 * Set to `0` to allow unbounded prompt processing. Default: auto-detected
+	 * (disabled for local OpenAI-compatible backends).
+	 */
+	streamFirstEventTimeoutMs?: number;
 	/**
 	 * Stream-watchdog idle-timeout floor in ms for slow reasoning hosts.
 	 * Default: auto-detected (GLM coding-plan hosts, direct DeepSeek reasoning).
@@ -385,6 +401,15 @@ export interface OpenAICompat {
  * that proxy gateways (Vertex AI, AWS Bedrock-style fronts, etc.) reject.
  */
 export interface AnthropicCompat {
+	/**
+	 * Stream-watchdog idle-timeout fallback in ms for slow reasoning hosts.
+	 * Set to 0 to disable the inter-event idle watchdog entirely, matching
+	 * `OpenAICompat.streamIdleTimeoutMs`.
+	 *
+	 * When unset, direct Anthropic streams use `PI_STREAM_IDLE_TIMEOUT_MS`,
+	 * then the legacy `PI_OPENAI_STREAM_IDLE_TIMEOUT_MS` alias, then 300s.
+	 */
+	streamIdleTimeoutMs?: number;
 	/**
 	 * Drop the top-level `strict: true` field on tool definitions. Vertex AI's
 	 * Anthropic-compatible endpoint rejects unknown tool fields with
@@ -457,6 +482,63 @@ export interface AnthropicCompat {
 	 * blocks instead of normal `tool_use` calls.
 	 */
 	escapeBuiltinToolNames?: boolean;
+	/**
+	 * The configured endpoint enforces Anthropic's signature protocol on
+	 * replayed thinking blocks — either the official API itself or a proxy
+	 * that forwards to it (GitHub Copilot, ZenMux, Cloudflare AI Gateway's
+	 * `/anthropic` route, Google Vertex's `publishers/anthropic/…`).
+	 * Downstream transforms strip stale cross-model thinking signatures on
+	 * these endpoints so the signing proxy doesn't 400 with
+	 * `Invalid signature in thinking block` (#4297), and adaptive-thinking
+	 * models keep the interleaved-thinking beta on them (#6717). Known hosts
+	 * are auto-detected from provider id and baseUrl; set this to mark an
+	 * opaque signing proxy the URL list can't recognize. Superset of
+	 * {@link ResolvedAnthropicCompat.officialEndpoint}.
+	 */
+	signingEndpoint?: boolean;
+}
+
+/**
+ * Compatibility settings for Bedrock Converse prompt caching. Cache pricing is
+ * deliberately not used to infer these request-shape capabilities.
+ */
+export interface BedrockCompat {
+	/** Whether this endpoint accepts no checkpoints, automatic caching, or explicit cachePoint blocks. */
+	promptCacheMode?: "none" | "automatic" | "explicit";
+	/** Whether explicit cachePoint blocks accept `ttl: "1h"`; omitted TTL means Bedrock's 5-minute default. */
+	supportsLongPromptCacheRetention?: boolean;
+	/**
+	 * Bedrock-enforced minimum prompt-prefix tokens for an effective checkpoint.
+	 * Capability metadata only: emitters must not estimate local token counts.
+	 * Zero means no explicit checkpoints.
+	 */
+	promptCacheMinimumTokens?: number;
+	/**
+	 * Bedrock-enforced maximum explicit cache checkpoints per request.
+	 * Capability metadata only; zero means no explicit checkpoints.
+	 */
+	promptCacheMaximumCheckpoints?: number;
+	/**
+	 * Stream-watchdog idle-timeout fallback in ms; 0 disables the idle watchdog.
+	 * Undefined defers to `PI_STREAM_IDLE_TIMEOUT_MS`, then the legacy
+	 * `PI_OPENAI_STREAM_IDLE_TIMEOUT_MS` alias, then the 300s default.
+	 */
+	streamIdleTimeoutMs?: number;
+}
+
+/** Fully-resolved Bedrock Converse prompt-cache capabilities, materialized once by `buildModel`. */
+export interface ResolvedBedrockCompat {
+	promptCacheMode: NonNullable<BedrockCompat["promptCacheMode"]>;
+	supportsLongPromptCacheRetention: boolean;
+	promptCacheMinimumTokens: number;
+	promptCacheMaximumCheckpoints: number;
+	/**
+	 * Stream-watchdog idle-timeout fallback in ms for hosts with no keepalive
+	 * events; 0 disables the idle watchdog. Undefined defers to
+	 * `PI_STREAM_IDLE_TIMEOUT_MS`, then the legacy
+	 * `PI_OPENAI_STREAM_IDLE_TIMEOUT_MS` alias, then the 300s default.
+	 */
+	streamIdleTimeoutMs?: number;
 }
 
 /**
@@ -481,6 +563,12 @@ export interface VercelGatewayRouting {
 	only?: string[];
 	/** List of provider slugs to try in order (e.g., ["anthropic", "openai"]). */
 	order?: string[];
+	/** Enables Vercel AI Gateway's provider-aware automatic prompt caching. */
+	caching?: "auto";
+	/** Stable Responses input-item prefix to anchor for automatic caching. */
+	cacheAnchorItems?: number;
+	/** Requested automatic-cache lifetime for the Responses API. */
+	cacheTtl?: "5m" | "1h";
 }
 
 type ResolvedToolStrictMode = NonNullable<OpenAICompat["toolStrictMode"]> | "mixed";
@@ -521,10 +609,20 @@ export interface ResolvedOpenAISharedCompat {
 	requiresAssistantContentForToolCalls: boolean;
 	stripDeepseekSpecialTokens: boolean;
 	streamMarkupHealingPattern?: OpenAIStreamMarkupHealingPattern;
+	/** See {@link OpenAICompat.streamFirstEventTimeoutMs}. */
+	streamFirstEventTimeoutMs?: number;
 	reasoningDeltasMayBeCumulative: boolean;
 	emptyLengthFinishIsContextError: boolean;
 	usesOpenAIToolCallIdLimit: boolean;
 	promptCacheSessionHeader?: OpenAICompat["promptCacheSessionHeader"];
+	/**
+	 * Whether this model accepts explicit OpenAI prompt-cache breakpoints.
+	 * Built catalog models always materialize this false-by-default value;
+	 * optionality preserves hand-authored resolved compat fixtures.
+	 */
+	supportsPromptCacheBreakpoints?: boolean;
+	/** Minimum cache lifetime supported by explicit OpenAI prompt-cache breakpoints. */
+	promptCacheBreakpointTtl?: "30m";
 	/** The model sits behind OpenRouter (routing prefs and max-token omission apply). */
 	isOpenRouterHost: boolean;
 	/** Whether this endpoint needs a max-token field even when caller did not set one. */
@@ -581,6 +679,8 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "emptyLengthFinishIsContextError"
 			| "usesOpenAIToolCallIdLimit"
 			| "promptCacheSessionHeader"
+			| "supportsPromptCacheBreakpoints"
+			| "promptCacheBreakpointTtl"
 			| "openRouterRouting"
 			| "isOpenRouterHost"
 			| "supportsStrictMode"
@@ -591,6 +691,7 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "extraBody"
 			| "toolStrictMode"
 			| "toolSchemaFlavor"
+			| "streamFirstEventTimeoutMs"
 			| "streamIdleTimeoutMs"
 			| "cacheControlFormat"
 			| "thinkingKeep"
@@ -620,6 +721,9 @@ export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompa
 	supportsImageDetailOriginal: boolean;
 	supportsObfuscationOptOut: boolean;
 	streamIdleTimeoutMs?: number;
+	vercelGatewayRouting?: OpenAICompat["vercelGatewayRouting"];
+	/** The model sits behind Vercel AI Gateway's Responses endpoint. */
+	isVercelGatewayHost: boolean;
 }
 
 /**
@@ -630,7 +734,13 @@ export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompa
 export type ResolvedOpenRouterCompat = ResolvedOpenAICompat & ResolvedOpenAIResponsesCompat;
 
 /** Fully-resolved anthropic-messages compat view (same contract as `ResolvedOpenAICompat`). */
-export type ResolvedAnthropicCompat = Required<AnthropicCompat> & {
+export type ResolvedAnthropicCompat = Required<Omit<AnthropicCompat, "streamIdleTimeoutMs">> & {
+	/**
+	 * Stream-watchdog idle-timeout fallback in ms for slow reasoning hosts; 0 disables the idle watchdog.
+	 * Undefined defers to `PI_STREAM_IDLE_TIMEOUT_MS`, then the legacy
+	 * `PI_OPENAI_STREAM_IDLE_TIMEOUT_MS` alias, then 300s.
+	 */
+	streamIdleTimeoutMs?: number;
 	/**
 	 * The configured endpoint is the official first-party Anthropic API
 	 * (https + exact `api.anthropic.com` host; a missing baseUrl counts as
@@ -638,17 +748,6 @@ export type ResolvedAnthropicCompat = Required<AnthropicCompat> & {
 	 * env headers, and cache-TTL shaping without per-request URL parsing.
 	 */
 	officialEndpoint: boolean;
-	/**
-	 * The configured endpoint enforces Anthropic's signature protocol on
-	 * replayed thinking blocks — either the official API itself or a proxy
-	 * that forwards to it (GitHub Copilot, ZenMux, Cloudflare AI Gateway's
-	 * `/anthropic` route, Google Vertex's `publishers/anthropic/…`).
-	 * Downstream transforms strip stale cross-model thinking signatures on
-	 * these endpoints so the signing proxy doesn't 400 with
-	 * `Invalid signature in thinking block` (#4297). Superset of
-	 * {@link officialEndpoint}.
-	 */
-	signingEndpoint: boolean;
 };
 
 /**
@@ -681,9 +780,11 @@ export type CompatConfigOf<TApi extends Api> = TApi extends
 	? OpenAICompat
 	: TApi extends "anthropic-messages"
 		? AnthropicCompat
-		: TApi extends "devin-agent"
-			? DevinCompat
-			: undefined;
+		: TApi extends "bedrock-converse-stream"
+			? BedrockCompat
+			: TApi extends "devin-agent"
+				? DevinCompat
+				: undefined;
 
 /** Resolved compat for a given API: complete record, materialized once by `buildModel`. */
 export type CompatOf<TApi extends Api> = TApi extends "openrouter"
@@ -694,9 +795,11 @@ export type CompatOf<TApi extends Api> = TApi extends "openrouter"
 			? ResolvedOpenAIResponsesCompat
 			: TApi extends "anthropic-messages"
 				? ResolvedAnthropicCompat
-				: TApi extends "devin-agent"
-					? ResolvedDevinCompat
-					: undefined;
+				: TApi extends "bedrock-converse-stream"
+					? ResolvedBedrockCompat
+					: TApi extends "devin-agent"
+						? ResolvedDevinCompat
+						: undefined;
 
 /** Provider-native compaction endpoint configuration for one model. */
 export interface RemoteCompactionConfig<TApi extends Api = Api> {
@@ -753,6 +856,10 @@ export interface Model<TApi extends Api = Api> {
 	 * reports that native tool calling is unsupported.
 	 */
 	supportsTools?: boolean;
+	/** Whether this model accepts the GA OpenAI Responses `{ type: "computer" }` native tool. */
+	supportsComputerUse?: boolean;
+	/** Verbatim explicit computer-use support from the spec; undefined when `buildModel` inferred the runtime value. */
+	supportsComputerUseConfig?: boolean;
 	/** GitLab Duo Workflow root namespace selected during catalog discovery. */
 	gitlabDuoWorkflowRootNamespaceId?: string;
 	/** Cursor `max_mode` request flag returned by `GetUsableModels` for premium models that require max mode. */
@@ -838,7 +945,8 @@ export interface Model<TApi extends Api = Api> {
  * vocabulary of `buildModel`. Identical to `Model` except `compat` carries the
  * sparse override shape and nothing is resolved yet.
  */
-export interface ModelSpec<TApi extends Api = Api> extends Omit<Model<TApi>, "compat" | "compatConfig"> {
+export interface ModelSpec<TApi extends Api = Api>
+	extends Omit<Model<TApi>, "compat" | "compatConfig" | "supportsComputerUseConfig"> {
 	/** Sparse compatibility overrides; resolved into `Model.compat` by `buildModel`. */
 	compat?: CompatConfigOf<TApi>;
 }

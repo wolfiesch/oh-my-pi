@@ -39,6 +39,30 @@ describe("SYSTEM.md prompt assembly", () => {
 
 	afterEach(cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome })));
 
+	it("renders an absolute cwd beneath the user's home directory", async () => {
+		const projectDir = path.join(os.homedir(), "project");
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: projectDir,
+			contextFiles: [],
+			skills: [],
+			rules: [],
+			toolNames: [],
+			activeRepoContext: null,
+			workspaceTree: {
+				rootPath: projectDir,
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			},
+		});
+
+		const promptText = systemPrompt.join("\n\n");
+		const normalizedProjectDir = projectDir.replace(/\\/g, "/");
+		// cwd interpolation: the quoted absolute path appears in the footer line.
+		expect(promptText).toContain(`'${normalizedProjectDir}'`);
+	});
+
 	it("renders SYSTEM.md exactly once when it is used as the custom base prompt", async () => {
 		const projectDir = path.join(tempDir, "project");
 		const systemDir = path.join(projectDir, ".omp");
@@ -138,12 +162,7 @@ describe("SYSTEM.md prompt assembly", () => {
 		expect(promptText).toContain("CLI custom prompt");
 		expect(promptText).toContain("<workspace-tree>");
 		expect(promptText).toContain("<dir-context>");
-		expect(promptText).toMatch(
-			new RegExp(
-				`^Today is [^,\\n]+, and the current working directory is '${escapeRegExp(normalizedProjectDir)}'\\.$`,
-				"m",
-			),
-		);
+		expect(promptText).toContain(`'${normalizedProjectDir}'`);
 		expect(appendMatches).toHaveLength(1);
 		expect(promptText).not.toContain("Discovered project SYSTEM prompt");
 	});
@@ -169,8 +188,8 @@ describe("SYSTEM.md prompt assembly", () => {
 
 		const promptText = systemPrompt.join("\n\n");
 		expect(promptText).toContain("<active-repo-context>");
-		expect(promptText).toContain("Exactly one direct child git repository was detected at `active-project`.");
-		expect(promptText).toContain("Paths under `active-project/` are the active project");
+		expect(promptText).toContain("`active-project`");
+		expect(promptText).toContain("`active-project/`");
 	});
 
 	it("prefers project SYSTEM.md over user SYSTEM.md", async () => {

@@ -48,7 +48,9 @@ import { Settings } from "../../config/settings";
 import agentCreationArchitectPrompt from "../../prompts/system/agent-creation-architect.md" with { type: "text" };
 import agentCreationUserPrompt from "../../prompts/system/agent-creation-user.md" with { type: "text" };
 import { createAgentSession } from "../../sdk";
+import { refreshAgentDiscovery } from "../../task";
 import { discoverAgents } from "../../task/discovery";
+import { resolveAgentPrewalkDefault } from "../../task/prewalk";
 import type { AgentDefinition, AgentSource } from "../../task/types";
 import { shortenPath } from "../../tools/render-utils";
 import { getEditorTheme, theme } from "../theme/theme";
@@ -602,7 +604,7 @@ export class AgentDashboard extends Container {
 		this.#persistPrewalkOverrides();
 		const pattern = resolveAgentPrewalkPattern({
 			settingsOverride: selected.prewalkOverride,
-			agentPrewalk: selected.prewalk,
+			agentPrewalk: resolveAgentPrewalkDefault(selected, this.#settingsManager?.get("task.prewalk") ?? false),
 		});
 		const state = selected.prewalkOverride ?? "agent default";
 		this.#notice = `Prewalk for ${selected.name}: ${state}${pattern ? ` (into ${pattern})` : ""}`;
@@ -823,6 +825,7 @@ export class AgentDashboard extends Container {
 		).trimEnd();
 		const content = `---\n${frontmatter}\n---\n\n${spec.systemPrompt.trim()}\n`;
 		await Bun.write(filePath, content);
+		await refreshAgentDiscovery(this.cwd);
 		await this.#reloadData();
 		this.#clearCreateFlow();
 		this.#notice = `Created agent ${spec.identifier} at ${shortenPath(filePath)}`;
@@ -1081,7 +1084,10 @@ export class AgentDashboard extends Container {
 			const prewalkPattern = selected
 				? resolveAgentPrewalkPattern({
 						settingsOverride: selected.prewalkOverride,
-						agentPrewalk: selected.prewalk,
+						agentPrewalk: resolveAgentPrewalkDefault(
+							selected,
+							this.#settingsManager?.get("task.prewalk") ?? false,
+						),
 					})
 				: undefined;
 			const prewalkResolution = prewalkPattern ? this.#resolvePatterns([prewalkPattern]) : undefined;

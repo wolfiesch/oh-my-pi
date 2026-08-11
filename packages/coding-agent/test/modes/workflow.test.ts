@@ -65,18 +65,15 @@ describe("workflow keyword highlighting", () => {
 });
 
 describe("workflow notice", () => {
-	it("is a non-empty system notice carrying the task fan-out contract", () => {
-		expect(WORKFLOW_NOTICE.length).toBeGreaterThan(0);
+	it("renders the Workflowz trigger with eval orchestration helper guidance", () => {
 		expect(WORKFLOW_NOTICE).toContain("**workflowz** keyword");
-		expect(WORKFLOW_NOTICE).toContain("Use the `task` tool for batched fan-out");
-		expect(WORKFLOW_NOTICE).toContain("tasks[]");
+		expect(WORKFLOW_NOTICE).toContain("`parallel(thunks)`");
+		expect(WORKFLOW_NOTICE).toContain("await budget.remaining()");
 	});
 
-	it("renders flat task-call guidance when task.batch is disabled", () => {
+	it("renders the same eval notice when task.batch is disabled", () => {
 		const notice = renderWorkflowNotice({ taskBatch: false });
-		expect(notice).toContain("once per independent subagent");
-		expect(notice).toContain("Do not pass `context` or `tasks[]`");
-		expect(notice).toContain("one independent task call per leaf");
-		expect(notice).not.toContain("Call `task` once per independent fan-out batch");
+		expect(notice).toContain("**workflowz** keyword");
+		expect(notice).toContain("`parallel(thunks)`");
 	});
 });

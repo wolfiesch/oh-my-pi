@@ -24,10 +24,15 @@
 
 pub mod appearance;
 pub mod ast;
+pub mod audio;
 pub mod block;
 pub mod clipboard;
 pub mod crash_handler;
+pub mod desktop;
+pub mod devicecheck;
+pub mod diff;
 pub mod fd;
+pub mod file_lock;
 pub mod glob;
 pub mod glob_util;
 pub mod grep;
@@ -35,6 +40,7 @@ pub mod highlight;
 pub mod html;
 pub mod iofs;
 pub mod keys;
+pub mod live;
 pub mod sixel;
 pub mod snapcompact;
 pub use pi_ast::language;
@@ -54,6 +60,7 @@ pub(crate) mod testing;
 pub mod text;
 pub mod tokens;
 pub(crate) mod utils;
+pub mod vectors;
 pub mod workspace;
 
 #[cfg(target_os = "windows")]
@@ -196,12 +203,12 @@ fn configure_rayon_pool() {
 			.num_threads(threads)
 			.build_global(),
 		RayonPoolPlan::SkipGlobalPool => {
-			pi_uutils_ctx::set_rayon_global_pool_available(false);
+			pi_shell::set_rayon_global_pool_available(false);
 			return;
 		},
 	};
 	if result.is_ok() {
-		pi_uutils_ctx::set_rayon_global_pool_available(true);
+		pi_shell::set_rayon_global_pool_available(true);
 	}
 }
 
@@ -249,7 +256,7 @@ fn create_windows_napi_tokio_runtime() -> Option<tokio::runtime::Runtime> {
 /// MUST stay in sync with `VERSION_SENTINEL_EXPORT` in
 /// `packages/natives/native/index.js` (which derives the name from
 /// `package.json#version`).
-#[napi(js_name = "__piNativesV17_0_5")]
+#[napi(js_name = "__piNativesV17_2_12")]
 pub const fn pi_natives_version_sentinel() {}
 
 /// Native module entry point: install crash diagnostics before any tool can

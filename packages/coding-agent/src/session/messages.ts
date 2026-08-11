@@ -23,8 +23,10 @@ import type {
 	UserMessage,
 } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
-import { prompt } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
+import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 import userInterjectionTemplate from "../prompts/steering/user-interjection.md" with { type: "text" };
+import { formatTitleConversationContext, type TitleConversationTurn } from "../tiny/message-preproc";
 
 export {
 	type BranchSummaryMessage,
@@ -40,9 +42,274 @@ import { formatOutputNotice } from "../tools/output-meta";
 export const SKILL_PROMPT_MESSAGE_TYPE = "skill-prompt";
 export const LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE = "lsp-late-diagnostic";
 export const BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE = "background-tan-dispatch";
+export const PREWALK_PLAN_MESSAGE_TYPE = "prewalk-plan";
+
+/**
+ * Logs provider-error turns so their actual cause is available outside the
+ * session transcript. No-op for non-error stop reasons.
+ */
+export function logProviderTurnError(msg: AssistantMessage): void {
+	if (msg.stopReason !== "error") return;
+	logger.warn("agent turn ended with provider error", {
+		provider: msg.provider,
+		model: msg.model,
+		errorMessage: msg.errorMessage,
+		errorStatus: msg.errorStatus,
+		errorId: msg.errorId,
+	});
+}
+
+const EPHEMERAL_REPLY_MAX_BYTES = 4096;
+const REPLAN_TITLE_CONTEXT_TURN_LIMIT = 6;
+
+/**
+ * Removes replay-bound provider state before reparenting an assistant message
+ * under a different user turn.
+ */
+export function sanitizeAssistantForReparentedHistory(message: AssistantMessage): AssistantMessage {
+	const content: AssistantMessage["content"] = [];
+	for (const block of message.content) {
+		if (block.type === "redactedThinking" || block.type === "anthropicServerTool") continue;
+		if (block.type === "thinking") {
+			content.push({ type: "thinking", thinking: block.thinking });
+			continue;
+		}
+		content.push(block);
+	}
+	return { ...message, content, providerPayload: undefined };
+}
+
+/**
+ * Collapses degenerate repeated lines and bounds an ephemeral side-channel
+ * reply to 4 KiB.
+ */
+export function dedupeEphemeralReply(text: string): string {
+	if (!text) return text;
+	const lines = text.split("\n");
+	const out: string[] = [];
+	let i = 0;
+	while (i < lines.length) {
+		let j = i + 1;
+		while (j < lines.length && lines[j] === lines[i]) j++;
+		const runLen = j - i;
+		if (runLen > 3) {
+			out.push(lines[i], `[…${runLen}×]`);
+		} else {
+			for (let k = 0; k < runLen; k++) out.push(lines[i]);
+		}
+		i = j;
+	}
+	let result = out.join("\n");
+	if (Buffer.byteLength(result, "utf8") > EPHEMERAL_REPLY_MAX_BYTES) {
+		const suffix = "\n[…truncated]";
+		const budget = EPHEMERAL_REPLY_MAX_BYTES - Buffer.byteLength(suffix, "utf8");
+		while (Buffer.byteLength(result, "utf8") > budget) {
+			result = result.slice(0, -1);
+		}
+		result += suffix;
+	}
+	return result;
+}
+
+/** Builds the recent user/assistant context supplied to title regeneration. */
+export function buildReplanTitleContext(messages: AgentMessage[]): string {
+	const turns: TitleConversationTurn[] = [];
+	for (let i = messages.length - 1; i >= 0 && turns.length < REPLAN_TITLE_CONTEXT_TURN_LIMIT; i--) {
+		const message = messages[i];
+		if (!message) continue;
+		const turn = titleConversationTurnFromMessage(message);
+		if (turn) turns.push(turn);
+	}
+	turns.reverse();
+	return formatTitleConversationContext(turns);
+}
+
+/**
+ * Compares session messages by provider-replay semantics, ignoring runtime-only
+ * fields that do not change a restored request.
+ */
+export function didSessionMessagesChange(previousMessages: AgentMessage[], nextMessages: AgentMessage[]): boolean {
+	if (previousMessages.length !== nextMessages.length) return true;
+	return previousMessages.some(
+		(message, i) =>
+			!Bun.deepEquals(
+				normalizeSessionMessageForProviderReplay(message),
+				normalizeSessionMessageForProviderReplay(nextMessages[i]),
+			),
+	);
+}
+
+function textFromContent(content: unknown): string {
+	if (typeof content === "string") return content.trim();
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const block of content) {
+		if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") continue;
+		const text = block.text.trim();
+		if (text) parts.push(text);
+	}
+	return parts.join("\n\n");
+}
+
+function thinkingFromContent(content: unknown): string {
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const block of content) {
+		if (!isRecord(block) || block.type !== "thinking" || typeof block.thinking !== "string") continue;
+		const thinking = block.thinking.trim();
+		if (thinking) parts.push(thinking);
+	}
+	return parts.join("\n\n");
+}
+
+function titleConversationTurnFromMessage(message: AgentMessage): TitleConversationTurn | undefined {
+	if (message.role !== "user" && message.role !== "assistant") return undefined;
+	const text = textFromContent(message.content);
+	const thinking = message.role === "assistant" ? thinkingFromContent(message.content) : undefined;
+	if (!text && !thinking) return undefined;
+	return { role: message.role, ...(text ? { text } : {}), ...(thinking ? { thinking } : {}) };
+}
+
+function normalizeProviderReplayValue(value: unknown): unknown {
+	if (Array.isArray(value)) {
+		return value.map(normalizeProviderReplayValue);
+	}
+	if (value && typeof value === "object") {
+		return Object.fromEntries(
+			Object.entries(value).map(([key, entryValue]) => [key, normalizeProviderReplayValue(entryValue)]),
+		);
+	}
+	return value;
+}
+
+function normalizeSessionMessageForProviderReplay(message: AgentMessage): unknown {
+	switch (message.role) {
+		case "user":
+		case "developer":
+			return {
+				role: message.role,
+				content: normalizeProviderReplayValue(message.content),
+				providerPayload: message.providerPayload,
+			};
+		case "assistant": {
+			const isResponsesFamilyMessage =
+				message.api === "openai-responses" || message.api === "openai-codex-responses";
+			return {
+				role: message.role,
+				content:
+					isResponsesFamilyMessage && Array.isArray(message.content)
+						? message.content.flatMap(block => {
+								if (block.type === "thinking") {
+									return [];
+								}
+								if (block.type === "toolCall") {
+									return [
+										{
+											type: block.type,
+											id: block.id,
+											name: block.name,
+											arguments: block.arguments,
+										},
+									];
+								}
+								if (block.type === "text") {
+									return [{ type: block.type, text: block.text, textSignature: block.textSignature }];
+								}
+								return [normalizeProviderReplayValue(block)];
+							})
+						: normalizeProviderReplayValue(message.content),
+				api: message.api,
+				provider: message.provider,
+				model: message.model,
+				stopReason: message.stopReason,
+				errorMessage: message.errorMessage,
+				providerPayload: isResponsesFamilyMessage ? undefined : message.providerPayload,
+			};
+		}
+		case "toolResult":
+			return {
+				role: message.role,
+				toolName: message.toolName,
+				toolCallId: message.toolCallId,
+				isError: message.isError,
+				content: normalizeProviderReplayValue(message.content),
+			};
+		case "bashExecution":
+			return {
+				role: message.role,
+				command: message.command,
+				output: message.output,
+				exitCode: message.exitCode,
+				cancelled: message.cancelled,
+				meta: message.meta
+					? {
+							truncation: normalizeProviderReplayValue(message.meta.truncation),
+							limits: normalizeProviderReplayValue(message.meta.limits),
+							diagnostics: message.meta.diagnostics
+								? normalizeProviderReplayValue({
+										summary: message.meta.diagnostics.summary,
+										messages: message.meta.diagnostics.messages,
+									})
+								: undefined,
+						}
+					: undefined,
+				excludeFromContext: message.excludeFromContext,
+			};
+		case "pythonExecution":
+			return {
+				role: message.role,
+				code: message.code,
+				output: message.output,
+				exitCode: message.exitCode,
+				cancelled: message.cancelled,
+				meta: message.meta
+					? {
+							truncation: normalizeProviderReplayValue(message.meta.truncation),
+							limits: normalizeProviderReplayValue(message.meta.limits),
+							diagnostics: message.meta.diagnostics
+								? normalizeProviderReplayValue({
+										summary: message.meta.diagnostics.summary,
+										messages: message.meta.diagnostics.messages,
+									})
+								: undefined,
+						}
+					: undefined,
+				excludeFromContext: message.excludeFromContext,
+			};
+		case "custom":
+		case "hookMessage":
+			return {
+				role: message.role,
+				customType: message.customType,
+				content: normalizeProviderReplayValue(message.content),
+			};
+		case "branchSummary":
+			return { role: message.role, summary: message.summary };
+		case "compactionSummary":
+			return {
+				role: message.role,
+				summary: message.summary,
+				providerPayload: message.providerPayload,
+			};
+		case "fileMention":
+			return {
+				role: message.role,
+				files: message.files.map(file => ({
+					path: file.path,
+					content: file.content,
+					image: file.image,
+				})),
+			};
+		default:
+			return normalizeProviderReplayValue(message);
+	}
+}
 
 /** Fallback type for extension-injected messages that omit a custom type. */
 export const DEFAULT_CUSTOM_MESSAGE_TYPE = "custom-message";
+
+/** Custom message carrying a coding request delegated by the live voice model. */
+export const LIVE_DELEGATION_MESSAGE_TYPE = "live-delegation";
 
 /** Content shape accepted for extension-injected messages. */
 export type CustomMessageContent = string | (TextContent | ImageContent)[];
@@ -349,8 +616,18 @@ export function normalizeCustomMessagePayload<T = unknown>(
 	};
 }
 
-function isSteeringUserMessage(message: AgentMessage | undefined): message is UserMessage & { steering: true } {
-	return message?.role === "user" && message.steering === true;
+type SteeringUserMessage =
+	| (UserMessage & { steering: true })
+	| (CustomMessage & {
+			customType: typeof COLLAB_PROMPT_MESSAGE_TYPE;
+			attribution: "user";
+	  });
+
+function isSteeringUserMessage(message: AgentMessage | undefined): message is SteeringUserMessage {
+	if (message?.role === "user") return message.steering === true;
+	return (
+		message?.role === "custom" && message.customType === COLLAB_PROMPT_MESSAGE_TYPE && message.attribution === "user"
+	);
 }
 
 function userMessageWithoutSteering(message: UserMessage): UserMessage {
@@ -390,17 +667,26 @@ function getArrayContentImages(content: (TextContent | ImageContent)[]): ImageCo
 	return images ?? [];
 }
 
-function wrapSteeringUserMessage(message: UserMessage): UserMessage {
+function wrapSteeringUserMessage(message: SteeringUserMessage): UserMessage {
+	const userMessage: UserMessage =
+		message.role === "user"
+			? userMessageWithoutSteering(message)
+			: {
+					role: "user",
+					content: message.content,
+					attribution: "user",
+					timestamp: message.timestamp,
+				};
 	if (typeof message.content === "string") {
-		if (message.content.length === 0) return message;
-		return { ...userMessageWithoutSteering(message), content: renderSteeringEnvelope(message.content) };
+		if (message.content.length === 0) return message.role === "user" ? message : userMessage;
+		return { ...userMessage, content: renderSteeringEnvelope(message.content) };
 	}
 
 	const text = getArrayContentText(message.content);
-	if (text.length === 0) return message;
+	if (text.length === 0) return message.role === "user" ? message : userMessage;
 	const content: (TextContent | ImageContent)[] = [{ type: "text", text: renderSteeringEnvelope(text) }];
 	content.push(...getArrayContentImages(message.content));
-	return { ...userMessageWithoutSteering(message), content };
+	return { ...userMessage, content };
 }
 
 export function wrapSteeringForModel(messages: AgentMessage[]): AgentMessage[] {
@@ -883,6 +1169,10 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 		}
 		case "custom": {
 			if (!isCustomMessageContent(m.content)) return [];
+			if (isSteeringUserMessage(m)) {
+				const converted = convertMessageToLlm(wrapSteeringUserMessage(m));
+				return converted ? [converted] : [];
+			}
 			if (isUserInvokedSkillPrompt(m)) {
 				return [
 					{
@@ -907,7 +1197,7 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 		}
 		case "assistant": {
 			// A user-interrupted turn keeps its trailing thinking run on the
-			// persisted/displayed message so reload and Ctrl+L rebuilds still
+			// persisted/displayed message so reload and display-reset rebuilds still
 			// show it. That run is incomplete/unsigned and gets rejected on
 			// resend, so strip it here — LLM path only — when the hidden
 			// interrupted-thinking continuity message follows.

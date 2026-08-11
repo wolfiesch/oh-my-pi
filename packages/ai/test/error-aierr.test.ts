@@ -23,6 +23,25 @@ describe("AIError.classify — structural provider errors", () => {
 		expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
 	});
 
+	it("classifies statusless provider capacity errors as transient and retryable", () => {
+		const messages = [
+			"Error Code no_capacity: The system is currently experiencing high demand",
+			"Provider is at capacity",
+			"Insufficient capacity during peak load",
+			"Capacity exhausted",
+		];
+		for (const message of messages) {
+			const id = AIError.classify(new Error(message));
+			expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
+			expect(AIError.retriable(id)).toBe(true);
+		}
+	});
+
+	it("does not treat benign capacity descriptions as transient", () => {
+		const id = AIError.classify(new Error("This model has a 128k token capacity"));
+		expect(AIError.is(id, AIError.Flag.Transient)).toBe(false);
+	});
+
 	it("maps 401/403 to authFailed via status", () => {
 		expect(
 			AIError.is(AIError.classify(new AIError.ProviderHttpError("Unauthorized", 401)), AIError.Flag.AuthFailed),
@@ -134,5 +153,19 @@ describe("aierr flag helpers", () => {
 	it("treats transient and usageLimit ids as retryable", () => {
 		expect(AIError.retriable(AIError.create(AIError.Flag.Transient))).toBe(true);
 		expect(AIError.retriable(AIError.create(AIError.Flag.UsageLimit))).toBe(true);
+	});
+
+	it("recognizes explicit transient stream parse diagnostics without broad text false positives", () => {
+		const message = "JSON Parse error: Unterminated string";
+		expect(AIError.isTransientStreamParseError(new Error(message))).toBe(true);
+		expect(AIError.isTransientStreamParseError(new Error("response truncated"))).toBe(true);
+		expect(AIError.isTransientStreamParseError(message)).toBe(true);
+		expect(AIError.isTransientStreamParseError("Unexpected end of JSON input")).toBe(true);
+		expect(AIError.isTransientStreamParseError("JSON.parse: unexpected end of data at line 1 column 8")).toBe(true);
+		expect(AIError.isTransientStreamParseError("Unexpected EOF")).toBe(true);
+		expect(AIError.isTransientStreamParseError("EOF while parsing")).toBe(true);
+		expect(AIError.isTransientStreamParseError("truncated")).toBe(false);
+		expect(AIError.isTransientStreamParseError("end of file")).toBe(false);
+		expect(AIError.isTransientStreamParseError("Unexpected token in JSON")).toBe(false);
 	});
 });

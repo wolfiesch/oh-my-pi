@@ -49,6 +49,7 @@ function createFixture(opts: { isStreaming: boolean }) {
 	const session = {
 		retryAttempt: 0,
 		getToolByName: () => undefined,
+		hasBuiltInTool: () => true,
 		sessionManager: { getCwd: () => process.cwd() },
 		isStreaming: opts.isStreaming,
 	};
@@ -57,6 +58,7 @@ function createFixture(opts: { isStreaming: boolean }) {
 		isInitialized: true,
 		init: vi.fn(async () => {}),
 		chatContainer,
+		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
 		ui: { requestRender: vi.fn() },
 		statusLine: { invalidate: vi.fn() },

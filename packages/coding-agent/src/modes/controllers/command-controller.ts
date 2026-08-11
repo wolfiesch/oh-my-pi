@@ -11,9 +11,11 @@ import {
 	type UsageReport,
 } from "@oh-my-pi/pi-ai";
 import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@oh-my-pi/pi-tui";
-import { formatDuration, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
+import { formatDuration, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
+import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
+import { parseExportArgs } from "../../export/html/args";
 import { shareSession } from "../../export/share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
 import {
@@ -26,7 +28,7 @@ import {
 	seedAlreadyExists,
 	summarizeMentalModel,
 } from "../../hindsight";
-import { resolveMemoryBackend } from "../../memory-backend";
+import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../../memory-backend";
 import { BashExecutionComponent } from "../../modes/components/bash-execution";
 import { BorderedLoader } from "../../modes/components/bordered-loader";
 import { DynamicBorder } from "../../modes/components/dynamic-border";
@@ -75,16 +77,14 @@ export class CommandController {
 	}
 
 	async handleExportCommand(text: string): Promise<void> {
-		const parts = text.split(/\s+/);
-		const arg = parts.length > 1 ? parts[1] : undefined;
-
-		if (arg === "--copy" || arg === "clipboard" || arg === "copy") {
-			this.ctx.showWarning("Use /dump to copy the session to clipboard.");
-			return;
-		}
-
 		try {
-			const filePath = await this.ctx.session.exportToHtml(arg);
+			const { outputPath, useUserThemes } = parseExportArgs(text.slice("/export".length));
+			if (outputPath === "--copy" || outputPath === "clipboard" || outputPath === "copy") {
+				this.ctx.showWarning("Use /dump to copy the session to clipboard.");
+				return;
+			}
+
+			const filePath = await this.ctx.session.exportToHtml(outputPath, useUserThemes);
 			this.ctx.showStatus(`Session exported to: ${filePath}`);
 			this.openInBrowser(filePath);
 		} catch (error: unknown) {
@@ -346,7 +346,7 @@ export class CommandController {
 			}
 		}
 
-		this.ctx.present([new Spacer(1), new Text(info, 1, 0)]);
+		this.ctx.presentCommandOutput([new Spacer(1), new Text(info, 1, 0)]);
 	}
 
 	static readonly #advisorStatusGlyph: Record<string, string> = {
@@ -368,7 +368,7 @@ export class CommandController {
 	async handleAdvisorStatusCommand(): Promise<void> {
 		const stats = this.ctx.session.getAdvisorStats();
 		if (!stats.configured) {
-			this.ctx.present([new Spacer(1), new Text("Advisor is disabled.", 1, 0)]);
+			this.ctx.presentCommandOutput([new Spacer(1), new Text("Advisor is disabled.", 1, 0)]);
 			return;
 		}
 		// Fetch live quota data (cached 5 min by the auth-gateway) so we can show
@@ -434,7 +434,7 @@ export class CommandController {
 				info += `${theme.fg("dim", "Tokens:")} ${stats.tokens.total.toLocaleString()}\n`;
 				if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
 			}
-			this.ctx.present([new Spacer(1), new Text(info, 1, 0)]);
+			this.ctx.presentCommandOutput([new Spacer(1), new Text(info, 1, 0)]);
 			return;
 		}
 		// Single active advisor — detailed view.
@@ -480,7 +480,7 @@ export class CommandController {
 			info += `${theme.fg("dim", "Cache Read:")} ${stats.tokens.cacheRead.toLocaleString()}\n`;
 		}
 		if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
-		this.ctx.present([new Spacer(1), new Text(info, 1, 0)]);
+		this.ctx.presentCommandOutput([new Spacer(1), new Text(info, 1, 0)]);
 	}
 
 	async handleJobsCommand(): Promise<void> {
@@ -497,7 +497,7 @@ export class CommandController {
 
 		if (snapshot.running.length === 0 && snapshot.recent.length === 0) {
 			info += `\n${theme.fg("dim", "No async jobs yet.")}\n`;
-			this.ctx.present([new Spacer(1), new Text(info, 1, 0)]);
+			this.ctx.presentCommandOutput([new Spacer(1), new Text(info, 1, 0)]);
 			return;
 		}
 
@@ -517,7 +517,7 @@ export class CommandController {
 			}
 		}
 
-		this.ctx.present([new Spacer(1), new Text(info.trimEnd(), 1, 0)]);
+		this.ctx.presentCommandOutput([new Spacer(1), new Text(info.trimEnd(), 1, 0)]);
 	}
 
 	async handleUsageCommand(reports?: UsageReport[] | null): Promise<void> {
@@ -549,10 +549,16 @@ export class CommandController {
 					this.ctx.session.sessionId,
 				)
 			: undefined;
-		const output = renderUsageReports(usageReports, theme, Date.now(), availableWidth, provider =>
-			provider === currentProvider ? activeAccount : undefined,
+		const usageModelSelectors = this.ctx.session.getUsageReportingModelSelectors(usageReports);
+		const output = renderUsageReports(
+			usageReports,
+			theme,
+			Date.now(),
+			availableWidth,
+			provider => (provider === currentProvider ? activeAccount : undefined),
+			usageModelSelectors,
 		);
-		this.ctx.present([new Spacer(1), new Text(output, 1, 0)]);
+		this.ctx.presentCommandOutput([new Spacer(1), new Text(output, 1, 0)]);
 	}
 
 	async handleChangelogCommand(showFull = false): Promise<void> {
@@ -572,7 +578,7 @@ export class CommandController {
 		block.addChild(new Spacer(1));
 		block.addChild(new Markdown(changelogMarkdown + hint, 1, 1, getMarkdownTheme()));
 		block.addChild(new DynamicBorder());
-		this.ctx.present(block);
+		this.ctx.presentCommandOutput(block);
 	}
 
 	handleHotkeysCommand(): void {
@@ -601,7 +607,7 @@ export class CommandController {
 		block.addChild(new Spacer(1));
 		block.addChild(new Text(output, 1, 0));
 		block.addChild(new DynamicBorder());
-		this.ctx.present(block);
+		this.ctx.presentCommandOutput(block);
 	}
 
 	async handleMemoryCommand(text: string): Promise<void> {
@@ -622,7 +628,7 @@ export class CommandController {
 			block.addChild(new Spacer(1));
 			block.addChild(new Markdown(payload, 1, 1, getMarkdownTheme()));
 			block.addChild(new DynamicBorder());
-			this.ctx.present(block);
+			this.ctx.presentCommandOutput(block);
 			return;
 		}
 
@@ -652,7 +658,7 @@ export class CommandController {
 			try {
 				const payload = await hook?.(agentDir, this.ctx.sessionManager.getCwd(), this.ctx.session);
 				if (!payload) {
-					this.ctx.showWarning(`Memory ${action} is not available for the ${backend.id} backend.`);
+					this.ctx.showWarning(memoryStatsUnavailableMessage(backend.id, action));
 					return;
 				}
 				showMarkdownPanel(this.ctx, `Memory ${action === "stats" ? "Stats" : "Diagnostics"}`, payload);
@@ -955,6 +961,37 @@ export class CommandController {
 		this.ctx.showStatus(`Fresh provider session started (${result.closedProviderSessions} ${stateLabel} pruned).`);
 	}
 
+	async handleResetContextCommand(): Promise<void> {
+		if (this.ctx.session.isCompacting) {
+			this.ctx.session.abortCompaction();
+			while (this.ctx.session.isCompacting) {
+				await Bun.sleep(10);
+			}
+		}
+		const result = await this.ctx.session.resetSessionContext();
+		if (!result) {
+			this.ctx.showWarning("Wait for the current response to finish or abort it before resetting the context.");
+			return;
+		}
+		// Drop the rendered transcript so the UI matches the now-empty model
+		// context (mirrors #runNewSessionFlow's teardown, minus the new session —
+		// the session id, title, and transcript file all survive).
+		this.ctx.clearTransientSessionUi();
+		this.ctx.resetTranscript();
+		this.ctx.statusLine.invalidate();
+		this.ctx.updateEditorBorderColor();
+		const noun = result.droppedCount === 1 ? "message" : "messages";
+		this.ctx.present([
+			new Spacer(1),
+			new Text(
+				`${theme.fg("accent", `${theme.status.success} Context reset — ${result.droppedCount} ${noun} dropped; session continues.`)}`,
+				1,
+				1,
+			),
+		]);
+		this.ctx.ui.requestRender(true, { clearScrollback: true });
+	}
+
 	async handleDropCommand(): Promise<void> {
 		if (!this.ctx.sessionManager.getSessionFile()) {
 			this.ctx.showError("Nothing to drop (in-memory session)");
@@ -1067,7 +1104,7 @@ export class CommandController {
 		}
 
 		try {
-			await this.ctx.sessionManager.moveTo(resolvedPath);
+			await this.ctx.session.moveSession(resolvedPath);
 		} catch (err) {
 			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
 			return;
@@ -1100,6 +1137,12 @@ export class CommandController {
 
 	async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
+		const shouldPersistCwd = isPersistentShellCdCommand(command);
+		if (isDeferred && shouldPersistCwd) {
+			this.ctx.showWarning("Wait for the current response to finish or abort it before changing directories.");
+			return;
+		}
+
 		this.ctx.bashComponent = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
 
 		if (isDeferred) {
@@ -1120,13 +1163,21 @@ export class CommandController {
 				},
 				{ excludeFromContext, useUserShell: true },
 			);
-
 			if (this.ctx.bashComponent) {
 				const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 				this.ctx.bashComponent.setComplete(result.exitCode, result.cancelled, {
 					output: result.output,
 					truncation: meta?.truncation,
 				});
+			}
+			try {
+				if (shouldPersistCwd) await this.#applyBashResultCwd(result);
+			} catch (error) {
+				this.ctx.showError(
+					`Bash command completed, but OMP failed to update its working directory: ${
+						error instanceof Error ? error.message : "Unknown error"
+					}`,
+				);
 			}
 		} catch (error) {
 			if (this.ctx.bashComponent) {
@@ -1137,6 +1188,31 @@ export class CommandController {
 
 		this.ctx.bashComponent = undefined;
 		this.ctx.ui.requestRender();
+	}
+
+	async #moveInteractiveCwd(resolvedPath: string): Promise<void> {
+		await this.ctx.sessionManager.moveTo(resolvedPath);
+		await this.ctx.applyCwdChange(resolvedPath);
+		this.ctx.updateEditorBorderColor();
+		await this.ctx.reloadTodos();
+	}
+
+	async #applyBashResultCwd(result: BashResult): Promise<void> {
+		if (result.cancelled || result.exitCode !== 0 || !result.workingDir) return;
+		if (!path.isAbsolute(result.workingDir)) return;
+
+		const resolvedPath = path.resolve(result.workingDir);
+		if (resolvedPath === path.resolve(this.ctx.sessionManager.getCwd())) return;
+
+		let isDirectory = false;
+		try {
+			isDirectory = (await fs.stat(resolvedPath)).isDirectory();
+		} catch {
+			isDirectory = false;
+		}
+		if (!isDirectory) return;
+
+		await this.#moveInteractiveCwd(resolvedPath);
 	}
 
 	async handlePythonCommand(code: string, excludeFromContext = false): Promise<void> {
@@ -1271,7 +1347,7 @@ export class CommandController {
 
 			compactingLoader.stop();
 			this.ctx.statusContainer.disposeChildren();
-			this.ctx.rebuildChatFromMessages();
+			this.ctx.rebuildChatFromMessages({ reuseSettledComponents: true });
 
 			this.ctx.statusLine.invalidate();
 			// Same as the auto-compaction rebuild: a collapsed transcript is an
@@ -1360,9 +1436,15 @@ export class CommandController {
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			if (message === "Handoff cancelled" || (error instanceof Error && error.name === "AbortError")) {
+			// `session.handoff()` normalizes genuine cancellations to this exact message; a
+			// provider error (even one named AbortError) is re-thrown verbatim so it surfaces
+			// as a real failure instead of a false "cancelled".
+			if (message === "Handoff cancelled") {
 				this.ctx.showError("Handoff cancelled");
 			} else {
+				// Persist the real failure so it is debuggable after the transient
+				// TUI error clears (#7993).
+				logger.error("Handoff failed", { error: message });
 				this.ctx.showError(`Handoff failed: ${message}`);
 			}
 		} finally {
@@ -1553,11 +1635,28 @@ function padColumn(text: string, width: number): string {
 	return `${text}${padding(width - visible)}`;
 }
 
-function resolveAggregateStatus(limits: UsageLimit[]): UsageLimit["status"] {
+type AggregateDisplayStatus = NonNullable<UsageLimit["status"]> | "neutral";
+
+function isUsedOnlyAbsoluteAmount(limit: UsageLimit): boolean {
+	const amount = limit.amount;
+	return (
+		amount.unit !== "percent" &&
+		amount.unit !== "unknown" &&
+		amount.used !== undefined &&
+		Number.isFinite(amount.used) &&
+		amount.limit === undefined &&
+		amount.remaining === undefined &&
+		resolveUsedFraction(limit) === undefined
+	);
+}
+
+function resolveAggregateStatus(limits: UsageLimit[]): AggregateDisplayStatus {
 	const hasOk = limits.some(limit => limit.status === "ok");
 	const hasWarning = limits.some(limit => limit.status === "warning");
 	const hasExhausted = limits.some(limit => limit.status === "exhausted");
-	if (!hasOk && !hasWarning && !hasExhausted) return "unknown";
+	if (!hasOk && !hasWarning && !hasExhausted) {
+		return limits.length > 0 && limits.every(isUsedOnlyAbsoluteAmount) ? "neutral" : "unknown";
+	}
 	if (hasOk) {
 		return hasWarning || hasExhausted ? "warning" : "ok";
 	}
@@ -1585,6 +1684,8 @@ function formatAggregateAmount(limits: UsageLimit[]): string {
 		return `${formatNumber(remainingPct)}% free`;
 	}
 
+	if (limits.length > 0 && limits.every(isUsedOnlyAbsoluteAmount)) return "";
+
 	// Count unique accounts from limit scopes — not limits.length.
 	const uniqueAccountIds = new Set(
 		limits.map(limit => limit.scope.accountId).filter((id): id is string => typeof id === "string" && id.length > 0),
@@ -1596,17 +1697,24 @@ function formatAggregateAmount(limits: UsageLimit[]): string {
 }
 
 function resolveResetRange(limits: UsageLimit[], nowMs: number): string | null {
-	const absolute = limits
-		.map(limit => limit.window?.resetsAt)
-		.filter((value): value is number => value !== undefined && Number.isFinite(value) && value > nowMs);
-	if (absolute.length === 0) return null;
-	const offsets = absolute.map(value => value - nowMs);
+	const windows = limits
+		.map(limit => limit.window)
+		.filter(
+			(window): window is NonNullable<UsageLimit["window"]> =>
+				window?.resetsAt !== undefined && Number.isFinite(window.resetsAt) && window.resetsAt > nowMs,
+		);
+	if (windows.length === 0) return null;
+	// Use the shared verb when every contributing window agrees (e.g. all "tick");
+	// mixed or absent labels fall back to the generic "resets".
+	const labels = new Set(windows.map(window => window.resetLabel ?? "resets"));
+	const verb = labels.size === 1 ? [...labels][0]! : "resets";
+	const offsets = windows.map(window => window.resetsAt! - nowMs);
 	const minReset = Math.min(...offsets);
 	const maxReset = Math.max(...offsets);
 	if (maxReset - minReset > 60_000) {
-		return `resets in ${formatDuration(minReset)}–${formatDuration(maxReset)}`;
+		return `${verb} in ${formatDuration(minReset)}–${formatDuration(maxReset)}`;
 	}
-	return `resets in ${formatDuration(minReset)}`;
+	return `${verb} in ${formatDuration(minReset)}`;
 }
 /**
  * Compact one-line quota summary for a single advisor's provider.
@@ -1660,7 +1768,8 @@ export function formatCompactQuota(
 	return `Quota: ${lines.join(" │ ")}`;
 }
 
-function resolveStatusIcon(status: UsageLimit["status"], uiTheme: typeof theme): string {
+function resolveStatusIcon(status: AggregateDisplayStatus, uiTheme: typeof theme): string {
+	if (status === "neutral") return uiTheme.fg("dim", uiTheme.status.info);
 	if (status === "exhausted") return uiTheme.fg("error", uiTheme.status.error);
 	if (status === "warning") return uiTheme.fg("warning", uiTheme.status.warning);
 	if (status === "ok") return uiTheme.fg("success", uiTheme.status.success);
@@ -1675,6 +1784,14 @@ function resolveStatusColor(status: UsageLimit["status"]): "success" | "warning"
 }
 
 function renderUsageBar(limit: UsageLimit, uiTheme: typeof theme, barWidth: number): string {
+	const usedAmount = limit.amount.used;
+	if (usedAmount !== undefined && isUsedOnlyAbsoluteAmount(limit)) {
+		const used =
+			limit.amount.unit === "usd"
+				? `$${usedAmount.toFixed(2)}`
+				: `${formatNumber(usedAmount, 2)} ${limit.amount.unit}`;
+		return uiTheme.fg("dim", truncateJobLabel(`${used} used`, barWidth));
+	}
 	const fraction = resolveUsedFraction(limit);
 	if (fraction === undefined) {
 		return uiTheme.fg("dim", "·".repeat(barWidth));
@@ -1712,6 +1829,7 @@ export function renderUsageReports(
 	nowMs: number,
 	availableWidth: number,
 	resolveActiveAccount?: (provider: string) => OAuthAccountIdentity | undefined,
+	usageModelSelectors: readonly string[] = [],
 ): string {
 	const lines: string[] = [];
 	const latestFetchedAt = Math.max(...reports.map(report => report.fetchedAt ?? 0));
@@ -1765,6 +1883,13 @@ export function renderUsageReports(
 		if (activeAccountLabel) {
 			lines.push(`  ${uiTheme.fg("accent", "in use by this session:")} ${activeAccountLabel}`);
 		}
+		const reportingModels = usageModelSelectors.filter(selector => selector.startsWith(`${provider}/`));
+		if (reportingModels.length > 0) {
+			lines.push(`  ${uiTheme.fg("accent", "Models with usage data")}`);
+			for (const selector of reportingModels) {
+				lines.push(`    ${replaceTabs(truncateToWidth(sanitizeText(selector), availableWidth - 4))}`);
+			}
+		}
 
 		// Provider-wide disclaimers (e.g. "OMP-observed spend only") render once
 		// above the per-account sections instead of duplicating onto every limit.
@@ -1817,17 +1942,34 @@ export function renderUsageReports(
 			for (const line of resetAccountLines) lines.push(uiTheme.fg("dim", line));
 		}
 
+		// Order account columns ONCE per provider (worst-first), then apply that
+		// same order to every window group. Sorting each group independently by
+		// its own used fraction (issue #6067) desynchronized the columns: an
+		// account exhausted on its 5h window but light on the weekly window would
+		// land in different column positions on each row, so the positional
+		// `account N` labels denoted different credentials per row and an
+		// exhausted limit appeared under a sibling that still had quota.
+		const accountRank = new Map<UsageReport, number>();
+		providerReports.forEach((report, position) => {
+			const worst = report.limits.reduce((max, limit) => {
+				const fraction = resolveUsedFraction(limit) ?? -1;
+				return fraction > max ? fraction : max;
+			}, -1);
+			// Encode worst-first primary key with the stable position as tiebreak
+			// so accounts tied on pressure keep their discovery order.
+			accountRank.set(report, -worst * 1000 + position);
+		});
+
 		const renderableGroups = Array.from(limitGroups.values()).map(group => {
 			const entries = group.limits.map((limit, index) => ({
 				limit,
 				report: group.reports[index],
-				fraction: resolveUsedFraction(limit),
 				index,
 			}));
 			entries.sort((a, b) => {
-				const aFraction = a.fraction ?? -1;
-				const bFraction = b.fraction ?? -1;
-				if (aFraction !== bFraction) return bFraction - aFraction;
+				const aRank = accountRank.get(a.report) ?? a.index;
+				const bRank = accountRank.get(b.report) ?? b.index;
+				if (aRank !== bRank) return aRank - bRank;
 				return a.index - b.index;
 			});
 			const sortedLimits = entries.map(entry => entry.limit);

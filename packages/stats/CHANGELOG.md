@@ -5,6 +5,42 @@
 ### Fixed
 
 - Fixed session sync visiting session files in filesystem-dependent order. Files now sync in deterministic name order, so a forked session's copied entries always land after the filename-timestamped original and stay attributed to the parent session instead of whichever file happened to sync first.
+## [17.2.10] - 2026-08-06
+
+### Changed
+
+- Optimized package dependencies by replacing `date-fns` with `@oh-my-pi/pi-utils/dates` and removing unused test dependencies.
+
+## [17.2.9] - 2026-08-05
+
+### Fixed
+
+- Restricted the stats dashboard to IPv4 loopback and removed wildcard CORS access to its API ([#7633](https://github.com/can1357/oh-my-pi/issues/7633)).
+
+## [17.2.4] - 2026-08-01
+
+### Fixed
+
+- Fixed provider usage window stats silently showing no data during SQLite contention by installing a five-second busy timeout on read-only agent database connections ([#7300](https://github.com/can1357/oh-my-pi/issues/7300)).
+
+## [17.1.2] - 2026-07-24
+
+### Added
+
+- Added a Providers dashboard section: per-provider totals, stacked token/cost burn over time, peak-burn-hours histogram, subscription-window insights (windows burned, estimated tokens per window, peak concurrent utilization, ideal account count, exhaustion events), and latest window utilization per account — window analytics read the auth broker's `/v1/usage/history` when a broker is configured (falling back to the local agent DB), since broker deployments record usage history on the broker host
+
+## [17.1.0] - 2026-07-24
+
+### Fixed
+
+- Fixed an issue where malformed persisted content blocks could abort stats ingestion for subsequent projects, and ensured pending full-session migrations are properly settled after successful backfills.
+
+## [17.0.6] - 2026-07-20
+
+### Changed
+
+- Clarified overview token accounting by separating uncached input from cache reads and showing the conversation-token total used by the agent breakdown.
+
 ## [17.0.5] - 2026-07-18
 
 ### Fixed

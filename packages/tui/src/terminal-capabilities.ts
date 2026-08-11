@@ -10,6 +10,7 @@ import {
 	setKittyGraphics,
 } from "./kitty-graphics";
 import { isInsideTmux, wrapTmuxPassthrough, wrapTmuxPassthroughIfNeeded } from "./tmux";
+import type { HangulCompatibilityJamoWidth } from "./utils";
 
 export { isInsideTmux, wrapTmuxPassthrough } from "./tmux";
 
@@ -105,6 +106,12 @@ export class TerminalInfo {
 		readonly supportsScreenToScrollback: boolean = false,
 		/** Renders the Kitty OSC 66 text-sizing protocol (scaled spans). Kitty only. */
 		public readonly textSizing: boolean = false,
+		/**
+		 * Hangul Compatibility Jamo (U+3131..=U+318E) cell width. Ghostty follows
+		 * UAX#11 (2 cells); Warp paints 1; "platform" keeps the OS default
+		 * (macOS narrow, otherwise UAX#11).
+		 */
+		public readonly hangulJamoWidth: HangulCompatibilityJamoWidth = "platform",
 	) {}
 
 	/**
@@ -180,12 +187,12 @@ export class TerminalInfo {
 
 /** Detect terminal multiplexers where scrollback clearing and height-change redraws are hostile. */
 export function isInsideTerminalMultiplexer(env: NodeJS.ProcessEnv = Bun.env): boolean {
-	// TMUX/STY/ZELLIJ and CMUX workspace/surface/remote-transport markers are
-	// authoritative session signals. TERM can also survive when those are
+	// TMUX/STY/ZELLIJ, Herdr, and CMUX workspace/surface/remote-transport
+	// markers are authoritative session signals. TERM can also survive when those are
 	// stripped (`sudo` without -E, `su`, env-sanitizing launchers/ssh). Do not
 	// use CMUX_SOCKET_PATH here: it is a CLI socket override and can be set
 	// outside a CMUX terminal.
-	if (env.TMUX || env.STY || env.ZELLIJ) return true;
+	if (env.TMUX || env.STY || env.ZELLIJ || env.HERDR_ENV === "1") return true;
 	if (env.CMUX_WORKSPACE_ID || env.CMUX_SURFACE_ID || env.CMUX_REMOTE_TRANSPORT) return true;
 	const term = env.TERM?.toLowerCase() ?? "";
 	return term.startsWith("tmux") || term.startsWith("screen");
@@ -447,7 +454,17 @@ export function resolveWarpImageProtocol(
 }
 
 function getWarpTerminalInfo(platform: NodeJS.Platform, env: NodeJS.ProcessEnv = Bun.env): TerminalInfo {
-	return new TerminalInfo("warp", resolveWarpImageProtocol(platform, env), true, false, NotifyProtocol.Osc9);
+	return new TerminalInfo(
+		"warp",
+		resolveWarpImageProtocol(platform, env),
+		true,
+		false,
+		NotifyProtocol.Osc9,
+		false,
+		false,
+		false,
+		1,
+	);
 }
 const KNOWN_TERMINALS = Object.freeze({
 	// Fallback terminals
@@ -455,7 +472,7 @@ const KNOWN_TERMINALS = Object.freeze({
 	trueColor: new TerminalInfo("trueColor", null, true, false, NotifyProtocol.Bell),
 	// Recognized terminals
 	kitty: new TerminalInfo("kitty", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc99, true, true, true),
-	ghostty: new TerminalInfo("ghostty", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc9),
+	ghostty: new TerminalInfo("ghostty", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc9, false, false, false, 2),
 	wezterm: new TerminalInfo("wezterm", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc9),
 	iterm2: new TerminalInfo("iterm2", ImageProtocol.Iterm2, true, true, NotifyProtocol.Osc9),
 	vscode: new TerminalInfo("vscode", null, true, true, NotifyProtocol.Bell),
@@ -465,7 +482,7 @@ const KNOWN_TERMINALS = Object.freeze({
 	// detectKittyUnicodePlaceholdersSupport correctly excludes it). It does not
 	// honor OSC 8 yet (the escape renders as visible text), so hyperlinks stay off,
 	// but it does support OSC 9 notifications.
-	warp: new TerminalInfo("warp", ImageProtocol.Kitty, true, false, NotifyProtocol.Osc9),
+	warp: new TerminalInfo("warp", ImageProtocol.Kitty, true, false, NotifyProtocol.Osc9, false, false, false, 1),
 });
 
 /** Resolve terminal identity from environment markers used by common emulators. */

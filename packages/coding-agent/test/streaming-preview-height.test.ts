@@ -144,7 +144,7 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 		const tool = { mode: "replace" } as unknown as AgentTool;
 		const component = new ToolExecutionComponent(
 			"edit",
-			{ path: file, edits: [{ old_text: oldBlock, new_text: fullNew.slice(0, 1) }] },
+			{ path: file, old_string: oldBlock, new_string: fullNew.slice(0, 1) },
 			{},
 			tool,
 			tui,
@@ -199,7 +199,7 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 		const tool = { mode: "replace" } as unknown as AgentTool;
 		const component = new ToolExecutionComponent(
 			"edit",
-			{ path: bigFile, edits: [{ old_text: bigOld, new_text: bigNew.slice(0, 1) }] },
+			{ path: bigFile, old_string: bigOld, new_string: bigNew.slice(0, 1) },
 			{},
 			tool,
 			uiStub,
@@ -225,7 +225,7 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 		const heights: number[] = [];
 		let maxTrailingBlank = 0;
 		for (const newText of bigPartials) {
-			component.updateArgs({ path: bigFile, edits: [{ old_text: bigOld, new_text: newText }] });
+			component.updateArgs({ path: bigFile, old_string: bigOld, new_string: newText });
 			await component.whenPreviewSettled();
 			const rows = component.render(RENDER_WIDTH_WIDE);
 			heights.push(rows.length);
@@ -284,7 +284,7 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 			const streamingStepCount = streamedReplacements.length;
 			const lifecycleSteps = [
 				...streamedReplacements.map((newText, i) => () => {
-					component.updateArgs({ path: file, edits: [{ old_text: oldBlock, new_text: newText }] });
+					component.updateArgs({ path: file, old_string: oldBlock, new_string: newText });
 					if (i % 4 === 1) {
 						component.setExpanded(true);
 					} else if (i % 4 === 3) {
@@ -367,7 +367,7 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 		const rawLineCounts: number[] = [];
 		for (const newText of partials) {
 			const previews = await EDIT_MODE_STRATEGIES.replace.computeDiffPreview(
-				{ path: file, edits: [{ old_text: oldBlock, new_text: newText }] },
+				{ path: file, old_string: oldBlock, new_string: newText },
 				ctx,
 			);
 			const first = previews?.[0];
@@ -457,7 +457,9 @@ describe("streaming tool call preview height (bounded across renderers)", () => 
 		const window = previewWindowRows();
 		const total = window + 5;
 		const hidden = total - window;
-		const longLines = Array.from({ length: total }, (_, i) => `line-${i}`);
+		// Underscore identifiers: the display formatter would space `line-1` as a
+		// subtraction, and this test asserts windowing, not operator layout.
+		const longLines = Array.from({ length: total }, (_, i) => `line_${i}`);
 		const { lines, text } = renderPending("eval", {
 			language: "js",
 			title: "big",
@@ -466,10 +468,10 @@ describe("streaming tool call preview height (bounded across renderers)", () => 
 
 		expect(lines.length, "eval code preview should stay bounded").toBeLessThan(window + 10);
 		const renderedLines = getRenderedLines(lines);
-		expect(renderedLines).toContain(`const line-${total - 1} = 1;`);
-		expect(renderedLines).toContain(`const line-${hidden} = 1;`);
-		expect(renderedLines).not.toContain("const line-0 = 1;");
-		expect(renderedLines).not.toContain(`const line-${hidden - 1} = 1;`);
+		expect(renderedLines).toContain(`const line_${total - 1} = 1;`);
+		expect(renderedLines).toContain(`const line_${hidden} = 1;`);
+		expect(renderedLines).not.toContain("const line_0 = 1;");
+		expect(renderedLines).not.toContain(`const line_${hidden - 1} = 1;`);
 		expect(text).toContain(`… ${hidden} earlier lines`);
 	}, 30_000);
 });

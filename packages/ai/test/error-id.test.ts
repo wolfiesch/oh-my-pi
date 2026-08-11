@@ -43,6 +43,25 @@ describe("error-id classification", () => {
 		expect(AIError.retriable(id)).toBe(true);
 	});
 
+	it("classifies provider connection failures as transient", () => {
+		const assistant = message({
+			errorMessage: "Unable to connect. Is the computer able to access the url?",
+		});
+		const id = AIError.classifyMessage(assistant);
+		expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
+		expect(AIError.retriable(id)).toBe(true);
+	});
+
+	it("keeps authenticated connection rejections non-retryable", () => {
+		const assistant = message({
+			errorMessage: "Unable to connect: 401 Unauthorized",
+		});
+		const id = AIError.classifyMessage(assistant);
+		expect(AIError.is(id, AIError.Flag.AuthFailed)).toBe(true);
+		expect(AIError.is(id, AIError.Flag.Transient)).toBe(false);
+		expect(AIError.retriable(id)).toBe(false);
+	});
+
 	it("keeps provider content filters non-retryable", () => {
 		const error = new AIError.ProviderResponseError("Provider returned error finish_reason: content_filter", {
 			provider: "openrouter",
@@ -52,6 +71,20 @@ describe("error-id classification", () => {
 		expect(AIError.is(id, AIError.Flag.ContentBlocked)).toBe(true);
 		expect(AIError.is(id, AIError.Flag.ProviderFinishError)).toBe(true);
 		expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
+		expect(AIError.retriable(id)).toBe(false);
+	});
+
+	it("classifies Codex cyber approval denials as account-scoped policy blocks", () => {
+		const assistant = message({
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			model: "gpt-5.6-sol",
+			errorMessage:
+				"Codex error event: This content was flagged for possible cybersecurity risk. Join Trusted Access for Cyber. (code=cyber_policy)",
+		});
+		const id = AIError.classifyMessage(assistant);
+		expect(AIError.is(id, AIError.Flag.AccountPolicy)).toBe(true);
+		expect(AIError.is(id, AIError.Flag.ContentBlocked)).toBe(true);
 		expect(AIError.retriable(id)).toBe(false);
 	});
 

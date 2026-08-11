@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { resolveContainedPathSync } from "../discovery/contained-path";
 import type { Skill } from "../extensibility/skills";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { validateRelativePath } from "../internal-urls/skill-protocol";
@@ -89,6 +90,20 @@ export function resolveSkillUrlToPath(url: string, skills: readonly Skill[]): st
 	if (!resolvedPath.startsWith(resolvedBaseDir + path.sep) && resolvedPath !== resolvedBaseDir) {
 		throw new ToolError("Path traversal is not allowed in skill:// URLs");
 	}
+	// Agent Plugin skills (§4.1): the resource must canonically resolve within
+	// the plugin root. Fail closed: a dangling or unresolvable path is rejected
+	// rather than handed to bash, where writing through it could create the
+	// outside target. Symlinks may target other files inside the same package.
+	if (skill.containRoot) {
+		const contained = resolveContainedPathSync(skill.containRoot, resolvedPath);
+		if (contained.status === "outside") {
+			throw new ToolError(`skill:// path resolves outside the plugin root: ${url}`);
+		}
+		if (contained.status === "missing") {
+			throw new ToolError(`skill:// path does not exist: ${url}`);
+		}
+		return contained.realPath;
+	}
 
 	return resolvedPath;
 }
@@ -144,6 +159,8 @@ function unquoteToken(token: string): string {
 function isInsideShellQuote(command: string, index: number): boolean {
 	type ShellQuote = "'" | '"' | undefined;
 	interface CommandSubstitution {
+		/** `$(` … `)` tracks paren depth; `` ` `` … `` ` `` is a plain toggle. */
+		kind: "dollar" | "backtick";
 		outerQuote: ShellQuote;
 		depth: number;
 	}
@@ -152,6 +169,19 @@ function isInsideShellQuote(command: string, index: number): boolean {
 	const substitutions: CommandSubstitution[] = [];
 	for (let i = 0; i < index; i++) {
 		const char = command[i];
+		// Inside a backtick substitution nested in double quotes, bash treats `\"`
+		// as a quote delimiter for the inner command, not as an escaped literal.
+		if (
+			char === "\\" &&
+			command[i + 1] === '"' &&
+			quote !== "'" &&
+			substitutions.at(-1)?.kind === "backtick" &&
+			substitutions.at(-1)?.outerQuote === '"'
+		) {
+			quote = quote === '"' ? undefined : '"';
+			i++;
+			continue;
+		}
 		if (char === "\\" && quote !== "'") {
 			i++;
 			continue;
@@ -165,15 +195,26 @@ function isInsideShellQuote(command: string, index: number): boolean {
 			continue;
 		}
 		if (char === "$" && command[i + 1] === "(" && quote !== "'") {
-			substitutions.push({ outerQuote: quote, depth: 1 });
+			substitutions.push({ kind: "dollar", outerQuote: quote, depth: 1 });
 			quote = undefined;
 			i++;
+			continue;
+		}
+		if (char === "`" && quote !== "'") {
+			const top = substitutions.at(-1);
+			if (top?.kind === "backtick") {
+				substitutions.pop();
+				quote = top.outerQuote;
+			} else {
+				substitutions.push({ kind: "backtick", outerQuote: quote, depth: 0 });
+				quote = undefined;
+			}
 			continue;
 		}
 		if (quote !== undefined) continue;
 
 		const substitution = substitutions.at(-1);
-		if (!substitution) continue;
+		if (substitution?.kind !== "dollar") continue;
 		if (char === "(") {
 			substitution.depth++;
 		} else if (char === ")") {

@@ -90,12 +90,12 @@ describe("CI workflow product release contract", () => {
 			"native addon download inputs",
 		);
 		expect(nativeDownload.pattern).toBe(
-			"pi-natives-linux-x64-*-h${{ needs.native_artifact_lookup.outputs.source-hash }}",
+			`pi-natives-linux-x64-*-h\${{ needs.native_artifact_lookup.outputs.source-hash }}`,
 		);
-		expect(nativeDownload["run-id"]).toBe("${{ steps.native-source.outputs.artifact-run-id }}");
+		expect(nativeDownload["run-id"]).toBe(`\${{ steps.native-source.outputs.artifact-run-id }}`);
 		const manifestCommand = step("release_github", "Generate native addon provenance manifest").run;
 		expect(manifestCommand).toContain('--commit "$GITHUB_SHA"');
-		expect(manifestCommand).toContain('--source-hash "${{ needs.native_artifact_lookup.outputs.source-hash }}"');
+		expect(manifestCommand).toContain(`--source-hash "\${{ needs.native_artifact_lookup.outputs.source-hash }}"`);
 		const releaseUpload = config(step("release_github", "Create GitHub Release").with, "GitHub release inputs");
 		expect(String(releaseUpload.files).trim().split(/\r?\n/u)).toEqual([
 			"packages/coding-agent/binaries/omp-*",

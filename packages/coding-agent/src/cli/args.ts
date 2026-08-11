@@ -1,8 +1,10 @@
 /**
  * CLI argument parsing and help display
  */
-import { APP_NAME, CONFIG_DIR_NAME, logger } from "@oh-my-pi/pi-utils";
-import chalk from "chalk";
+import * as path from "node:path";
+import { $env, APP_NAME, logger } from "@oh-my-pi/pi-utils";
+import chalk from "@oh-my-pi/pi-utils/chalk";
+import type { ServiceTierOpenAISettingValue } from "../config/service-tier";
 import { CLI_THINKING_LEVELS, type ConfiguredThinkingLevel, parseCliThinkingLevel } from "../thinking";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolNames } from "../tools/builtin-names";
 import {
@@ -13,12 +15,17 @@ import {
 	STRING_SETTERS,
 	STRING_VALUE_FLAGS,
 } from "./flag-tables";
+import { getExtraHelpText } from "./help-extra";
 import { CliUsageError } from "./usage-error";
+
+export { getExtraHelpText };
 
 export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
 
 export interface Args {
 	cwd?: string;
+	/** Workspace directories beyond cwd for this session (repeatable `--add-dir`). */
+	addDir?: string[];
 	profile?: string;
 	alias?: string;
 	allowHome?: boolean;
@@ -38,10 +45,13 @@ export interface Args {
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
 	thinking?: ConfiguredThinkingLevel;
+	serviceTier?: ServiceTierOpenAISettingValue;
 	hideThinking?: boolean;
 	advisor?: boolean;
 	continue?: boolean;
 	resume?: string | true;
+	fromClaude?: boolean;
+	fromCodex?: boolean;
 	help?: boolean;
 	version?: boolean;
 	mode?: Mode;
@@ -59,6 +69,7 @@ export interface Args {
 	noPty?: boolean;
 	hooks?: string[];
 	extensions?: string[];
+	trustedExtensions?: string[];
 	noExtensions?: boolean;
 	pluginDirs?: string[];
 	print?: boolean;
@@ -101,7 +112,7 @@ const PARSE_DEPS: ParseDeps = {
 	thinkingEfforts: CLI_THINKING_LEVELS,
 };
 
-const WINDOWS_PATH_VALUE_FLAGS: ReadonlySet<string> = new Set(["--extension", "-e", "--hook"]);
+const WINDOWS_PATH_VALUE_FLAGS = new Set(["--extension", "-e", "--hook", "--trusted-extension"]);
 const WINDOWS_PATH_START_RE =
 	/^(?:[A-Za-z]:[\\/]|\\\\[?]\\(?:[A-Za-z]:[\\/]|UNC[\\/])|\\\\[^\\/]+[\\/][^\\/]+[\\/]|\/\/[?]\/(?:[A-Za-z]:\/|UNC\/)|\/\/[^/]+\/[^/]+\/)/;
 const WINDOWS_MODULE_PATH_SUFFIX_RE = /\.(?:[cm]?[jt]sx?)$/i;
@@ -141,11 +152,13 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		fileArgs: [],
 		unknownFlags: new Map(),
 		unrecognizedFlags: [],
+		sessionDir: $env.PI_CODING_AGENT_SESSION_DIR || undefined,
 	};
 
 	// `--` ends option parsing (POSIX end-of-options). Everything after it is
 	// literal positional text, so flag-shaped messages are not parsed or rejected.
 	let sawSeparator = false;
+	let trustedFlagCount = 0;
 	for (let i = 0; i < args.length; i++) {
 		let arg = args[i];
 		if (sawSeparator) {
@@ -190,6 +203,7 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 				}
 			}
 		} else if (STRING_VALUE_FLAGS.has(arg)) {
+			if (arg === "--trusted-extension") trustedFlagCount++;
 			// Built-in string flags consume the next token even when it is flag-looking
 			// (`--system-prompt --profile foo` ⇒ the prompt is the literal "--profile").
 			// The one token they must never absorb is the profile bootstrap's internal
@@ -225,6 +239,10 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.alias = arg.slice("--alias=".length);
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;
+		} else if (arg === "--from-claude") {
+			result.fromClaude = true;
+		} else if (arg === "--from-codex") {
+			result.fromCodex = true;
 		} else if (arg === "--no-session") {
 			result.noSession = true;
 		} else if (arg === "--no-tools") {
@@ -290,6 +308,24 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		}
 	}
 
+	const swallowedTrustedFlag = [...(result.extensions ?? []), ...(result.hooks ?? [])].some(
+		value => value === "--trusted-extension" || value.startsWith("--trusted-extension="),
+	);
+	if ((result.trustedExtensions?.length ?? 0) !== trustedFlagCount || swallowedTrustedFlag) {
+		throw new CliUsageError("--trusted-extension requires a non-empty, non-flag value");
+	}
+	if (trustedFlagCount > 0 && ((result.extensions?.length ?? 0) > 0 || (result.hooks?.length ?? 0) > 0)) {
+		throw new CliUsageError("--trusted-extension cannot be combined with --extension, -e, or --hook");
+	}
+	for (const trustedPath of result.trustedExtensions ?? []) {
+		if (trustedPath.length === 0) {
+			throw new CliUsageError("--trusted-extension requires a non-empty, non-flag value");
+		}
+		if (!path.isAbsolute(trustedPath)) {
+			throw new CliUsageError(`--trusted-extension requires an absolute path: ${trustedPath}`);
+		}
+	}
+
 	return result;
 }
 
@@ -320,91 +356,6 @@ export function reportCliUsageError(
 	write(`${chalk.red(`Error: ${error.message}`)}\n`);
 	write(`Run \`${APP_NAME} --help\` for available flags.\n`);
 	return true;
-}
-
-export function getExtraHelpText(): string {
-	return `${chalk.bold("Environment Variables:")}
-  ${chalk.dim("# Core Providers")}
-  ANTHROPIC_API_KEY          - Anthropic Claude models
-  ANTHROPIC_OAUTH_TOKEN      - Anthropic OAuth (takes precedence over API key)
-  CLAUDE_CODE_USE_FOUNDRY    - Enable Anthropic Foundry mode (uses Foundry endpoint + mTLS)
-  FOUNDRY_BASE_URL           - Anthropic Foundry base URL (e.g., https://<foundry-host>)
-  ANTHROPIC_FOUNDRY_API_KEY  - Anthropic token used as Authorization: Bearer <token> in Foundry mode
-  ANTHROPIC_CUSTOM_HEADERS   - Extra headers for Foundry or any custom ANTHROPIC_BASE_URL gateway (e.g., "user-id: USERNAME")
-  CLAUDE_CODE_CLIENT_CERT    - Client certificate (PEM path or inline PEM) for mTLS
-  CLAUDE_CODE_CLIENT_KEY     - Client private key (PEM path or inline PEM) for mTLS
-  NODE_EXTRA_CA_CERTS        - CA bundle path (or inline PEM) for server certificate validation
-  OPENAI_API_KEY             - OpenAI GPT models
-  GEMINI_API_KEY             - Google Gemini models
-  COPILOT_GITHUB_TOKEN      - GitHub Copilot
-
-  ${chalk.dim("# Additional LLM Providers")}
-  AZURE_OPENAI_API_KEY       - Azure OpenAI models
-  GROQ_API_KEY               - Groq models
-  CEREBRAS_API_KEY           - Cerebras models
-  XAI_API_KEY                - xAI Grok models
-  OPENROUTER_API_KEY         - OpenRouter aggregated models
-  KILO_API_KEY               - Kilo Gateway models
-  MISTRAL_API_KEY            - Mistral models
-  ZAI_API_KEY                - z.ai models (ZhipuAI/GLM)
-  UMANS_AI_CODING_PLAN_API_KEY - Umans AI Coding Plan models
-  UMANS_WEBSEARCH_PROVIDER    - Umans gateway web search backend (native or exa)
-  MINIMAX_API_KEY            - MiniMax models
-  OPENCODE_API_KEY           - OpenCode Zen/OpenCode Go models
-  CURSOR_ACCESS_TOKEN        - Cursor AI models
-  AI_GATEWAY_API_KEY         - Vercel AI Gateway
-  WAFER_SERVERLESS_API_KEY   - Wafer Serverless (pay-as-you-go)
-
-  ${chalk.dim("# Cloud Providers")}
-  AWS_PROFILE                - AWS Bedrock (or AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY)
-  GOOGLE_CLOUD_PROJECT       - Google Vertex AI (requires GOOGLE_CLOUD_LOCATION)
-  GOOGLE_APPLICATION_CREDENTIALS - Service account for Vertex AI
-
-  ${chalk.dim("# Search & Tools")}
-  EXA_API_KEY                - Exa web search
-  BRAVE_API_KEY              - Brave web search
-  PERPLEXITY_API_KEY         - Perplexity web search API key (optional; anonymous fallback)
-  PERPLEXITY_COOKIES         - Perplexity web search (session cookie)
-  TAVILY_API_KEY             - Tavily web search
-  TINYFISH_API_KEY           - TinyFish web search
-  FIRECRAWL_API_KEY          - Firecrawl web search
-  ANTHROPIC_SEARCH_API_KEY   - Anthropic web search (override; isolates search from main ANTHROPIC_API_KEY)
-  ANTHROPIC_SEARCH_BASE_URL  - Anthropic web search base URL (override; pairs with ANTHROPIC_SEARCH_API_KEY)
-
-  ${chalk.dim("# Configuration")}
-  OMP_PROFILE                 - Named profile for isolated agent state (same as --profile)
-  Use \`omp --profile <name> --alias <command>\` to create a shell shortcut for a profile
-  PI_CODING_AGENT_DIR        - Session storage directory (default: ~/${CONFIG_DIR_NAME}/agent)
-  PI_PACKAGE_DIR             - Override package directory (for Nix/Guix store paths)
-  PI_SMOL_MODEL              - Override smol/fast model (see --smol)
-  PI_SLOW_MODEL              - Override slow/reasoning model (see --slow)
-  PI_PLAN_MODEL              - Override planning model (see --plan)
-  PI_NO_PTY                  - Disable PTY-based interactive bash execution
-  For complete environment variable reference, see:
-  ${chalk.dim("docs/environment-variables.md")}
-${chalk.bold("Available Tools (default-enabled unless noted):")}
-  read          - Read file contents
-  bash          - Execute bash commands
-  edit          - Edit files with find/replace
-  write         - Write files (creates/overwrites)
-  grep          - Search file contents
-  glob          - Find files by glob pattern
-  lsp           - Language server protocol (code intelligence)
-  python        - Execute Python code (requires: ${APP_NAME} setup python)
-  notebook      - Edit Jupyter notebooks
-  inspect_image - Analyze images with a vision model
-  browser       - Browser automation (Puppeteer)
-  task          - Launch sub-agents for parallel tasks
-  todo          - Manage todo/task lists
-  web_search    - Search the web
-  ask           - Ask user questions (interactive mode only)
-
-${chalk.bold("Plugin Options:")}
-  --plugin-dir <path>        Load plugin from directory (repeatable)
-
-${chalk.bold("Useful Commands:")}
-  omp agents unpack           - Export bundled subagents to ~/.omp/agent/agents (default)
-  omp agents unpack --project - Export bundled subagents to ./.omp/agents`;
 }
 
 export function printHelp(): void {

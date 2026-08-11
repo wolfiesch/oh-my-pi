@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { formatHashlineHeader, stripHashlinePrefixes } from "@oh-my-pi/hashline";
+import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentTool,
 	AgentToolContext,
@@ -12,7 +13,6 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import { type Component, Text } from "@oh-my-pi/pi-tui";
 import { isEnoent, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 
 import { canonicalSnapshotKey, getFileSnapshotStore } from "../edit/file-snapshot-store";
 import { normalizeToLF } from "../edit/normalize";
@@ -49,7 +49,14 @@ import {
 } from "./conflict-detect";
 import { invalidateFsScanAfterWrite } from "./fs-cache-invalidation";
 import { type OutputMeta, outputMeta } from "./output-meta";
-import { formatPathRelativeToCwd, isInternalUrlPath, pathTargetsSsh, peelWriteUrlSelector } from "./path-utils";
+import {
+	formatPathRelativeToCwd,
+	isInternalUrlPath,
+	pathTargetsSsh,
+	peelWriteUrlSelector,
+	probeLiteralPathExists,
+	splitPathAndSel,
+} from "./path-utils";
 import { enforcePlanModeWrite, resolvePlanPath, unwrapHashlineHeaderPath } from "./plan-mode-guard";
 import {
 	cachedRenderedString,
@@ -81,10 +88,119 @@ import {
 } from "./sqlite-reader";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
-import { renderXdevCall, renderXdevResult, type XdevDispatch } from "./xdev";
+import {
+	dispatchXdevTool,
+	renderXdevCall,
+	renderXdevResult,
+	resolveXdevTool,
+	type XdevDispatch,
+	xdevListing,
+} from "./xdev";
 
 const LOOSE_HASHLINE_HEADER_RE = /^\s*\[[^#\r\n]+#[^ \t\r\n]*\]\s*$/;
 const EXECUTABLE_NOTICE = "[Notice: Made executable via chmod +x]";
+const URI_LIKE_WRITE_PATH_RE = /^([a-z][a-z0-9+.-]*):\/{1,2}(.*)$/i;
+const XD_MISSING_DELIMITER_RE = /^xd\/+(.*)$/i;
+const XD_SCHEME_NEAR_MISSES: Record<string, true> = { dx: true, xdd: true, xdt: true };
+
+function assertWriteTargetAddressable(target: string, router: InternalUrlRouter): void {
+	const trimmed = target.trim();
+	if (path.win32.isAbsolute(trimmed) || router.canHandle(trimmed)) return;
+
+	const missingDelimiter = trimmed.match(XD_MISSING_DELIMITER_RE);
+	if (missingDelimiter) {
+		throw new ToolError(
+			`Unknown URI-like write target '${trimmed}'. Did you mean 'xd://${missingDelimiter[1]}'? Prefix the path with './' to write it as a filesystem path.`,
+		);
+	}
+
+	const uriLike = trimmed.match(URI_LIKE_WRITE_PATH_RE);
+	if (!uriLike) return;
+
+	const scheme = uriLike[1]!.toLowerCase();
+	// conflict:// has no router handler but is spliced downstream by
+	// parseConflictUri (which emits its own precise id/scope errors); let it pass.
+	if (scheme === "conflict") return;
+	const canonicalScheme = router.getHandler(scheme) ? scheme : XD_SCHEME_NEAR_MISSES[scheme] ? "xd" : undefined;
+	const suggestion = canonicalScheme
+		? ` Did you mean '${canonicalScheme}://${uriLike[2]}'?`
+		: " Tool devices use 'xd://<tool>'.";
+	throw new ToolError(
+		`Unknown URI-like write target '${trimmed}'.${suggestion} Prefix the path with './' to write it as a filesystem path.`,
+	);
+}
+
+/**
+ * Fail closed when a local write target looks like a mis-dispatched read.
+ *
+ * A read-only step that selects `write` instead of `read` passes the full read
+ * expression (`src/foo.tsx:1-260:raw`) as the target. Because a literal colon
+ * filename is legal on POSIX (issue #4618), that request otherwise resolves to
+ * filesystem creation and reports success, leaving a stray zero-byte file the
+ * model cannot recover from — the local analogue of the `xd://` near-miss guard
+ * ({@link assertWriteTargetAddressable}, issue #6123).
+ *
+ * Fires only on the high-confidence combination the report identifies: the tail
+ * parses as a read-tool selector, the literal target is missing, and no content
+ * was supplied. Non-empty content is the escape hatch — it is never blocked, so
+ * a deliberate write to a selector-shaped filename still succeeds. An existing
+ * literal path or an ambiguous stat (`"unknown"`: EACCES, transient I/O) also
+ * passes through so a real file is never shadowed by the guard.
+ */
+function readSelectorForEmptyWrite(target: string, content: string): string | undefined {
+	if (content.length > 0) return undefined;
+	return splitPathAndSel(target).sel;
+}
+
+function throwReadSelectorMisfire(target: string, sel: string): never {
+	throw new ToolError(
+		`write target '${target}' ends with a read-tool selector ':${sel}' and no such file exists — refusing to create a literal file by that name. ` +
+			`If you meant to read it, use read({ path: "${target}" }). ` +
+			`If you truly intend to create this file, pass its contents in \`content\` (a non-empty write is never blocked).`,
+	);
+}
+
+/**
+ * Recognize a semicolon-joined list of read-tool selectors mis-dispatched as a
+ * single write target — the multi-file read expression the scout emitted in
+ * issue #6809 (`a.txt:1-2;b/c.txt:3-4`). Every `;`-segment must be non-empty and
+ * carry its own read selector ({@link splitPathAndSel} peels a `:N-M`, `:raw`,
+ * or `:conflicts` tail). No real call targets such a list: `read` accepts one
+ * path, `write` writes one file. Unlike {@link readSelectorForEmptyWrite} this
+ * fires regardless of `content` — the non-empty-content escape hatch exists for
+ * a lone selector-shaped *filename*, never a `;`-list, and honoring it here
+ * silently creates a nested directory tree (`a.txt:1-2;b/`) in the workspace.
+ * The caller still probes the literal target first, so an existing POSIX file
+ * by that exact name stays writable (same escape as the single-selector guard).
+ */
+function readSelectorListMisfire(target: string): number | undefined {
+	if (!target.includes(";")) return undefined;
+	const segments = target.split(";");
+	if (segments.length < 2) return undefined;
+	for (const segment of segments) {
+		const trimmed = segment.trim();
+		if (trimmed.length === 0 || splitPathAndSel(trimmed).sel === undefined) return undefined;
+	}
+	return segments.length;
+}
+
+function throwReadSelectorListMisfire(target: string, count: number): never {
+	throw new ToolError(
+		`write target '${target}' is a semicolon-joined list of ${count} read-tool selectors, not a filesystem path — refusing to create it. ` +
+			`write creates a single file; issue one read() per path to read these ranges (e.g. read({ path: "<one path>:<range>" })).`,
+	);
+}
+
+async function assertNotReadSelectorMisfire(target: string, content: string, cwd: string): Promise<void> {
+	const listCount = readSelectorListMisfire(target);
+	if (listCount !== undefined && (await probeLiteralPathExists(target, cwd)) === "missing") {
+		throwReadSelectorListMisfire(target, listCount);
+	}
+	const sel = readSelectorForEmptyWrite(target, content);
+	if (sel === undefined) return;
+	if ((await probeLiteralPathExists(target, cwd)) !== "missing") return;
+	throwReadSelectorMisfire(target, sel);
+}
 
 const BULK_DIRECTIVE_RE = /^#?(\d+)\s*[:=]\s*(@ours|@theirs|@base|@both)$/;
 /**
@@ -397,7 +513,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		if (xdevTarget) {
 			if (xdevTarget.name === REPORT_ISSUE_DEVICE_NAME) return "write";
 			if (xdevTarget.name && isResolutionDeviceName(xdevTarget.name)) return "read";
-			const inst = xdevTarget.name ? this.session.xdevRegistry?.get(xdevTarget.name) : undefined;
+			const inst =
+				xdevTarget.name && this.session.xdev ? resolveXdevTool(this.session.xdev, xdevTarget.name) : undefined;
 			if (!inst) return "exec";
 			// Decode the device JSON payload and evaluate the mounted tool's own
 			// approval (which may be argument-dependent, e.g. ast_edit is read-tier
@@ -545,6 +662,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			} catch (error) {
 				throw new ToolError(error instanceof Error ? error.message : String(error));
 			}
+		}
+		const writeTarget = `${resolvedArchivePath.archivePath}:${resolvedArchivePath.archiveSubPath}`;
+		const sel = readSelectorForEmptyWrite(writeTarget, content);
+		if (sel !== undefined && !entries.has(resolvedArchivePath.archiveSubPath)) {
+			throwReadSelectorMisfire(writeTarget, sel);
 		}
 		entries.set(resolvedArchivePath.archiveSubPath, content);
 
@@ -987,6 +1109,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			// Strip hashline display prefixes ([PATH#HASH] + LINE:) if the model copied them from read output
 			const { text: cleanContent, stripped } = stripWriteContent(this.session, content);
 			const internalRouter = InternalUrlRouter.instance();
+			assertWriteTargetAddressable(path, internalRouter);
 			if (internalRouter.canHandle(path)) {
 				const parsed = parseInternalUrl(path);
 				const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
@@ -1024,14 +1147,15 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 									};
 									return;
 								}
-								const registry = this.session.xdevRegistry;
-								if (!registry || registry.size === 0) {
+								const xdev = this.session.xdev;
+								if (!xdev) {
 									throw new ToolError("xd:// is not mounted in this session.");
 								}
 								if (!name) {
-									throw new ToolError(`Cannot write to xd:// itself — pick a device:\n${registry.listing()}`);
+									throw new ToolError(`Cannot write to xd:// itself — pick a device:\n${xdevListing(xdev)}`);
 								}
-								const { result, xdev } = await registry.dispatch(
+								const { result, xdev: dispatch } = await dispatchXdevTool(
+									xdev,
 									name,
 									deviceContent,
 									_toolCallId,
@@ -1044,7 +1168,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 								);
 								xdResult = {
 									content: result.content,
-									details: { xdev },
+									details: { xdev: dispatch },
 									isError: result.isError,
 									useless: result.useless,
 								};
@@ -1128,13 +1252,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				return sqliteResult;
 			}
 
+			await assertNotReadSelectorMisfire(path, cleanContent, this.session.cwd);
 			enforcePlanModeWrite(this.session, path, { op: "create" });
 			const absolutePath = resolvePlanPath(this.session, path);
 			const batchRequest = getLspBatchRequest(context?.toolCall);
 
 			// Check if file exists and is auto-generated before overwriting
 			if (await fs.exists(absolutePath)) {
-				await assertEditableFile(absolutePath, path);
+				await assertEditableFile(absolutePath, path, this.session.settings);
 			}
 
 			const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
@@ -1142,9 +1267,15 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			// Try ACP bridge first for editor-visible filesystem paths. Internal
 			// artifacts such as local:// plans are owned by OMP, not the editor.
-			if (await routeWriteThroughBridge(this.session, path, absolutePath, cleanContent, signal)) {
-				const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, cleanContent);
-				const header = maybeWriteSnapshotHeader(this.session, absolutePath, cleanContent);
+			const bridgeWrite = await routeWriteThroughBridge(this.session, path, absolutePath, cleanContent, signal);
+			if (bridgeWrite) {
+				// `write` always replaces the whole file, so (unlike hashline's
+				// hunk-scoped diff) there's no size cost to keying the header/
+				// executable-bit check on the verified post-write content —
+				// use it so a drifted write (e.g. client format-on-save) still
+				// hands back a tag that matches what's actually on disk.
+				const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, bridgeWrite.text);
+				const header = maybeWriteSnapshotHeader(this.session, absolutePath, bridgeWrite.text);
 				const writeLine = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;
 				let resultText = header ? `${header}\n${writeLine}` : writeLine;
 				if (stripped) {

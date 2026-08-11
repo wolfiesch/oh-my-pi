@@ -14,11 +14,12 @@
 import type { Api, Effort, Model } from "@oh-my-pi/pi-ai";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
-import chalk from "chalk";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
 import { Settings } from "../config/settings";
-import { discoverAndLoadExtensions, loadExtensions } from "../extensibility/extensions";
+import { discoverAndLoadExtensions, ExtensionRunner, emitSessionShutdownEvent } from "../extensibility/extensions";
 import { discoverAuthStorage } from "../sdk";
+import { SessionManager } from "../session/session-manager";
 import { EventBus } from "../utils/event-bus";
 
 export type ModelsAction = "ls" | "find" | "refresh";
@@ -277,7 +278,7 @@ export interface RunModelsListingOptions {
 	settingsExtensions?: string[];
 	/** Disabled extension ids from settings (`disabledExtensions`). */
 	disabledExtensionIds?: string[];
-	/** When true, skip discovery and only load `additionalExtensionPaths`. */
+	/** When true, exclude ambient factories and resolve only `additionalExtensionPaths`. */
 	disableExtensionDiscovery?: boolean;
 }
 
@@ -295,33 +296,49 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 	} = options;
 
 	const eventBus = new EventBus();
-	const extensionsResult = disableExtensionDiscovery
-		? await loadExtensions(additionalExtensionPaths, cwd, eventBus)
-		: await discoverAndLoadExtensions(
-				[...additionalExtensionPaths, ...settingsExtensions],
-				cwd,
-				eventBus,
-				disabledExtensionIds,
-			);
+	const configuredPaths = disableExtensionDiscovery
+		? additionalExtensionPaths
+		: [...additionalExtensionPaths, ...settingsExtensions];
+	const extensionsResult = await discoverAndLoadExtensions(
+		configuredPaths,
+		cwd,
+		eventBus,
+		disableExtensionDiscovery ? undefined : disabledExtensionIds,
+		{ ambient: !disableExtensionDiscovery },
+	);
+	const extensionRunner =
+		extensionsResult.extensions.length > 0
+			? new ExtensionRunner(
+					extensionsResult.extensions,
+					extensionsResult.runtime,
+					cwd,
+					SessionManager.inMemory(cwd),
+					modelRegistry,
+				)
+			: undefined;
 
-	for (const { path: extPath, error } of extensionsResult.errors) {
-		process.stderr.write(`Failed to load extension: ${extPath}: ${error}\n`);
-	}
+	try {
+		for (const { path: extPath, error } of extensionsResult.errors) {
+			process.stderr.write(`Failed to load extension: ${extPath}: ${error}\n`);
+		}
 
-	// Mirror sdk.ts: drain pending provider registrations into the registry.
-	const activeSources = extensionsResult.extensions.map(extension => extension.path);
-	modelRegistry.syncExtensionSources(activeSources);
-	for (const sourceId of new Set(activeSources)) {
-		modelRegistry.clearSourceRegistrations(sourceId);
-	}
-	for (const { name, config, sourceId } of extensionsResult.runtime.pendingProviderRegistrations) {
-		modelRegistry.registerProvider(name, config, sourceId);
-	}
-	extensionsResult.runtime.pendingProviderRegistrations = [];
-	// Discover runtime (extension) provider catalogs now that they are registered.
-	await modelRegistry.refreshRuntimeProviders(action === "refresh" ? "online" : "online-if-uncached");
+		// Mirror sdk.ts: drain pending provider registrations into the registry.
+		const activeSources = extensionsResult.extensions.map(extension => extension.path);
+		modelRegistry.syncExtensionSources(activeSources);
+		for (const sourceId of new Set(activeSources)) {
+			modelRegistry.clearSourceRegistrations(sourceId);
+		}
+		for (const { name, config, sourceId } of extensionsResult.runtime.pendingProviderRegistrations) {
+			modelRegistry.registerProvider(name, config, sourceId);
+		}
+		extensionsResult.runtime.pendingProviderRegistrations = [];
+		// Discover runtime (extension) provider catalogs now that they are registered.
+		await modelRegistry.refreshRuntimeProviders(action === "refresh" ? "online" : "online-if-uncached");
 
-	renderProviderModels(modelRegistry, action, pattern, json);
+		renderProviderModels(modelRegistry, action, pattern, json);
+	} finally {
+		await emitSessionShutdownEvent(extensionRunner);
+	}
 }
 
 /**
@@ -350,7 +367,7 @@ export async function runModelsCommand(command: ModelsCommandArgs): Promise<void
 		}
 		await modelRegistry.refresh(action === "refresh" ? "online" : "online-if-uncached");
 
-		const cliExtensionPaths = command.flags.noExtensions ? [] : (command.flags.extensions ?? []);
+		const cliExtensionPaths = command.flags.extensions ?? [];
 		await runModelsListing({
 			modelRegistry,
 			cwd,

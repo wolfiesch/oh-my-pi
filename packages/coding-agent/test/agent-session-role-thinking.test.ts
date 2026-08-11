@@ -300,6 +300,21 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
 		expect(session.thinkingLevel).toBe(resolveProvisionalAutoLevel(model));
 		expect(agent.state.disableReasoning).toBe(false);
+		const autoReceipt = session.sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "thinking_level_change")
+			.at(-1);
+		expect(autoReceipt).toMatchObject({
+			thinkingLevel: resolveProvisionalAutoLevel(model),
+			configured: AUTO_THINKING,
+		});
+		const autoReceiptCount = session.sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "thinking_level_change").length;
+		session.setThinkingLevel(AUTO_THINKING);
+		expect(session.sessionManager.getEntries().filter(entry => entry.type === "thinking_level_change")).toHaveLength(
+			autoReceiptCount,
+		);
 		expect(session.cycleThinkingLevel()).toBe(Effort.Minimal);
 		expect(session.thinkingLevel).toBe(Effort.Minimal);
 	});
@@ -521,6 +536,37 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.thinkingLevel).toBe(fallback);
 		expect(session.autoResolvedThinkingLevel()).toBe(fallback);
 		expect(session.agent.state.thinkingLevel).toBe(fallback);
+		expect(session.sessionManager.getEntries().filter(entry => entry.type === "thinking_level_change")).toHaveLength(
+			1,
+		);
+	});
+
+	it("preserves the resolved auto level when a later classification fails", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: model.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${model.provider}/${model.id}` },
+		});
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty")
+			.mockResolvedValueOnce(Effort.Low)
+			.mockRejectedValueOnce(new Error("classifier down"));
+
+		session.setThinkingLevel(AUTO_THINKING);
+		await session.prompt("Handle a straightforward update");
+		const receiptCount = session.sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "thinking_level_change").length;
+		await session.prompt("Investigate another update");
+
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+		expect(session.autoResolvedThinkingLevel()).toBe(Effort.Low);
+		expect(session.agent.state.thinkingLevel).toBe(Effort.Low);
+		expect(session.sessionManager.getEntries().filter(entry => entry.type === "thinking_level_change")).toHaveLength(
+			receiptCount,
+		);
 	});
 
 	it("skips classification for synthetic turns", async () => {

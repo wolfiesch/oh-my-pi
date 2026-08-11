@@ -1,5 +1,4 @@
-export { type Type, type } from "arktype";
-export { type ZodType, z } from "zod/v4";
+export { type Type, type } from "@oh-my-pi/omptype";
 export * from "./api-registry";
 export type * from "./auth-broker";
 export type { AuthGatewayBootOptions, ModelResolver } from "./auth-gateway/server";
@@ -39,6 +38,8 @@ export * from "./usage/ollama";
 export * from "./usage/openai-codex";
 export * from "./usage/openai-codex-reset";
 export * from "./usage/opencode-go";
+export * from "./usage/synthetic";
+export * from "./usage/xai-oauth";
 export * from "./usage/zai";
 export * from "./utils/anthropic-auth";
 export * from "./utils/event-stream";

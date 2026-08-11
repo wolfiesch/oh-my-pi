@@ -267,9 +267,11 @@ describe("shape resolution", () => {
 		expect(snapcompact.resolveShape({ api: "openai-responses" })).toBe(snapcompact.SHAPES.openai);
 		expect(snapcompact.resolveShape({ api: "azure-openai-responses" })).toBe(snapcompact.SHAPES.openai);
 		expect(snapcompact.resolveShape({ api: "google-generative-ai" })).toBe(snapcompact.SHAPES.google);
-		// Unknown and absent APIs fall back to the Anthropic family default.
-		expect(snapcompact.resolveShape({ api: "some-future-api" })).toBe(snapcompact.SHAPES.anthropic);
-		expect(snapcompact.resolveShape(undefined)).toBe(snapcompact.SHAPES.anthropic);
+		// Unknown and absent APIs fall back to the unknown family default (8on22-bw with Anthropic token billing).
+		const unknownFallback = snapcompact.resolveShape({ api: "some-future-api" });
+		expect(unknownFallback.cellHeight).toBe(22);
+		expect(unknownFallback.variant).toBe("bw");
+		expect(snapcompact.resolveShape(undefined)).toEqual(unknownFallback);
 	});
 
 	it("detects the ideal shape from the model id across gateways", () => {
@@ -309,11 +311,11 @@ describe("shape resolution", () => {
 		expect(gemini.cellHeight).toBe(22); // extra leading
 		expect(gemini.frameTokenEstimate).toBe(1120);
 
-		// Measured openai-compat readers keep their own validated `8on16-bw`
-		// geometry (not the family's leading default), at the gateway's billing.
-		const kimiShape = snapcompact.resolveShape({ api: "openai-completions" }, "8on16-bw");
+		// Kimi models resolve to 8on22-bw; GLM keeps 8on16-bw.
+		const kimiShape = snapcompact.resolveShape({ api: "openai-completions" }, "8on22-bw");
+		const glmShape = snapcompact.resolveShape({ api: "openai-completions" }, "8on16-bw");
 		expect(snapcompact.resolveShape({ api: "openai-completions", id: "moonshotai/kimi-k2.6" })).toEqual(kimiShape);
-		expect(snapcompact.resolveShape({ api: "openai-completions", id: "z-ai/glm-4.6v" })).toEqual(kimiShape);
+		expect(snapcompact.resolveShape({ api: "openai-completions", id: "z-ai/glm-4.6v" })).toEqual(glmShape);
 
 		// Unmeasured model ids fall back to the API family default object.
 		expect(snapcompact.resolveShape({ api: "openai-completions", id: "qwen/qwen3-vl" })).toBe(
@@ -717,6 +719,21 @@ describe("serializeConversation", () => {
 		expect(out).toBe("¶think:weigh options\n\n¶ai:the answer");
 	});
 
+	it("drops ¶think reasoning sections when includeThinking is false but keeps the reply", () => {
+		const out = snapcompact.serializeConversation(
+			[
+				createAssistantMessage([
+					{ type: "thinking", thinking: "private chain of thought" },
+					{ type: "text", text: "the answer" },
+				]),
+			],
+			{ includeThinking: false },
+		);
+		expect(out).not.toContain("¶think:");
+		expect(out).not.toContain("private chain of thought");
+		expect(out).toBe("¶ai:the answer");
+	});
+
 	it("gives a thinking-only turn its own heading before the tool calls", () => {
 		const out = snapcompact.serializeConversation([
 			createAssistantMessage([
@@ -831,10 +848,9 @@ describe("compact", () => {
 
 		expect(result.firstKeptEntryId).toBe("kept-1");
 		expect(result.tokensBefore).toBe(99000);
-		expect(result.summary).toContain("You are resuming a prior conversation.");
 		expect(result.summary).toContain("HISTORY");
-		expect(result.summary).toContain("`¶user:`, `¶think:`, `¶ai:`, and `¶call:`");
-		expect(result.summary).toContain("Following lines without a `¶…:` prefix remain in the current scope.");
+		expect(result.summary).toContain("`¶user:`");
+		expect(result.summary).toContain("`¶call:`");
 		expect(result.summary).toContain("`¶call:name(args)//intent`");
 		expect(result.summary).toContain("FILES\n===================\n# src/\nauth.ts (Read)\nlogin.ts (Write)");
 
@@ -900,7 +916,7 @@ describe("compact", () => {
 		const hugeText = `HEAD sentinel. ${"Important fact number one. ".repeat(1000)}TAIL sentinel.`;
 		const result = await snapcompact.compact(
 			makePreparation({ messagesToSummarize: [createUserMessage(hugeText)] }),
-			{ frameSize: TEST_FRAME_SIZE, maxFrames: 7 },
+			{ model: { api: "anthropic-messages" }, frameSize: TEST_FRAME_SIZE, maxFrames: 7 },
 		);
 		const archive = snapcompact.getPreservedArchive(result.preserveData);
 		expect(archive?.frames).toHaveLength(7);
@@ -909,6 +925,7 @@ describe("compact", () => {
 		expect(cols.slice(0, 3)).toEqual([hiCols, hiCols, hiCols]);
 		expect(cols.slice(-3)).toEqual([hiCols, hiCols, hiCols]);
 		expect(cols[3]).toBeGreaterThan(hiCols);
+		expect(result.summary).toContain(`${hiCols} or ${cols[3]} characters wide`);
 	});
 
 	it("keeps foveated Silver archives on the Silver font", async () => {
@@ -942,6 +959,34 @@ describe("compact", () => {
 		expect(archive?.text).toContain("A short follow-up turn.");
 		expect(archive?.textTail ?? archive?.textHead).toContain("A short follow-up turn.");
 		expect(archive?.frames.length).toBe(5);
+	});
+
+	it("re-compacting with a smaller maxFrames than the previous archive shrinks the frame count", async () => {
+		const first = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [
+					createUserMessage(`HEAD SENTINEL. ${"Important fact number one. ".repeat(1000)}TAIL SENTINEL.`),
+				],
+			}),
+			{ frameSize: TEST_FRAME_SIZE, maxFrames: 7 },
+		);
+		const firstArchive = snapcompact.getPreservedArchive(first.preserveData);
+		expect(firstArchive?.frames.length).toBe(7);
+
+		// No new messages: rebuild the SAME archive at a reduced budget — the
+		// dead-end rescue path for a trailing over-threshold archive.
+		const shrunk = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [],
+				previousSummary: first.summary,
+				previousPreserveData: first.preserveData,
+			}),
+			{ frameSize: TEST_FRAME_SIZE, maxFrames: 3 },
+		);
+		const shrunkArchive = snapcompact.getPreservedArchive(shrunk.preserveData);
+		expect(shrunkArchive?.frames.length).toBeGreaterThan(0);
+		expect(shrunkArchive?.frames.length).toBeLessThanOrEqual(3);
+		expect(shrunkArchive?.textHead ?? shrunkArchive?.text).toContain("HEAD SENTINEL.");
 	});
 
 	it("keeps the original text head across later compactions", async () => {
@@ -1021,6 +1066,57 @@ describe("compact", () => {
 		expect(second.summary).not.toContain("[Summary of earlier history]");
 		expect(second.preserveData?.openaiRemoteCompaction).toBeUndefined();
 		expect(second.preserveData?.appKey).toBe("kept");
+	});
+
+	it("scrubs legacy ¶think: sections from the prior archive when thinking is excluded", async () => {
+		const first = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [
+					createUserMessage("Investigate the flaky auth test."),
+					createAssistantMessage([
+						{ type: "thinking", thinking: "legacy private chain of thought" },
+						{ type: "text", text: "The token clock is skewed." },
+					]),
+				],
+			}),
+			{ frameSize: TEST_FRAME_SIZE },
+		);
+		expect(snapcompact.getPreservedArchive(first.preserveData)?.text ?? "").toContain("¶think:");
+
+		const second = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [createUserMessage("Continue after switching to Claude.")],
+				previousPreserveData: first.preserveData,
+			}),
+			{ frameSize: TEST_FRAME_SIZE, includeThinking: false },
+		);
+		const archiveText = snapcompact.getPreservedArchive(second.preserveData)?.text ?? "";
+		expect(archiveText).not.toContain("¶think:");
+		expect(archiveText).not.toContain("legacy private chain of thought");
+		expect(archiveText).toContain("Investigate the flaky auth test.");
+		expect(archiveText).toContain("The token clock is skewed.");
+	});
+
+	it("keeps legacy ¶think: sections when thinking stays included", async () => {
+		const first = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [
+					createAssistantMessage([
+						{ type: "thinking", thinking: "legacy private chain of thought" },
+						{ type: "text", text: "Visible reply." },
+					]),
+				],
+			}),
+			{ frameSize: TEST_FRAME_SIZE },
+		);
+		const second = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [createUserMessage("Another turn.")],
+				previousPreserveData: first.preserveData,
+			}),
+			{ frameSize: TEST_FRAME_SIZE },
+		);
+		expect(snapcompact.getPreservedArchive(second.preserveData)?.text ?? "").toContain("¶think:");
 	});
 });
 

@@ -344,6 +344,44 @@ describe("mcp oauth flow", () => {
 		});
 	});
 
+	it("rejects an HTTP-200 token response that carries no access token", async () => {
+		let observedRedirectUri = "";
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+				clientId: "client-id",
+				clientSecret: "client-secret",
+				callbackPort: 14569,
+				fetch: async input => {
+					const url = String(input);
+					if (url === "https://provider.example/token") {
+						// Slack Web API error shape: HTTP 200 with `ok:false` and no
+						// `access_token`. Accepting it would store an empty credential.
+						return new Response(JSON.stringify({ ok: false, error: "bad_client_secret" }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					throw new Error(`Unexpected fetch: ${url}`);
+				},
+			},
+			{
+				onAuth: info => {
+					const authUrl = new URL(info.url);
+					observedRedirectUri = authUrl.searchParams.get("redirect_uri") ?? "";
+					const state = authUrl.searchParams.get("state") ?? "";
+					queueMicrotask(() => {
+						void completeLocalOAuthCallback(`${observedRedirectUri}?code=test-code&state=${state}`);
+					});
+				},
+				signal: AbortSignal.timeout(1_000),
+			},
+		);
+
+		await expect(flow.login()).rejects.toThrow(/bad_client_secret/);
+	});
+
 	it("preserves root redirectUri values without adding a trailing slash", async () => {
 		let observedRedirectUri = "";
 		let tokenRequestBody = "";
@@ -540,7 +578,10 @@ describe("mcp oauth flow", () => {
 		// Here `clientId` is unset, so `MCPOAuthFlow.#tryRegisterClient` will
 		// register the actual fallback URI with the provider and the
 		// authorization request will use that fresh client_id.
-		const blocker = Bun.serve({ port: 0, fetch: () => new Response("blocker") });
+		// Occupy 127.0.0.1 explicitly — the interface callback flows bind for
+		// `localhost` — because macOS lets a specific-address bind coexist with a
+		// wildcard one, which would let the flow bind the "blocked" port.
+		const blocker = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("blocker") });
 		const blockerPort = blocker.port;
 		if (typeof blockerPort !== "number") {
 			blocker.stop(true);

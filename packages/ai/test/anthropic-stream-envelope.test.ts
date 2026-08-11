@@ -6,8 +6,10 @@ import {
 	type AnthropicMessagesClientLike,
 	type AnthropicRequestOptions,
 } from "@oh-my-pi/pi-ai/providers/anthropic-client";
+import type { WebSearchToolResultBlockParam } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
 import type { AssistantMessageEvent, Context, Model, ModelSpec, ProviderSessionState } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import { withEnv } from "./helpers";
 
 const model: Model<"anthropic-messages"> = buildModel({
@@ -140,14 +142,6 @@ function createStrictGrammarTooLargeError(): Error {
 	return error;
 }
 
-// Azure Foundry-style rejection: no invalid_request_error wrapper, the gateway
-// just names the missing feature for the hosted model deployment.
-function createStructuredOutputsUnsupportedError(): Error {
-	const error = new Error('400 {"error":{"code":"BadRequest","message":"structured_outputs not supported"}}');
-	(error as Error & { status: number }).status = 400;
-	return error;
-}
-
 function createOtherInvalidRequestError(): Error {
 	const error = new Error(
 		'400 {"type":"error","error":{"type":"invalid_request_error","message":"Some other validation error."},"request_id":"req_test"}',
@@ -266,6 +260,12 @@ function createMalformedToolUseEvents(): MockAnthropicEvent[] {
 			delta: { type: "input_json_delta", partial_json: '{"city":"Par' },
 		},
 		{ type: "content_block_stop", index: 0 },
+		{
+			type: "message_delta",
+			delta: { stop_reason: "end_turn" },
+			usage: { input_tokens: 12, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+		},
+		{ type: "message_stop" },
 	];
 }
 
@@ -294,6 +294,12 @@ function createGenuinelyMalformedToolUseEvents(): MockAnthropicEvent[] {
 			delta: { type: "input_json_delta", partial_json: '{"city": Par' },
 		},
 		{ type: "content_block_stop", index: 0 },
+		{
+			type: "message_delta",
+			delta: { stop_reason: "end_turn" },
+			usage: { input_tokens: 12, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+		},
+		{ type: "message_stop" },
 	];
 }
 
@@ -542,6 +548,205 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(events, "toolcall_start")).toBe(0);
 		expect(result.stopReason).toBe("stop");
 		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "59" }]);
+	});
+
+	it("replays native server-tool blocks in their original assistant order", async () => {
+		const searchResult: WebSearchToolResultBlockParam = {
+			type: "web_search_tool_result",
+			tool_use_id: "srvtoolu_1",
+			content: [
+				{
+					type: "web_search_result",
+					url: "https://example.com/result",
+					title: "Search result",
+					encrypted_content: "encrypted-result",
+					page_age: "July 24, 2026",
+				},
+			],
+		};
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(
+			() =>
+				createMockRequest([
+					{
+						type: "message_start",
+						message: {
+							id: "msg_native_search",
+							usage: {
+								input_tokens: 12,
+								output_tokens: 0,
+								cache_read_input_tokens: 0,
+								cache_creation_input_tokens: 0,
+							},
+						},
+					},
+					{ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } },
+					{ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Search first." } },
+					{ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig-1" } },
+					{ type: "content_block_stop", index: 0 },
+					{
+						type: "content_block_start",
+						index: 1,
+						content_block: { type: "server_tool_use", id: "srvtoolu_1", name: "web_search" },
+					},
+					{
+						type: "content_block_delta",
+						index: 1,
+						delta: { type: "input_json_delta", partial_json: '{"query":"current weather"}' },
+					},
+					{ type: "content_block_stop", index: 1 },
+					{ type: "content_block_start", index: 2, content_block: searchResult },
+					{ type: "content_block_stop", index: 2 },
+					{ type: "content_block_start", index: 3, content_block: { type: "thinking", thinking: "" } },
+					{ type: "content_block_delta", index: 3, delta: { type: "thinking_delta", thinking: "Read the file." } },
+					{ type: "content_block_delta", index: 3, delta: { type: "signature_delta", signature: "sig-2" } },
+					{ type: "content_block_stop", index: 3 },
+					{ type: "content_block_start", index: 4, content_block: { type: "text", text: "" } },
+					{ type: "content_block_delta", index: 4, delta: { type: "text_delta", text: "I found the forecast." } },
+					{ type: "content_block_stop", index: 4 },
+					{
+						type: "content_block_start",
+						index: 5,
+						content_block: { type: "tool_use", id: "tool_1", name: "read", input: {} },
+					},
+					{
+						type: "content_block_delta",
+						index: 5,
+						delta: { type: "input_json_delta", partial_json: '{"path":"forecast.txt"}' },
+					},
+					{ type: "content_block_stop", index: 5 },
+					{
+						type: "message_delta",
+						delta: { stop_reason: "tool_use" },
+						usage: {
+							input_tokens: 12,
+							output_tokens: 20,
+							cache_read_input_tokens: 0,
+							cache_creation_input_tokens: 0,
+							server_tool_use: { web_search_requests: 1 },
+						},
+					},
+					{ type: "message_stop" },
+				]) as never,
+		);
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		for await (const _ of stream) {
+			// drain stream
+		}
+		const result = await stream.result();
+		const persistedResult = structuredCloneJSON(result);
+		const replay = convertAnthropicMessages(
+			[
+				context.messages[0],
+				persistedResult,
+				{
+					role: "toolResult",
+					toolCallId: "tool_1",
+					toolName: "read",
+					content: [{ type: "text", text: "forecast contents" }],
+					isError: false,
+					timestamp: 2,
+				},
+			],
+			model,
+			false,
+		);
+		const assistant = replay.find(message => message.role === "assistant");
+
+		expect(assistant?.content).toEqual([
+			{ type: "thinking", thinking: "Search first.", signature: "sig-1" },
+			{
+				type: "server_tool_use",
+				id: "srvtoolu_1",
+				name: "web_search",
+				input: { query: "current weather" },
+			},
+			searchResult,
+			{ type: "thinking", thinking: "Read the file.", signature: "sig-2" },
+			{ type: "text", text: "I found the forecast." },
+			{ type: "tool_use", id: "tool_1", name: "read", input: { path: "forecast.txt" } },
+		]);
+		expect(replay.at(-1)?.content).toEqual([
+			{
+				type: "tool_result",
+				tool_use_id: "tool_1",
+				content: "forecast contents",
+				is_error: false,
+			},
+		]);
+	});
+
+	it("does not persist a code-execution call without its unsupported result block", async () => {
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(
+			() =>
+				createMockRequest([
+					{
+						type: "message_start",
+						message: {
+							id: "msg_code_execution",
+							usage: {
+								input_tokens: 12,
+								output_tokens: 0,
+								cache_read_input_tokens: 0,
+								cache_creation_input_tokens: 0,
+							},
+						},
+					},
+					{
+						type: "content_block_start",
+						index: 0,
+						content_block: {
+							type: "server_tool_use",
+							id: "srvtoolu_code",
+							name: "bash_code_execution",
+						},
+					},
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "input_json_delta", partial_json: '{"command":"printf ok"}' },
+					},
+					{ type: "content_block_stop", index: 0 },
+					{
+						type: "content_block_start",
+						index: 1,
+						content_block: {
+							type: "bash_code_execution_tool_result",
+							tool_use_id: "srvtoolu_code",
+							content: {
+								type: "bash_code_execution_result",
+								stdout: "ok",
+								stderr: "",
+								return_code: 0,
+								content: [],
+							},
+						},
+					},
+					{ type: "content_block_stop", index: 1 },
+					{ type: "content_block_start", index: 2, content_block: { type: "text", text: "" } },
+					{ type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "done" } },
+					{ type: "content_block_stop", index: 2 },
+					{
+						type: "message_delta",
+						delta: { stop_reason: "end_turn" },
+						usage: {
+							input_tokens: 12,
+							output_tokens: 8,
+							cache_read_input_tokens: 0,
+							cache_creation_input_tokens: 0,
+						},
+					},
+					{ type: "message_stop" },
+				]) as never,
+		);
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		for await (const _ of stream) {
+			// drain stream
+		}
+		const result = await stream.result();
+
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "done" }]);
 	});
 
 	it("passes Umans gateway web search headers to custom clients", async () => {
@@ -906,7 +1111,7 @@ describe("anthropic stream envelope handling", () => {
 			{
 				type: "content_block_start",
 				index: 0,
-				content_block: { type: "server_tool_use", id: "srv_1", name: "web_search" },
+				content_block: { type: "future_server_block", id: "srv_1", name: "web_search" },
 			},
 			{
 				type: "content_block_delta",
@@ -1024,7 +1229,23 @@ describe("anthropic stream envelope handling", () => {
 		expect(strictFlags).toEqual([[true], [false], [false]]);
 	});
 
-	it("retries without strict tools when the endpoint rejects structured outputs for the model", async () => {
+	it.each([
+		[
+			"unsupported structured outputs",
+			Object.assign(new Error('400 {"error":{"code":"BadRequest","message":"structured_outputs not supported"}}'), {
+				status: 400,
+			}),
+		],
+		[
+			"an unsupported strict field",
+			Object.assign(
+				new Error(
+					'400 {"error":{"message":"{\\"message\\":\\"tools.2.custom.strict: Extra inputs are not permitted\\"}"}}',
+				),
+				{ status: 400 },
+			),
+		],
+	])("retries without strict tools when the endpoint rejects %s", async (_case, rejection) => {
 		const toolContext: Context = {
 			...context,
 			tools: [
@@ -1043,7 +1264,7 @@ describe("anthropic stream envelope handling", () => {
 			attempt += 1;
 			strictFlags.push(getStrictFlags(params));
 			if (attempt === 1) {
-				return createRejectedMockRequest(createStructuredOutputsUnsupportedError()) as never;
+				return createRejectedMockRequest(rejection) as never;
 			}
 			return createMockRequest(createTextSuccessEvents("recovered")) as never;
 		});
@@ -1230,6 +1451,138 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(events, "done")).toBe(1);
 		expect(result.stopReason).toBe("stop");
 		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "partial" }]);
+	});
+
+	it("retries a stream cut before any stop_reason when no content streamed", async () => {
+		const successEvents = createTextSuccessEvents("recovered");
+		let attempt = 0;
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
+			attempt += 1;
+			if (attempt === 1) {
+				// Connection died right after the envelope opened: only message_start
+				// arrived — no blocks, no message_delta stop_reason, no message_stop.
+				// (Any content_block_start already marks the stream replay-unsafe,
+				// which forbids the transparent retry.)
+				return createMockRequest([successEvents[0]]) as never;
+			}
+			return createMockRequest(createTextSuccessEvents("recovered")) as never;
+		});
+
+		const stream = streamAnthropic(model, context, {
+			apiKey: "sk-ant-test",
+			providerRetryWait: async () => {},
+		});
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const result = await stream.result();
+
+		expect(attempt).toBe(2);
+		expect(countEvents(events, "error")).toBe(0);
+		expect(countEvents(events, "done")).toBe(1);
+		expect(result.stopReason).toBe("stop");
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "recovered" }]);
+	});
+
+	it("fails the turn instead of finalizing a clean stop when the stream dies mid-generation", async () => {
+		// message_start + content_block_start + text_delta, then the wire goes dead:
+		// no content_block_stop, no message_delta stop_reason, no message_stop.
+		const truncatedEvents = createTextSuccessEvents("partial").slice(0, 3);
+		let attempt = 0;
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
+			attempt += 1;
+			return createMockRequest(truncatedEvents) as never;
+		});
+
+		const stream = streamAnthropic(model, context, {
+			apiKey: "sk-ant-test",
+			providerRetryWait: async () => {},
+		});
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const result = await stream.result();
+
+		// Streamed text is replay-unsafe, so no transparent retry — the turn must
+		// surface as an error the agent loop can act on, never a silent "stop".
+		expect(attempt).toBe(1);
+		expect(countEvents(events, "done")).toBe(0);
+		expect(countEvents(events, "error")).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("message_stop");
+	});
+
+	it("fails a truncated turn with mixed closed and half-streamed tool calls, keeping the closed call", async () => {
+		// One tool call closes cleanly, a second is cut mid-arguments, and the
+		// wire dies with no message_delta stop_reason and no message_stop. The
+		// turn must error (never finalize the half-streamed sibling into an
+		// executable call); the closed call stays in content so the agent loop's
+		// `retainCompletedToolCalls` + envelope-aware salvage can run it.
+		const truncatedEvents: MockAnthropicEvent[] = [
+			{
+				type: "message_start",
+				message: {
+					id: "msg_mixed_truncated",
+					usage: {
+						input_tokens: 12,
+						output_tokens: 0,
+						cache_read_input_tokens: 0,
+						cache_creation_input_tokens: 0,
+					},
+				},
+			},
+			{
+				type: "content_block_start",
+				index: 0,
+				content_block: { type: "tool_use", id: "tool_closed", name: "lookup_weather", input: {} },
+			},
+			{
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "input_json_delta", partial_json: '{"city":"Paris"}' },
+			},
+			{ type: "content_block_stop", index: 0 },
+			{
+				type: "content_block_start",
+				index: 1,
+				content_block: { type: "tool_use", id: "tool_open", name: "lookup_weather", input: {} },
+			},
+			{
+				type: "content_block_delta",
+				index: 1,
+				delta: { type: "input_json_delta", partial_json: '{"city":"Ber' },
+			},
+		];
+		let attempt = 0;
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
+			attempt += 1;
+			return createMockRequest(truncatedEvents) as never;
+		});
+
+		const stream = streamAnthropic(model, context, {
+			apiKey: "sk-ant-test",
+			providerRetryWait: async () => {},
+		});
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const result = await stream.result();
+
+		expect(attempt).toBe(1);
+		expect(countEvents(events, "done")).toBe(0);
+		expect(countEvents(events, "error")).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("message_stop");
+		const closedCall = result.content.find(block => block.type === "toolCall" && block.id === "tool_closed");
+		expect(closedCall).toBeDefined();
+		// The closed call emitted toolcall_end (loop-side completion marker);
+		// the half-streamed sibling did not.
+		const endedIds = events.filter(e => e.type === "toolcall_end").map(e => e.toolCall.id);
+		expect(endedIds).toContain("tool_closed");
+		expect(endedIds).not.toContain("tool_open");
 	});
 
 	it("skips malformed raw SSE event frames and degrades to best-effort content", async () => {

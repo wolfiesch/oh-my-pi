@@ -45,13 +45,17 @@ function createMockSession(
 	return {
 		state: { messages },
 		getLastAssistantMessage: () => messages.findLast(message => message.role === "assistant"),
+		settings: { get: () => false },
 		sessionManager: {
 			getHeader: () => undefined,
+			buildSessionContext: () => ({ messages: [] }),
+			getEntries: () => [],
 		},
 		extensionRunner: undefined,
 		subscribe: () => () => {},
 		prompt: async () => {},
 		prepareForHeadlessAdvisorDrain: () => {},
+		setTextOutputCommitted: () => {},
 		waitForAdvisorCatchup: async () => true,
 		dispose,
 	} as unknown as AgentSession;

@@ -12,12 +12,21 @@ export type OAuthCredentials = {
 	apiEndpoint?: string;
 	/**
 	 * Organization/workspace the token is scoped to (e.g. an Anthropic org
-	 * UUID). Captured once at login; token refreshes never rewrite it. Lets
-	 * one account email hold credentials for multiple subscriptions.
+	 * UUID or a ChatGPT workspace id). Captured once at login; token refreshes
+	 * never rewrite it. Lets one account email hold credentials for multiple
+	 * subscriptions.
 	 */
 	orgId?: string;
 	/** Human-readable organization name for display (may embed the email). */
 	orgName?: string;
+	/**
+	 * Epoch ms of the interactive login that minted this grant. Set by
+	 * `AuthStorage.login`; token refreshes preserve it. Providers with an
+	 * absolute grant lifetime (Anthropic expires the whole refresh-token
+	 * family ~30 days after authorization regardless of rotation) use it to
+	 * surface re-login deadlines before the grant dies.
+	 */
+	authorizedAt?: number;
 };
 
 export type OAuthProvider = OAuthProviderUnion;

@@ -29,14 +29,18 @@ const BASE64_ONE_PIXEL_PNG =
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==";
 
 const ORIGINAL_TMUX = Bun.env.TMUX;
+const ORIGINAL_HERDR_ENV = Bun.env.HERDR_ENV;
 
 beforeEach(() => {
 	delete Bun.env.TMUX;
+	delete Bun.env.HERDR_ENV;
 });
 
 afterEach(() => {
 	if (ORIGINAL_TMUX === undefined) delete Bun.env.TMUX;
 	else Bun.env.TMUX = ORIGINAL_TMUX;
+	if (ORIGINAL_HERDR_ENV === undefined) delete Bun.env.HERDR_ENV;
+	else Bun.env.HERDR_ENV = ORIGINAL_HERDR_ENV;
 });
 
 /** Drive one render pass against the budget with `count` images (ids 1..count, stable across passes). */
@@ -704,6 +708,48 @@ describe("TUI inline-image budget", () => {
 			expect([...tui.imageBudget.takeAllTransmittedIds()]).toEqual([]);
 		} finally {
 			tui.stop();
+		}
+	});
+
+	it("lets a full-width non-fullscreen overlay replace Unicode image placeholder rows", async () => {
+		const originalGraphics = { ...getKittyGraphics() };
+		const term = new VirtualTerminal(40, 12);
+		const writes: string[] = [];
+		const realWrite = term.write.bind(term);
+		vi.spyOn(term, "write").mockImplementation((data: string) => {
+			writes.push(data);
+			realWrite(data);
+		});
+
+		setKittyGraphics({ unicodePlaceholders: true });
+		const tui = new TUI(term);
+		tui.addChild(makeImage(tui.imageBudget, "behind-modal"));
+		try {
+			tui.start();
+			await settle(term);
+			writes.length = 0;
+
+			const overlay = tui.showOverlay(new Text("MODEL SELECTOR\nMODEL ROW 2\nMODEL ROW 3\nMODEL ROW 4", 0, 0), {
+				anchor: "top-left",
+				width: "100%",
+				maxHeight: "100%",
+			});
+			await settle(term);
+
+			const modalOutput = writes.join("");
+			expect(modalOutput).not.toContain("\x1b[?1049h");
+			const modalViewport = term.getViewport().join("\n");
+			expect(modalViewport).toContain("MODEL SELECTOR");
+			expect(modalViewport).not.toContain(KITTY_PLACEHOLDER);
+
+			writes.length = 0;
+			overlay.hide();
+			await settle(term);
+
+			expect(term.getViewport().join("\n")).toContain(KITTY_PLACEHOLDER);
+		} finally {
+			tui.stop();
+			setKittyGraphics(originalGraphics);
 		}
 	});
 

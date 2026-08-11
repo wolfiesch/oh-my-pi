@@ -31,11 +31,12 @@
  *   billing (32px × 1.2, 10k-patch budget at `detail: "original"`) is
  *   area-proportional, so resolution cannot improve chars/$ — 1568 stays.
  *   `detail: "high"` would downgrade (2,500-patch cap); `original` is sent.
- * - **Unknown providers** default to the Anthropic shape. `providerImageBudget`
- *   still caps per-request images per provider so inline imaging cannot flood a
- *   request with attachments, but the old OpenRouter-specific 8-image cap is
- *   gone; routers now use the same permissive budget as direct Anthropic/Claude
- *   lines unless configured otherwise upstream.
+ * - **Unknown providers** default to `8on22-bw` with Anthropic-style
+ *   visual-token area billing. `providerImageBudget` still caps per-request
+ *   images per provider so inline imaging cannot flood a request with
+ *   attachments, but the old OpenRouter-specific 8-image cap is gone; routers
+ *   now use the same permissive budget as direct Anthropic/Claude lines unless
+ *   configured otherwise upstream.
  *
  * The whole pass is local and deterministic — no LLM call, no API key, no
  * latency beyond rendering. Rasterization and PNG encoding happen in native
@@ -201,10 +202,13 @@ export function isShapeVariantName(value: unknown): value is ShapeVariantName {
 }
 
 /** Provider families with distinct image billing. */
-type BillingFamily = "anthropic" | "google" | "openai";
+type BillingFamily = "anthropic" | "google" | "openai" | "unknown";
 
 function billingFamily(api?: Api): BillingFamily {
 	switch (api) {
+		case "anthropic-messages":
+		case "bedrock-converse-stream":
+			return "anthropic";
 		case "openai-completions":
 		case "openai-responses":
 		case "openai-codex-responses":
@@ -215,9 +219,8 @@ function billingFamily(api?: Api): BillingFamily {
 		case "google-vertex":
 			return "google";
 		default:
-			// anthropic-messages, bedrock-converse-stream, and anything unknown
-			// share Anthropic's pixel-area pricing as the safe ceiling.
-			return "anthropic";
+			// Unknown APIs share Anthropic's pixel-area pricing as the safe ceiling.
+			return "unknown";
 	}
 }
 
@@ -305,6 +308,7 @@ const FAMILY_VARIANT: Record<BillingFamily, ShapeVariantName> = {
 	anthropic: "11on16-bw",
 	google: "8on22-bw",
 	openai: "8on22-bw",
+	unknown: "8on22-bw",
 };
 
 /** Denser companion variant per family for the foveated archive middle: same
@@ -315,12 +319,14 @@ const FAMILY_VARIANT_LOW: Record<BillingFamily, ShapeVariantName> = {
 	anthropic: "8on16-bw",
 	google: "8on16-bw",
 	openai: "8on16-bw",
+	unknown: "8on16-bw",
 };
 
 const FAMILY_SHAPE: Record<BillingFamily, Shape> = {
 	anthropic: SHAPES.anthropic,
 	google: SHAPES.google,
 	openai: SHAPES.openai,
+	unknown: priceShape(SHAPE_VARIANTS["8on22-bw"], "unknown"),
 };
 
 /** One model line's ideal format: variant plus an optional frame-size
@@ -348,9 +354,9 @@ const MODEL_VARIANTS: readonly (readonly [RegExp, IdealShape])[] = [
 	[/gemini/i, { variant: "8on22-bw", frameSize: 2048 }],
 	// gpt-5.5 patch billing is area-proportional; 1568 is already optimal.
 	[/gpt|codex/i, { variant: "8on22-bw" }],
-	// kimi's image processor downscales past 1792px (64×64 28px patches);
-	// 1568 wins on chars/$ and reads at f1 .973 (≤8 frames per request).
-	[/kimi/i, { variant: "8on16-bw" }],
+	// kimi-k3 chunked bench: `8on22-bw` scored f1 .915 @ $0.66 vs .813 on `8on16-bw` ($0.70);
+	// 1568 wins on chars/$ (image processor downscales past 1792px).
+	[/kimi/i, { variant: "8on22-bw" }],
 	// glm-4.6v .780 mono via direct vendor routing.
 	[/glm/i, { variant: "8on16-bw" }],
 ];
@@ -735,6 +741,12 @@ export interface SerializeOptions {
 	/** Print tool-result text in dim gray ink so archived conversation reads
 	 *  louder than archived tool noise. Defaults to `true`. */
 	dimToolResults?: boolean;
+	/** Serialize assistant reasoning as `¶think:` sections. Defaults to `true`.
+	 *  Callers archiving for a Claude/Anthropic-dialect model set this `false`:
+	 *  the archive frames are replayed as text into every later request, and
+	 *  reasoning rendered back to Claude trips its `reasoning_extraction`
+	 *  classifier (issue #6093). */
+	includeThinking?: boolean;
 }
 
 /** Keep the head and tail of `text`, eliding the middle beyond `maxChars`. */
@@ -773,6 +785,7 @@ export function serializeConversation(messages: Message[], options?: SerializeOp
 	const toolCallMaxChars = options?.toolCallMaxChars ?? TOOL_CALL_MAX_CHARS;
 	const headRatio = options?.truncateHeadRatio ?? TRUNCATE_HEAD_RATIO;
 	const dimToolResults = options?.dimToolResults !== false;
+	const includeThinking = options?.includeThinking !== false;
 	const parts: string[] = [];
 	let lastPrefix: string | null = null;
 
@@ -845,6 +858,7 @@ export function serializeConversation(messages: Message[], options?: SerializeOp
 					const text = stripDimMarkers(block.text);
 					if (text.trim()) pendingText.push(text);
 				} else if (block.type === "thinking") {
+					if (!includeThinking) continue;
 					const thinking = stripDimMarkers(block.thinking);
 					if (thinking.trim()) pendingThinking.push(thinking);
 				} else if (block.type === "toolCall") {
@@ -1834,6 +1848,29 @@ function planArchive(text: string, high: Shape, low: Shape, maxFrames: number): 
 }
 
 /**
+ * Drop `¶think:` sections from serialized archive source text.
+ *
+ * Archives written before {@link SerializeOptions.includeThinking} existed bake
+ * reasoning into their kept source; replaying it to Claude trips the
+ * `reasoning_extraction` classifier (issue #6093). Re-compaction re-renders the
+ * whole unfolded source, so scrubbing the prior text heals a poisoned session
+ * at its next compaction. Conservative by construction: only sections that
+ * start with `¶think:` at a section boundary are dropped.
+ */
+function stripThinkingSections(text: string): string {
+	return text
+		.split(NEWLINE_GLYPH)
+		.map(segment =>
+			segment
+				.split(/\n\n(?=¶(?:user|think|ai|call):)/)
+				.filter(section => !section.startsWith("¶think:"))
+				.join("\n\n"),
+		)
+		.filter(segment => segment.length > 0)
+		.join(NEWLINE_GLYPH);
+}
+
+/**
  * Run a snapcompact compaction over prepared messages. Fully local: serializes
  * the discarded history, appends it to the accumulated archive source text, and
  * re-renders that source into an ordered history layout: plain text at the
@@ -1858,11 +1895,18 @@ export async function compact<TMessage = Message>(
 	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(messages);
 	const serialized = serializeConversation(llmMessages, options);
 	const previousArchive = getPreservedArchive(previousPreserveData);
-	const previousText =
+	const previousTextRaw =
 		previousArchive?.text ??
 		[previousArchive?.textHead, previousArchive?.textTail]
 			.filter((part): part is string => typeof part === "string" && part.length > 0)
 			.join(NEWLINE_GLYPH);
+	// Legacy archives may carry `¶think:` sections from before includeThinking
+	// existed; scrub them when this compaction excludes thinking so the
+	// re-rendered archive stops replaying reasoning (issue #6093).
+	const previousText =
+		options?.includeThinking === false && previousTextRaw.length > 0
+			? stripThinkingSections(previousTextRaw)
+			: previousTextRaw;
 	const hasPreviousText = previousText.length > 0;
 	const includedPreviousSummary = !hasPreviousText && !!previousSummary;
 	const shapeProbeText = renderabilityProbeText(serialized, previousPreserveData, previousSummary);
@@ -1925,6 +1969,11 @@ export async function compact<TMessage = Message>(
 
 	const frames = await Promise.all(newFrames);
 	const totalChars = frames.reduce((sum, frame) => sum + frame.chars, 0) + textChars;
+	const frameCols: number[] = [];
+	for (const frame of frames) {
+		if (!frameCols.includes(frame.cols)) frameCols.push(frame.cols);
+	}
+	const summaryCols = frameCols.length > 0 ? frameCols.join(" or ") : geo.cols;
 
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	const files = formatFileList(readFiles, modifiedFiles, fileOps.read);
@@ -1937,7 +1986,7 @@ export async function compact<TMessage = Message>(
 			frameCount: frames.length,
 			multipleFrames: frames.length > 1,
 			docColumns: high.columns === 2,
-			cols: geo.cols,
+			cols: summaryCols,
 			rows: geo.rows,
 			sentenceInk: high.variant === "sent",
 			stopwordDimmed: high.stopwordDim === true,

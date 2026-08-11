@@ -3,7 +3,7 @@ import hashlineGrammar from "@oh-my-pi/hashline/grammar.lark" with { type: "text
 import hashlineDescription from "@oh-my-pi/hashline/prompt.md" with { type: "text" };
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
-import { prompt } from "@oh-my-pi/pi-utils";
+import { isEnoent, isEnotdir, prompt } from "@oh-my-pi/pi-utils";
 import { createLspWritethrough, flushLspWritethroughBatch, type WritethroughCallback, writethroughNoop } from "../lsp";
 import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
@@ -12,13 +12,14 @@ import patchDescription from "../prompts/tools/patch.md" with { type: "text" };
 import replaceDescription from "../prompts/tools/replace.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import { truncateForPrompt } from "../tools/approval";
-import { isInternalUrlPath } from "../tools/path-utils";
+import { findUniqueWorkspaceSuffix, isInternalUrlPath } from "../tools/path-utils";
+import { resolvePlanPath } from "../tools/plan-mode-guard";
 import { type EditMode, normalizeEditMode, resolveEditMode } from "../utils/edit-mode";
 import { executeHashlineSingle, hashlineEditParamsSchema } from "./hashline";
 import { type ApplyPatchParams, applyPatchSchema, expandApplyPatchToEntries } from "./modes/apply-patch";
 import applyPatchGrammar from "./modes/apply-patch.lark" with { type: "text" };
 import { executePatchSingle, type PatchEditEntry, type PatchParams, patchEditSchema } from "./modes/patch";
-import { executeReplaceSingle, type ReplaceEditEntry, type ReplaceParams, replaceEditSchema } from "./modes/replace";
+import { executeReplace, type ReplaceBatchParams, type ReplaceParams, replaceEditSchema } from "./modes/replace";
 import { type EditToolDetails, type EditToolPerFileResult, getLspBatchRequest, type LspBatchRequest } from "./renderer";
 import { pruneOversizedEditSnapshots } from "./snapshot-details";
 import { EDIT_MODE_STRATEGIES } from "./streaming";
@@ -45,7 +46,7 @@ type TInput =
 
 type HashlineParams = typeof hashlineEditParamsSchema.infer;
 
-type EditParams = ReplaceParams | PatchParams | HashlineParams | ApplyPatchParams;
+type EditParams = ReplaceParams | ReplaceBatchParams | PatchParams | HashlineParams | ApplyPatchParams;
 
 type EditModeDefinition = {
 	description: (session: ToolSession) => string;
@@ -71,6 +72,24 @@ function resolveConfiguredEditMode(rawEditMode: string): EditMode | undefined {
 	}
 
 	return editMode;
+}
+
+async function resolveEditPath(
+	session: ToolSession,
+	authoredPath: string,
+	options: { mustExist: boolean; signal?: AbortSignal },
+): Promise<string> {
+	if (!options.mustExist || isInternalUrlPath(authoredPath)) return authoredPath;
+
+	try {
+		await Bun.file(resolvePlanPath(session, authoredPath)).stat();
+		return authoredPath;
+	} catch (error) {
+		if (!isEnoent(error) && !isEnotdir(error)) throw error;
+	}
+
+	const match = await findUniqueWorkspaceSuffix(authoredPath, session.cwd, options.signal);
+	return match?.displayPath ?? authoredPath;
 }
 
 function resolveAllowFuzzy(session: ToolSession, rawValue: string): boolean {
@@ -380,14 +399,24 @@ export class EditTool implements AgentTool<TInput> {
 	readonly #editMode?: EditMode;
 	readonly #deferredDiagnostics: DeferredDiagnostics;
 
-	constructor(private readonly session: ToolSession) {
+	/**
+	 * `mode` pins the edit variant for this instance, for callers whose protocol
+	 * fixes the shape of an edit. The Cursor `pi_edit` frame carries
+	 * `old_string`/`new_string` args, which only `replace` accepts — under the
+	 * default `hashline` mode those args do not match the schema at all. Left
+	 * unset, the env/settings resolution applies as before.
+	 */
+	constructor(
+		private readonly session: ToolSession,
+		mode?: EditMode,
+	) {
 		const {
 			PI_EDIT_FUZZY: editFuzzy = "auto",
 			PI_EDIT_FUZZY_THRESHOLD: editFuzzyThreshold = "auto",
 			PI_EDIT_VARIANT: envEditVariant = "auto",
 		} = Bun.env;
 
-		this.#editMode = resolveConfiguredEditMode(envEditVariant);
+		this.#editMode = mode ?? resolveConfiguredEditMode(envEditVariant);
 		this.#allowFuzzy = resolveAllowFuzzy(session, editFuzzy);
 		this.#fuzzyThreshold = resolveFuzzyThreshold(session, editFuzzyThreshold);
 		const deduplicateDiagnostics =
@@ -517,7 +546,7 @@ export class EditTool implements AgentTool<TInput> {
 						note: "All entries in one call apply to the top-level `path`; use separate calls for different files.",
 					},
 				] satisfies readonly ToolExample<PatchParams>[],
-				execute: (
+				execute: async (
 					tool: EditTool,
 					params: EditParams,
 					signal: AbortSignal | undefined,
@@ -525,11 +554,15 @@ export class EditTool implements AgentTool<TInput> {
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
 				) => {
 					const { edits, path } = params as PatchParams;
+					const targetPath = await resolveEditPath(tool.session, path, {
+						mustExist: (edits[0]?.op ?? "update") !== "create",
+						signal,
+					});
 					const runs = (edits as PatchEditEntry[]).map(
 						entry => (br: LspBatchRequest | undefined) =>
 							executePatchSingle({
 								session: tool.session,
-								path,
+								path: targetPath,
 								params: entry,
 								signal,
 								batchRequest: br,
@@ -542,7 +575,7 @@ export class EditTool implements AgentTool<TInput> {
 								beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
 							}),
 					);
-					return executeSinglePathEntries(path, runs, batchRequest, onUpdate, tool.session.cwd, signal);
+					return executeSinglePathEntries(targetPath, runs, batchRequest, onUpdate, tool.session.cwd, signal);
 				},
 			},
 			apply_patch: {
@@ -564,14 +597,26 @@ export class EditTool implements AgentTool<TInput> {
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
 				) => {
 					const entries = expandApplyPatchToEntries(params as ApplyPatchParams);
+					// Resolve each authored path once per patch so paired hunks (e.g. delete
+					// then re-add of the same file) share the same workspace target.
+					const resolvedTargets = new Map<string, Promise<string>>();
+					const resolveOnce = (path: string, mustExist: boolean): Promise<string> => {
+						let pending = resolvedTargets.get(path);
+						if (!pending) {
+							pending = resolveEditPath(tool.session, path, { mustExist, signal });
+							resolvedTargets.set(path, pending);
+						}
+						return pending;
+					};
 					const perFile = entries.map(entry => {
 						const { path, ...patchParams } = entry;
 						return {
 							path,
-							run: (br: LspBatchRequest | undefined) =>
-								executePatchSingle({
+							run: async (br: LspBatchRequest | undefined) => {
+								const targetPath = await resolveOnce(path, patchParams.op !== "create");
+								return executePatchSingle({
 									session: tool.session,
-									path,
+									path: targetPath,
 									params: patchParams,
 									signal,
 									batchRequest: br,
@@ -579,7 +624,8 @@ export class EditTool implements AgentTool<TInput> {
 									fuzzyThreshold: tool.#fuzzyThreshold,
 									writethrough: tool.#writethrough,
 									beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
-								}),
+								});
+							},
 						};
 					});
 					return executeApplyPatchPerFile(perFile, batchRequest, tool.session.cwd, signal, onUpdate);
@@ -609,19 +655,33 @@ export class EditTool implements AgentTool<TInput> {
 			replace: {
 				description: () => prompt.render(replaceDescription),
 				parameters: replaceEditSchema,
-				execute: (
+				execute: async (
 					tool: EditTool,
 					params: EditParams,
 					signal: AbortSignal | undefined,
 					batchRequest: LspBatchRequest | undefined,
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
 				) => {
-					const { edits, path } = params as ReplaceParams;
-					const runs = (edits as ReplaceEditEntry[]).map(
+					// `edits` is the internal `ReplaceBatchParams` form only the Cursor
+					// exec bridge produces (multi-replacement `pi_edit` frames run as one
+					// lifecycle); model calls always arrive in the single-edit schema shape.
+					const replaceParams = params as ReplaceParams | ReplaceBatchParams;
+					const entries =
+						"edits" in replaceParams
+							? replaceParams.edits
+							: [
+									{
+										old_string: replaceParams.old_string,
+										new_string: replaceParams.new_string,
+										replace_all: replaceParams.replace_all,
+									},
+								];
+					const targetPath = await resolveEditPath(tool.session, replaceParams.path, { mustExist: true, signal });
+					const runs = entries.map(
 						entry => (br: LspBatchRequest | undefined) =>
-							executeReplaceSingle({
+							executeReplace({
 								session: tool.session,
-								path,
+								path: targetPath,
 								params: entry,
 								signal,
 								batchRequest: br,
@@ -631,7 +691,7 @@ export class EditTool implements AgentTool<TInput> {
 								beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
 							}),
 					);
-					return executeSinglePathEntries(path, runs, batchRequest, onUpdate, tool.session.cwd, signal);
+					return executeSinglePathEntries(targetPath, runs, batchRequest, onUpdate, tool.session.cwd, signal);
 				},
 			},
 		}[this.mode];

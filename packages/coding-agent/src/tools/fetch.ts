@@ -516,7 +516,7 @@ function cleanFeedText(text: string): string {
  * Parse RSS/Atom feed to markdown
  */
 async function parseFeedToMarkdown(content: string, maxItems = 10): Promise<string> {
-	const { parseHTML } = await import("linkedom");
+	const { parseHTML } = await import("@oh-my-pi/pi-utils/dom");
 	try {
 		const doc = parseHTML(content).document;
 
@@ -1622,7 +1622,7 @@ export async function fetchReadUrl(
 ): Promise<ReadUrlEntry> {
 	const { path: url, raw = false } = params;
 
-	const effectiveTimeout = clampTimeout("fetch", 30);
+	const effectiveTimeout = clampTimeout("fetch", 30, session.settings.get("tools.maxTimeout"));
 
 	if (signal?.aborted) {
 		throw new ToolAbortError();

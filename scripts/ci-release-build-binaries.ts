@@ -26,9 +26,7 @@ if (
 	throw new Error("@huggingface/transformers package manifest has no string version");
 }
 const transformersVersion = transformersManifest.version;
-// Worker threads re-enter the binary's CLI entry module. Legacy Pi host
-// modules are supplied by the in-memory compile plugin, so neither subsystem
-// needs extra `--compile` entrypoints.
+// Worker threads re-enter the binary's single CLI host entry.
 const isDryRun = process.argv.includes("--dry-run");
 const targets: BinaryTarget[] = [
 	{
@@ -58,6 +56,20 @@ const targets: BinaryTarget[] = [
 		arch: "arm64",
 		target: "bun-linux-arm64",
 		outfile: "packages/coding-agent/binaries/omp-linux-arm64",
+	},
+	{
+		id: "linux-musl-x64",
+		platform: "linux",
+		arch: "x64",
+		target: "bun-linux-x64-musl-baseline",
+		outfile: "packages/coding-agent/binaries/omp-linux-musl-x64",
+	},
+	{
+		id: "linux-musl-arm64",
+		platform: "linux",
+		arch: "arm64",
+		target: "bun-linux-arm64-musl",
+		outfile: "packages/coding-agent/binaries/omp-linux-musl-arm64",
 	},
 	{
 		id: "win32-x64",

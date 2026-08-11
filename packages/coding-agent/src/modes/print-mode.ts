@@ -8,9 +8,11 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { logger, sanitizeText } from "@oh-my-pi/pi-utils";
+import { resolvePlanModelTransition } from "../plan-mode/model-transition";
 import { type AgentSession, type AgentSessionEvent, SHUTDOWN_CONSOLIDATE_BUDGET_MS } from "../session/agent-session";
 import { isSilentAbort } from "../session/messages";
 import { flushTelemetryExport } from "../telemetry-export";
+import { PROPOSE_DEVICE_NAME, writeDeviceDispatch } from "../tools/resolve";
 import { initializeExtensions } from "./runtime-init";
 
 /**
@@ -89,11 +91,29 @@ export function printableEvent(event: AgentSessionEvent): unknown {
 export async function runPrintMode(session: AgentSession, options: PrintModeOptions): Promise<void> {
 	const { mode, messages = [], initialMessage, initialImages, printThoughts } = options;
 
+	// process.stdout.write is fire-and-forget: a large final record (e.g. a
+	// multi-MB agent_end) can be dropped when the process exits before the pipe
+	// drains, truncating the record mid-line while the process still exits 0.
+	// Serialize every stdout write on the previous write's completion callback so
+	// records stay ordered and honor backpressure, then block shutdown on the
+	// tail before dispose/exit. Same truncation class as issue #5309 (issue #7635).
+	let stdoutTail: Promise<void> = Promise.resolve();
+	const writeStdoutLine = (text: string): void => {
+		stdoutTail = stdoutTail.then(() => {
+			const { promise, resolve, reject } = Promise.withResolvers<void>();
+			process.stdout.write(text, err => {
+				if (err) reject(err);
+				else resolve();
+			});
+			return promise;
+		});
+	};
+
 	// Emit session header for JSON mode
 	if (mode === "json") {
 		const header = session.sessionManager.getHeader();
 		if (header) {
-			process.stdout.write(`${JSON.stringify(header)}\n`);
+			writeStdoutLine(`${JSON.stringify(header)}\n`);
 		}
 	}
 	// Set up extensions for print mode (no UI, no command context)
@@ -108,11 +128,69 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		},
 	});
 
+	// InteractiveMode applies the same startup default during TUI initialization.
+	// Print mode has no TUI bootstrap, so arm the shared session directly before
+	// the first prompt; persisting the mode_change also lets a later interactive
+	// attachment restore and review the generated plan.
+	let abortAfterPlanProposal = false;
+	const planDefaultArmed =
+		session.settings.get("plan.defaultOnStartup") &&
+		session.settings.get("plan.enabled") &&
+		session.sessionManager.buildSessionContext().messages.length === 0 &&
+		!session.sessionManager.getEntries().some(entry => entry.type === "mode_change");
+	if (planDefaultArmed) {
+		const planFilePath = session.getPlanReferencePath() || "local://PLAN.md";
+		const previousTools = session.getEnabledToolNames();
+		const planTools = session.hasBuiltInTool("write") ? [...new Set([...previousTools, "write"])] : previousTools;
+		await session.setActiveToolsByName(planTools);
+		session.setPlanModeState({
+			enabled: true,
+			planFilePath,
+			workflow: "parallel",
+		});
+		session.sessionManager.appendModeChange("plan", { planFilePath });
+		abortAfterPlanProposal = true;
+		session.setPlanProposalHandler(async title => {
+			const result = await session.preparePlanForReview(title);
+			const details = result.details;
+			if (details) {
+				const state = session.getPlanModeState();
+				if (state?.enabled) {
+					session.setPlanModeState({ ...state, planFilePath: details.planFilePath });
+				}
+				session.sessionManager.appendModeChange("plan", { planFilePath: details.planFilePath });
+			}
+			return result;
+		});
+
+		const resolved = session.resolveRoleModelWithThinking("plan");
+		const transition = resolvePlanModelTransition(session.model, resolved, false);
+		if (transition.kind === "thinking") {
+			session.setThinkingLevel(transition.thinkingLevel);
+		} else if (transition.kind === "apply") {
+			try {
+				await session.setModelTemporary(transition.model, transition.thinkingLevel);
+			} catch (error) {
+				logger.warn("Failed to switch to plan model for print mode", { error: String(error) });
+			}
+		}
+	}
+
 	// Always subscribe to enable session persistence via _handleAgentEvent
 	session.subscribe(event => {
+		if (abortAfterPlanProposal && event.type === "tool_execution_end" && !event.isError) {
+			const dispatch = writeDeviceDispatch(event.toolName, event.result);
+			if (dispatch?.tool === PROPOSE_DEVICE_NAME && dispatch.mode === "execute") {
+				abortAfterPlanProposal = false;
+				session.markPlanInternalAbortPending();
+				void session.abort().finally(() => {
+					session.clearPlanInternalAbortPending();
+				});
+			}
+		}
 		// In JSON mode, output all events
 		if (mode === "json") {
-			process.stdout.write(`${JSON.stringify(printableEvent(event))}\n`);
+			writeStdoutLine(`${JSON.stringify(printableEvent(event))}\n`);
 		}
 	});
 
@@ -126,12 +204,14 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	// Send initial message with attachments
 	if (initialMessage !== undefined) {
 		writeTextWorkingIndicator();
+		if (mode === "text") session.setTextOutputCommitted(false);
 		await logger.time("print:prompt:initial", () => session.prompt(initialMessage, { images: initialImages }));
 	}
 
 	// Send remaining messages
 	for (const message of messages) {
 		writeTextWorkingIndicator();
+		if (mode === "text") session.setTextOutputCommitted(false);
 		await logger.time("print:prompt:next", () => session.prompt(message));
 	}
 
@@ -183,23 +263,20 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			// Output text content
 			for (const content of assistantMsg.content) {
 				if (content.type === "text") {
-					process.stdout.write(`${sanitizeText(content.text)}\n`);
+					writeStdoutLine(`${sanitizeText(content.text)}\n`);
 				} else if (printThoughts && content.type === "thinking" && content.thinking.trim().length > 0) {
-					process.stdout.write(`${sanitizeText(content.thinking)}\n`);
+					writeStdoutLine(`${sanitizeText(content.thinking)}\n`);
 				}
 			}
 		}
+		session.setTextOutputCommitted(true);
 	}
 
 	await session.waitForAdvisorCatchup(PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS);
 
-	// Ensure stdout, including late JSON advisor events, is fully flushed before returning.
-	// This prevents race conditions where the process exits before all output is written.
-	await new Promise<void>((resolve, reject) => {
-		process.stdout.write("", err => {
-			if (err) reject(err);
-			else resolve();
-		});
-	});
+	// Block shutdown until every serialized stdout write (including the final
+	// agent_end and late JSON advisor events) has drained; process.exit would
+	// otherwise discard the buffered tail and truncate the last record.
+	await stdoutTail;
 	await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
 }

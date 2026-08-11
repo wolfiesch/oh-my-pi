@@ -11,21 +11,26 @@
  *   const isolated = Settings.isolated({ "compaction.enabled": false });
  */
 
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { configureCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { configureProviderMaxInFlightRequests } from "@oh-my-pi/pi-ai/stream";
 import {
 	getAgentDbPath,
 	getAgentDir,
 	getLastChangelogVersionPath,
 	getProjectDir,
+	hasFsCode,
 	isEnoent,
 	logger,
 	MAIN_CONFIG_FILENAMES,
 	procmgr,
 	setWorktreesDir,
+	toError,
 } from "@oh-my-pi/pi-utils";
+import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { JSONC, YAML } from "bun";
 import { invalidate as invalidateCapabilityFsCache } from "../capability/fs";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
@@ -33,8 +38,10 @@ import type { ModelRole } from "../config/model-roles";
 import { loadCapability } from "../discovery";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
 import { AgentStorage } from "../session/agent-storage";
+import { AUTO_IMAGE_PROVIDER_ORDER, isImageProviderId } from "../tools/image-providers";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
-import { withFileLock } from "./file-lock";
+import { INSPECT_IMAGE_MODES } from "../utils/inspect-image-mode";
+import { isSearchProviderId, SEARCH_PROVIDER_ORDER } from "../web/search/types";
 import {
 	type BashInterceptorRule,
 	type GroupPrefix,
@@ -72,6 +79,12 @@ export interface SettingsDesktopSnapshot {
 	effective: unknown;
 	source: "override" | "configOverlay" | "project" | "global" | "default";
 }
+
+type YamlLoadResult =
+	| { kind: "missing" }
+	| { kind: "loaded"; settings: RawSettings }
+	| { kind: "invalid"; error: unknown; backupPath?: string }
+	| { kind: "unreadable"; error: unknown };
 
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
@@ -124,9 +137,8 @@ function getByPath(obj: RawSettings, segments: readonly string[]): unknown {
 	return current;
 }
 
-const settingPaths = Object.keys(SETTINGS_SCHEMA) as SettingPath[];
 const SETTING_PATH_SEGMENTS: Record<SettingPath, readonly string[]> = Object.fromEntries(
-	settingPaths.map(settingPath => [settingPath, settingPath.split(".")]),
+	(Object.keys(SETTINGS_SCHEMA) as SettingPath[]).map(settingPath => [settingPath, settingPath.split(".")]),
 ) as unknown as Record<SettingPath, readonly string[]>;
 
 /**
@@ -373,16 +385,22 @@ export class Settings {
 	#configFiles: string[] = [];
 	/** Global settings from config.yml/config.yaml */
 	#global: RawSettings = {};
-	/** Local settings from local/config.yml */
+	/** Host-local settings from local/config.yml. */
 	#local: RawSettings = {};
 	/** Project settings discovered from non-writable capability providers. */
 	#projectDiscovered: RawSettings = {};
 	/** Native project settings owned by <project>/.omp/config.yml. */
 	#projectNative: RawSettings = {};
-	/** Effective project layer (discovered providers overlaid by native settings). */
+	/** Effective project layer. */
 	#project: RawSettings = {};
+	/** Logical config paths whose malformed targets were moved aside. */
+	#quarantinedYamlTargets = new Map<string, string>();
 	/** Extra config.yml-style overlays passed by CLI */
 	#configOverlay: RawSettings = {};
+	/** Project settings file that most recently supplied shellPath. */
+	#projectShellPathSource: string | undefined;
+	/** Explicit config overlay that most recently supplied shellPath. */
+	#overlayShellPathSource: string | undefined;
 	/** Runtime overrides (not persisted) */
 	#overrides: RawSettings = {};
 	/** Merged view (global + project + overrides) */
@@ -393,12 +411,14 @@ export class Settings {
 
 	/** Paths modified during this session (for partial save) */
 	#modified = new Set<string>();
-	/** Paths modified in the local layer during this session */
+	/** Host-local paths modified during this session. */
 	#localModified = new Set<SettingPath>();
-	/** Project paths modified during this session, keyed by their accepted project root. */
+	/** Project paths modified during this session, keyed by accepted project root. */
 	#modifiedProject = new Map<string, Map<string, PendingProjectChange>>();
 	/** Native project state retained outside the serializable desktop snapshot. */
 	#desktopSnapshotProjectState = new WeakMap<SettingsDesktopSnapshot, DesktopSnapshotProjectState>();
+	/** Individual global model roles modified during this session (for partial save) */
+	#modifiedGlobalModelRoles = new Set<string>();
 	/**
 	 * Original process-wide model-role overrides captured before a project edit
 	 * temporarily replaced them via `#updateRuntimeModelRoleOverride`. Restored
@@ -407,6 +427,7 @@ export class Settings {
 	 * when the role had no runtime override).
 	 */
 	#savedRuntimeModelRoleOverrides = new Map<string, string | undefined>();
+
 	/** Legacy `lastChangelogVersion` captured from config.yml during migration (now a marker file). */
 	#legacyLastChangelogVersion?: string;
 
@@ -426,11 +447,12 @@ export class Settings {
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
 		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
 		this.#localConfigPath = options.inMemory ? null : path.join(this.#agentDir, "local", "config.yml");
+		this.#loadProjectSettingsOnInit = options.loadProjectSettings !== false;
 		const configFiles = process.env.PI_CONFIG_FILES?.split(path.delimiter).filter(Boolean) ?? [];
 		if (options.configFiles) configFiles.push(...options.configFiles);
 		this.#configFiles = configFiles.map(file => path.resolve(this.#cwd, expandTilde(file)));
 		this.#persist = !options.inMemory && options.readOnly !== true;
-		this.#loadProjectSettingsOnInit = options.loadProjectSettings !== false;
+		liveSettingsInstances.add(new WeakRef(this));
 
 		if (options.overrides) {
 			for (const [key, value] of Object.entries(options.overrides)) {
@@ -490,11 +512,15 @@ export class Settings {
 	}
 
 	/**
-	 * Create an isolated instance for testing.
-	 * Does not affect the global singleton.
+	 * Create an in-memory settings instance without affecting the global singleton.
+	 * A supplied storage handle remains shared for runtime data while setting overrides stay non-persistent.
 	 */
-	static isolated(overrides: Partial<Record<SettingPath, unknown>> = {}): Settings {
+	static isolated(
+		overrides: Partial<Record<SettingPath, unknown>> = {},
+		options: { storage?: AgentStorage | null } = {},
+	): Settings {
 		const instance = new Settings({ inMemory: true, overrides });
+		instance.#storage = options.storage ?? null;
 		instance.#rebuildMerged();
 		return instance;
 	}
@@ -677,23 +703,19 @@ export class Settings {
 	 */
 	set<P extends SettingPath>(path: P, value: SettingValue<P>): void {
 		const prev = this.get(path);
-		const segments = path.split(".");
+		const segments = SETTING_PATH_SEGMENTS[path];
 		if (isHostLocal(path)) {
-			setByPath(this.#local, segments, value);
+			setByPath(this.#local, [...segments], value);
 			this.#localModified.add(path);
 		} else {
-			setByPath(this.#global, segments, value);
+			setByPath(this.#global, [...segments], value);
 			this.#modified.add(path);
 		}
 		this.#rebuildMerged();
 		const next = this.get(path);
 		this.#queueSave();
-
-		// Trigger hook if exists
 		const hook = SETTING_HOOKS[path];
-		if (hook) {
-			hook(next, prev);
-		}
+		if (hook) hook(next, prev);
 		this.#fireEffectiveSettingChanged(path, next, prev);
 	}
 
@@ -741,6 +763,23 @@ export class Settings {
 		}
 	}
 
+	/** Set once this instance is discarded; background saves become no-ops. */
+	#savesCancelled = false;
+
+	/**
+	 * Drop pending debounced saves and refuse any further background writes.
+	 * Used when an instance is being discarded (test teardown): an armed timer
+	 * or a chained in-flight save on a dropped instance would otherwise fire
+	 * later and race the successor's file locks.
+	 */
+	cancelPendingSaves(): void {
+		this.#savesCancelled = true;
+		clearTimeout(this.#saveTimer);
+		this.#saveTimer = undefined;
+		clearTimeout(this.#projectSaveTimer);
+		this.#projectSaveTimer = undefined;
+	}
+
 	/**
 	 * Flush any pending saves to disk.
 	 * Call before exit to ensure all changes are persisted.
@@ -766,7 +805,7 @@ export class Settings {
 				await this.#startProjectSave();
 			}
 		}
-		if (this.#modified.size > 0 || this.#localModified.size > 0) {
+		if (this.#modified.size > 0 || this.#modifiedGlobalModelRoles.size > 0 || this.#localModified.size > 0) {
 			await this.#saveNow();
 		}
 	}
@@ -783,14 +822,19 @@ export class Settings {
 		cloned.#global = structuredClone(this.#global);
 		cloned.#local = structuredClone(this.#local);
 		if (this.#persist) {
-			cloned.#setProjectSettingsLayers(await cloned.#loadProjectSettings());
+			const project = await cloned.#loadProjectSettings();
+			cloned.#projectDiscovered = project.discovered;
+			cloned.#projectNative = project.native;
+			cloned.#rebuildProject();
 		} else {
 			cloned.#projectDiscovered = structuredClone(this.#projectDiscovered);
 			cloned.#projectNative = structuredClone(this.#projectNative);
-			cloned.#rebuildProject();
+			cloned.#project = structuredClone(this.#project);
+			cloned.#projectShellPathSource = this.#projectShellPathSource;
 		}
 		cloned.#configFiles = [...this.#configFiles];
 		cloned.#configOverlay = structuredClone(this.#configOverlay);
+		cloned.#overlayShellPathSource = this.#overlayShellPathSource;
 		cloned.#overrides = this.#buildOriginalOverrides();
 		cloned.#rebuildMerged();
 		cloned.#fireAllHooks();
@@ -849,7 +893,17 @@ export class Settings {
 	 */
 	getShellConfig() {
 		const shell = this.get("shellPath");
-		return procmgr.getShellConfig(shell);
+		let configSource = this.#configPath ?? path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
+		if (Object.hasOwn(this.#project, "shellPath")) {
+			configSource = this.#projectShellPathSource ?? "the active project configuration";
+		}
+		if (Object.hasOwn(this.#configOverlay, "shellPath")) {
+			configSource = this.#overlayShellPathSource ?? "the active config overlay";
+		}
+		if (Object.hasOwn(this.#overrides, "shellPath")) {
+			configSource = "the runtime settings override";
+		}
+		return procmgr.getShellConfig(shell, { configSource });
 	}
 
 	/**
@@ -1080,13 +1134,22 @@ export class Settings {
 	 * stale skip in place.
 	 */
 	setModelRole(role: ModelRole | string, modelId: string | undefined): void {
+		const prev = this.get("modelRoles");
 		const current = this.#modelRolesFromLayer(this.#global);
 		if (modelId === undefined) {
 			delete current[role];
 		} else {
 			current[role] = modelId;
 		}
-		this.set("modelRoles", current);
+		// Persist per-role rather than marking the whole `modelRoles` path
+		// modified: #saveNow merges only the changed role into the re-read
+		// file, so a concurrent external edit to a sibling role is not
+		// clobbered by this process's stale in-memory snapshot.
+		setByPath(this.#global, ["modelRoles"], current);
+		this.#modifiedGlobalModelRoles.add(role);
+		this.#rebuildMerged();
+		this.#queueSave();
+		this.#fireEffectiveSettingChanged("modelRoles", this.get("modelRoles"), prev);
 		if (this.isProjectModelRoleRuntimeOverrideActive(role)) {
 			return;
 		}
@@ -1219,33 +1282,22 @@ export class Settings {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	async #load(): Promise<Settings> {
-		// Project settings load (loadCapability scans cwd) is independent of the
-		// persist chain (storage open → legacy migration → global config read), so
-		// kick it off first and await after the persist chain completes. The
-		// persist steps remain sequential: existing config discovery decides
-		// whether migration may write config.yml before the global config is read;
-		// migration's db fallback needs #storage opened.
-		const projectPromise = this.#loadProjectSettingsOnInit
-			? this.#loadProjectSettings()
-			: Promise.resolve<ProjectSettingsLayers>({ discovered: {}, native: {} });
+		// Project settings discovery is independent of the persist chain, while
+		// the persist steps themselves remain sequential. Wait for both branches
+		// to settle so simultaneous failures produce one catchable error without
+		// abandoning the other rejection.
+		const [globalResult, projectResult] = await Promise.allSettled([
+			this.#persist ? this.#loadGlobalSettings() : Promise.resolve(),
+			this.#loadProjectSettingsOnInit
+				? this.#loadProjectSettings()
+				: Promise.resolve({ discovered: {}, native: {} } satisfies ProjectSettingsLayers),
+		]);
+		if (globalResult.status === "rejected") throw globalResult.reason;
+		if (projectResult.status === "rejected") throw projectResult.reason;
 
-		if (this.#persist) {
-			this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
-			const existingConfig = await this.#loadExistingMainYaml();
-			if (existingConfig) {
-				this.#global = existingConfig;
-			} else {
-				await this.#migrateFromLegacy();
-				this.#global = await this.#loadYaml(this.#configPath!);
-			}
-			await this.#seedLastChangelogVersionMarker();
-
-			if (this.#localConfigPath) {
-				this.#local = await this.#loadYaml(this.#localConfigPath);
-			}
-		}
-
-		this.#setProjectSettingsLayers(await projectPromise);
+		this.#projectDiscovered = projectResult.value.discovered;
+		this.#projectNative = projectResult.value.native;
+		this.#rebuildProject();
 		this.#configOverlay = await this.#loadConfigOverlays();
 
 		// Build merged view (global → project → overrides; project wins over global)
@@ -1253,51 +1305,166 @@ export class Settings {
 		this.#fireAllHooks();
 		return this;
 	}
-
-	async #loadReadOnly(): Promise<Settings> {
-		const projectPromise = this.#loadProjectSettingsOnInit
-			? this.#loadProjectSettings()
-			: Promise.resolve<ProjectSettingsLayers>({ discovered: {}, native: {} });
-
+	async #loadGlobalSettings(): Promise<void> {
+		this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
 		const existingConfig = await this.#loadExistingMainYaml();
 		if (existingConfig) {
 			this.#global = existingConfig;
+		} else {
+			await this.#migrateFromLegacy();
+			this.#global = await this.#loadYaml(this.#configPath!);
 		}
+		this.#local = this.#localConfigPath ? await this.#loadYaml(this.#localConfigPath) : {};
+		await this.#seedLastChangelogVersionMarker();
+	}
 
-		if (this.#localConfigPath) {
-			this.#local = await this.#loadYaml(this.#localConfigPath);
-		}
-
-		this.#setProjectSettingsLayers(await projectPromise);
+	async #loadReadOnly(): Promise<Settings> {
+		const [globalResult, localResult, projectResult] = await Promise.allSettled([
+			this.#loadExistingMainYaml(),
+			this.#localConfigPath ? this.#loadYaml(this.#localConfigPath) : Promise.resolve({}),
+			this.#loadProjectSettingsOnInit
+				? this.#loadProjectSettings()
+				: Promise.resolve({ discovered: {}, native: {} } satisfies ProjectSettingsLayers),
+		]);
+		if (globalResult.status === "rejected") throw globalResult.reason;
+		if (localResult.status === "rejected") throw localResult.reason;
+		if (projectResult.status === "rejected") throw projectResult.reason;
+		if (globalResult.value) this.#global = globalResult.value;
+		this.#local = localResult.value;
+		this.#projectDiscovered = projectResult.value.discovered;
+		this.#projectNative = projectResult.value.native;
+		this.#rebuildProject();
 		this.#configOverlay = await this.#loadConfigOverlays();
 		this.#rebuildMerged();
 		return this;
 	}
 
 	async #loadYaml(filePath: string): Promise<RawSettings> {
-		const loaded = await this.#loadYamlIfPresent(filePath);
+		const loaded = await this.#loadYamlIfPresentForStartup(filePath);
 		return loaded ?? {};
 	}
 
-	async #loadYamlIfPresent(filePath: string): Promise<RawSettings | null> {
+	async #loadYamlIfPresent(filePath: string): Promise<YamlLoadResult> {
 		let content: string;
 		try {
-			content = await Bun.file(filePath).text();
+			content = await fs.promises.readFile(filePath, "utf8");
 		} catch (error) {
-			if (isEnoent(error)) return null;
-			logger.warn("Settings: failed to load", { path: filePath, error: String(error) });
-			return {};
+			if (isEnoent(error)) return { kind: "missing" };
+			return { kind: "unreadable", error };
 		}
 
+		let parsed: unknown;
 		try {
-			const parsed = YAML.parse(content);
-			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-				return {};
-			}
-			return this.#migrateRawSettings(parsed as RawSettings);
+			parsed = YAML.parse(content);
 		} catch (error) {
-			logger.warn("Settings: failed to load", { path: filePath, error: String(error) });
-			return {};
+			return { kind: "invalid", error };
+		}
+		if (parsed === null || parsed === undefined) {
+			return { kind: "loaded", settings: {} };
+		}
+		if (typeof parsed !== "object" || Array.isArray(parsed)) {
+			return {
+				kind: "invalid",
+				error: new Error("Settings YAML must contain a mapping at the document root"),
+			};
+		}
+		return { kind: "loaded", settings: this.#migrateRawSettings(parsed as RawSettings) };
+	}
+
+	async #resolveYamlWritePath(filePath: string): Promise<string> {
+		const quarantinedTarget = this.#quarantinedYamlTargets.get(filePath);
+		if (quarantinedTarget) return quarantinedTarget;
+		try {
+			return await fs.promises.realpath(filePath);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+
+		// realpath fails for a dangling symlink. Resolve its immediate target so
+		// recreating a quarantined config repairs the target without replacing
+		// the user-managed link.
+		try {
+			const stat = await fs.promises.lstat(filePath);
+			if (stat.isSymbolicLink()) {
+				const target = await fs.promises.readlink(filePath);
+				return path.resolve(path.dirname(filePath), target);
+			}
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+		return path.resolve(filePath);
+	}
+
+	async #withYamlWriteLock<T>(filePath: string, fn: (writePath: string) => Promise<T>): Promise<T> {
+		const writePath = await this.#resolveYamlWritePath(filePath);
+		return await withFileLock(writePath, async () => fn(writePath));
+	}
+
+	async #loadYamlIfPresentForStartup(filePath: string): Promise<RawSettings | null> {
+		const result = await this.#loadYamlIfPresent(filePath);
+		if (result.kind !== "invalid" || !this.#persist) {
+			return this.#unwrapYamlLoadResult(filePath, result);
+		}
+		return await this.#withYamlWriteLock(filePath, async writePath =>
+			this.#loadYamlIfPresentForWriteLocked(filePath, writePath, true),
+		);
+	}
+
+	/**
+	 * Read a YAML settings file while its write lock is held. Invalid files are
+	 * moved aside before reporting failure, so a later write can never truncate
+	 * the only copy of the user's configuration.
+	 */
+	async #loadYamlIfPresentForWriteLocked(
+		filePath: string,
+		writePath: string,
+		rejectMissing = false,
+	): Promise<RawSettings | null> {
+		let result = await this.#loadYamlIfPresent(writePath);
+		if (result.kind === "missing" && rejectMissing) {
+			throw new Error(
+				`Settings config was invalid before locking and is now missing: ${filePath}; another process may have moved it aside`,
+			);
+		}
+		if (result.kind === "invalid") {
+			result = await this.#quarantineInvalidYamlLocked(writePath, result);
+			this.#quarantinedYamlTargets.set(filePath, writePath);
+		}
+		return this.#unwrapYamlLoadResult(filePath, result);
+	}
+
+	async #quarantineInvalidYamlLocked(
+		filePath: string,
+		result: Extract<YamlLoadResult, { kind: "invalid" }>,
+	): Promise<Extract<YamlLoadResult, { kind: "invalid" }>> {
+		const backupPath = `${filePath}.broken-${Date.now()}-${process.pid}-${randomUUID()}`;
+		try {
+			await fs.promises.rename(filePath, backupPath);
+		} catch (error) {
+			throw new Error(
+				`Settings config is invalid and could not be moved aside: ${filePath}; refusing to overwrite it: ${String(error)}`,
+			);
+		}
+		logger.warn("Settings: moved invalid config aside", {
+			path: filePath,
+			backupPath,
+			error: String(result.error),
+		});
+		return { ...result, backupPath };
+	}
+
+	#unwrapYamlLoadResult(filePath: string, result: YamlLoadResult): RawSettings | null {
+		switch (result.kind) {
+			case "missing":
+				return null;
+			case "loaded":
+				return result.settings;
+			case "invalid":
+				throw new Error(
+					`Settings config is invalid: ${filePath}${result.backupPath ? ` (moved to ${result.backupPath})` : ""}: ${String(result.error)}`,
+				);
+			case "unreadable":
+				throw new Error(`Failed to read settings config ${filePath}: ${String(result.error)}`);
 		}
 	}
 
@@ -1305,7 +1472,7 @@ export class Settings {
 		if (!this.#configPath) return null;
 		for (const filename of MAIN_CONFIG_FILENAMES) {
 			const configPath = path.join(this.#agentDir, filename);
-			const loaded = await this.#loadYamlIfPresent(configPath);
+			const loaded = await this.#loadYamlIfPresentForStartup(configPath);
 			if (loaded) {
 				this.#configPath = configPath;
 				return loaded;
@@ -1316,26 +1483,32 @@ export class Settings {
 	}
 
 	async #loadProjectSettings(projectRoot = this.#currentProjectRoot()): Promise<ProjectSettingsLayers> {
+		this.#projectShellPathSource = undefined;
 		const nativeConfigPath = path.join(projectRoot, ".omp", "config.yml");
-		const native = await this.#loadYaml(nativeConfigPath);
+		let discovered: RawSettings = {};
 		try {
 			const result = await loadCapability(settingsCapability.id, { cwd: projectRoot });
-			let discovered: RawSettings = {};
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level === "project" && path.resolve(item.path) !== nativeConfigPath) {
 					discovered = this.#deepMerge(discovered, item.data as RawSettings);
+					if (Object.hasOwn(item.data, "shellPath")) this.#projectShellPathSource = item.path;
 				}
 			}
-			return { discovered: this.#migrateRawSettings(discovered), native };
 		} catch {
-			return { discovered: {}, native };
+			this.#projectShellPathSource = undefined;
 		}
+		const native = await this.#loadYaml(nativeConfigPath);
+		if (Object.hasOwn(native, "shellPath")) this.#projectShellPathSource = nativeConfigPath;
+		return { discovered: this.#migrateRawSettings(discovered), native };
 	}
 
 	async #loadConfigOverlays(): Promise<RawSettings> {
+		this.#overlayShellPathSource = undefined;
 		let merged: RawSettings = {};
 		for (const filePath of this.#configFiles) {
-			merged = this.#deepMerge(merged, await this.#loadOverlayYaml(filePath));
+			const overlay = await this.#loadOverlayYaml(filePath);
+			merged = this.#deepMerge(merged, overlay);
+			if (Object.hasOwn(overlay, "shellPath")) this.#overlayShellPathSource = filePath;
 		}
 		return merged;
 	}
@@ -1400,7 +1573,7 @@ export class Settings {
 		// 3. Write merged settings
 		if (migrated && Object.keys(settings).length > 0) {
 			try {
-				await Bun.write(this.#configPath, YAML.stringify(settings, null, 2));
+				await this.#writeYamlAtomically(this.#configPath, settings);
 				logger.debug("Settings: migrated to config.yml", { path: this.#configPath });
 			} catch {}
 		}
@@ -1424,11 +1597,36 @@ export class Settings {
 		}
 		delete raw.lastChangelogVersion;
 
+		// collapseChangelog (boolean) -> startup.changelogMode (enum). Preserve
+		// every explicit legacy choice while giving new installs the schema's
+		// "summary" default: true -> summary, false -> expanded. A separately
+		// configured new mode always wins.
+		const startupObj = isRecord(raw.startup) ? (raw.startup as Record<string, unknown>) : undefined;
+		const legacyCollapseChangelog = typeof raw.collapseChangelog === "boolean" ? raw.collapseChangelog : undefined;
+		const flatChangelogMode = raw["startup.changelogMode"];
+		const normalizedFlatChangelogMode =
+			flatChangelogMode === "summary" || flatChangelogMode === "expanded" || flatChangelogMode === "hidden"
+				? flatChangelogMode
+				: undefined;
+		if (legacyCollapseChangelog !== undefined || normalizedFlatChangelogMode !== undefined) {
+			if (!startupObj) {
+				raw.startup = {};
+			}
+			const target = raw.startup as Record<string, unknown>;
+			if (target.changelogMode === undefined) {
+				target.changelogMode =
+					normalizedFlatChangelogMode ??
+					(legacyCollapseChangelog !== undefined ? (legacyCollapseChangelog ? "summary" : "expanded") : undefined);
+			}
+		}
+		delete raw.collapseChangelog;
+		delete raw["startup.changelogMode"];
+
 		// ask.timeout: ms -> seconds (if value > 1000, it's old ms format)
-		if (isRecord(raw.ask) && typeof raw.ask.timeout === "number") {
-			const oldValue = raw.ask.timeout;
+		if (raw.ask && typeof (raw.ask as Record<string, unknown>).timeout === "number") {
+			const oldValue = (raw.ask as Record<string, unknown>).timeout as number;
 			if (oldValue > 1000) {
-				raw.ask.timeout = Math.round(oldValue / 1000);
+				(raw.ask as Record<string, unknown>).timeout = Math.round(oldValue / 1000);
 			}
 		}
 
@@ -1443,6 +1641,40 @@ export class Settings {
 				const slot = isLightTheme(oldTheme) ? "light" : "dark";
 				raw.theme = { [slot]: oldTheme };
 			}
+		}
+
+		// inspect_image.enabled (boolean) -> inspect_image.mode (enum). Explicit
+		// user choices are preserved: true -> "on", false -> "off". Configs with
+		// no legacy key get the new "auto" default, which hides the tool for
+		// models with native image input. Handles nested and quoted-dotted
+		// ("inspect_image.enabled") sources; the target is always the nested
+		// form, which is the only shape the resolver reads.
+		const inspectImageObj = isRecord(raw.inspect_image) ? (raw.inspect_image as Record<string, unknown>) : undefined;
+		const legacyEnabled =
+			typeof inspectImageObj?.enabled === "boolean"
+				? inspectImageObj.enabled
+				: typeof raw["inspect_image.enabled"] === "boolean"
+					? (raw["inspect_image.enabled"] as boolean)
+					: undefined;
+		if (legacyEnabled !== undefined) {
+			if (!inspectImageObj) {
+				raw.inspect_image = {};
+			}
+			const target = raw.inspect_image as Record<string, unknown>;
+			const flatMode = raw["inspect_image.mode"];
+			if (target.mode === undefined) {
+				// A quoted-dotted explicit mode wins over the legacy boolean but
+				// must be normalized into the nested form the resolver reads.
+				target.mode =
+					typeof flatMode === "string" && (INSPECT_IMAGE_MODES as readonly string[]).includes(flatMode)
+						? flatMode
+						: legacyEnabled
+							? "on"
+							: "off";
+			}
+			delete target.enabled;
+			delete raw["inspect_image.enabled"];
+			delete raw["inspect_image.mode"];
 		}
 
 		// task.isolation.enabled (boolean) -> task.isolation.mode (enum)
@@ -1840,6 +2072,91 @@ export class Settings {
 		delete raw["mcp.discoveryMode"];
 		delete raw["mcp.discoveryDefaultServers"];
 
+		// providers.webSearch / providers.image (single preferred provider) →
+		// providers.webSearchOrder / providers.imageOrder (priority lists). A
+		// concrete legacy choice becomes the head of the new list with every
+		// remaining provider appended in its built-in order, so the old
+		// preference stays #1 and the fallback chain is written out explicitly.
+		// "auto" (or an unknown id) just drops the key — the default chain.
+		const providerPrefsObj = raw.providers as Record<string, unknown> | undefined;
+		const migrateProviderPreference = (
+			legacyKey: string,
+			orderKey: string,
+			expand: (value: string) => string[] | undefined,
+		): void => {
+			const flatLegacyKey = `providers.${legacyKey}`;
+			const legacy = providerPrefsObj?.[legacyKey] ?? raw[flatLegacyKey];
+			if (legacy === undefined) return;
+			const existingOrder = providerPrefsObj?.[orderKey] ?? raw[`providers.${orderKey}`];
+			const orderAlreadySet = Array.isArray(existingOrder) && existingOrder.length > 0;
+			if (!orderAlreadySet && typeof legacy === "string") {
+				const expanded = expand(legacy);
+				if (expanded) {
+					const root = providerPrefsObj ?? {};
+					root[orderKey] = expanded;
+					raw.providers = root;
+				}
+			}
+			if (providerPrefsObj) delete providerPrefsObj[legacyKey];
+			delete raw[flatLegacyKey];
+		};
+		migrateProviderPreference("webSearch", "webSearchOrder", value =>
+			value !== "auto" && isSearchProviderId(value)
+				? [value, ...SEARCH_PROVIDER_ORDER.filter(id => id !== value)]
+				: undefined,
+		);
+		migrateProviderPreference("image", "imageOrder", value =>
+			value !== "auto" && isImageProviderId(value)
+				? [value, ...AUTO_IMAGE_PROVIDER_ORDER.filter(id => id !== value)]
+				: undefined,
+		);
+
+		// Consolidate the retired Exa suite toggles onto the sole remaining
+		// provider switch. The old runtime required both `enabled` and
+		// `enableSearch`, so preserve that AND semantics when both are present.
+		// Researcher and Websets were removed with the standalone Exa tools.
+		const exaObj = isRecord(raw.exa) ? raw.exa : undefined;
+		const exaEnabledValues = [
+			exaObj?.enabled,
+			raw["exa.enabled"],
+			exaObj?.enableSearch,
+			raw["exa.enableSearch"],
+		].filter((value): value is boolean => typeof value === "boolean");
+		const hasFlatExaSetting =
+			"exa.enabled" in raw ||
+			"exa.enableSearch" in raw ||
+			"exa.enableResearcher" in raw ||
+			"exa.enableWebsets" in raw;
+		if (exaObj || hasFlatExaSetting) {
+			const exaRoot = exaObj ?? {};
+			if (exaEnabledValues.length > 0) {
+				exaRoot.enabled = exaEnabledValues.every(Boolean);
+			}
+			delete exaRoot.enableSearch;
+			delete exaRoot.enableResearcher;
+			delete exaRoot.enableWebsets;
+			if (Object.keys(exaRoot).length > 0) {
+				raw.exa = exaRoot;
+			} else {
+				delete raw.exa;
+			}
+			delete raw["exa.enabled"];
+			delete raw["exa.enableSearch"];
+			delete raw["exa.enableResearcher"];
+			delete raw["exa.enableWebsets"];
+		}
+
+		// computer.backend and model-specific controller routing were removed
+		// when the computer tool moved to one native desktop implementation.
+		const computerObj = isRecord(raw.computer) ? raw.computer : undefined;
+		if (computerObj && "backend" in computerObj) {
+			delete computerObj.backend;
+			if (Object.keys(computerObj).length === 0) {
+				delete raw.computer;
+			}
+		}
+		delete raw["computer.backend"];
+
 		return raw;
 	}
 
@@ -1868,14 +2185,81 @@ export class Settings {
 	// Saving
 	// ─────────────────────────────────────────────────────────────────────────
 
+	async #writeYamlAtomically(filePath: string, settings: RawSettings): Promise<void> {
+		const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+		let removeTemp = false;
+		try {
+			const handle = await fs.promises.open(tempPath, "wx", 0o600);
+			removeTemp = true;
+			try {
+				await handle.writeFile(YAML.stringify(settings, null, 2), "utf8");
+				await handle.sync();
+			} finally {
+				await handle.close();
+			}
+			try {
+				await fs.promises.rename(tempPath, filePath);
+			} catch (error) {
+				if (!hasFsCode(error, "EPERM")) throw error;
+				await this.#replaceYamlAfterEperm(tempPath, filePath, error);
+			}
+			removeTemp = false;
+		} finally {
+			if (removeTemp) {
+				await fs.promises.rm(tempPath, { force: true }).catch(() => {});
+			}
+		}
+	}
+	async #replaceYamlAfterEperm(tempPath: string, filePath: string, renameError: unknown): Promise<void> {
+		const backupPath = `${filePath}.${process.pid}.${randomUUID()}.bak`;
+		try {
+			await fs.promises.rename(filePath, backupPath);
+		} catch (error) {
+			if (isEnoent(error)) {
+				await fs.promises.rename(tempPath, filePath);
+				return;
+			}
+			throw renameError;
+		}
+
+		try {
+			await fs.promises.rename(tempPath, filePath);
+		} catch (replaceError) {
+			try {
+				await fs.promises.rename(backupPath, filePath);
+			} catch (rollbackError) {
+				throw new Error(
+					`Failed to replace settings file after EPERM (original: ${toError(renameError).message}; retry: ${
+						toError(replaceError).message
+					}; rollback: ${toError(rollbackError).message})`,
+					{ cause: toError(renameError) },
+				);
+			}
+			throw replaceError;
+		}
+
+		try {
+			await fs.promises.rm(backupPath);
+		} catch (error) {
+			if (!isEnoent(error)) {
+				logger.warn("Settings: failed to remove atomic-write backup", {
+					path: filePath,
+					backupPath,
+					error: toError(error).message,
+				});
+			}
+		}
+	}
+
 	#queueSave(): void {
-		if (!this.#persist || (!this.#configPath && !this.#localConfigPath)) return;
+		if (!this.#persist || !this.#configPath) return;
 
 		// Debounce: wait 100ms for more changes
 		clearTimeout(this.#saveTimer);
 		this.#saveTimer = setTimeout(() => {
 			this.#saveTimer = undefined;
-			const savePromise = this.#saveNow();
+			const previousSave = this.#savePromise;
+			const savePromise = previousSave ? previousSave.then(() => this.#saveNow()) : this.#saveNow();
 			this.#savePromise = savePromise;
 			savePromise
 				.catch(err => {
@@ -1890,79 +2274,126 @@ export class Settings {
 	}
 
 	async #saveNow(): Promise<void> {
-		if (!this.#persist) return;
-
-		const globalModified = this.#modified.size > 0 && this.#configPath;
-		const localModified = this.#localModified.size > 0 && this.#localConfigPath;
-
-		if (!globalModified && !localModified) return;
-
-		const globalModifiedPaths = [...this.#modified];
+		if (this.#savesCancelled || !this.#persist) return;
+		const globalModified = this.#modified.size > 0 || this.#modifiedGlobalModelRoles.size > 0;
+		if (!globalModified) {
+			await this.#saveLocalNow();
+			this.#rebuildMerged();
+			return;
+		}
+		if (!this.#configPath) return;
+		const configPath = this.#configPath;
+		const modifiedPaths = [...this.#modified];
+		const modifiedModelRoles = [...this.#modifiedGlobalModelRoles];
+		const globalRolesAtStart = this.#modelRolesFromLayer(this.#global);
 		this.#modified.clear();
+		this.#modifiedGlobalModelRoles.clear();
 
-		const localModifiedPaths = [...this.#localModified];
-		this.#localModified.clear();
+		try {
+			await this.#withYamlWriteLock(configPath, async writePath => {
+				// Re-read to preserve external changes. If this instance moved a
+				// malformed file aside, recover from its last in-memory state
+				// rather than recreating the config from only the pending path.
+				const loaded = await this.#loadYamlIfPresentForWriteLocked(configPath, writePath);
+				const current =
+					loaded ?? (this.#quarantinedYamlTargets.has(configPath) ? structuredClone(this.#global) : {});
 
-		if (globalModified) {
-			const configPath = this.#configPath!;
-			try {
-				await withFileLock(configPath, async () => {
-					// Re-read to preserve external changes
-					const current = await this.#loadYaml(configPath);
+				// Apply only our modified whole-value paths
+				for (const modPath of modifiedPaths) {
+					const segments = modPath.split(".");
+					const value = getByPath(this.#global, segments);
+					setByPath(current, segments, value);
+				}
 
-					// Apply only our modified paths
-					for (const modPath of globalModifiedPaths) {
-						const segments = modPath.split(".");
-						const value = getByPath(this.#global, segments);
-						setByPath(current, segments, value);
+				// Merge only the model roles captured by this save. Then retain
+				// any role changed while the async read/lock was pending before
+				// replacing #global, so the follow-up save still sees its value.
+				const latestGlobalRoles = this.#modelRolesFromLayer(this.#global);
+				const rolesToPreserve = new Set(this.#modifiedGlobalModelRoles);
+				for (const role in globalRolesAtStart) {
+					if (globalRolesAtStart[role] !== latestGlobalRoles[role]) {
+						rolesToPreserve.add(role);
 					}
-
-					// Update our global with any external changes we preserved
-					this.#global = current;
-					await Bun.write(configPath, YAML.stringify(this.#global, null, 2));
-				});
-			} catch (error) {
-				logger.warn("Settings: save failed", { error: String(error) });
-				// Re-add failed paths for retry
-				for (const p of globalModifiedPaths) {
-					this.#modified.add(p);
 				}
-			}
-		}
-
-		if (localModified) {
-			const localConfigPath = this.#localConfigPath!;
-			try {
-				const localDir = path.dirname(localConfigPath);
-				if (!fs.existsSync(localDir)) {
-					fs.mkdirSync(localDir, { recursive: true });
-				}
-
-				await withFileLock(localConfigPath, async () => {
-					// Re-read to preserve external changes
-					const current = await this.#loadYaml(localConfigPath);
-
-					// Apply only our modified paths
-					for (const modPath of localModifiedPaths) {
-						const segments = modPath.split(".");
-						const value = getByPath(this.#local, segments);
-						setByPath(current, segments, value);
+				for (const role in latestGlobalRoles) {
+					if (globalRolesAtStart[role] !== latestGlobalRoles[role]) {
+						rolesToPreserve.add(role);
 					}
-
-					// Update our local with any external changes we preserved
-					this.#local = current;
-					await Bun.write(localConfigPath, YAML.stringify(this.#local, null, 2));
-				});
-			} catch (error) {
-				logger.warn("Settings: local save failed", { error: String(error) });
-				// Re-add failed paths for retry
-				for (const p of localModifiedPaths) {
-					this.#localModified.add(p);
 				}
-			}
-		}
+				if (modifiedModelRoles.length > 0 || rolesToPreserve.size > 0) {
+					const currentRoles = getByPath(current, ["modelRoles"]);
+					const mergedRoles: Record<string, unknown> = isRecord(currentRoles) ? { ...currentRoles } : {};
+					for (const role of modifiedModelRoles) {
+						if (Object.hasOwn(globalRolesAtStart, role)) {
+							mergedRoles[role] = globalRolesAtStart[role];
+						} else {
+							delete mergedRoles[role];
+						}
+					}
+					for (const role of rolesToPreserve) {
+						if (Object.hasOwn(latestGlobalRoles, role)) {
+							mergedRoles[role] = latestGlobalRoles[role];
+						} else {
+							delete mergedRoles[role];
+						}
+					}
+					setByPath(current, ["modelRoles"], mergedRoles);
+				}
 
+				// Update our global with any external changes we preserved
+				this.#global = current;
+				await this.#writeYamlAtomically(writePath, this.#global);
+				this.#quarantinedYamlTargets.delete(configPath);
+				// These pending roles were included in this write. Remove each
+				// only if no newer local change arrived while the write was in flight.
+				const globalRolesAfterWrite = this.#modelRolesFromLayer(this.#global);
+				for (const role of rolesToPreserve) {
+					if (latestGlobalRoles[role] === globalRolesAfterWrite[role]) {
+						this.#modifiedGlobalModelRoles.delete(role);
+					}
+				}
+			});
+		} catch (error) {
+			logger.warn("Settings: save failed", { error: String(error) });
+			// Re-add failed paths for retry
+			for (const p of modifiedPaths) {
+				this.#modified.add(p);
+			}
+			for (const role of modifiedModelRoles) {
+				this.#modifiedGlobalModelRoles.add(role);
+			}
+			this.#rebuildMerged();
+			throw error;
+		}
+		await this.#saveLocalNow();
 		this.#rebuildMerged();
+	}
+
+	async #saveLocalNow(): Promise<void> {
+		if (this.#savesCancelled || !this.#persist || !this.#localConfigPath || this.#localModified.size === 0) return;
+		const localConfigPath = this.#localConfigPath;
+		const modifiedPaths = [...this.#localModified];
+		this.#localModified.clear();
+		try {
+			await fs.promises.mkdir(path.dirname(localConfigPath), { recursive: true });
+			await this.#withYamlWriteLock(localConfigPath, async writePath => {
+				const loaded = await this.#loadYamlIfPresentForWriteLocked(localConfigPath, writePath);
+				const current =
+					loaded ?? (this.#quarantinedYamlTargets.has(localConfigPath) ? structuredClone(this.#local) : {});
+				for (const modPath of modifiedPaths) {
+					const segments = SETTING_PATH_SEGMENTS[modPath];
+					const value = getByPath(this.#local, segments);
+					if (value === undefined) deleteByPath(current, segments);
+					else setByPath(current, [...segments], structuredClone(value));
+				}
+				this.#local = current;
+				await this.#writeYamlAtomically(writePath, current);
+				this.#quarantinedYamlTargets.delete(localConfigPath);
+			});
+		} catch (error) {
+			for (const modPath of modifiedPaths) this.#localModified.add(modPath);
+			throw error;
+		}
 	}
 	#queueProjectSave(): void {
 		if (!this.#persist) return;
@@ -1977,7 +2408,7 @@ export class Settings {
 	}
 
 	async #saveProjectNow(): Promise<void> {
-		if (!this.#persist || this.#modifiedProject.size === 0) return;
+		if (this.#savesCancelled || !this.#persist || this.#modifiedProject.size === 0) return;
 
 		const batches = [...this.#modifiedProject];
 		this.#modifiedProject.clear();
@@ -1990,10 +2421,16 @@ export class Settings {
 			let savedNative: RawSettings | undefined;
 			try {
 				await fs.promises.mkdir(path.dirname(projectConfigPath), { recursive: true });
-				await withFileLock(projectConfigPath, async () => {
-					const projectSettings = await this.#loadYaml(projectConfigPath);
+				await this.#withYamlWriteLock(projectConfigPath, async writePath => {
+					const loaded = await this.#loadYamlIfPresentForWriteLocked(projectConfigPath, writePath);
+					const projectSettings =
+						loaded ??
+						(this.#quarantinedYamlTargets.has(projectConfigPath) && root === this.#currentProjectRoot()
+							? structuredClone(this.#projectNative)
+							: {});
 					this.#applyProjectChanges(projectSettings, changes.values());
-					await Bun.write(projectConfigPath, YAML.stringify(projectSettings, null, 2));
+					await this.#writeYamlAtomically(writePath, projectSettings);
+					this.#quarantinedYamlTargets.delete(projectConfigPath);
 					savedNative = projectSettings;
 				});
 				invalidateCapabilityFsCache(projectConfigPath);
@@ -2100,21 +2537,17 @@ export class Settings {
 
 	#rebuildMerged(): void {
 		let merged = this.#deepMerge(this.#deepMerge({}, this.#global), this.#projectSettingsForMerge());
-
 		for (const path of HOST_LOCAL_PATHS) {
 			deleteByPath(merged, SETTING_PATH_SEGMENTS[path]);
 		}
-
 		for (const path of HOST_LOCAL_PATHS) {
 			const value = getByPath(this.#local, SETTING_PATH_SEGMENTS[path]);
 			if (value !== undefined) {
 				setByPath(merged, [...SETTING_PATH_SEGMENTS[path]], structuredClone(value));
 			}
 		}
-
 		merged = this.#deepMerge(merged, this.#configOverlay);
 		merged = this.#deepMerge(merged, this.#overrides);
-
 		this.#merged = merged;
 		this.#resolvedCache.clear();
 		this.#editVariantCache = undefined;
@@ -2233,6 +2666,9 @@ const SETTING_HOOKS: Partial<Record<SettingPath, SettingHook<any>>> = {
 	"providers.maxInFlightRequests": value => {
 		configureProviderMaxInFlightRequests(validateProviderMaxInFlightRequests(value));
 	},
+	"secrets.enabled": value => {
+		configureCredentialRedaction(value === true);
+	},
 	"hindsight.bankId": () => hindsightScopeSignal.fire(),
 	"hindsight.bankIdPrefix": () => hindsightScopeSignal.fire(),
 	"hindsight.scoping": () => hindsightScopeSignal.fire(),
@@ -2292,6 +2728,13 @@ export const onHindsightScopeChanged = (cb: () => void) => hindsightScopeSignal.
 // Global Singleton
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * Weak registry of every constructed instance so `resetSettingsForTest` can
+ * disarm stray background saves on isolated instances too. WeakRefs never
+ * retain instances; the set is cleared on every test reset.
+ */
+const liveSettingsInstances = new Set<WeakRef<Settings>>();
+
 let globalInstance: Settings | null = null;
 let globalInstancePromise: Promise<Settings> | null = null;
 let boundSettingsInstance: Settings | null = null;
@@ -2311,10 +2754,19 @@ export function isSettingsInitialized(): boolean {
  * @internal
  */
 export function resetSettingsForTest(): void {
+	// Disarm every constructed instance's debounced saves — including isolated
+	// (non-singleton) instances: an armed timer or chained in-flight save on a
+	// dropped instance fires mid-way through the NEXT test and races its file
+	// locks/spies (cross-file pollution).
+	for (const ref of liveSettingsInstances) {
+		ref.deref()?.cancelPendingSaves();
+	}
+	liveSettingsInstances.clear();
 	globalInstance = null;
 	globalInstancePromise = null;
 	clearBoundSettingsMethods();
 	configureProviderMaxInFlightRequests(undefined);
+	configureCredentialRedaction(false);
 }
 
 /**

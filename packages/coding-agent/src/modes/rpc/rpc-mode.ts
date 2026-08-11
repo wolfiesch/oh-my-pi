@@ -11,8 +11,8 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 
-import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import {
 	MAX_ARRAY_ITEMS,
 	MAX_INPUT_BYTES,
@@ -32,7 +32,7 @@ import {
 	getOpenAICodexTransportDetails,
 	getOpenAICodexWebSocketDebugStats,
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
-import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isRecord, postmortem, readLines, Snowflake } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -54,10 +54,13 @@ import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import type { EventBus } from "../../utils/event-bus";
+import { calculateTokensPerSecond } from "../../utils/token-rate";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
+import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { claimRpcInput } from "./rpc-input";
+import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
 import { resolveRpcPromptImages } from "./rpc-prompt-images";
 import { registerRpcSessionTeardown } from "./rpc-session-teardown";
 import { RPC_SUBAGENT_TRANSCRIPT_MAX_BYTES, RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
@@ -83,7 +86,7 @@ import type {
 	RpcSubagentSubscriptionLevel,
 } from "./rpc-types";
 
-export { RPC_APP_IMAGE_ROOT_ENV, resolveRpcPromptImages } from "./rpc-prompt-images";
+export { RPC_APP_IMAGE_ROOT_ENV } from "./rpc-prompt-images";
 // Re-export types for consumers
 export type * from "./rpc-types";
 
@@ -1191,6 +1194,57 @@ export function requestRpcEditor(
 	} as RpcExtensionUIRequest);
 	return promise;
 }
+
+/** Sends an RPC extension dialog and cancels the remote presentation when its signal aborts. */
+export function requestRpcDialog<T>(
+	pendingRequests: Map<string, PendingExtensionRequest>,
+	output: RpcOutput,
+	opts: ExtensionUIDialogOptions | undefined,
+	defaultValue: T,
+	request: Record<string, unknown>,
+	parseResponse: (response: RpcExtensionUIResponse) => T,
+): Promise<T> {
+	if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
+
+	const id = Snowflake.next() as string;
+	const { promise, resolve, reject } = Promise.withResolvers<T>();
+	let timeoutId: NodeJS.Timeout | undefined;
+
+	const cleanup = () => {
+		clearTimeout(timeoutId);
+		opts?.signal?.removeEventListener("abort", onAbort);
+		pendingRequests.delete(id);
+	};
+	const onAbort = () => {
+		output({
+			type: "extension_ui_request",
+			id: Snowflake.next() as string,
+			method: "cancel",
+			targetId: id,
+		} as RpcExtensionUIRequest);
+		cleanup();
+		resolve(defaultValue);
+	};
+	opts?.signal?.addEventListener("abort", onAbort, { once: true });
+
+	if (opts?.timeout !== undefined) {
+		timeoutId = setTimeout(() => {
+			opts.onTimeout?.();
+			cleanup();
+			resolve(defaultValue);
+		}, opts.timeout);
+	}
+
+	pendingRequests.set(id, {
+		resolve: response => {
+			cleanup();
+			resolve(parseResponse(response));
+		},
+		reject,
+	});
+	output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
+	return promise;
+}
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
@@ -1208,9 +1262,42 @@ export async function runRpcMode(
 	// may write there.
 	process.env.PI_NOTIFICATIONS = "off";
 
+	const frameEncoder = new RpcFrameEncoder();
+	// Ordered stdout writer honoring backpressure: chunked v2 frames are produced
+	// lazily by the encoder and written one physical line at a time, so a near-limit
+	// logical frame never materializes its full base64 transport in memory.
+	let stdoutQueue: Promise<void> | undefined;
+	const writeRemainingFrames = async (iterator: Iterator<string>, waitForDrain: boolean): Promise<void> => {
+		if (waitForDrain) await once(process.stdout, "drain");
+		for (let next = iterator.next(); !next.done; next = iterator.next()) {
+			if (!process.stdout.write(next.value)) await once(process.stdout, "drain");
+		}
+	};
+	const queueStdout = (task: Promise<void>): void => {
+		const settled = task
+			.catch(() => {})
+			.finally(() => {
+				if (stdoutQueue === settled) stdoutQueue = undefined;
+			});
+		stdoutQueue = settled;
+	};
+	const writeFrames = (frames: Iterable<string>) => {
+		const iterator = frames[Symbol.iterator]();
+		if (stdoutQueue) {
+			queueStdout(stdoutQueue.then(() => writeRemainingFrames(iterator, false)));
+			return;
+		}
+		for (let next = iterator.next(); !next.done; next = iterator.next()) {
+			if (process.stdout.write(next.value)) continue;
+			queueStdout(writeRemainingFrames(iterator, true));
+			return;
+		}
+	};
 	const omitInlineImages = process.env[RPC_INLINE_IMAGE_DATA_ENV] === "omit";
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		process.stdout.write(`${JSON.stringify(rpcTransportFrame(obj, omitInlineImages))}\n`);
+		writeFrames(frameEncoder.encodeFrames(rpcTransportFrame(obj, omitInlineImages)));
+		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
+			frameEncoder.setProtocolVersion(2);
 	};
 	const sessionEntrySubscription = createRpcSessionEntrySubscription(
 		output,
@@ -1230,8 +1317,8 @@ export async function runRpcMode(
 		return { id, type: "response", command, success: true, data } as RpcResponse;
 	};
 
-	const error = (id: string | undefined, command: string, message: string): RpcResponse => {
-		return { id, type: "response", command, success: false, error: message };
+	const error = (id: string | undefined, command: string, message: string, code?: string): RpcResponse => {
+		return { id, type: "response", command, success: false, error: message, ...(code ? { code } : {}) };
 	};
 
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
@@ -1261,6 +1348,10 @@ export async function runRpcMode(
 	const loadedEntries = session.sessionManager.getEntries();
 	output({
 		type: "ready",
+		protocolVersion: 1,
+		supportedProtocolVersions: [1, 2],
+		maxFrameBytes: MAX_RPC_FRAME_BYTES,
+		maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
 		transcriptWatermark: {
 			lastEntryId: loadedEntries.at(-1)?.id ?? null,
 			entryCount: loadedEntries.length,
@@ -1279,56 +1370,14 @@ export async function runRpcMode(
 			private output: (obj: RpcResponse | RpcExtensionUIRequest | object) => void,
 		) {}
 
-		/** Helper for dialog methods with signal/timeout support */
-		#createDialogPromise<T>(
-			opts: ExtensionUIDialogOptions | undefined,
-			defaultValue: T,
-			request: Record<string, unknown>,
-			parseResponse: (response: RpcExtensionUIResponse) => T,
-		): Promise<T> {
-			if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
-
-			const id = Snowflake.next() as string;
-			const { promise, resolve, reject } = Promise.withResolvers<T>();
-			let timeoutId: NodeJS.Timeout | undefined;
-
-			const cleanup = () => {
-				if (timeoutId) clearTimeout(timeoutId);
-				opts?.signal?.removeEventListener("abort", onAbort);
-				this.pendingRequests.delete(id);
-			};
-
-			const onAbort = () => {
-				cleanup();
-				resolve(defaultValue);
-			};
-			opts?.signal?.addEventListener("abort", onAbort, { once: true });
-
-			if (opts?.timeout !== undefined) {
-				timeoutId = setTimeout(() => {
-					opts.onTimeout?.();
-					cleanup();
-					resolve(defaultValue);
-				}, opts.timeout);
-			}
-
-			this.pendingRequests.set(id, {
-				resolve: (response: RpcExtensionUIResponse) => {
-					cleanup();
-					resolve(parseResponse(response));
-				},
-				reject,
-			});
-			this.output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
-			return promise;
-		}
-
 		select(
 			title: string,
 			options: ExtensionUISelectItem[],
 			dialogOptions?: ExtensionUIDialogOptions,
 		): Promise<string | undefined> {
-			return this.#createDialogPromise(
+			return requestRpcDialog(
+				this.pendingRequests,
+				this.output,
 				dialogOptions,
 				undefined,
 				{
@@ -1342,7 +1391,9 @@ export async function runRpcMode(
 		}
 
 		confirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean> {
-			return this.#createDialogPromise(
+			return requestRpcDialog(
+				this.pendingRequests,
+				this.output,
 				dialogOptions,
 				false,
 				{ method: "confirm", title, message, timeout: dialogOptions?.timeout },
@@ -1362,7 +1413,9 @@ export async function runRpcMode(
 			placeholder?: string,
 			dialogOptions?: ExtensionUIDialogOptions,
 		): Promise<string | undefined> {
-			return this.#createDialogPromise(
+			return requestRpcDialog(
+				this.pendingRequests,
+				this.output,
 				dialogOptions,
 				undefined,
 				{ method: "input", title, placeholder, timeout: dialogOptions?.timeout },
@@ -1565,6 +1618,12 @@ export async function runRpcMode(
 		const id = command.id;
 
 		switch (command.type) {
+			case "negotiate_protocol": {
+				if (command.protocolVersion !== 2)
+					return error(id, "negotiate_protocol", `Unsupported RPC protocol version: ${command.protocolVersion}`);
+				return success(id, "negotiate_protocol", { protocolVersion: 2 });
+			}
+
 			// =================================================================
 			// Prompting
 			// =================================================================
@@ -1767,24 +1826,38 @@ export async function runRpcMode(
 					sessionId: session.sessionId,
 					sessionName: session.sessionName,
 					autoCompactionEnabled: session.autoCompactionEnabled,
-					messageCount: session.messages.length,
 					queuedMessageCount: session.queuedMessageCount,
 					queuedMessages: {
 						steering: queued.steering.slice(0, 128).map(text => text.slice(0, 65_536)),
 						followUp: queued.followUp.slice(0, 128).map(text => text.slice(0, 65_536)),
 					},
 					todoPhases: session.getTodoPhases(),
+					fastModeEnabled: session.isFastModeEnabled(),
+					tokensPerSecond: calculateTokensPerSecond(session.messages, session.isStreaming),
+					fastModeActive: session.isFastModeActive(),
+					messageCount: session.messages.length,
 					systemPrompt: session.systemPrompt,
 					dumpTools: session.agent.state.tools.map(tool => ({
 						name: tool.name,
 						description: tool.description,
-						parameters: isZodSchema(tool.parameters) ? zodToWireSchema(tool.parameters) : tool.parameters,
+						parameters: toolWireSchema(tool),
 						examples: tool.examples,
 					})),
 					contextUsage: session.getContextUsage(),
 					...(providerTransport ? { providerTransport } : {}),
 				};
 				return success(id, "get_state", state);
+			}
+
+			case "set_fast_mode": {
+				const supported = session.setFastMode(command.enabled);
+				if (command.enabled && !supported) {
+					return error(id, "set_fast_mode", "Fast mode is unavailable for the current model.");
+				}
+				return success(id, "set_fast_mode", {
+					enabled: session.isFastModeEnabled(),
+					active: session.isFastModeActive(),
+				});
 			}
 
 			case "get_available_commands": {
@@ -1869,18 +1942,15 @@ export async function runRpcMode(
 						command.selector !== undefined || (command.provider !== undefined && command.modelId !== undefined);
 					const hasRole = command.role !== undefined;
 					if (hasSelector === hasRole) throw new Error("provide exactly one selector or role");
-					if (command.selector === undefined && !hasRole) {
-						await session.setModelSelector({
-							selector: `${command.provider}/${command.modelId}`,
-							persist: command.persist,
-						});
-					} else {
-						await session.setModelSelector({
-							selector: command.selector,
-							role: command.role,
-							persist: command.persist,
-						});
-					}
+					await session.setModelSelector({
+						selector:
+							command.selector ??
+							(command.provider !== undefined && command.modelId !== undefined
+								? `${command.provider}/${command.modelId}`
+								: undefined),
+						role: command.role,
+						persist: command.persist,
+					});
 					return success(id, "set_model", session.model);
 				} catch (caught) {
 					return error(id, "set_model", caught instanceof Error ? caught.message : String(caught));
@@ -1896,6 +1966,7 @@ export async function runRpcMode(
 			}
 
 			case "get_available_models": {
+				await session.modelRegistry.awaitBackgroundRefresh();
 				const models = session.getAvailableModels();
 				return success(id, "get_available_models", { models });
 			}
@@ -2041,6 +2112,34 @@ export async function runRpcMode(
 
 			case "get_messages": {
 				return success(id, "get_messages", { messages: session.messages });
+			}
+
+			case "get_messages_page": {
+				if (session.isStreaming || session.isCompacting)
+					return error(id, "get_messages_page", RPC_MESSAGES_PAGE_BUSY_ERROR, "session_busy");
+				const messages = session.messages;
+				try {
+					return success(
+						id,
+						"get_messages_page",
+						pageRpcMessages(
+							messages,
+							{
+								sessionId: session.sessionId,
+								leafId: session.sessionManager.getLeafId(),
+								messageCount: messages.length,
+							},
+							{ cursor: command.cursor, limit: command.limit },
+						),
+					);
+				} catch (pageError) {
+					return error(
+						id,
+						"get_messages_page",
+						pageError instanceof Error ? pageError.message : String(pageError),
+						pageError instanceof RpcMessagesPageError ? pageError.code : undefined,
+					);
+				}
 			}
 
 			// =================================================================

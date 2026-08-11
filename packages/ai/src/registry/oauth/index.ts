@@ -12,6 +12,7 @@ import type {
 	OAuthProviderInterface,
 } from "./types";
 
+export * from "./anthropic";
 export * from "./device-code";
 export type * from "./types";
 
@@ -31,6 +32,13 @@ const customOAuthProviders = new Map<string, OAuthProviderInterface>();
  */
 export function registerOAuthProvider(provider: OAuthProviderInterface): void {
 	customOAuthProviders.set(provider.id, provider);
+}
+
+/**
+ * Remove a custom OAuth provider by ID.
+ */
+export function unregisterOAuthProvider(id: string): void {
+	customOAuthProviders.delete(id);
 }
 
 /**

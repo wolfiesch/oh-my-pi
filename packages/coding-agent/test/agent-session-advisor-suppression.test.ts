@@ -20,6 +20,7 @@
  *     including when the preserved advisor card would otherwise block continuation.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ToolCall } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockHandler, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
@@ -32,7 +33,6 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Snowflake, TempDir } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 
 interface MockYieldDetails {
 	status: "success";
@@ -194,6 +194,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 						},
 					],
 				},
+				{ content: [], stopReason: "stop" },
 			],
 		});
 		const agent = new Agent({

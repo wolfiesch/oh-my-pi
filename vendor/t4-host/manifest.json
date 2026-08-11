@@ -10,7 +10,7 @@
       "name": "@t4-code/host-service",
       "version": "0.1.31",
       "file": "t4-code-host-service-0.1.31.tgz",
-      "sha256": "64eed3f8f595b9db4a190f9e2489d20313631d33747d709bb3c6e7cdd373f6cf"
+      "sha256": "efca447e414655062ca74029967fad9e0f5792443af94a18925c7ad5e0ca645f"
     },
     {
       "name": "@t4-code/host-wire",
