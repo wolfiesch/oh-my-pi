@@ -110,6 +110,37 @@ describe("usage status-line segment", () => {
 		expect(content).toContain("8%");
 	});
 
+	it("renders active-provider usage on the optional second row", async () => {
+		const component = makeComponent([
+			{
+				limits: [
+					{ scope: { windowId: "5h" }, amount: { usedFraction: 0.24 } },
+					{ scope: { windowId: "7d" }, amount: { usedFraction: 0.08 } },
+				],
+			},
+		]);
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: [],
+			rightSegments: [],
+			secondaryLeftSegments: ["usage"],
+			secondaryRightSegments: ["context_pct"],
+			sessionAccent: false,
+		});
+
+		component.refreshUsageInBackground();
+		await flushUsageRefresh();
+		const top = stripVTControlCharacters(component.getTopBorder(200).content);
+		const secondary = component.render(200).map(stripVTControlCharacters);
+
+		expect(top).not.toContain("5h");
+		expect(secondary).toHaveLength(1);
+		expect(secondary[0]).toContain("5h");
+		expect(secondary[0]).toContain("24%");
+		expect(secondary[0]).toContain("7d");
+		expect(secondary[0]).toContain("8%");
+	});
+
 	it("prefers untiered windows and labels the displayed tiered window", async () => {
 		const component = makeComponent([
 			{

@@ -30,6 +30,9 @@ export interface StatusLineSettings {
 	preset?: StatusLinePreset;
 	leftSegments?: StatusLineSegmentId[];
 	rightSegments?: StatusLineSegmentId[];
+	/** Optional second status row rendered directly above the editor. */
+	secondaryLeftSegments?: StatusLineSegmentId[];
+	secondaryRightSegments?: StatusLineSegmentId[];
 	separator?: StatusLineSeparatorStyle;
 	segmentOptions?: StatusLineSegmentOptions;
 	showHookStatus?: boolean;
@@ -47,7 +50,15 @@ export interface StatusLineSettings {
 }
 
 export type EffectiveStatusLineSettings = Required<
-	Pick<StatusLineSettings, "leftSegments" | "rightSegments" | "separator" | "segmentOptions">
+	Pick<
+		StatusLineSettings,
+		| "leftSegments"
+		| "rightSegments"
+		| "secondaryLeftSegments"
+		| "secondaryRightSegments"
+		| "separator"
+		| "segmentOptions"
+	>
 > &
 	StatusLineSettings;
 

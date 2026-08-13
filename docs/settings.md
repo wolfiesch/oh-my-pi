@@ -651,6 +651,8 @@ statusLine:
   separator: powerline-thin
   transparent: false
   showHookStatus: true
+  secondaryLeftSegments: []  # optional second row above the editor
+  secondaryRightSegments: []
 
 terminal:
   showImages: true
@@ -661,24 +663,26 @@ tui:
   hyperlinks: auto # off, auto, always
 ```
 
-| Key                         | Type    | Default          | Values                                                                    |
-| --------------------------- | ------- | ---------------- | ------------------------------------------------------------------------- |
-| `theme.dark`                | string  | `titanium`       | Theme used on a dark terminal background.                                 |
-| `theme.light`               | string  | `light`          | Theme used on a light terminal background.                                |
-| `symbolPreset`              | enum    | `unicode`        | `unicode`, `nerd`, `ascii`.                                               |
-| `colorBlindMode`            | boolean | `false`          | Use blue instead of green for diff additions.                             |
-| `showHardwareCursor`        | boolean | `true`           | Show the terminal hardware cursor.                                        |
-| `statusLine.preset`         | enum    | `default`        | `default`, `minimal`, `compact`, `full`, `nerd`, `ascii`, `custom`.       |
-| `statusLine.separator`      | enum    | `powerline-thin` | `powerline`, `powerline-thin`, `slash`, `pipe`, `block`, `none`, `ascii`. |
-| `statusLine.sessionAccent`  | boolean | `true`           | Tint the editor border with the session color.                            |
-| `statusLine.transparent`    | boolean | `false`          | Use the terminal background for the status line.                          |
-| `statusLine.showHookStatus` | boolean | `true`           | Show hook status messages.                                                |
-| `terminal.showImages`       | boolean | `true`           | Render images inline (when the terminal supports it).                     |
-| `images.autoResize`         | boolean | `true`           | Resize large images for model compatibility.                              |
-| `images.blockImages`        | boolean | `false`          | Never send images to providers.                                           |
-| `tui.hyperlinks`            | enum    | `auto`           | `off`, `auto`, `always`.                                                  |
+| Key                                    | Type    | Default          | Values                                                                    |
+| -------------------------------------- | ------- | ---------------- | ------------------------------------------------------------------------- |
+| `theme.dark`                           | string  | `titanium`       | Theme used on a dark terminal background.                                 |
+| `theme.light`                          | string  | `light`          | Theme used on a light terminal background.                                |
+| `symbolPreset`                         | enum    | `unicode`        | `unicode`, `nerd`, `ascii`.                                               |
+| `colorBlindMode`                       | boolean | `false`          | Use blue instead of green for diff additions.                             |
+| `showHardwareCursor`                   | boolean | `true`           | Show the terminal hardware cursor.                                        |
+| `statusLine.preset`                    | enum    | `default`        | `default`, `minimal`, `compact`, `full`, `nerd`, `ascii`, `custom`.       |
+| `statusLine.separator`                 | enum    | `powerline-thin` | `powerline`, `powerline-thin`, `slash`, `pipe`, `block`, `none`, `ascii`. |
+| `statusLine.sessionAccent`             | boolean | `true`           | Tint the editor border with the session color.                            |
+| `statusLine.transparent`               | boolean | `false`          | Use the terminal background for the status line.                          |
+| `statusLine.showHookStatus`            | boolean | `true`           | Show hook status messages.                                                |
+| `statusLine.secondaryLeftSegments`     | array   | `[]`             | Left-aligned segments on an optional second status row.                   |
+| `statusLine.secondaryRightSegments`    | array   | `[]`             | Right-aligned segments on an optional second status row.                  |
+| `terminal.showImages`                  | boolean | `true`           | Render images inline (when the terminal supports it).                     |
+| `images.autoResize`                    | boolean | `true`           | Resize large images for model compatibility.                              |
+| `images.blockImages`                   | boolean | `false`          | Never send images to providers.                                           |
+| `tui.hyperlinks`                       | enum    | `auto`           | `off`, `auto`, `always`.                                                  |
 
-For a custom status line, set `statusLine.preset: custom` and configure `statusLine.leftSegments`, `statusLine.rightSegments`, and `statusLine.segmentOptions`.
+For a custom status line, set `statusLine.preset: custom` and configure `statusLine.leftSegments`, `statusLine.rightSegments`, and `statusLine.segmentOptions`. Set `statusLine.secondaryLeftSegments` or `statusLine.secondaryRightSegments` to add a second row directly above the editor. The `usage` segment shows the active provider and account's reported quota windows.
 
 ### Interaction
 

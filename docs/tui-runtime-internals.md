@@ -41,8 +41,8 @@ Boundary rule: the TUI engine is message-agnostic. It only knows `Component.rend
 - `omfgContainer`
 - `errorBannerContainer`
 - `modelCycleContainer` (ctrl+p model-role cycle chip track)
-- `statusLine`
 - `hookWidgetContainerAbove`
+- `statusLine`
 - `editorContainer` (holds `CustomEditor`)
 - `hookWidgetContainerBelow`
 
@@ -187,7 +187,7 @@ Read-tool grouping is intentionally stateful (`#lastReadGroup`) to coalesce cons
 Status lane ownership:
 
 - `statusContainer` holds transient loaders (`loadingAnimation`, `autoCompactionLoader`, `retryLoader`).
-- `statusLine` renders persistent status/hooks/plan indicators and drives editor top border updates.
+- `statusLine` renders optional secondary metrics and hook statuses directly above the editor, and drives the primary status row embedded in the editor top border.
 
 Loader behavior:
 

@@ -1098,6 +1098,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		// the prompt while keeping the one-line gap above the editor.
 		this.ui.addChild(this.statusContainer);
 		this.ui.addChild(this.hookWidgetContainerAbove);
+		// Secondary metrics and hook statuses sit directly above the editor border,
+		// after the ordinary one-line prompt margin.
+		this.ui.addChild(this.statusLine);
 		this.ui.addChild(this.editorContainer);
 		this.ui.addChild(this.hookWidgetContainerBelow);
 		this.ui.addChild(this.statusLine);

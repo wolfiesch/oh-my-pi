@@ -318,10 +318,6 @@ function hasPathSegment(segments: readonly StatusLineSegmentId[]): boolean {
 	return segments.includes("path");
 }
 
-function hasGitBackedSegment(segments: readonly StatusLineSegmentId[]): boolean {
-	return hasGitSegment(segments) || hasPrSegment(segments);
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // StatusLineComponent
 // ═══════════════════════════════════════════════════════════════════════════
@@ -462,6 +458,8 @@ export class StatusLineComponent implements Component {
 			preset: settings.get("statusLine.preset"),
 			leftSegments: settings.get("statusLine.leftSegments"),
 			rightSegments: settings.get("statusLine.rightSegments"),
+			secondaryLeftSegments: settings.get("statusLine.secondaryLeftSegments"),
+			secondaryRightSegments: settings.get("statusLine.secondaryRightSegments"),
 			separator: settings.get("statusLine.separator"),
 			showHookStatus: settings.get("statusLine.showHookStatus"),
 			segmentOptions: settings.getGroup("statusLine").segmentOptions,
@@ -476,9 +474,12 @@ export class StatusLineComponent implements Component {
 	}
 	#hasGitBackedSegment(): boolean {
 		const effectiveSettings = this.#resolveSettings();
-		return (
-			hasGitBackedSegment(effectiveSettings.leftSegments) || hasGitBackedSegment(effectiveSettings.rightSegments)
-		);
+		return [
+			...effectiveSettings.leftSegments,
+			...effectiveSettings.rightSegments,
+			...effectiveSettings.secondaryLeftSegments,
+			...effectiveSettings.secondaryRightSegments,
+		].some(segment => segment === "git" || segment === "pr");
 	}
 
 	#resolveActiveRepoCache(): ActiveRepoCache {
@@ -1733,11 +1734,15 @@ export class StatusLineComponent implements Component {
 		const rightSegments = useCustomSegments
 			? (this.#settings.rightSegments ?? presetDef.rightSegments)
 			: presetDef.rightSegments;
+		const secondaryLeftSegments = this.#settings.secondaryLeftSegments ?? [];
+		const secondaryRightSegments = this.#settings.secondaryRightSegments ?? [];
 
 		return {
 			...this.#settings,
 			leftSegments,
 			rightSegments,
+			secondaryLeftSegments,
+			secondaryRightSegments,
 			separator: this.#settings.separator ?? presetDef.separator,
 			segmentOptions: mergedSegmentOptions,
 		};
@@ -1766,17 +1771,19 @@ export class StatusLineComponent implements Component {
 		width: number,
 		layout: "box" | "plain-full" | "plain-left" | "plain-right" = "box",
 		previewTitle?: string,
+		leftSegments?: readonly StatusLineSegmentId[],
+		rightSegments?: readonly StatusLineSegmentId[],
+		includeTransientBadges = true,
 	): string {
 		const effectiveSettings = this.#resolveSettings();
+		const effectiveLeftSegments = leftSegments ?? effectiveSettings.leftSegments;
+		const effectiveRightSegments = rightSegments ?? effectiveSettings.rightSegments;
 		const plain = layout !== "box";
-		const includePath =
-			hasPathSegment(effectiveSettings.leftSegments) || hasPathSegment(effectiveSettings.rightSegments);
+		const includePath = hasPathSegment(effectiveLeftSegments) || hasPathSegment(effectiveRightSegments);
+		const includeContext = hasContextSegment(effectiveLeftSegments) || hasContextSegment(effectiveRightSegments);
 		const gitEnabled = this.#gitEnabled();
-		const includeGit =
-			gitEnabled &&
-			(hasGitSegment(effectiveSettings.leftSegments) || hasGitSegment(effectiveSettings.rightSegments));
-		const includePr =
-			gitEnabled && (hasPrSegment(effectiveSettings.leftSegments) || hasPrSegment(effectiveSettings.rightSegments));
+		const includeGit = gitEnabled && (hasGitSegment(effectiveLeftSegments) || hasGitSegment(effectiveRightSegments));
+		const includePr = gitEnabled && (hasPrSegment(effectiveLeftSegments) || hasPrSegment(effectiveRightSegments));
 		const ctx = this.#buildSegmentContext(
 			width,
 			effectiveSettings.segmentOptions,
@@ -1808,7 +1815,7 @@ export class StatusLineComponent implements Component {
 		// Collect visible segment contents
 		const leftParts: string[] = [];
 		const leftSegIds: StatusLineSegmentId[] = [];
-		const leftSegmentIds = layout === "plain-right" ? [] : effectiveSettings.leftSegments;
+		const leftSegmentIds = layout === "plain-right" ? [] : effectiveLeftSegments;
 		for (const segId of leftSegmentIds) {
 			if (subagentBadge && segId === "subagents") continue;
 			const rendered = renderSegment(segId, ctx);
@@ -1820,7 +1827,7 @@ export class StatusLineComponent implements Component {
 
 		const rightParts: string[] = [];
 		const rightSegIds: StatusLineSegmentId[] = [];
-		const rightSegmentIds = layout === "plain-left" ? [] : effectiveSettings.rightSegments;
+		const rightSegmentIds = layout === "plain-left" ? [] : effectiveRightSegments;
 		for (const segId of rightSegmentIds) {
 			if (subagentBadge && segId === "subagents") continue;
 			const rendered = renderSegment(segId, ctx);
@@ -1844,7 +1851,7 @@ export class StatusLineComponent implements Component {
 			removeContextSegments(rightParts, rightSegIds);
 		}
 
-		if (layout !== "plain-left") {
+		if (includeTransientBadges && layout !== "plain-left") {
 			const runningBackgroundJobs = this.session.getAsyncJobSnapshot()?.running.length ?? 0;
 			if (runningBackgroundJobs > 0) {
 				rightParts.unshift(theme.fg("statusLineSubagents", `${theme.icon.job} ${runningBackgroundJobs}`));
@@ -2240,6 +2247,23 @@ export class StatusLineComponent implements Component {
 				lines.push(content);
 			}
 		}
+
+		const effectiveSettings = this.#resolveSettings();
+		if (effectiveSettings.secondaryLeftSegments.length > 0 || effectiveSettings.secondaryRightSegments.length > 0) {
+			let secondary = this.#buildStatusLine(
+				width,
+				"plain-full",
+				undefined,
+				effectiveSettings.secondaryLeftSegments,
+				effectiveSettings.secondaryRightSegments,
+				false,
+			);
+			if (this.#focusedAgentId && secondary) {
+				secondary = `\x1b[2m${secondary.replaceAll("\x1b[0m", "\x1b[0m\x1b[2m")}\x1b[22m`;
+			}
+			if (secondary) lines.push(secondary);
+		}
+
 		const showHooks = this.#settings.showHookStatus ?? true;
 		if (showHooks && this.#hookStatuses.size > 0) {
 			const hookLines = Array.from(this.#hookStatuses.entries())

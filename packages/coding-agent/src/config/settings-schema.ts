@@ -921,6 +921,10 @@ export const SETTINGS_SCHEMA = {
 
 	"statusLine.rightSegments": { type: "array", default: [] as StatusLineSegmentId[] },
 
+	"statusLine.secondaryLeftSegments": { type: "array", default: [] as StatusLineSegmentId[] },
+
+	"statusLine.secondaryRightSegments": { type: "array", default: [] as StatusLineSegmentId[] },
+
 	"statusLine.segmentOptions": { type: "record", default: {} as Record<string, unknown> },
 
 	// Images and terminal
@@ -5945,6 +5949,8 @@ export interface StatusLineSettings {
 	showHookStatus: boolean;
 	leftSegments: StatusLineSegmentId[];
 	rightSegments: StatusLineSegmentId[];
+	secondaryLeftSegments: StatusLineSegmentId[];
+	secondaryRightSegments: StatusLineSegmentId[];
 	segmentOptions: Record<string, unknown>;
 }
 
