@@ -9,7 +9,13 @@ import { fileHyperlink } from "../../../tui/hyperlink";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
 import { sanitizeStatusText } from "../../shared";
 import { formatContextUsage, getContextUsageLevel, getContextUsageThemeColor } from "./context-thresholds";
-import type { RenderedSegment, SegmentContext, StatusLineSegment, StatusLineSegmentId } from "./types";
+import type {
+	RenderedSegment,
+	SegmentContext,
+	StatusLineSegment,
+	StatusLineSegmentId,
+	StatusUsageQuota,
+} from "./types";
 
 export type { SegmentContext } from "./types";
 
@@ -691,6 +697,48 @@ function formatUsageReset(value: number, unit: "m" | "h"): string {
 	return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
 }
 
+function renderUsageQuota(usage: StatusUsageQuota, includeReset: boolean): string {
+	if (usage.unavailable || (!usage.daily && !usage.fiveHour && !usage.sevenDay && !usage.monthly)) {
+		return theme.fg("muted", "quota n/a");
+	}
+	const parts: string[] = [];
+	if (usage.tier) {
+		const tier = truncateToWidth(sanitizeStatusText(usage.tier), TRUNCATE_LENGTHS.SHORT);
+		if (tier) parts.push(theme.fg("accent", tier));
+	}
+	if (usage.daily) {
+		const reset =
+			includeReset && usage.daily.resetMinutes !== undefined
+				? theme.fg("muted", ` (${formatUsageReset(usage.daily.resetMinutes, "m")})`)
+				: "";
+		parts.push(formatUsageWindow("1d", usage.daily.percent, reset));
+	}
+	if (usage.fiveHour) {
+		const reset =
+			includeReset && usage.fiveHour.resetMinutes !== undefined
+				? theme.fg("muted", ` (${formatUsageReset(usage.fiveHour.resetMinutes, "m")})`)
+				: "";
+		parts.push(formatUsageWindow("5h", usage.fiveHour.percent, reset));
+	}
+	if (usage.sevenDay) {
+		const reset =
+			includeReset && usage.sevenDay.resetHours !== undefined
+				? theme.fg("muted", ` (${formatUsageReset(usage.sevenDay.resetHours, "h")})`)
+				: "";
+		parts.push(formatUsageWindow("7d", usage.sevenDay.percent, reset));
+	}
+	if (usage.monthly) {
+		// Cursor and OpenCode Go floor used percents upstream.
+		const percent = Math.floor(usage.monthly.percent);
+		const reset =
+			includeReset && usage.monthly.resetHours !== undefined
+				? theme.fg("muted", ` (${formatUsageReset(usage.monthly.resetHours, "h")})`)
+				: "";
+		parts.push(formatUsageWindow("mo", percent, reset));
+	}
+	return parts.join(theme.sep.dot);
+}
+
 const usageSegment: StatusLineSegment = {
 	id: "usage",
 	render(ctx) {
@@ -698,46 +746,19 @@ const usageSegment: StatusLineSegment = {
 		if (!u) {
 			return { content: "", visible: false };
 		}
-		if (u.unavailable || (!u.daily && !u.fiveHour && !u.sevenDay && !u.monthly)) {
-			return { content: withIcon(theme.icon.time, theme.fg("muted", "quota n/a")), visible: true };
+		if (u.accounts && u.accounts.length > 1) {
+			const accounts = u.accounts.map(account => {
+				const cleanLabel = sanitizeStatusText(account.label);
+				const at = cleanLabel.indexOf("@");
+				const localLabel = at > 0 ? cleanLabel.slice(0, at) : cleanLabel;
+				const label = truncateToWidth(localLabel, 10);
+				const marker = account.active ? "●" : "○";
+				const accountLabel = theme.fg(account.active ? "accent" : "muted", `${marker}${label}`);
+				return `${accountLabel} ${renderUsageQuota(account, false)}`;
+			});
+			return { content: withIcon(theme.icon.time, accounts.join(theme.sep.dot)), visible: true };
 		}
-		const parts: string[] = [];
-		if (u.tier) {
-			const tier = truncateToWidth(sanitizeStatusText(u.tier), TRUNCATE_LENGTHS.SHORT);
-			if (tier) parts.push(theme.fg("accent", tier));
-		}
-		if (u.daily) {
-			const reset =
-				u.daily.resetMinutes !== undefined
-					? theme.fg("muted", ` (${formatUsageReset(u.daily.resetMinutes, "m")})`)
-					: "";
-			parts.push(formatUsageWindow("1d", u.daily.percent, reset));
-		}
-		if (u.fiveHour) {
-			const reset =
-				u.fiveHour.resetMinutes !== undefined
-					? theme.fg("muted", ` (${formatUsageReset(u.fiveHour.resetMinutes, "m")})`)
-					: "";
-			parts.push(formatUsageWindow("5h", u.fiveHour.percent, reset));
-		}
-		if (u.sevenDay) {
-			const reset =
-				u.sevenDay.resetHours !== undefined
-					? theme.fg("muted", ` (${formatUsageReset(u.sevenDay.resetHours, "h")})`)
-					: "";
-			parts.push(formatUsageWindow("7d", u.sevenDay.percent, reset));
-		}
-		if (u.monthly) {
-			// Cursor and OpenCode Go floor used percents upstream.
-			const percent = Math.floor(u.monthly.percent);
-			const reset =
-				u.monthly.resetHours !== undefined
-					? theme.fg("muted", ` (${formatUsageReset(u.monthly.resetHours, "h")})`)
-					: "";
-			parts.push(formatUsageWindow("mo", percent, reset));
-		}
-		const content = withIcon(theme.icon.time, parts.join(theme.sep.dot));
-		return { content, visible: true };
+		return { content: withIcon(theme.icon.time, renderUsageQuota(u, true)), visible: true };
 	},
 };
 

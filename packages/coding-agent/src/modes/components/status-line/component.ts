@@ -2,6 +2,7 @@ import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
 import { getAntigravityCounterKeyForModel } from "@oh-my-pi/pi-ai/usage/google-antigravity";
+import { scopeCodexLimitsForRequest } from "@oh-my-pi/pi-ai/usage/openai-codex";
 import {
 	type Component,
 	type ComposerStyle,
@@ -14,7 +15,11 @@ import { adjustHsv, formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
 import { settings } from "../../../config/settings";
 import type { AgentSession } from "../../../session/agent-session";
 import type { OAuthAccountIdentity } from "../../../session/auth-storage";
-import { limitMatchesActiveAccount } from "../../../slash-commands/helpers/active-oauth-account";
+import {
+	formatUsageReportAccountLabel,
+	limitMatchesActiveAccount,
+	reportMatchesActiveAccount,
+} from "../../../slash-commands/helpers/active-oauth-account";
 import { type ActiveRepoContext, resolveActiveRepoContextSync } from "../../../utils/active-repo-context";
 import * as git from "../../../utils/git";
 import * as jj from "../../../utils/jj";
@@ -38,6 +43,7 @@ import type {
 	StatusLineSegmentId,
 	StatusLineSegmentOptions,
 	StatusLineSettings,
+	StatusUsage,
 } from "./types";
 
 const JJ_REFRESH_TTL_MS = 5000;
@@ -431,14 +437,7 @@ export class StatusLineComponent implements Component {
 	#lastTokensPerSecondTimestamp: number | null = null;
 
 	// Provider usage caching (5-min TTL, OAuth/sub only)
-	#cachedUsage: {
-		tier?: string;
-		unavailable?: boolean;
-		daily?: { percent: number; resetMinutes?: number };
-		fiveHour?: { percent: number; resetMinutes?: number };
-		sevenDay?: { percent: number; resetHours?: number };
-		monthly?: { percent: number; resetHours?: number };
-	} | null = null;
+	#cachedUsage: StatusUsage | null = null;
 	#cachedUsageContextKey: string | null = null;
 	#usageFetchedAt = 0;
 	#usageInFlight = false;
@@ -1438,14 +1437,8 @@ export class StatusLineComponent implements Component {
 		activeProvider?: string,
 		activeModelId?: string,
 		activeIdentity?: OAuthAccountIdentity,
-	): {
-		unavailable?: boolean;
-		tier?: string;
-		daily?: { percent: number; resetMinutes?: number };
-		fiveHour?: { percent: number; resetMinutes?: number };
-		sevenDay?: { percent: number; resetHours?: number };
-		monthly?: { percent: number; resetHours?: number };
-	} | null {
+		includeAccounts = true,
+	): StatusUsage | null {
 		if (!Array.isArray(reports)) return null;
 		let daily: { percent: number; resetMinutes?: number } | undefined;
 		let fiveHour: { percent: number; resetMinutes?: number } | undefined;
@@ -1455,6 +1448,7 @@ export class StatusLineComponent implements Component {
 		let fiveHourTier: string | undefined;
 		let sevenDayTier: string | undefined;
 		let monthlyTier: string | undefined;
+		const providerReports: UsageReport[] = [];
 		let monthlyPriority = Number.POSITIVE_INFINITY;
 		const now = Date.now();
 		const cursorMonthlyPriority = (limitId: unknown): number => {
@@ -1472,6 +1466,7 @@ export class StatusLineComponent implements Component {
 			const limits = (report as { limits?: unknown }).limits;
 			if (!Array.isArray(limits)) continue;
 			const usageReport = report as UsageReport;
+			providerReports.push(usageReport);
 			let scopedLimits: readonly UsageLimit[] = usageReport.limits;
 			if (provider === "google-antigravity") {
 				const counterKey = getAntigravityCounterKeyForModel(activeModelId);
@@ -1484,6 +1479,9 @@ export class StatusLineComponent implements Component {
 					);
 					scopedLimits = matching.length > 0 ? matching : fallback;
 				}
+			}
+			if (provider === "openai-codex" && usageReport.limits.every(limit => typeof limit.id === "string")) {
+				scopedLimits = scopeCodexLimitsForRequest(usageReport, { modelId: activeModelId });
 			}
 			for (const l of scopedLimits) {
 				if (activeIdentity && !limitMatchesActiveAccount(usageReport, l, activeIdentity)) {
@@ -1561,10 +1559,19 @@ export class StatusLineComponent implements Component {
 				}
 			}
 		}
-		if (!daily && !fiveHour && !sevenDay && !monthly) return { unavailable: true };
-		// Single compact label; prefer the shortest displayed tier.
 		const effectiveTier = dailyTier ?? fiveHourTier ?? sevenDayTier ?? monthlyTier;
-		return { tier: effectiveTier, daily, fiveHour, sevenDay, monthly };
+		const normalized: StatusUsage =
+			daily || fiveHour || sevenDay || monthly
+				? { tier: effectiveTier, daily, fiveHour, sevenDay, monthly }
+				: { unavailable: true };
+		if (!includeAccounts || providerReports.length < 2) return normalized;
+
+		normalized.accounts = providerReports.map((report, index) => ({
+			...this.#normalizeUsageReports([report], activeProvider, activeModelId, undefined, false),
+			label: formatUsageReportAccountLabel(report, index),
+			active: activeIdentity !== undefined ? reportMatchesActiveAccount(report, activeIdentity) : index === 0,
+		}));
+		return normalized;
 	}
 
 	/**

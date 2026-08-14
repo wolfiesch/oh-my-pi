@@ -200,6 +200,9 @@
 - Fixed Streamable HTTP MCP sessions being invalidated by opening the optional GET SSE stream before sending `notifications/initialized`, which prevented Figma Dev Mode MCP from connecting ([#8514](https://github.com/can1357/oh-my-pi/issues/8514)).
 - Fixed the `/hotkeys` table describing Ctrl+D (`app.exit`) as "Exit (when editor is empty)" when it actually exits unconditionally and saves the current prompt as a resumable draft ([#8530](https://github.com/can1357/oh-my-pi/issues/8530)).
 - Fixed Ctrl+G external editors failing to launch on Windows because Bun re-quoted the embedded `cmd.exe /c` command line ([#8544](https://github.com/can1357/oh-my-pi/issues/8544)).
+### Added
+
+- Added optional `statusLine.secondaryLeftSegments` and `statusLine.secondaryRightSegments` rows, so dense custom status layouts can keep active-model quota visible without crowding the editor border. The `usage` segment now renders compact quota bars for every account under the active provider, marks the account used by the current session, supports daily provider windows, scopes shared Antigravity and Codex reports to the active model family, and explains when quota reporting is unavailable.
 
 ## [17.3.3] - 2026-08-14
 
@@ -208,9 +211,6 @@
 - Automatically continued Gemini turns that stopped after thinking without final output, using a bounded final-answer reminder instead of exhausting generic retries.
 - Retried Gemini `MALFORMED_FUNCTION_CALL` failures when every emitted tool call was proven unexecuted, while preserving real tool-result and visible-output replay guards.
 - Kept current terminal retry errors in one pinned banner with attempt context while surfacing local continuation failures instead of stale provider errors.
-### Added
-
-- Added optional `statusLine.secondaryLeftSegments` and `statusLine.secondaryRightSegments` rows, so dense custom status layouts can keep active-model quota visible without crowding the editor border. The `usage` segment now renders compact quota bars, supports daily provider windows, scopes shared Antigravity reports to the active model family, and explains when quota reporting is unavailable.
 
 ## [17.3.2] - 2026-08-13
 

@@ -224,7 +224,7 @@ describe("usage status-line segment", () => {
 		expect(content).toContain("8%");
 	});
 
-	it("scopes fetched usage reports to the active provider and account", async () => {
+	it("renders every active-provider account and marks the session account", async () => {
 		const component = makeComponent(
 			[
 				{
@@ -237,31 +237,79 @@ describe("usage status-line segment", () => {
 				{
 					provider: "openai-codex",
 					metadata: { accountId: "other-account" },
-					limits: [{ scope: { windowId: "5h", tier: "other" }, amount: { usedFraction: 0.66 } }],
+					limits: [
+						{
+							id: "openai-codex:primary",
+							scope: { windowId: "7d" },
+							amount: { usedFraction: 0.66 },
+						},
+					],
 				},
 				{
 					provider: "openai-codex",
 					metadata: { accountId: "active-account" },
 					limits: [
-						{ scope: { windowId: "5h", tier: "prolite" }, amount: { usedFraction: 0.24 } },
-						{ scope: { windowId: "7d", tier: "prolite" }, amount: { usedFraction: 0.08 } },
+						{
+							id: "openai-codex:primary",
+							scope: { windowId: "7d" },
+							amount: { usedFraction: 0.24 },
+						},
 					],
 				},
 			],
-			{ provider: "openai-codex", activeIdentity: { accountId: "active-account" } },
+			{
+				provider: "openai-codex",
+				modelId: "gpt-5.6",
+				activeIdentity: { accountId: "active-account" },
+			},
 		);
 
 		component.refreshUsageInBackground();
 		await flushUsageRefresh();
 		const content = stripVTControlCharacters(component.getTopBorder(200).content);
 
-		expect(content).toContain("prolite");
+		expect(content).toContain("○other-acc");
+		expect(content).toContain("66%");
+		expect(content).toContain("●active-ac");
 		expect(content).toContain("24%");
-		expect(content).toContain("8%");
 		expect(content).not.toContain("99%");
 		expect(content).not.toContain("98%");
-		expect(content).not.toContain("66%");
-		expect(content).not.toContain("other");
+	});
+
+	it("uses the active Codex model meter for every account", async () => {
+		const reports = ["first@example.com", "second@example.com"].map((email, index) => ({
+			provider: "openai-codex",
+			metadata: { email },
+			limits: [
+				{
+					id: "openai-codex:primary",
+					scope: { windowId: "7d" },
+					amount: { usedFraction: index === 0 ? 0.11 : 0.12 },
+				},
+				{
+					id: "openai-codex:spark:primary",
+					scope: { windowId: "7d" },
+					amount: { usedFraction: index === 0 ? 0.31 : 0.32 },
+				},
+			],
+		}));
+		const component = makeComponent(reports, {
+			provider: "openai-codex",
+			modelId: "gpt-5.3-codex-spark",
+			activeIdentity: { email: "first@example.com" },
+		});
+
+		component.refreshUsageInBackground();
+		await flushUsageRefresh();
+		const content = stripVTControlCharacters(component.getTopBorder(100).content);
+
+		expect(content.length).toBeLessThanOrEqual(100);
+		expect(content).toContain("●first");
+		expect(content).toContain("31%");
+		expect(content).toContain("○second");
+		expect(content).toContain("32%");
+		expect(content).not.toContain("11%");
+		expect(content).not.toContain("12%");
 	});
 
 	it("invalidates cached usage when the active provider changes", async () => {
@@ -329,7 +377,7 @@ describe("usage status-line segment", () => {
 		expect(refreshed).toContain("24%");
 	});
 
-	it("keeps active-provider rate-limit header reports with account metadata", async () => {
+	it("keeps every provider rate-limit header report with account metadata", async () => {
 		const component = makeComponent(
 			[
 				{
@@ -353,11 +401,12 @@ describe("usage status-line segment", () => {
 		await flushUsageRefresh();
 		const content = stripVTControlCharacters(component.getTopBorder(200).content);
 
-		expect(content).toContain("5h");
+		expect(content).toContain("○other-acc");
+		expect(content).toContain("66%");
+		expect(content).toContain("●active-ac");
 		expect(content).toContain("24%");
 		expect(content).toContain("7d");
 		expect(content).toContain("8%");
-		expect(content).not.toContain("66%");
 	});
 
 	it("renders tiered limits with the tier label", () => {
