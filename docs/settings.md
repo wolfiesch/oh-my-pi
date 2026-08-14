@@ -682,7 +682,7 @@ tui:
 | `images.blockImages`                   | boolean | `false`          | Never send images to providers.                                           |
 | `tui.hyperlinks`                       | enum    | `auto`           | `off`, `auto`, `always`.                                                  |
 
-For a custom status line, set `statusLine.preset: custom` and configure `statusLine.leftSegments`, `statusLine.rightSegments`, and `statusLine.segmentOptions`. Set `statusLine.secondaryLeftSegments` or `statusLine.secondaryRightSegments` to add a second row directly above the editor. The `usage` segment shows the active provider and account's reported quota windows.
+For a custom status line, set `statusLine.preset: custom` and configure `statusLine.leftSegments`, `statusLine.rightSegments`, and `statusLine.segmentOptions`. Set `statusLine.secondaryLeftSegments` or `statusLine.secondaryRightSegments` to add a second row directly above the editor. The `usage` segment shows compact quota bars for the active provider, account, and model family, including daily, five-hour, seven-day, or supported monthly windows. It displays `quota n/a` after a successful refresh when the provider does not report a compatible quota window.
 
 ### Interaction
 

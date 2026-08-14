@@ -18,11 +18,16 @@ afterAll(() => {
 
 function makeComponent(
 	reports: unknown,
-	options: { provider?: string; activeIdentity?: { accountId?: string; email?: string; projectId?: string } } = {},
+	options: {
+		provider?: string;
+		modelId?: string;
+		activeIdentity?: { accountId?: string; email?: string; projectId?: string };
+	} = {},
 ): StatusLineComponent {
+	const model = { id: options.modelId ?? "test-model", contextWindow: 1000, provider: options.provider };
 	const component = new StatusLineComponent({
-		state: { messages: [], model: { contextWindow: 1000, provider: options.provider } },
-		model: { contextWindow: 1000, provider: options.provider },
+		state: { messages: [], model },
+		model,
 		sessionManager: {
 			getUsageStatistics: () => ({
 				input: 0,
@@ -78,6 +83,61 @@ describe("usage status-line segment", () => {
 		expect(content).toContain("7d");
 		expect(content).toContain("8%");
 		expect(content).toContain("5d 21h");
+		expect(content).toContain("█░░░░");
+	});
+
+	it("renders the active Antigravity model-family daily quota", async () => {
+		const now = Date.now();
+		const component = makeComponent(
+			[
+				{
+					provider: "google-antigravity",
+					metadata: { projectId: "active-project" },
+					limits: [
+						{
+							id: "google-antigravity:anthropic:default:daily",
+							scope: { windowId: "daily" },
+							window: { resetsAt: now + 90 * 60_000 },
+							amount: { usedFraction: 0.8 },
+						},
+						{
+							id: "google-antigravity:google:default:daily",
+							scope: { windowId: "daily" },
+							window: { resetsAt: now + 30 * 60_000 },
+							amount: { usedFraction: 0.27 },
+						},
+						{
+							id: "google-antigravity:openai:default:daily",
+							scope: { windowId: "daily" },
+							amount: { usedFraction: 0.1 },
+						},
+					],
+				},
+			],
+			{
+				provider: "google-antigravity",
+				modelId: "gemini-3.7-flash-tiered",
+				activeIdentity: { projectId: "active-project" },
+			},
+		);
+
+		component.refreshUsageInBackground();
+		await flushUsageRefresh();
+		const content = stripVTControlCharacters(component.getTopBorder(200).content);
+
+		expect(content).toContain("1d");
+		expect(content).toContain("█░░░░");
+		expect(content).toContain("27%");
+		expect(content).toContain("30m");
+		expect(content).not.toContain("80%");
+		expect(content).not.toContain("10%");
+	});
+
+	it("explains when the active model has no provider quota report", () => {
+		const result = renderSegment("usage", {
+			usage: { unavailable: true },
+		} as unknown as SegmentContext);
+		expect(stripVTControlCharacters(result.content)).toContain("quota n/a");
 	});
 
 	it("renders tiered usage fetched from provider reports", async () => {
@@ -341,11 +401,11 @@ describe("usage status-line segment", () => {
 		expect(result.content).toBe("");
 	});
 
-	it("hides usage without visible windows", () => {
+	it("explains usage without visible windows", () => {
 		const result = renderSegment("usage", { usage: {} } as unknown as SegmentContext);
 
-		expect(result.visible).toBe(false);
-		expect(result.content).toBe("");
+		expect(result.visible).toBe(true);
+		expect(stripVTControlCharacters(result.content)).toContain("quota n/a");
 	});
 
 	it("renders five-hour usage without seven-day usage", () => {
@@ -496,8 +556,8 @@ describe("usage status-line segment", () => {
 	it("uses a distinct error color at the eighty-percent threshold", () => {
 		const high = renderSegment("usage", { usage: { fiveHour: { percent: 80 } } } as unknown as SegmentContext);
 		const low = renderSegment("usage", { usage: { fiveHour: { percent: 24 } } } as unknown as SegmentContext);
-		const highWithoutValue = high.content.replace("80%", "PCT");
-		const lowWithoutValue = low.content.replace("24%", "PCT");
+		const highWithoutValue = high.content.replace(/[█░]+/g, "BAR").replace(/\d+%/, "PCT");
+		const lowWithoutValue = low.content.replace(/[█░]+/g, "BAR").replace(/\d+%/, "PCT");
 
 		expect(high.visible).toBe(true);
 		expect(low.visible).toBe(true);

@@ -210,7 +210,7 @@
 - Kept current terminal retry errors in one pinned banner with attempt context while surfacing local continuation failures instead of stale provider errors.
 ### Added
 
-- Added optional `statusLine.secondaryLeftSegments` and `statusLine.secondaryRightSegments` rows, so dense custom status layouts can keep active-account `usage` quota visible without crowding the editor border.
+- Added optional `statusLine.secondaryLeftSegments` and `statusLine.secondaryRightSegments` rows, so dense custom status layouts can keep active-model quota visible without crowding the editor border. The `usage` segment now renders compact quota bars, supports daily provider windows, scopes shared Antigravity reports to the active model family, and explains when quota reporting is unavailable.
 
 ## [17.3.2] - 2026-08-13
 

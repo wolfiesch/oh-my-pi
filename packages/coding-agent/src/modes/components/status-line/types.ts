@@ -145,6 +145,8 @@ export interface SegmentContext {
 	 */
 	worktree: { projectName: string; worktreeName: string } | null;
 	usage: {
+		unavailable?: boolean;
+		daily?: { percent: number; resetMinutes?: number };
 		tier?: string;
 		fiveHour?: { percent: number; resetMinutes?: number };
 		sevenDay?: { percent: number; resetHours?: number };

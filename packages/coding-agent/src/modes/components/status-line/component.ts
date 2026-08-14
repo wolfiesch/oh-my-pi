@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
+import { getAntigravityCounterKeyForModel } from "@oh-my-pi/pi-ai/usage/google-antigravity";
 import {
 	type Component,
 	type ComposerStyle,
@@ -432,6 +433,8 @@ export class StatusLineComponent implements Component {
 	// Provider usage caching (5-min TTL, OAuth/sub only)
 	#cachedUsage: {
 		tier?: string;
+		unavailable?: boolean;
+		daily?: { percent: number; resetMinutes?: number };
 		fiveHour?: { percent: number; resetMinutes?: number };
 		sevenDay?: { percent: number; resetHours?: number };
 		monthly?: { percent: number; resetHours?: number };
@@ -1233,13 +1236,17 @@ export class StatusLineComponent implements Component {
 		return this.#vibeWorkerTokenRate?.() ?? null;
 	}
 
-	#formatUsageContextKey(activeProvider: string | undefined, identity: OAuthAccountIdentity | undefined): string {
+	#formatUsageContextKey(
+		activeProvider: string | undefined,
+		activeModelId: string | undefined,
+		identity: OAuthAccountIdentity | undefined,
+	): string {
 		if (!activeProvider) return "";
-		// orgId is part of the key: rotating between two same-email Anthropic
-		// subscriptions must invalidate the cached usage immediately instead of
-		// showing the previous org's quota for the rest of the cache TTL.
+		// Model id is part of the key because providers such as Antigravity expose
+		// separate backend-family counters under the same account.
 		return [
 			activeProvider,
+			activeModelId ?? "",
 			identity?.accountId ?? "",
 			identity?.email ?? "",
 			identity?.projectId ?? "",
@@ -1248,11 +1255,12 @@ export class StatusLineComponent implements Component {
 	}
 
 	#getUsageContextKey(session: AgentSession): string {
-		const activeProvider = session.state.model?.provider ?? session.model?.provider;
+		const activeModel = session.state.model ?? session.model;
+		const activeProvider = activeModel?.provider;
 		const identity = activeProvider
 			? session.modelRegistry?.authStorage?.getOAuthAccountIdentity(activeProvider, session.sessionId)
 			: undefined;
-		return this.#formatUsageContextKey(activeProvider, identity);
+		return this.#formatUsageContextKey(activeProvider, activeModel?.id, identity);
 	}
 
 	/**
@@ -1310,12 +1318,13 @@ export class StatusLineComponent implements Component {
 			return;
 		}
 		this.#latestAppliedUsageRefreshSequence = sequence;
-		const activeProvider = session.state.model?.provider ?? session.model?.provider;
+		const activeModel = session.state.model ?? session.model;
+		const activeProvider = activeModel?.provider;
 		const activeIdentity =
 			activeProvider && session.modelRegistry?.authStorage
 				? session.modelRegistry.authStorage.getOAuthAccountIdentity(activeProvider, session.sessionId)
 				: undefined;
-		const normalized = this.#normalizeUsageReports(reports, activeProvider, activeIdentity);
+		const normalized = this.#normalizeUsageReports(reports, activeProvider, activeModel?.id, activeIdentity);
 		const resetSnapshot =
 			activeProvider === "openai-codex" ? this.#normalizeCodexResetSnapshot(reports, activeIdentity) : null;
 		const usageChanged = this.#cachedUsage !== normalized;
@@ -1325,7 +1334,7 @@ export class StatusLineComponent implements Component {
 		// some unrelated event (git resolve, keystroke, …) rebuilds it.
 		if (usageChanged) this.#onBranchChange?.();
 		if (!resetSnapshot) return;
-		const contextKey = this.#formatUsageContextKey(activeProvider, activeIdentity);
+		const contextKey = this.#formatUsageContextKey(activeProvider, activeModel?.id, activeIdentity);
 		const previous = this.#codexResetSnapshots.get(contextKey);
 		this.#codexResetSnapshots.set(contextKey, resetSnapshot);
 		if (!previous || !settings.get("tui.codexResetFireworks")) return;
@@ -1427,17 +1436,22 @@ export class StatusLineComponent implements Component {
 	#normalizeUsageReports(
 		reports: unknown,
 		activeProvider?: string,
+		activeModelId?: string,
 		activeIdentity?: OAuthAccountIdentity,
 	): {
+		unavailable?: boolean;
 		tier?: string;
+		daily?: { percent: number; resetMinutes?: number };
 		fiveHour?: { percent: number; resetMinutes?: number };
 		sevenDay?: { percent: number; resetHours?: number };
 		monthly?: { percent: number; resetHours?: number };
 	} | null {
 		if (!Array.isArray(reports)) return null;
+		let daily: { percent: number; resetMinutes?: number } | undefined;
 		let fiveHour: { percent: number; resetMinutes?: number } | undefined;
 		let sevenDay: { percent: number; resetHours?: number } | undefined;
 		let monthly: { percent: number; resetHours?: number } | undefined;
+		let dailyTier: string | undefined;
 		let fiveHourTier: string | undefined;
 		let sevenDayTier: string | undefined;
 		let monthlyTier: string | undefined;
@@ -1458,22 +1472,36 @@ export class StatusLineComponent implements Component {
 			const limits = (report as { limits?: unknown }).limits;
 			if (!Array.isArray(limits)) continue;
 			const usageReport = report as UsageReport;
-			for (const limit of limits) {
-				if (!limit || typeof limit !== "object") continue;
-				if (activeIdentity && !limitMatchesActiveAccount(usageReport, limit as UsageLimit, activeIdentity)) {
+			let scopedLimits: readonly UsageLimit[] = usageReport.limits;
+			if (provider === "google-antigravity") {
+				const counterKey = getAntigravityCounterKeyForModel(activeModelId);
+				if (counterKey) {
+					const matching = usageReport.limits.filter(limit =>
+						limit.id.toLowerCase().startsWith(`${provider}:${counterKey}:`),
+					);
+					const fallback = usageReport.limits.filter(limit =>
+						limit.id.toLowerCase().startsWith(`${provider}:default:`),
+					);
+					scopedLimits = matching.length > 0 ? matching : fallback;
+				}
+			}
+			for (const l of scopedLimits) {
+				if (activeIdentity && !limitMatchesActiveAccount(usageReport, l, activeIdentity)) {
 					continue;
 				}
-				const l = limit as {
-					id?: string;
-					scope?: { windowId?: string; tier?: string };
-					window?: { resetsAt?: number; durationMs?: number };
-					amount?: { usedFraction?: number };
-				};
 				const fraction = l.amount?.usedFraction;
 				if (typeof fraction !== "number") continue;
 				const windowId = l.scope?.windowId;
 				const tier = l.scope?.tier;
 				const resetsAt = l.window?.resetsAt;
+				if (windowId === "daily" && (!daily || (dailyTier !== undefined && !tier))) {
+					daily = {
+						percent: fraction * 100,
+						resetMinutes:
+							typeof resetsAt === "number" ? Math.max(0, Math.round((resetsAt - now) / 60_000)) : undefined,
+					};
+					dailyTier = tier || undefined;
+				}
 				// Canonical window ids win. Fall back to the reported span (same
 				// tolerance as the 5h priority-boost check) so providers that emit
 				// non-canonical ids, and cache rows written before a provider was
@@ -1533,10 +1561,10 @@ export class StatusLineComponent implements Component {
 				}
 			}
 		}
-		if (!fiveHour && !sevenDay && !monthly) return null;
-		// Single compact label; prefer the five-hour tier if displayed windows ever disagree.
-		const effectiveTier = fiveHourTier ?? sevenDayTier ?? monthlyTier;
-		return { tier: effectiveTier, fiveHour, sevenDay, monthly };
+		if (!daily && !fiveHour && !sevenDay && !monthly) return { unavailable: true };
+		// Single compact label; prefer the shortest displayed tier.
+		const effectiveTier = dailyTier ?? fiveHourTier ?? sevenDayTier ?? monthlyTier;
+		return { tier: effectiveTier, daily, fiveHour, sevenDay, monthly };
 	}
 
 	/**
