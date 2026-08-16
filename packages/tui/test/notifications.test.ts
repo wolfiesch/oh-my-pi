@@ -223,6 +223,20 @@ describe("terminal notifications", () => {
 		expect(stdout).not.toHaveBeenCalled();
 	});
 
+	it("rings BEL when a cmux notification explicitly requests sound", () => {
+		Bun.env.CMUX_SURFACE_ID = "123e4567-e89b-12d3-a456-426614174000";
+		const writes: string[] = [];
+		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			writes.push(typeof chunk === "string" ? chunk : chunk.toString());
+			return true;
+		});
+		vi.spyOn(Bun, "spawn").mockImplementation((..._args: unknown[]) => ({ unref: vi.fn() }) as never);
+
+		TERMINAL.sendNotification({ title: "Oh My Pi", body: "Waiting for input", sound: "question" });
+
+		expect(writes).toEqual(["\x07"]);
+	});
+
 	it("keeps the existing OSC fallback for cmux workspace or socket state without a surface", () => {
 		mutableTerminal.notifyProtocol = NotifyProtocol.Osc99;
 		const writes: string[] = [];
@@ -367,6 +381,20 @@ describe("terminal notifications", () => {
 		TERMINAL.sendNotification("ping");
 
 		expect(writes).toEqual(["\x1b]99;;ping\x1b\\"]);
+	});
+
+	it("falls back to BEL when the active OSC protocol cannot encode requested sound", () => {
+		mutableTerminal.notifyProtocol = NotifyProtocol.Osc9;
+		const writes: string[] = [];
+		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			writes.push(typeof chunk === "string" ? chunk : chunk.toString());
+			return true;
+		});
+
+		TERMINAL.sendNotification({ title: "Oh My Pi", body: "Waiting for input", sound: "question" });
+		TERMINAL.sendNotification({ title: "Oh My Pi", body: "Quiet", sound: "silent" });
+
+		expect(writes).toEqual(["\x1b]9;Oh My Pi: Waiting for input\x1b\\\x07", "\x1b]9;Oh My Pi: Quiet\x1b\\"]);
 	});
 
 	it("isInsideZellij reads the ZELLIJ env fresh on each call", () => {

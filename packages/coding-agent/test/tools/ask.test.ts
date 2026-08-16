@@ -12,6 +12,7 @@ import { getThemeByName, initTheme, type Theme } from "@oh-my-pi/pi-coding-agent
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { AskTool, askToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/ask";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
+import { TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
 
 function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
@@ -85,6 +86,43 @@ beforeAll(async () => {
 	const loadedTheme = await getThemeByName("dark");
 	if (!loadedTheme) throw new Error("Expected dark theme");
 	darkTheme = loadedTheme;
+});
+
+describe("AskTool notifications", () => {
+	it("requests an audible question notification while waiting for input", async () => {
+		const notification = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		try {
+			const tool = new AskTool(createSession());
+			const context = createContext({ select: async () => "yes" });
+
+			await tool.execute(
+				"call-1",
+				{
+					questions: [
+						{
+							id: "confirm",
+							question: "Proceed?",
+							options: [{ label: "yes" }, { label: "no" }],
+						},
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			);
+
+			expect(notification).toHaveBeenCalledWith({
+				title: "Oh My Pi",
+				body: "Waiting for input",
+				type: "ask",
+				urgency: "normal",
+				sound: "question",
+				actions: "focus",
+			});
+		} finally {
+			notification.mockRestore();
+		}
+	});
 });
 
 describe("AskTool cancellation", () => {

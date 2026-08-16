@@ -22,6 +22,9 @@
 
 - Fixed long CPU-bound event-loop stalls being misclassified as system sleep and omitted from loop-blocked diagnostics.
 - Fixed focused components with markers falling back to full-screen redraws instead of direct row updates, preserving cursor position and native scrollback across marker changes.
+### Changed
+
+- Added a terminal bell fallback for structured notification sounds on OSC 9, unconfirmed OSC 99, and cmux surfaces.
 
 ## [17.3.4] - 2026-08-14
 

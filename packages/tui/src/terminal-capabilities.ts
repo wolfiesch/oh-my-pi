@@ -150,7 +150,13 @@ export class TerminalInfo {
 
 	sendNotification(message: string | TerminalNotification): void {
 		if (isNotificationSuppressed() || isTerminalHeadless()) return;
-		if (sendCmuxNotification(message)) return;
+		const audible = typeof message !== "string" && message.sound !== undefined && message.sound !== "silent";
+		if (sendCmuxNotification(message)) {
+			// cmux's notify command has no sound field, so preserve an explicit
+			// sound request through the terminal's native bell.
+			if (audible) process.stdout.write(NotifyProtocol.Bell);
+			return;
+		}
 		const formatted = this.formatNotification(message);
 		// Under tmux, terminals whose notify protocol is OSC 9 / OSC 99 would
 		// otherwise lose the notification entirely: tmux does not forward bare
@@ -172,7 +178,14 @@ export class TerminalInfo {
 			process.stdout.write(`${formatted}\x07`);
 			return;
 		}
-		process.stdout.write(formatted);
+		const soundNeedsBell =
+			audible &&
+			this.notifyProtocol !== NotifyProtocol.Bell &&
+			!(this.notifyProtocol === NotifyProtocol.Osc99 && osc99CapabilitiesConfirmed);
+		// OSC 9 and unconfirmed OSC 99 cannot encode `sound`. Append BEL only
+		// when the caller explicitly requested sound; ordinary notifications
+		// retain their existing single-protocol output.
+		process.stdout.write(soundNeedsBell ? `${formatted}${NotifyProtocol.Bell}` : formatted);
 		// VTE-family terminals (Ptyxis, GNOME Terminal, Tilix, …) plus Alacritty
 		// and bare xterm-on-Wayland have no in-band escape that surfaces an
 		// arbitrary desktop toast (#3685). When the chosen `notifyProtocol` is
