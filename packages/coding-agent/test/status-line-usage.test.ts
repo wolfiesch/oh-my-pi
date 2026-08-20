@@ -201,6 +201,44 @@ describe("usage status-line segment", () => {
 		expect(secondary[0]).toContain("8%");
 	});
 
+	it("separates above-editor secondary rows from standalone bottom-bar rows", async () => {
+		const component = makeComponent([
+			{
+				limits: [
+					{ scope: { windowId: "5h" }, amount: { usedFraction: 0.24 } },
+					{ scope: { windowId: "7d" }, amount: { usedFraction: 0.08 } },
+				],
+			},
+		]);
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["pi"],
+			rightSegments: [],
+			secondaryLeftSegments: ["usage"],
+			secondaryRightSegments: ["context_pct"],
+			sessionAccent: false,
+		});
+		component.refreshUsageInBackground();
+		await flushUsageRefresh();
+
+		// Box style (default): bottomBar is none
+		const aboveBox = component.above.render(200).map(stripVTControlCharacters);
+		const bottomBox = component.bottomBar.render(200).map(stripVTControlCharacters);
+		expect(aboveBox).toHaveLength(1);
+		expect(aboveBox[0]).toContain("5h");
+		expect(bottomBox).toHaveLength(0);
+
+		// Standalone style (e.g. borderless): bottomBar is full
+		component.setComposerStyle({ bottomBar: "full", bottomBarGap: false });
+		const aboveStandalone = component.above.render(200).map(stripVTControlCharacters);
+		const bottomStandalone = component.bottomBar.render(200).map(stripVTControlCharacters);
+		expect(aboveStandalone).toHaveLength(1);
+		expect(aboveStandalone[0]).toContain("5h");
+		expect(bottomStandalone).toHaveLength(1);
+		expect(bottomStandalone[0]).toContain("π");
+		expect(bottomStandalone[0]).not.toContain("5h");
+	});
+
 	it("prefers untiered windows and labels the displayed tiered window", async () => {
 		const component = makeComponent([
 			{

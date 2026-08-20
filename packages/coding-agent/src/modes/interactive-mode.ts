@@ -83,7 +83,7 @@ import type { CompactOptions } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import { loadSlashCommands } from "../extensibility/slash-commands";
 import type { Goal, GoalModeState } from "../goals/state";
-import { copyLocalArtifacts, resolveLocalUrlToPath } from "../internal-urls";
+import { resolveLocalUrlToPath } from "../internal-urls";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
 import type { MCPManager } from "../mcp";
 import {
@@ -1097,10 +1097,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.addChild(this.hookWidgetContainerAbove);
 		// Secondary metrics and hook statuses sit directly above the editor border,
 		// after the ordinary one-line prompt margin.
-		this.ui.addChild(this.statusLine);
+		this.ui.addChild(this.statusLine.above);
 		this.ui.addChild(this.editorContainer);
 		this.ui.addChild(this.hookWidgetContainerBelow);
-		this.ui.addChild(this.statusLine);
+		// Standalone bottom bar sits below the editor for shapes with detached bottom status.
+		this.ui.addChild(this.statusLine.bottomBar);
 		this.ui.setFocus(this.editor);
 		this.syncComposerShape();
 
@@ -3100,7 +3101,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.ui.requestRender(true);
 		}
 	}
-
 
 	async #approvePlan(
 		planContent: string,

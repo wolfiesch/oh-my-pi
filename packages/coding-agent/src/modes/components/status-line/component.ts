@@ -2273,16 +2273,12 @@ export class StatusLineComponent implements Component {
 		return lines;
 	}
 
-	render(width: number): readonly string[] {
+	/**
+	 * Renders secondary metrics and hook status rows placed directly above
+	 * the editor container.
+	 */
+	renderAbove(width: number): readonly string[] {
 		const lines: string[] = [];
-		if (this.#standalone && !this.#autocompleteActiveProbe?.()) {
-			const content = this.renderBottomBar(width, this.#standalone === "left-only" ? "left" : "full");
-			if (content) {
-				if (this.#standaloneGap) lines.push("");
-				lines.push(content);
-			}
-		}
-
 		const effectiveSettings = this.#resolveSettings();
 		if (effectiveSettings.secondaryLeftSegments.length > 0 || effectiveSettings.secondaryRightSegments.length > 0) {
 			let secondary = this.#buildStatusLine(
@@ -2308,4 +2304,38 @@ export class StatusLineComponent implements Component {
 		}
 		return lines;
 	}
+
+	/**
+	 * Renders the standalone bottom bar row placed below the editor container
+	 * when using shapes with detached bottom status (e.g. borderless, pi, claude).
+	 */
+	renderBelow(width: number): readonly string[] {
+		const lines: string[] = [];
+		if (this.#standalone && !this.#autocompleteActiveProbe?.()) {
+			const content = this.renderBottomBar(width, this.#standalone === "left-only" ? "left" : "full");
+			if (content) {
+				if (this.#standaloneGap) lines.push("");
+				lines.push(content);
+			}
+		}
+		return lines;
+	}
+
+	/**
+	 * Composite render returning all rows (above + below) for standalone
+	 * test harnesses that do not mount distinct sub-components.
+	 */
+	render(width: number): readonly string[] {
+		return [...this.renderAbove(width), ...this.renderBelow(width)];
+	}
+
+	/** Component mounted above the editor for secondary metrics and hook statuses. */
+	readonly above: Component = {
+		render: (width: number) => this.renderAbove(width),
+	};
+
+	/** Component mounted below the editor for standalone bottom bars. */
+	readonly bottomBar: Component = {
+		render: (width: number) => this.renderBelow(width),
+	};
 }
