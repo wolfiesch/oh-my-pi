@@ -89,6 +89,43 @@ beforeAll(async () => {
 	darkTheme = loadedTheme;
 });
 
+describe("AskTool notifications", () => {
+	it("requests an audible question notification while waiting for input", async () => {
+		const notification = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		try {
+			const tool = new AskTool(createSession());
+			const context = createContext({ select: async () => "yes" });
+
+			await tool.execute(
+				"call-1",
+				{
+					questions: [
+						{
+							id: "confirm",
+							question: "Proceed?",
+							options: [{ label: "yes" }, { label: "no" }],
+						},
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			);
+
+			expect(notification).toHaveBeenCalledWith({
+				title: "Oh My Pi",
+				body: "Waiting for input",
+				type: "ask",
+				urgency: "normal",
+				sound: "question",
+				actions: "focus",
+			});
+		} finally {
+			notification.mockRestore();
+		}
+	});
+});
+
 describe("AskTool cancellation", () => {
 	it("aborts the turn when the user cancels selection", async () => {
 		const tool = new AskTool(createSession());

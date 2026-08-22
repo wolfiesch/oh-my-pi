@@ -47,10 +47,14 @@ export interface JobSnapshot {
 	status: "running" | "completed" | "failed" | "cancelled";
 	label: string;
 	durationMs: number;
+	/** Registered but waiting for a caller-managed execution slot. */
+	queued?: boolean;
 	/** Effective task model selector, including an explicit reasoning suffix when configured. */
 	resolvedModel?: string;
 	resultText?: string;
+	resultTruncated?: boolean;
 	errorText?: string;
+	errorTruncated?: boolean;
 }
 
 export type CancelStatus = "cancelled" | "not_found" | "already_completed";

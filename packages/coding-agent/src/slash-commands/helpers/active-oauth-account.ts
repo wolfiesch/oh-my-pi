@@ -21,6 +21,20 @@ export function formatActiveAccountLabel(identity: OAuthAccountIdentity | undefi
 	return org && org !== base ? `${base} (${org})` : base;
 }
 
+/** Stable display label for one provider usage report. */
+export function formatUsageReportAccountLabel(report: UsageReport, index: number): string {
+	const metadata = report.metadata ?? {};
+	for (const key of ["email", "accountId", "projectId"] as const) {
+		const value = metadata[key];
+		if (typeof value === "string" && value) return value;
+	}
+	for (const limit of report.limits) {
+		const scoped = limit.scope.accountId ?? limit.scope.projectId;
+		if (scoped) return scoped;
+	}
+	return `account ${index + 1}`;
+}
+
 /**
  * True when a single usage-limit column belongs to the given OAuth identity.
  *

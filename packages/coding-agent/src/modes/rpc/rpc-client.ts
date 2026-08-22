@@ -10,8 +10,18 @@ import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
+import type { SettingTab } from "../../config/settings-schema";
+import type { SettingsSnapshot } from "../../config/settings-snapshot";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type {
+	SessionCatalogPage,
+	SessionCatalogQuery,
+	SessionCatalogScope,
+	SessionWorkspaceRoot,
+} from "../../session/session-catalog";
+import type { ToolInventory } from "../../session/session-tools";
+import type { TodoPhase } from "../../tools/todo";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
 import {
 	RPC_MESSAGES_PAGE_BUSY_ERROR,
@@ -20,25 +30,75 @@ import {
 	type RpcMessagesPageOptions,
 } from "./rpc-messages";
 import type {
+	RpcAdvisorState,
+	RpcAgentRegistryUpdateFrame,
+	RpcAgentReleaseResult,
+	RpcAgentResult,
+	RpcAgentSendResult,
+	RpcAgentSnapshot,
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
+	RpcCancelOperationResult,
+	RpcCapabilityManifest,
 	RpcCommand,
+	RpcCommandOutputFrame,
+	RpcConfigUpdateFrame,
+	RpcDeleteSessionResult,
+	RpcEvalCompleteFrame,
+	RpcEvalHistoryEntry,
+	RpcEvalLanguage,
+	RpcEvalOutputFrame,
+	RpcExtensionErrorFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcForkSessionResult,
 	RpcHandoffResult,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
 	RpcHostToolDefinition,
 	RpcHostToolResult,
 	RpcHostToolUpdate,
+	RpcHostUriCancelRequest,
+	RpcHostUriRequest,
+	RpcHostUriResult,
+	RpcHostUriSchemeDefinition,
+	RpcJobListResult,
+	RpcJobUpdateFrame,
+	RpcModeChangeResult,
+	RpcOperationAccepted,
+	RpcOperationStartedFrame,
+	RpcOperationsSnapshot,
+	RpcOperationTerminalFrame,
+	RpcPlanApprovalRequestFrame,
+	RpcPlanApprovalSettledFrame,
+	RpcPlanState,
+	RpcPlanStateUpdateFrame,
+	RpcPlanWorkflow,
+	RpcPromptResultFrame,
+	RpcProviderAuthMethod,
+	RpcProviderAuthRequestFrame,
+	RpcProviderAuthState,
+	RpcProviderAuthUpdateFrame,
+	RpcQueueUpdateFrame,
+	RpcRenameSessionResult,
 	RpcResponse,
+	RpcResumeSessionResult,
+	RpcSessionInfoResult,
+	RpcSessionInfoUpdateFrame,
+	RpcSessionMode,
 	RpcSessionState,
+	RpcSettingsChange,
+	RpcSettingsUpdateFrame,
 	RpcSubagentEventFrame,
 	RpcSubagentLifecycleFrame,
 	RpcSubagentMessagesResult,
 	RpcSubagentProgressFrame,
 	RpcSubagentSnapshot,
 	RpcSubagentSubscriptionLevel,
+	RpcToolActivationResult,
+	RpcToolInventoryUpdateFrame,
+	SessionQueueClearResult,
+	SessionQueueSnapshot,
 } from "./rpc-types";
 
 /** Distributive Omit that works with union types */
@@ -75,7 +135,44 @@ export type RpcSessionEventListener = (event: AgentSessionEvent) => void;
 export type RpcSubagentLifecycleListener = (payload: RpcSubagentLifecycleFrame["payload"]) => void;
 export type RpcSubagentProgressListener = (payload: RpcSubagentProgressFrame["payload"]) => void;
 export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"]) => void;
+export type RpcAgentRegistryUpdateListener = (frame: RpcAgentRegistryUpdateFrame) => void;
 export type RpcAvailableCommandsUpdateListener = (commands: RpcAvailableSlashCommand[]) => void;
+export type RpcEvalOutputListener = (frame: RpcEvalOutputFrame) => void;
+export type RpcEvalCompleteListener = (frame: RpcEvalCompleteFrame) => void;
+export type RpcToolInventoryUpdateListener = (frame: RpcToolInventoryUpdateFrame) => void;
+export type RpcRawFrameListener = (frame: Readonly<Record<string, unknown>>) => void;
+export type RpcPromptResultListener = (frame: RpcPromptResultFrame) => void;
+export type RpcOperationTerminalListener = (frame: RpcOperationTerminalFrame) => void;
+export type RpcOperationStartedListener = (frame: RpcOperationStartedFrame) => void;
+export type RpcPlanStateUpdateListener = (frame: RpcPlanStateUpdateFrame) => void;
+export type RpcPlanApprovalRequestListener = (frame: RpcPlanApprovalRequestFrame) => void;
+export type RpcPlanApprovalSettledListener = (frame: RpcPlanApprovalSettledFrame) => void;
+export type RpcCommandOutputListener = (frame: RpcCommandOutputFrame) => void;
+export type RpcSessionInfoUpdateListener = (frame: RpcSessionInfoUpdateFrame) => void;
+export type RpcConfigUpdateListener = (frame: RpcConfigUpdateFrame) => void;
+export type RpcExtensionErrorListener = (frame: RpcExtensionErrorFrame) => void;
+export type RpcSettingsUpdateListener = (frame: RpcSettingsUpdateFrame) => void;
+export type RpcExtensionUIRequestListener = (request: RpcExtensionUIRequest) => void;
+export type RpcProviderAuthRequestListener = (request: RpcProviderAuthRequestFrame) => void;
+export type RpcProviderAuthUpdateListener = (state: RpcProviderAuthState) => void;
+export type RpcQueueUpdateListener = (frame: RpcQueueUpdateFrame) => void;
+export type RpcJobUpdateListener = (frame: RpcJobUpdateFrame) => void;
+
+export interface RpcClientHostUriContext {
+	signal: AbortSignal;
+}
+
+export interface RpcClientHostUriReadResult {
+	content: string;
+	contentType?: "text/markdown" | "application/json" | "text/plain";
+	notes?: string[];
+	immutable?: boolean;
+}
+
+export type RpcClientHostUriHandler = (
+	request: RpcHostUriRequest,
+	context: RpcClientHostUriContext,
+) => string | RpcClientHostUriReadResult | void | Promise<string | RpcClientHostUriReadResult | void>;
 
 export interface RpcClientToolContext<TDetails = unknown> {
 	toolCallId: string;
@@ -140,10 +237,30 @@ function isRpcResponse(value: unknown): value is RpcResponse {
 	if (typeof value.command !== "string") return false;
 	if (typeof value.success !== "boolean") return false;
 	if (value.id !== undefined && typeof value.id !== "string") return false;
-	if (value.success === false) {
-		return typeof value.error === "string";
-	}
+	if (value.success === false) return typeof value.error === "string";
 	return true;
+}
+
+function parseRpcPlanState(value: unknown): RpcPlanState {
+	if (!isRecord(value)) return { mode: "none" };
+	const mode: RpcSessionMode =
+		value.mode === "plan" || value.mode === "plan_paused" || value.mode === "none" ? value.mode : "none";
+	const workflow: RpcPlanWorkflow | undefined =
+		value.workflow === "parallel" || value.workflow === "iterative" ? value.workflow : undefined;
+	return {
+		...value,
+		mode,
+		workflow,
+		awaitingApproval: isRecord(value.awaitingApproval)
+			? {
+					approvalId:
+						typeof value.awaitingApproval.approvalId === "string" ? value.awaitingApproval.approvalId : "",
+					title: typeof value.awaitingApproval.title === "string" ? value.awaitingApproval.title : "",
+					planFilePath:
+						typeof value.awaitingApproval.planFilePath === "string" ? value.awaitingApproval.planFilePath : "",
+				}
+			: undefined,
+	} as RpcPlanState;
 }
 
 function supportsRpcProtocolV2(value: Record<string, unknown>): boolean {
@@ -170,6 +287,10 @@ function isAgentSessionEvent(value: unknown): value is AgentSessionEvent {
 	return sessionEventTypes.has(type as AgentSessionEvent["type"]);
 }
 
+function isTerminalAgentEnd(event: AgentEvent): boolean {
+	return event.type === "agent_end" && Reflect.get(event, "isTerminal") !== false;
+}
+
 function isRpcSubagentLifecycleFrame(value: unknown): value is RpcSubagentLifecycleFrame {
 	if (!isRecord(value)) return false;
 	return value.type === "subagent_lifecycle" && isRecord(value.payload);
@@ -185,9 +306,239 @@ function isRpcSubagentEventFrame(value: unknown): value is RpcSubagentEventFrame
 	return value.type === "subagent_event" && isRecord(value.payload);
 }
 
+function isRpcAgentRegistryUpdateFrame(value: unknown): value is RpcAgentRegistryUpdateFrame {
+	return isRecord(value) && value.type === "agent_registry_update" && isRecord(value.agent);
+}
+
 function isRpcAvailableCommandsUpdateFrame(value: unknown): value is RpcAvailableCommandsUpdateFrame {
 	if (!isRecord(value)) return false;
 	return value.type === "available_commands_update" && Array.isArray(value.commands);
+}
+function isRpcToolInventoryUpdateFrame(value: unknown): value is RpcToolInventoryUpdateFrame {
+	return isRecord(value) && value.type === "tool_inventory_update";
+}
+function isRpcEvalOutputFrame(value: unknown): value is RpcEvalOutputFrame {
+	return (
+		isRecord(value) &&
+		value.type === "eval_output" &&
+		typeof value.operationId === "string" &&
+		typeof value.sequence === "number" &&
+		typeof value.chunk === "string" &&
+		typeof value.truncated === "boolean"
+	);
+}
+
+function isRpcEvalCompleteFrame(value: unknown): value is RpcEvalCompleteFrame {
+	if (!isRecord(value) || value.type !== "eval_complete" || typeof value.operationId !== "string") return false;
+	const result = value.result;
+	return (
+		isRecord(result) &&
+		(result.language === "py" || result.language === "js" || result.language === "rb" || result.language === "jl") &&
+		typeof result.code === "string" &&
+		typeof result.output === "string" &&
+		typeof result.cancelled === "boolean" &&
+		typeof result.truncated === "boolean" &&
+		typeof result.timestamp === "number"
+	);
+}
+
+function isRpcPromptResultFrame(value: unknown): value is RpcPromptResultFrame {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "prompt_result" &&
+		(value.id === undefined || typeof value.id === "string") &&
+		typeof value.agentInvoked === "boolean"
+	);
+}
+
+function isRpcOperationStartedFrame(value: unknown): value is RpcOperationStartedFrame {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "operation_started" &&
+		typeof value.operationId === "string" &&
+		typeof value.command === "string" &&
+		(value.requestId === undefined || typeof value.requestId === "string") &&
+		typeof value.startedAt === "number"
+	);
+}
+
+function isRpcOperationTerminalFrame(value: unknown): value is RpcOperationTerminalFrame {
+	if (!isRecord(value)) return false;
+	if (
+		value.type !== "operation_completed" &&
+		value.type !== "operation_failed" &&
+		value.type !== "operation_cancelled"
+	)
+		return false;
+	if (typeof value.operationId !== "string" || typeof value.command !== "string") return false;
+	if (value.requestId !== undefined && typeof value.requestId !== "string") return false;
+	if (typeof value.settledAt !== "number") return false;
+	if (value.type === "operation_completed") return typeof value.agentInvoked === "boolean";
+	if (value.type === "operation_failed")
+		return typeof value.error === "string" && (value.code === undefined || typeof value.code === "string");
+	return typeof value.reason === "string" && typeof value.code === "string";
+}
+
+function isRpcPlanStateUpdateFrame(value: unknown): value is RpcPlanStateUpdateFrame {
+	return isRecord(value) && value.type === "plan_state_update" && isRecord(value.state);
+}
+
+function isRpcPlanApprovalRequestFrame(value: unknown): value is RpcPlanApprovalRequestFrame {
+	return (
+		isRecord(value) &&
+		value.type === "plan_approval_request" &&
+		typeof value.approvalId === "string" &&
+		typeof value.planFilePath === "string" &&
+		typeof value.title === "string" &&
+		typeof value.planContent === "string"
+	);
+}
+
+function isRpcPlanApprovalSettledFrame(value: unknown): value is RpcPlanApprovalSettledFrame {
+	if (!isRecord(value) || value.type !== "plan_approval_settled" || typeof value.approvalId !== "string") return false;
+	const result = value.result;
+	return (
+		isRecord(result) &&
+		typeof result.approvalId === "string" &&
+		(result.decision === "approve" || result.decision === "refine" || result.decision === "reject") &&
+		typeof result.executionDispatched === "boolean" &&
+		typeof result.planFilePath === "string" &&
+		(result.compaction === undefined ||
+			result.compaction === "ok" ||
+			result.compaction === "cancelled" ||
+			result.compaction === "failed")
+	);
+}
+function parseRpcOperationAccepted(value: unknown): RpcOperationAccepted | undefined {
+	if (!isRecord(value) || value.accepted !== true || typeof value.operationId !== "string" || !value.operationId) {
+		return undefined;
+	}
+	return { operationId: value.operationId, accepted: true };
+}
+function isRpcProviderAuthRequestFrame(value: unknown): value is RpcProviderAuthRequestFrame {
+	return (
+		isRecord(value) &&
+		value.type === "provider_auth_request" &&
+		typeof value.operationId === "string" &&
+		typeof value.requestId === "string" &&
+		typeof value.providerId === "string" &&
+		value.method === "open_url" &&
+		typeof value.url === "string"
+	);
+}
+
+function isRpcProviderAuthUpdateFrame(value: unknown): value is RpcProviderAuthUpdateFrame {
+	return isRecord(value) && value.type === "provider_auth_update" && isRecord(value.state);
+}
+
+const RPC_ADVISOR_STATUSES = ["running", "paused", "quota_exhausted", "error", "no_model"] as const;
+function parseRpcAdvisorState(value: unknown): RpcAdvisorState | undefined {
+	if (
+		!isRecord(value) ||
+		typeof value.configured !== "boolean" ||
+		typeof value.active !== "boolean" ||
+		!Array.isArray(value.advisors)
+	) {
+		return undefined;
+	}
+	const advisors: RpcAdvisorState["advisors"] = [];
+	for (const advisor of value.advisors) {
+		if (!isRecord(advisor) || typeof advisor.name !== "string" || typeof advisor.status !== "string")
+			return undefined;
+		const status = RPC_ADVISOR_STATUSES.find(candidate => candidate === advisor.status);
+		if (!status) return undefined;
+		advisors.push({ name: advisor.name, status });
+	}
+	return { configured: value.configured, active: value.active, advisors };
+}
+
+function parseProviderAuthState(value: unknown): RpcProviderAuthState {
+	if (!isRecord(value) || typeof value.providerId !== "string" || typeof value.name !== "string")
+		throw new Error("RPC provider auth state is malformed");
+	const knownMethods = new Set<RpcProviderAuthMethod>(["oauth_callback", "paste_code", "device_code", "api_key"]);
+	const methods = Array.isArray(value.methods)
+		? value.methods.flatMap(method => {
+				if (
+					!isRecord(method) ||
+					typeof method.method !== "string" ||
+					!knownMethods.has(method.method as RpcProviderAuthMethod)
+				)
+					return [];
+				return [
+					{
+						method: method.method as RpcProviderAuthMethod,
+						available: method.available === true,
+						exclusive: true as const,
+					},
+				];
+			})
+		: [];
+	const origin =
+		value.credentialOrigin === "runtime" ||
+		value.credentialOrigin === "config" ||
+		value.credentialOrigin === "oauth" ||
+		value.credentialOrigin === "api_key" ||
+		value.credentialOrigin === "env" ||
+		value.credentialOrigin === "fallback"
+			? value.credentialOrigin
+			: undefined;
+	return {
+		providerId: value.providerId,
+		name: value.name,
+		credentialOrigin: origin,
+		authenticated: value.authenticated === true,
+		disabled: value.disabled === true,
+		available: value.available === true,
+		unavailableReason: typeof value.unavailableReason === "string" ? value.unavailableReason : undefined,
+		identity: isRecord(value.identity)
+			? {
+					email: typeof value.identity.email === "string" ? value.identity.email : undefined,
+					accountId: typeof value.identity.accountId === "string" ? value.identity.accountId : undefined,
+					projectId: typeof value.identity.projectId === "string" ? value.identity.projectId : undefined,
+					orgId: typeof value.identity.orgId === "string" ? value.identity.orgId : undefined,
+					orgName: typeof value.identity.orgName === "string" ? value.identity.orgName : undefined,
+				}
+			: undefined,
+		methods,
+	};
+}
+
+function isRpcCommandOutputFrame(value: unknown): value is RpcCommandOutputFrame {
+	if (!isRecord(value)) return false;
+	return value.type === "command_output" && typeof value.text === "string";
+}
+
+function isRpcSessionInfoUpdateFrame(value: unknown): value is RpcSessionInfoUpdateFrame {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "session_info_update" &&
+		(value.title === undefined || typeof value.title === "string") &&
+		typeof value.sessionId === "string"
+	);
+}
+
+function isRpcConfigUpdateFrame(value: unknown): value is RpcConfigUpdateFrame {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "config_update" &&
+		(value.model === undefined || isRecord(value.model)) &&
+		(value.thinkingLevel === undefined || typeof value.thinkingLevel === "string") &&
+		(value.advisor === undefined || parseRpcAdvisorState(value.advisor) !== undefined)
+	);
+}
+
+function isRpcSettingsUpdateFrame(value: unknown): value is RpcSettingsUpdateFrame {
+	return isRecord(value) && value.type === "settings_update";
+}
+
+function isRpcExtensionErrorFrame(value: unknown): value is RpcExtensionErrorFrame {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "extension_error" &&
+		typeof value.extensionPath === "string" &&
+		typeof value.event === "string" &&
+		typeof value.error === "string"
+	);
 }
 
 function isRpcHostToolCallRequest(value: unknown): value is RpcHostToolCallRequest {
@@ -204,6 +555,26 @@ function isRpcHostToolCallRequest(value: unknown): value is RpcHostToolCallReque
 function isRpcHostToolCancelRequest(value: unknown): value is RpcHostToolCancelRequest {
 	if (!isRecord(value)) return false;
 	return value.type === "host_tool_cancel" && typeof value.id === "string" && typeof value.targetId === "string";
+}
+
+function isRpcHostUriRequest(value: unknown): value is RpcHostUriRequest {
+	if (!isRecord(value)) return false;
+	const hasValidContent =
+		value.operation === "write"
+			? typeof value.content === "string"
+			: value.content === undefined || typeof value.content === "string";
+	return (
+		value.type === "host_uri_request" &&
+		typeof value.id === "string" &&
+		(value.operation === "read" || value.operation === "write") &&
+		typeof value.url === "string" &&
+		hasValidContent
+	);
+}
+
+function isRpcHostUriCancelRequest(value: unknown): value is RpcHostUriCancelRequest {
+	if (!isRecord(value)) return false;
+	return value.type === "host_uri_cancel" && typeof value.id === "string" && typeof value.targetId === "string";
 }
 
 function isRpcExtensionUiRequest(value: unknown): value is RpcExtensionUIRequest {
@@ -252,14 +623,45 @@ export class RpcClient {
 	#subagentLifecycleListeners = new Set<RpcSubagentLifecycleListener>();
 	#subagentProgressListeners = new Set<RpcSubagentProgressListener>();
 	#subagentEventListeners = new Set<RpcSubagentEventListener>();
+	#agentRegistryUpdateListeners = new Set<RpcAgentRegistryUpdateListener>();
 	#availableCommandsUpdateListeners = new Set<RpcAvailableCommandsUpdateListener>();
+	#toolInventoryUpdateListeners = new Set<RpcToolInventoryUpdateListener>();
+	#queueUpdateListeners = new Set<RpcQueueUpdateListener>();
+	#jobUpdateListeners = new Set<RpcJobUpdateListener>();
+	#rawFrameListeners = new Set<RpcRawFrameListener>();
+	#promptResultListeners = new Set<RpcPromptResultListener>();
+	#evalOutputListeners = new Set<RpcEvalOutputListener>();
+	#evalCompleteListeners = new Set<RpcEvalCompleteListener>();
+	#operationTerminalListeners = new Set<RpcOperationTerminalListener>();
+	#operationStartedListeners = new Set<RpcOperationStartedListener>();
+	#planStateUpdateListeners = new Set<RpcPlanStateUpdateListener>();
+	#planApprovalRequestListeners = new Set<RpcPlanApprovalRequestListener>();
+	#planApprovalSettledListeners = new Set<RpcPlanApprovalSettledListener>();
+	#activeOperationIds = new Set<string>();
+	#settledOperationIds = new Set<string>();
+	#agentStreaming = false;
+	#continuationRequestCount = 0;
+	#continuationGeneration = 0;
+	#confirmedContinuationGeneration = 0;
+	#pendingPromptRequestIds = new Set<string>();
+	#legacyPromptRequestIds = new Set<string>();
+	#commandOutputListeners = new Set<RpcCommandOutputListener>();
+	#sessionInfoUpdateListeners = new Set<RpcSessionInfoUpdateListener>();
+	#configUpdateListeners = new Set<RpcConfigUpdateListener>();
+	#extensionErrorListeners = new Set<RpcExtensionErrorListener>();
+	#settingsUpdateListeners = new Set<RpcSettingsUpdateListener>();
 	#pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
 	#customTools: RpcClientCustomTool[] = [];
+	#hostUriSchemes: RpcHostUriSchemeDefinition[] = [];
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
+	#pendingHostUriRequests = new Map<string, { controller: AbortController }>();
+	#hostUriHandler: RpcClientHostUriHandler | undefined;
 	#requestId = 0;
 	#protocolVersion: RpcProtocolVersion = 1;
-	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
+	#extensionUiListeners = new Set<RpcExtensionUIRequestListener>();
+	#providerAuthRequestListeners = new Set<RpcProviderAuthRequestListener>();
+	#providerAuthUpdateListeners = new Set<RpcProviderAuthUpdateListener>();
 	#abortController = new AbortController();
 
 	constructor(private options: RpcClientOptions = {}) {
@@ -284,6 +686,14 @@ export class RpcClient {
 		// short-circuit the new stdout reader (issue #4079).
 		this.#abortController = new AbortController();
 		this.#protocolVersion = 1;
+		this.#activeOperationIds.clear();
+		this.#settledOperationIds.clear();
+		this.#agentStreaming = false;
+		this.#continuationRequestCount = 0;
+		this.#continuationGeneration = 0;
+		this.#confirmedContinuationGeneration = 0;
+		this.#pendingPromptRequestIds.clear();
+		this.#legacyPromptRequestIds.clear();
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
@@ -324,6 +734,8 @@ export class RpcClient {
 			this.#pendingRequests.clear();
 			for (const pendingCall of this.#pendingHostToolCalls.values()) pendingCall.controller.abort(error);
 			this.#pendingHostToolCalls.clear();
+			for (const pendingRequest of this.#pendingHostUriRequests.values()) pendingRequest.controller.abort(error);
+			this.#pendingHostUriRequests.clear();
 
 			try {
 				child.kill(undefined, this.options.terminationGraceMs);
@@ -339,6 +751,7 @@ export class RpcClient {
 		void (async () => {
 			for await (const line of lines) {
 				if (!readySettled && isRecord(line) && line.type === "ready") {
+					this.#emitRawFrame(line);
 					protocolV2Supported = supportsRpcProtocolV2(line);
 					readySettled = true;
 					readyResolve();
@@ -430,6 +843,9 @@ export class RpcClient {
 			if (this.#customTools.length > 0) {
 				await this.setCustomTools(this.#customTools);
 			}
+			if (this.#hostUriSchemes.length > 0) {
+				await this.setHostUriSchemes(this.#hostUriSchemes);
+			}
 		} catch (cause) {
 			// Startup failed after spawning the child. Reap it before returning
 			// so a retry cannot inherit a live worker or its session lock.
@@ -454,10 +870,21 @@ export class RpcClient {
 		this.#process = null;
 		for (const request of this.#pendingRequests.values()) request.reject(error);
 		this.#pendingRequests.clear();
+		this.#activeOperationIds.clear();
+		this.#pendingPromptRequestIds.clear();
+		this.#legacyPromptRequestIds.clear();
+		this.#agentStreaming = false;
+		this.#continuationRequestCount = 0;
+		this.#continuationGeneration = 0;
+		this.#confirmedContinuationGeneration = 0;
 		for (const pendingCall of this.#pendingHostToolCalls.values()) {
 			pendingCall.controller.abort(error);
 		}
 		this.#pendingHostToolCalls.clear();
+		for (const pendingRequest of this.#pendingHostUriRequests.values()) {
+			pendingRequest.controller.abort(error);
+		}
+		this.#pendingHostUriRequests.clear();
 		return this.#waitForExit(child);
 	}
 
@@ -530,12 +957,151 @@ export class RpcClient {
 		return () => this.#subagentEventListeners.delete(listener);
 	}
 
+	onAgentRegistryUpdate(listener: RpcAgentRegistryUpdateListener): () => void {
+		this.#agentRegistryUpdateListeners.add(listener);
+		return () => this.#agentRegistryUpdateListeners.delete(listener);
+	}
+
 	/**
 	 * Subscribe to slash-command availability updates emitted by the RPC server.
 	 */
 	onAvailableCommandsUpdate(listener: RpcAvailableCommandsUpdateListener): () => void {
 		this.#availableCommandsUpdateListeners.add(listener);
 		return () => this.#availableCommandsUpdateListeners.delete(listener);
+	}
+	/** Subscribe to signals that the authoritative session tool inventory changed. */
+	onToolInventoryUpdate(listener: RpcToolInventoryUpdateListener): () => void {
+		this.#toolInventoryUpdateListeners.add(listener);
+		return () => this.#toolInventoryUpdateListeners.delete(listener);
+	}
+
+	onQueueUpdate(listener: RpcQueueUpdateListener): () => void {
+		this.#queueUpdateListeners.add(listener);
+		return () => this.#queueUpdateListeners.delete(listener);
+	}
+
+	onJobUpdate(listener: RpcJobUpdateListener): () => void {
+		this.#jobUpdateListeners.add(listener);
+		return () => this.#jobUpdateListeners.delete(listener);
+	}
+
+	/** Subscribe to every decoded JSON frame, including unknown future frames. */
+	onRawFrame(listener: RpcRawFrameListener): () => void {
+		this.#rawFrameListeners.add(listener);
+		return () => this.#rawFrameListeners.delete(listener);
+	}
+
+	/** Subscribe to prompt scheduling outcomes emitted after acknowledgement. */
+	onPromptResult(listener: RpcPromptResultListener): () => void {
+		this.#promptResultListeners.add(listener);
+		return () => this.#promptResultListeners.delete(listener);
+	}
+
+	/** Subscribe to exactly-once terminal outcomes for accepted asynchronous operations. */
+	onOperationTerminal(listener: RpcOperationTerminalListener): () => void {
+		this.#operationTerminalListeners.add(listener);
+		return () => this.#operationTerminalListeners.delete(listener);
+	}
+
+	/** Subscribe to the point where accepted operation work actually starts. */
+	onOperationStarted(listener: RpcOperationStartedListener): () => void {
+		this.#operationStartedListeners.add(listener);
+		return () => this.#operationStartedListeners.delete(listener);
+	}
+
+	/** Subscribe to plan-state projections emitted after authoritative transitions. */
+	onPlanStateUpdate(listener: RpcPlanStateUpdateListener): () => void {
+		this.#planStateUpdateListeners.add(listener);
+		return () => this.#planStateUpdateListeners.delete(listener);
+	}
+
+	/** Subscribe to explicit plan approvals awaiting a host decision. */
+	onPlanApprovalRequest(listener: RpcPlanApprovalRequestListener): () => void {
+		this.#planApprovalRequestListeners.add(listener);
+		return () => this.#planApprovalRequestListeners.delete(listener);
+	}
+
+	/** Subscribe to approval decisions after they settle. */
+	onPlanApprovalSettled(listener: RpcPlanApprovalSettledListener): () => void {
+		this.#planApprovalSettledListeners.add(listener);
+		return () => this.#planApprovalSettledListeners.delete(listener);
+	}
+	/** Subscribe to bounded monotonic output chunks for RPC eval operations. */
+	onEvalOutput(listener: RpcEvalOutputListener): () => void {
+		this.#evalOutputListeners.add(listener);
+		return () => this.#evalOutputListeners.delete(listener);
+	}
+
+	/** Subscribe to successful RPC eval completion payloads. */
+	onEvalComplete(listener: RpcEvalCompleteListener): () => void {
+		this.#evalCompleteListeners.add(listener);
+		return () => this.#evalCompleteListeners.delete(listener);
+	}
+	/** Subscribe to text produced by extension commands. */
+	onCommandOutput(listener: RpcCommandOutputListener): () => void {
+		this.#commandOutputListeners.add(listener);
+		return () => this.#commandOutputListeners.delete(listener);
+	}
+
+	/** Subscribe to active session identity changes. */
+	onSessionInfoUpdate(listener: RpcSessionInfoUpdateListener): () => void {
+		this.#sessionInfoUpdateListeners.add(listener);
+		return () => this.#sessionInfoUpdateListeners.delete(listener);
+	}
+
+	/** Subscribe to active model and thinking-level changes. */
+	onConfigUpdate(listener: RpcConfigUpdateListener): () => void {
+		this.#configUpdateListeners.add(listener);
+		return () => this.#configUpdateListeners.delete(listener);
+	}
+
+	/** Subscribe to persisted settings invalidations. Pull values with getSettings(). */
+	onSettingsUpdate(listener: RpcSettingsUpdateListener): () => void {
+		this.#settingsUpdateListeners.add(listener);
+		return () => this.#settingsUpdateListeners.delete(listener);
+	}
+
+	/** Subscribe to extension handler failures. */
+	onExtensionError(listener: RpcExtensionErrorListener): () => void {
+		this.#extensionErrorListeners.add(listener);
+		return () => this.#extensionErrorListeners.delete(listener);
+	}
+
+	/** Subscribe to extension UI requests and passive UI updates. */
+	onExtensionUiRequest(listener: RpcExtensionUIRequestListener): () => void {
+		this.#extensionUiListeners.add(listener);
+		return () => this.#extensionUiListeners.delete(listener);
+	}
+	/** Subscribe to correlated provider-auth prompts. Secret responses are never emitted back by the server. */
+	onProviderAuthRequest(listener: RpcProviderAuthRequestListener): () => void {
+		this.#providerAuthRequestListeners.add(listener);
+		return () => this.#providerAuthRequestListeners.delete(listener);
+	}
+
+	/** Subscribe to authoritative post-login/post-removal auth state. */
+	onProviderAuthUpdate(listener: RpcProviderAuthUpdateListener): () => void {
+		this.#providerAuthUpdateListeners.add(listener);
+		return () => this.#providerAuthUpdateListeners.delete(listener);
+	}
+
+	/** Respond to a confirmation request. Privileged mutations require the server-issued operation id. */
+	sendUiConfirmation(id: string, confirmed: boolean, operationId?: string): void {
+		this.#writeFrame({ type: "extension_ui_response", id, confirmed, operationId });
+	}
+
+	/** Respond to a select, input, or editor request from an extension. */
+	sendUiValue(id: string, value: string): void {
+		this.#writeFrame({ type: "extension_ui_response", id, value });
+	}
+
+	/** Cancel an outstanding extension UI request. */
+	cancelUiRequest(id: string, timedOut = false): void {
+		this.#writeFrame({
+			type: "extension_ui_response",
+			id,
+			cancelled: true,
+			...(timedOut ? { timedOut: true } : {}),
+		});
 	}
 
 	/**
@@ -555,27 +1121,105 @@ export class RpcClient {
 	// Command Methods
 	// =========================================================================
 
+	/** Return the server's application-level RPC capability manifest. */
+	async getCapabilities(): Promise<RpcCapabilityManifest> {
+		const response = await this.#send({ type: "get_capabilities" });
+		return this.#getData(response);
+	}
+
 	/**
 	 * Send a prompt to the agent.
 	 * Returns immediately after sending; use onEvent() to receive streaming events.
 	 * Use waitForIdle() to wait for completion.
 	 */
-	async prompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "prompt", message, images });
+	async prompt(message: string, images?: ImageContent[]): Promise<RpcOperationAccepted | undefined> {
+		return (await this.#sendPrompt(message, images)).accepted;
+	}
+
+	async #sendPrompt(
+		message: string,
+		images?: ImageContent[],
+		onRequestId?: (id: string) => void,
+	): Promise<{ accepted: RpcOperationAccepted | undefined; agentInvoked: boolean | undefined }> {
+		let requestId: string | undefined;
+		let response: RpcResponse;
+		try {
+			response = await this.#send({ type: "prompt", message, images }, 30_000, id => {
+				requestId = id;
+				this.#pendingPromptRequestIds.add(id);
+				onRequestId?.(id);
+			});
+		} catch (error) {
+			if (requestId) {
+				this.#pendingPromptRequestIds.delete(requestId);
+				this.#legacyPromptRequestIds.delete(requestId);
+			}
+			throw error;
+		}
+		const accepted = response.success && "data" in response ? parseRpcOperationAccepted(response.data) : undefined;
+		this.#registerAcceptedOperation(accepted);
+		const localOnly =
+			response.success &&
+			response.command === "prompt" &&
+			isRecord(response.data) &&
+			response.data.agentInvoked === false;
+		if (requestId) {
+			if (accepted?.operationId || localOnly || !response.success) {
+				this.#pendingPromptRequestIds.delete(requestId);
+			} else {
+				this.#legacyPromptRequestIds.add(requestId);
+			}
+		}
+		if (
+			response.success &&
+			response.command === "prompt" &&
+			isRecord(response.data) &&
+			typeof response.data.agentInvoked === "boolean"
+		) {
+			this.#emitPromptResult({
+				type: "prompt_result",
+				id: response.id,
+				agentInvoked: response.data.agentInvoked,
+			});
+		}
+		return {
+			accepted,
+			agentInvoked:
+				response.success &&
+				response.command === "prompt" &&
+				isRecord(response.data) &&
+				typeof response.data.agentInvoked === "boolean"
+					? response.data.agentInvoked
+					: undefined,
+		};
 	}
 
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "steer", message, images });
+		this.#continuationRequestCount++;
+		try {
+			await this.#send({ type: "steer", message, images });
+			this.#continuationGeneration++;
+			this.#agentStreaming = true;
+		} finally {
+			this.#continuationRequestCount--;
+		}
 	}
 
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 */
 	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "follow_up", message, images });
+		this.#continuationRequestCount++;
+		try {
+			await this.#send({ type: "follow_up", message, images });
+			this.#continuationGeneration++;
+			this.#agentStreaming = true;
+		} finally {
+			this.#continuationRequestCount--;
+		}
 	}
 
 	/**
@@ -588,8 +1232,96 @@ export class RpcClient {
 	/**
 	 * Abort current operation and immediately start a new turn with the given message.
 	 */
-	async abortAndPrompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "abort_and_prompt", message, images });
+	async abortAndPrompt(message: string, images?: ImageContent[]): Promise<RpcOperationAccepted | undefined> {
+		const response = await this.#send({ type: "abort_and_prompt", message, images });
+		const accepted = response.success && "data" in response ? parseRpcOperationAccepted(response.data) : undefined;
+		this.#registerAcceptedOperation(accepted);
+		return accepted;
+	}
+
+	/**
+	 * Accept a confirmed eval operation. The server emits a correlated confirm
+	 * request before executing any code; use onExtensionUIRequest/respondToExtensionUI.
+	 */
+	async evalExecute(options: {
+		language: RpcEvalLanguage;
+		code: string;
+		title?: string;
+		timeout?: number;
+		reset?: boolean;
+		excludeFromContext?: boolean;
+	}): Promise<RpcOperationAccepted> {
+		const response = await this.#send({ type: "eval_execute", ...options });
+		const accepted = response.success && "data" in response ? parseRpcOperationAccepted(response.data) : undefined;
+		if (!accepted) throw new Error("eval_execute response did not contain an operation ID");
+		this.#registerAcceptedOperation(accepted);
+		return accepted;
+	}
+
+	/** Read bounded user-eval entries from the authoritative session transcript. */
+	async getEvalHistory(limit?: number): Promise<RpcEvalHistoryEntry[]> {
+		const response = await this.#send({ type: "get_eval_history", limit });
+		const data = this.#getData<{ entries: RpcEvalHistoryEntry[] }>(response);
+		return data.entries;
+	}
+
+	/** Cancel one accepted operation without cancelling unrelated work. */
+	async cancelOperation(operationId: string): Promise<RpcCancelOperationResult> {
+		const response = await this.#send({ type: "cancel_operation", operationId });
+		return this.#getData<RpcCancelOperationResult>(response);
+	}
+
+	/** Reconcile active work and recently settled outcomes after missed frames. */
+	async getOperations(): Promise<RpcOperationsSnapshot> {
+		const response = await this.#send({ type: "get_operations" });
+		const snapshot = this.#getData<RpcOperationsSnapshot>(response);
+		this.#activeOperationIds = new Set(snapshot.active.map(operation => operation.operationId));
+		for (const terminal of snapshot.recent) this.#rememberSettledOperation(terminal.operationId);
+		return snapshot;
+	}
+	/** Read the authoritative tool registry at the session command boundary. */
+	async getToolInventory(): Promise<ToolInventory> {
+		const response = await this.#send({ type: "get_tool_inventory" });
+		return this.#getData(response);
+	}
+	/** Atomically activate and deactivate already-registered tools for this session. */
+	async setToolActivation(options: { activate?: string[]; deactivate?: string[] }): Promise<RpcToolActivationResult> {
+		const response = await this.#send({ type: "set_tool_activation", ...options });
+		return this.#getData(response);
+	}
+
+	async getQueue(): Promise<SessionQueueSnapshot> {
+		return this.#getData(await this.#send({ type: "get_queue" }));
+	}
+
+	async removeQueuedMessage(entryId: string): Promise<{
+		removed: { text: string; images?: ImageContent[] };
+		queue: SessionQueueSnapshot;
+	}> {
+		return this.#getData(await this.#send({ type: "remove_queued_message", entryId }));
+	}
+
+	async reorderQueuedMessage(entryId: string, toIndex: number): Promise<SessionQueueSnapshot> {
+		return this.#getData(await this.#send({ type: "reorder_queued_message", entryId, toIndex }));
+	}
+
+	async clearQueue(lane?: "steering" | "followUp" | "all"): Promise<SessionQueueClearResult> {
+		return this.#getData(await this.#send({ type: "clear_queue", lane }));
+	}
+
+	async listJobs(): Promise<RpcJobListResult> {
+		return this.#getData(await this.#send({ type: "list_jobs" }));
+	}
+
+	async getJob(jobId: string): Promise<RpcJobListResult["jobs"][number] | null> {
+		const result = this.#getData<{ job: RpcJobListResult["jobs"][number] | null }>(
+			await this.#send({ type: "get_job", jobId }),
+		);
+		return result.job;
+	}
+
+	async cancelJobs(jobIds: string[]): Promise<{ outcomes: Array<{ id: string; status: string; message: string }> }> {
+		return this.#getData(await this.#send({ type: "cancel_job", jobIds }, 60_000));
 	}
 
 	/**
@@ -605,18 +1337,89 @@ export class RpcClient {
 	/**
 	 * Get current session state.
 	 */
-	async getState(): Promise<RpcSessionState> {
-		const response = await this.#send({ type: "get_state" });
+	async getState(timeoutMs = 30_000): Promise<RpcSessionState> {
+		const response = await this.#send({ type: "get_state" }, timeoutMs);
 		const state = this.#getData<RpcSessionState>(response);
+		const rawActivityPhase: unknown = state.activityPhase;
+		const activityPhase: RpcSessionState["activityPhase"] =
+			rawActivityPhase === "provider" || rawActivityPhase === "maintenance" || rawActivityPhase === "idle"
+				? rawActivityPhase
+				: rawActivityPhase === undefined && !state.isStreaming
+					? "idle"
+					: "maintenance";
+		const mode: RpcSessionMode =
+			state.mode === "plan" || state.mode === "plan_paused" || state.mode === "none" ? state.mode : "none";
 		return {
 			...state,
+			mode,
+			plan: state.plan ? parseRpcPlanState(state.plan) : undefined,
+			activityPhase,
 			fastModeEnabled: state.fastModeEnabled === true,
 			fastModeActive: state.fastModeActive === true,
 			tokensPerSecond:
 				typeof state.tokensPerSecond === "number" && Number.isFinite(state.tokensPerSecond)
 					? state.tokensPerSecond
 					: null,
+			advisor: parseRpcAdvisorState(state.advisor),
 		};
+	}
+
+	/** Read configured intent and effective live advisor runtime state. */
+	async getAdvisorState(): Promise<RpcAdvisorState> {
+		const response = await this.#send({ type: "get_advisor_state" });
+		const advisor = parseRpcAdvisorState(this.#getData<unknown>(response));
+		if (!advisor) throw new Error("Invalid get_advisor_state response");
+		return advisor;
+	}
+
+	/** Enable or disable advisors for this session and return authoritative runtime state. */
+	async setAdvisorEnabled(enabled: boolean): Promise<RpcAdvisorState> {
+		const response = await this.#send({ type: "set_advisor_enabled", enabled });
+		const advisor = parseRpcAdvisorState(this.#getData<unknown>(response));
+		if (!advisor) throw new Error("Invalid set_advisor_enabled response");
+		return advisor;
+	}
+
+	async setMode(
+		mode: RpcSessionMode,
+		options?: {
+			planFilePath?: string;
+			workflow?: RpcPlanWorkflow;
+			when?: "immediate" | "next_idle";
+		},
+	): Promise<RpcModeChangeResult> {
+		const response = await this.#send({ type: "set_mode", mode, ...options });
+		const data = this.#getData<unknown>(response);
+		const accepted = parseRpcOperationAccepted(data);
+		if (!accepted || !isRecord(data) || typeof data.deferred !== "boolean") {
+			throw new Error("set_mode response did not contain a valid accepted operation");
+		}
+		this.#registerAcceptedOperation(accepted);
+		return { ...accepted, deferred: data.deferred };
+	}
+
+	async getPlan(): Promise<RpcPlanState> {
+		const response = await this.#send({ type: "get_plan" });
+		return parseRpcPlanState(this.#getData(response));
+	}
+
+	async resolvePlanApproval(
+		approvalId: string,
+		decision:
+			| {
+					decision: "approve";
+					preserveContext?: boolean;
+					compactBeforeExecute?: boolean;
+					executionModelRole?: string;
+					editedContent?: string;
+			  }
+			| { decision: "refine" | "reject"; feedback?: string },
+	): Promise<RpcOperationAccepted> {
+		const response = await this.#send({ type: "resolve_plan_approval", approvalId, ...decision });
+		const accepted = parseRpcOperationAccepted(this.#getData<unknown>(response));
+		if (!accepted) throw new Error("resolve_plan_approval response did not contain a valid accepted operation");
+		this.#registerAcceptedOperation(accepted);
+		return accepted;
 	}
 
 	/**
@@ -624,6 +1427,51 @@ export class RpcClient {
 	 */
 	async setFastMode(enabled: boolean): Promise<{ enabled: boolean; active: boolean }> {
 		const response = await this.#send({ type: "set_fast_mode", enabled });
+		return this.#getData(response);
+	}
+
+	/** Replace the active session's todo phases. */
+	async setTodos(phases: TodoPhase[]): Promise<TodoPhase[]> {
+		const response = await this.#send({ type: "set_todos", phases });
+		return this.#getData<{ todoPhases: TodoPhase[] }>(response).todoPhases;
+	}
+
+	/** Replace the URI schemes served by the embedding host. */
+	async setHostUriSchemes(schemes: RpcHostUriSchemeDefinition[]): Promise<string[]> {
+		const nextSchemes = structuredClone(schemes);
+		if (!this.#process) {
+			this.#hostUriSchemes = nextSchemes;
+			return this.#hostUriSchemes.map(scheme => scheme.scheme);
+		}
+		const response = await this.#send({ type: "set_host_uri_schemes", schemes: nextSchemes });
+		const accepted = this.#getData<{ schemes: string[] }>(response).schemes;
+		this.#hostUriSchemes = nextSchemes;
+		return accepted;
+	}
+
+	/** Register the handler for requests targeting host-owned URI schemes. */
+	registerHostUriHandler(handler: RpcClientHostUriHandler): () => void {
+		this.#hostUriHandler = handler;
+		return () => {
+			if (this.#hostUriHandler === handler) this.#hostUriHandler = undefined;
+		};
+	}
+
+	/**
+	 * Describe the settings schema, optionally scoped to one settings tab.
+	 *
+	 * Metadata is returned for every setting; a configured value is included
+	 * only for settings the schema explicitly marks readable over RPC, and the
+	 * rest carry `redacted: true` with no value and no configured status.
+	 */
+	async getSettings(tab?: SettingTab): Promise<SettingsSnapshot> {
+		const response = await this.#send(tab === undefined ? { type: "get_settings" } : { type: "get_settings", tab });
+		return this.#getData(response);
+	}
+
+	/** Persist a validated batch of global settings changes. */
+	async setSettings(changes: readonly RpcSettingsChange[]): Promise<SettingsSnapshot> {
+		const response = await this.#send({ type: "set_settings", changes: [...changes] });
 		return this.#getData(response);
 	}
 
@@ -659,6 +1507,44 @@ export class RpcClient {
 			fromByte: selector.fromByte,
 		});
 		return this.#getData<RpcSubagentMessagesResult>(response);
+	}
+
+	async listAgents(options: { includeAdvisors?: boolean } = {}): Promise<RpcAgentSnapshot[]> {
+		const response = await this.#send({ type: "list_agents", includeAdvisors: options.includeAdvisors });
+		return this.#getData<{ agents: RpcAgentSnapshot[] }>(response).agents;
+	}
+
+	async getAgent(agentId: string): Promise<RpcAgentSnapshot> {
+		const response = await this.#send({ type: "get_agent", agentId });
+		return this.#getData<{ agent: RpcAgentSnapshot }>(response).agent;
+	}
+
+	async getAgentResult(agentId: string): Promise<RpcAgentResult> {
+		return this.#getData(await this.#send({ type: "get_agent_result", agentId }));
+	}
+
+	async sendAgentMessage(agentId: string, message: string, replyTo?: string): Promise<RpcAgentSendResult> {
+		return this.#getData(await this.#send({ type: "send_agent_message", agentId, message, replyTo }));
+	}
+
+	async parkAgent(agentId: string): Promise<RpcAgentSnapshot> {
+		const response = await this.#send({ type: "park_agent", agentId });
+		return this.#getData<{ agent: RpcAgentSnapshot }>(response).agent;
+	}
+
+	async resumeAgent(agentId: string): Promise<RpcAgentSnapshot> {
+		const response = await this.#send({ type: "resume_agent", agentId });
+		return this.#getData<{ agent: RpcAgentSnapshot }>(response).agent;
+	}
+
+	async cancelAgent(
+		agentId: string,
+	): Promise<{ id: string; status: "cancelled" | "not_found" | "already_completed"; message: string }> {
+		return this.#getData(await this.#send({ type: "cancel_agent", agentId }));
+	}
+
+	async releaseAgent(agentId: string, tombstone = false): Promise<RpcAgentReleaseResult> {
+		return this.#getData(await this.#send({ type: "release_agent", agentId, tombstone }));
 	}
 
 	/**
@@ -724,6 +1610,14 @@ export class RpcClient {
 	 */
 	async setFollowUpMode(mode: "all" | "one-at-a-time"): Promise<void> {
 		await this.#send({ type: "set_follow_up_mode", mode });
+	}
+
+	/**
+	 * Choose whether new user input interrupts immediately or waits for the
+	 * current turn to settle.
+	 */
+	async setInterruptMode(mode: "immediate" | "wait"): Promise<void> {
+		await this.#send({ type: "set_interrupt_mode", mode });
 	}
 
 	/**
@@ -803,6 +1697,61 @@ export class RpcClient {
 		return this.#getData(response);
 	}
 
+	/** List persisted sessions without exposing transcript text. */
+	async listSessions(options: SessionCatalogQuery = {}): Promise<SessionCatalogPage> {
+		const response = await this.#send({ type: "list_sessions", ...options });
+		return this.#getData<SessionCatalogPage>(response);
+	}
+
+	/** Inspect one cataloged session by id, id prefix, or cataloged absolute path. */
+	async getSessionInfo(
+		session: string,
+		options: { scope?: SessionCatalogScope; cwd?: string } = {},
+	): Promise<RpcSessionInfoResult> {
+		const response = await this.#send({ type: "get_session_info", session, ...options });
+		return this.#getData<RpcSessionInfoResult>(response);
+	}
+
+	/** List distinct persisted workspace roots. */
+	async listWorkspaceRoots(): Promise<SessionWorkspaceRoot[]> {
+		const response = await this.#send({ type: "list_workspace_roots" });
+		return this.#getData<{ roots: SessionWorkspaceRoot[] }>(response).roots;
+	}
+
+	/** Resume a cataloged session by id, id prefix, or absolute path. */
+	async resumeSession(
+		session: string,
+		options: { scope?: SessionCatalogScope; cwd?: string } = {},
+	): Promise<RpcResumeSessionResult> {
+		const response = await this.#send({ type: "resume_session", session, ...options });
+		return this.#getData<RpcResumeSessionResult>(response);
+	}
+
+	/** Fork the active persisted session. */
+	async forkSession(): Promise<RpcForkSessionResult> {
+		const response = await this.#send({ type: "fork_session" });
+		return this.#getData<RpcForkSessionResult>(response);
+	}
+
+	/** Rename a cataloged active or inactive session. */
+	async renameSession(
+		session: string,
+		name: string,
+		options: { scope?: SessionCatalogScope; cwd?: string } = {},
+	): Promise<RpcRenameSessionResult> {
+		const response = await this.#send({ type: "rename_session", session, name, ...options });
+		return this.#getData<RpcRenameSessionResult>(response);
+	}
+
+	/** Delete a cataloged session without leaving an active writer attached. */
+	async deleteSession(
+		session: string,
+		options: { scope?: SessionCatalogScope; cwd?: string } = {},
+	): Promise<RpcDeleteSessionResult> {
+		const response = await this.#send({ type: "delete_session", session, ...options });
+		return this.#getData<RpcDeleteSessionResult>(response);
+	}
+
 	/**
 	 * Branch from a specific message.
 	 * @returns Object with `text` (the message text) and `cancelled` (if extension cancelled)
@@ -826,6 +1775,12 @@ export class RpcClient {
 	async getLastAssistantText(): Promise<string | null> {
 		const response = await this.#send({ type: "get_last_assistant_text" });
 		return this.#getData<{ text: string | null }>(response).text;
+	}
+
+	/** Set the active session's display name. */
+	async setSessionName(name: string): Promise<void> {
+		const response = await this.#send({ type: "set_session_name", name });
+		this.#getData<void>(response);
 	}
 
 	/**
@@ -869,70 +1824,29 @@ export class RpcClient {
 		return this.#getData<{ messages: AgentMessage[] }>(response).messages;
 	}
 
-	/**
-	 * Get list of OAuth providers available for login, with their current authentication status.
-	 */
-	async getLoginProviders(): Promise<Array<{ id: string; name: string; available: boolean; authenticated: boolean }>> {
-		const response = await this.#send({ type: "get_login_providers" });
-		return this.#getData<{
-			providers: Array<{ id: string; name: string; available: boolean; authenticated: boolean }>;
-		}>(response).providers;
+	async listProviderAuth(): Promise<RpcProviderAuthState[]> {
+		const response = await this.#send({ type: "list_provider_auth" });
+		const data = this.#getData<{ providers?: unknown }>(response);
+		if (!Array.isArray(data.providers)) throw new Error("RPC provider auth inventory is malformed");
+		return data.providers.map(parseProviderAuthState);
 	}
 
-	/**
-	 * Trigger OAuth login for the given provider.
-	 * The server will emit an `open_url` extension_ui_request for the auth URL.
-	 * Providers that require pasted-code completion may then emit an `input`
-	 * extension_ui_request; pass `onManualCodeInput` to satisfy it.
-	 * Resolves when login completes or rejects on failure.
-	 *
-	 * @param onOpenUrl Called when the server emits the auth URL. The host must
-	 *   open `url` in a browser. When the flow's callback server hosts a
-	 *   `/launch` redirect, `launchUrl` is a short loopback URL that 302s to
-	 *   `url` — hosts SHOULD surface it as the truncation-safe copy target so
-	 *   terminal viewport clipping cannot corrupt trailing OAuth query
-	 *   parameters (e.g. `code_challenge_method=S256`).
-	 */
-	async login(
-		providerId: string,
-		options?: {
-			onOpenUrl?: (url: string, instructions?: string, launchUrl?: string) => void;
-			onManualCodeInput?: (prompt: { title: string; placeholder?: string }) => string | Promise<string>;
-		},
-	): Promise<{ providerId: string }> {
-		const { onManualCodeInput, onOpenUrl } = options ?? {};
-		const listener =
-			onOpenUrl || onManualCodeInput
-				? (req: RpcExtensionUIRequest) => {
-						if (req.method === "open_url") {
-							onOpenUrl?.(req.url, req.instructions, req.launchUrl);
-							return;
-						}
-						if (req.method !== "input" || !onManualCodeInput) return;
-						void Promise.resolve(onManualCodeInput({ title: req.title, placeholder: req.placeholder }))
-							.then(value => {
-								this.#writeFrame({
-									type: "extension_ui_response",
-									id: req.id,
-									value,
-								});
-							})
-							.catch(() => {
-								this.#writeFrame({
-									type: "extension_ui_response",
-									id: req.id,
-									cancelled: true,
-								});
-							});
-					}
-				: undefined;
-		if (listener) this.#extensionUiListeners.add(listener);
-		try {
-			const response = await this.#send({ type: "login", providerId }, 600_000);
-			return this.#getData<{ providerId: string }>(response);
-		} finally {
-			if (listener) this.#extensionUiListeners.delete(listener);
-		}
+	async beginProviderAuth(providerId: string, method: RpcProviderAuthMethod): Promise<RpcOperationAccepted> {
+		const response = await this.#send({ type: "begin_provider_auth", providerId, method });
+		const accepted = parseRpcOperationAccepted(this.#getData<unknown>(response));
+		if (!accepted) throw new Error("RPC begin_provider_auth response is malformed");
+		this.#registerAcceptedOperation(accepted);
+		return accepted;
+	}
+
+	async cancelProviderAuth(operationId: string): Promise<RpcCancelOperationResult> {
+		return this.#getData<RpcCancelOperationResult>(await this.#send({ type: "cancel_provider_auth", operationId }));
+	}
+
+	async removeProviderAuth(providerId: string): Promise<RpcProviderAuthState> {
+		const response = await this.#send({ type: "remove_provider_auth", providerId });
+		const data = this.#getData<{ state?: unknown }>(response);
+		return parseProviderAuthState(data.state);
 	}
 
 	/**
@@ -961,28 +1875,85 @@ export class RpcClient {
 	// =========================================================================
 
 	/**
-	 * Wait for agent to become idle (no streaming).
-	 * Resolves when agent_end event is received.
+	 * Wait for the client to become idle.
+	 * Uses correlated operation terminals when supported, otherwise agent_end.
 	 */
-	waitForIdle(timeout = 60000): Promise<void> {
+	async waitForIdle(timeout = 60000): Promise<void> {
+		const deadline = Date.now() + timeout;
+		while (
+			this.#continuationRequestCount > 0 ||
+			this.#continuationGeneration !== this.#confirmedContinuationGeneration
+		) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) {
+				throw new Error(`Timeout waiting for agent to become idle. Stderr: ${this.#process?.peekStderr() ?? ""}`);
+			}
+			if (this.#continuationRequestCount > 0) {
+				await Bun.sleep(Math.min(10, remaining));
+				continue;
+			}
+
+			const generation = this.#continuationGeneration;
+			const stateTimeout = deadline - Date.now();
+			let state: RpcSessionState;
+			try {
+				state = await this.getState(stateTimeout);
+			} catch (error) {
+				if (Date.now() >= deadline) {
+					throw new Error(
+						`Timeout waiting for agent to become idle. Stderr: ${this.#process?.peekStderr() ?? ""}`,
+					);
+				}
+				throw error;
+			}
+			if (
+				this.#continuationRequestCount === 0 &&
+				this.#continuationGeneration === generation &&
+				this.#activeOperationIds.size === 0 &&
+				this.#pendingPromptRequestIds.size === 0 &&
+				state.activityPhase === "idle" &&
+				state.queuedMessageCount === 0
+			) {
+				this.#confirmedContinuationGeneration = generation;
+				this.#agentStreaming = false;
+				return;
+			}
+			await Bun.sleep(Math.min(10, Math.max(1, deadline - Date.now())));
+		}
+
+		if (this.#activeOperationIds.size === 0 && this.#pendingPromptRequestIds.size === 0 && !this.#agentStreaming)
+			return;
+
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		let settled = false;
-		const unsubscribe = this.onEvent(event => {
-			if (event.type === "agent_end") {
-				settled = true;
-				unsubscribe();
-				clearTimeout(timeoutId);
-				resolve();
-			}
+		const finishIfIdle = () => {
+			if (
+				settled ||
+				this.#activeOperationIds.size > 0 ||
+				this.#pendingPromptRequestIds.size > 0 ||
+				this.#agentStreaming
+			)
+				return;
+			settled = true;
+			unsubscribeOperation();
+			unsubscribeEvent();
+			clearTimeout(timeoutId);
+			resolve();
+		};
+		const unsubscribeOperation = this.onOperationTerminal(finishIfIdle);
+		const unsubscribeEvent = this.onEvent(event => {
+			if (isTerminalAgentEnd(event)) this.#agentStreaming = false;
+			finishIfIdle();
 		});
-
-		const timeoutId = this.#startTimeout(timeout, () => {
+		const timeoutId = this.#startTimeout(Math.max(0, deadline - Date.now()), () => {
 			if (settled) return;
 			settled = true;
-			unsubscribe();
+			unsubscribeOperation();
+			unsubscribeEvent();
 			reject(new Error(`Timeout waiting for agent to become idle. Stderr: ${this.#process?.peekStderr() ?? ""}`));
 		});
-		return promise;
+		finishIfIdle();
+		await promise;
 	}
 
 	/**
@@ -994,7 +1965,7 @@ export class RpcClient {
 		let settled = false;
 		const unsubscribe = this.onEvent(event => {
 			events.push(event);
-			if (event.type === "agent_end") {
+			if (isTerminalAgentEnd(event)) {
 				settled = true;
 				unsubscribe();
 				clearTimeout(timeoutId);
@@ -1015,16 +1986,81 @@ export class RpcClient {
 	 * Send prompt and wait for completion, returning all events.
 	 */
 	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentEvent[]> {
-		const eventsPromise = this.collectEvents(timeout);
-		await this.prompt(message, images);
-		return eventsPromise;
+		const events: AgentEvent[] = [];
+		const operationFrames = new Map<string, RpcOperationTerminalFrame>();
+		const terminalAgentEnd = Promise.withResolvers<void>();
+		let operationChanged = Promise.withResolvers<void>();
+		const unsubscribeEvent = this.onEvent(event => {
+			events.push(event);
+			if (isTerminalAgentEnd(event)) terminalAgentEnd.resolve();
+		});
+		const unsubscribeOperation = this.onOperationTerminal(frame => {
+			operationFrames.set(frame.operationId, frame);
+			operationChanged.resolve();
+		});
+		const timeoutSignal = Promise.withResolvers<never>();
+		const timeoutId = this.#startTimeout(timeout, () =>
+			timeoutSignal.reject(
+				new Error(`Timeout waiting for prompt operation. Stderr: ${this.#process?.peekStderr() ?? ""}`),
+			),
+		);
+
+		try {
+			const submission = await this.#sendPrompt(message, images);
+			if (submission.agentInvoked === false) return events;
+			if (!submission.accepted?.operationId) {
+				await Promise.race([terminalAgentEnd.promise, timeoutSignal.promise]);
+				return events;
+			}
+
+			while (!operationFrames.has(submission.accepted.operationId)) {
+				await Promise.race([operationChanged.promise, timeoutSignal.promise]);
+				operationChanged = Promise.withResolvers<void>();
+			}
+			const terminal = operationFrames.get(submission.accepted.operationId);
+			if (!terminal) throw new Error(`Missing terminal result for operation ${submission.accepted.operationId}`);
+			return events;
+		} finally {
+			clearTimeout(timeoutId);
+			unsubscribeEvent();
+			unsubscribeOperation();
+		}
 	}
 
 	// =========================================================================
 	// Internal
 	// =========================================================================
 
+	#emitRawFrame(data: unknown): void {
+		if (!isRecord(data) || this.#rawFrameListeners.size === 0) return;
+		const frame = structuredClone(data);
+		for (const listener of this.#rawFrameListeners) listener(frame);
+	}
+
+	#emitPromptResult(result: RpcPromptResultFrame): void {
+		for (const listener of this.#promptResultListeners) {
+			listener(result);
+		}
+	}
+
+	#registerAcceptedOperation(accepted: RpcOperationAccepted | undefined): void {
+		const operationId = accepted?.operationId;
+		if (!operationId || this.#settledOperationIds.has(operationId)) return;
+		this.#activeOperationIds.add(operationId);
+	}
+
+	#rememberSettledOperation(operationId: string): void {
+		this.#activeOperationIds.delete(operationId);
+		this.#settledOperationIds.add(operationId);
+		if (this.#settledOperationIds.size > 256) {
+			const oldest = this.#settledOperationIds.values().next().value;
+			if (typeof oldest === "string") this.#settledOperationIds.delete(oldest);
+		}
+	}
+
 	#handleLine(data: unknown): void {
+		this.#emitRawFrame(data);
+
 		// Check if it's a response to a pending request
 		if (isRpcResponse(data)) {
 			const id = data.id;
@@ -1041,15 +2077,44 @@ export class RpcClient {
 			return;
 		}
 
+		if (isRpcHostUriRequest(data)) {
+			void this.#handleHostUriRequest(data);
+			return;
+		}
+
 		if (isRpcExtensionUiRequest(data)) {
 			for (const listener of this.#extensionUiListeners) {
 				listener(data);
 			}
 			return;
 		}
+		if (isRpcProviderAuthRequestFrame(data)) {
+			for (const listener of this.#providerAuthRequestListeners) listener(data);
+			return;
+		}
+		if (isRpcProviderAuthUpdateFrame(data)) {
+			const state = parseProviderAuthState(data.state);
+			for (const listener of this.#providerAuthUpdateListeners) listener(state);
+			return;
+		}
+
+		if (isRpcProviderAuthRequestFrame(data)) {
+			for (const listener of this.#providerAuthRequestListeners) listener(data);
+			return;
+		}
+		if (isRpcProviderAuthUpdateFrame(data)) {
+			const state = parseProviderAuthState(data.state);
+			for (const listener of this.#providerAuthUpdateListeners) listener(state);
+			return;
+		}
 
 		if (isRpcHostToolCancelRequest(data)) {
 			this.#pendingHostToolCalls.get(data.targetId)?.controller.abort();
+			return;
+		}
+
+		if (isRpcHostUriCancelRequest(data)) {
+			this.#pendingHostUriRequests.get(data.targetId)?.controller.abort();
 			return;
 		}
 
@@ -1074,14 +2139,112 @@ export class RpcClient {
 			return;
 		}
 
+		if (isRpcEvalOutputFrame(data)) {
+			for (const listener of this.#evalOutputListeners) listener(data);
+			return;
+		}
+		if (isRpcEvalCompleteFrame(data)) {
+			for (const listener of this.#evalCompleteListeners) listener(data);
+			return;
+		}
+		if (isRpcAgentRegistryUpdateFrame(data)) {
+			for (const listener of this.#agentRegistryUpdateListeners) listener(data);
+			return;
+		}
 		if (isRpcAvailableCommandsUpdateFrame(data)) {
 			for (const listener of this.#availableCommandsUpdateListeners) {
 				listener(data.commands);
 			}
 			return;
 		}
+		if (isRpcToolInventoryUpdateFrame(data)) {
+			for (const listener of this.#toolInventoryUpdateListeners) listener(data);
+			return;
+		}
+		if (isRecord(data) && data.type === "queue_update" && isRecord(data.queue)) {
+			for (const listener of this.#queueUpdateListeners) listener(data as unknown as RpcQueueUpdateFrame);
+			return;
+		}
+		if (isRecord(data) && data.type === "job_update" && Array.isArray(data.jobs) && Array.isArray(data.agents)) {
+			for (const listener of this.#jobUpdateListeners) listener(data as unknown as RpcJobUpdateFrame);
+			return;
+		}
+
+		if (isRpcPromptResultFrame(data)) {
+			this.#emitPromptResult(data);
+			return;
+		}
+
+		if (isRpcOperationStartedFrame(data)) {
+			if (!this.#settledOperationIds.has(data.operationId)) this.#activeOperationIds.add(data.operationId);
+			for (const listener of this.#operationStartedListeners) listener(data);
+			return;
+		}
+		if (isRpcOperationTerminalFrame(data)) {
+			this.#rememberSettledOperation(data.operationId);
+			for (const listener of this.#operationTerminalListeners) {
+				listener(data);
+			}
+			return;
+		}
+		if (isRpcPlanStateUpdateFrame(data)) {
+			const frame: RpcPlanStateUpdateFrame = { ...data, state: parseRpcPlanState(data.state) };
+			for (const listener of this.#planStateUpdateListeners) listener(frame);
+			return;
+		}
+		if (isRpcPlanApprovalRequestFrame(data)) {
+			for (const listener of this.#planApprovalRequestListeners) listener(data);
+			return;
+		}
+		if (isRpcPlanApprovalSettledFrame(data)) {
+			for (const listener of this.#planApprovalSettledListeners) listener(data);
+			return;
+		}
+		if (isRpcCommandOutputFrame(data)) {
+			for (const listener of this.#commandOutputListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcSessionInfoUpdateFrame(data)) {
+			const mode: RpcSessionMode =
+				data.mode === "plan" || data.mode === "plan_paused" || data.mode === "none" ? data.mode : "none";
+			const frame: RpcSessionInfoUpdateFrame = { ...data, mode };
+			for (const listener of this.#sessionInfoUpdateListeners) listener(frame);
+			return;
+		}
+
+		if (isRpcConfigUpdateFrame(data)) {
+			const frame = { ...data, advisor: parseRpcAdvisorState(data.advisor) };
+			for (const listener of this.#configUpdateListeners) {
+				listener(frame);
+			}
+			return;
+		}
+
+		if (isRpcSettingsUpdateFrame(data)) {
+			for (const listener of this.#settingsUpdateListeners) listener(data);
+			return;
+		}
+
+		if (isRpcExtensionErrorFrame(data)) {
+			for (const listener of this.#extensionErrorListeners) {
+				listener(data);
+			}
+			return;
+		}
 
 		if (!isAgentSessionEvent(data)) return;
+		if (data.type === "agent_start" || data.type === "turn_start") this.#agentStreaming = true;
+		if (data.type === "agent_end" && Reflect.get(data, "isTerminal") !== false) {
+			this.#agentStreaming = false;
+			const legacyRequestId = this.#legacyPromptRequestIds.values().next().value;
+			if (typeof legacyRequestId === "string") {
+				this.#legacyPromptRequestIds.delete(legacyRequestId);
+				this.#pendingPromptRequestIds.delete(legacyRequestId);
+			}
+		}
 
 		for (const listener of this.#sessionEventListeners) {
 			listener(data);
@@ -1094,12 +2257,13 @@ export class RpcClient {
 		}
 	}
 
-	#send(command: RpcCommandBody, timeoutMs = 30_000): Promise<RpcResponse> {
+	#send(command: RpcCommandBody, timeoutMs = 30_000, onRequestId?: (id: string) => void): Promise<RpcResponse> {
 		if (!this.#process?.stdin) {
 			throw new Error("Client not started");
 		}
 
 		const id = `req_${++this.#requestId}`;
+		onRequestId?.(id);
 		const fullCommand = { ...command, id } as RpcCommand;
 		const { promise, resolve, reject } = Promise.withResolvers<RpcResponse>();
 		let settled = false;
@@ -1192,8 +2356,74 @@ export class RpcClient {
 		}
 	}
 
+	async #handleHostUriRequest(request: RpcHostUriRequest): Promise<void> {
+		const handler = this.#hostUriHandler;
+		if (!handler) {
+			this.#writeFrame({
+				type: "host_uri_result",
+				id: request.id,
+				isError: true,
+				error: "No host URI handler is registered",
+			} satisfies RpcHostUriResult);
+			return;
+		}
+
+		const controller = new AbortController();
+		this.#pendingHostUriRequests.set(request.id, { controller });
+		try {
+			const result = await handler(request, { signal: controller.signal });
+			if (controller.signal.aborted) return;
+			if (request.operation === "write") {
+				this.#writeFrame({ type: "host_uri_result", id: request.id } satisfies RpcHostUriResult);
+				return;
+			}
+			if (typeof result === "string") {
+				this.#writeFrame({ type: "host_uri_result", id: request.id, content: result } satisfies RpcHostUriResult);
+				return;
+			}
+			if (!isRecord(result) || typeof result.content !== "string") {
+				throw new Error("Host URI read handlers must return a string or an object with string content");
+			}
+			if (
+				result.contentType !== undefined &&
+				result.contentType !== "text/markdown" &&
+				result.contentType !== "application/json" &&
+				result.contentType !== "text/plain"
+			) {
+				throw new Error(`Unsupported host URI content type: ${String(result.contentType)}`);
+			}
+			if (
+				result.notes !== undefined &&
+				(!Array.isArray(result.notes) || !result.notes.every(note => typeof note === "string"))
+			) {
+				throw new Error("Host URI result notes must be an array of strings");
+			}
+			if (result.immutable !== undefined && typeof result.immutable !== "boolean") {
+				throw new Error("Host URI result immutable must be a boolean");
+			}
+			this.#writeFrame({
+				type: "host_uri_result",
+				id: request.id,
+				content: result.content,
+				...(result.contentType === undefined ? {} : { contentType: result.contentType }),
+				...(result.notes === undefined ? {} : { notes: result.notes }),
+				...(result.immutable === undefined ? {} : { immutable: result.immutable }),
+			} satisfies RpcHostUriResult);
+		} catch (error) {
+			if (controller.signal.aborted) return;
+			this.#writeFrame({
+				type: "host_uri_result",
+				id: request.id,
+				isError: true,
+				error: error instanceof Error ? error.message : String(error),
+			} satisfies RpcHostUriResult);
+		} finally {
+			this.#pendingHostUriRequests.delete(request.id);
+		}
+	}
+
 	#writeFrame(
-		frame: RpcCommand | RpcExtensionUIResponse | RpcHostToolResult | RpcHostToolUpdate,
+		frame: RpcCommand | RpcExtensionUIResponse | RpcHostToolResult | RpcHostToolUpdate | RpcHostUriResult,
 		onError?: (error: Error) => void,
 	): void {
 		if (!this.#process?.stdin) {

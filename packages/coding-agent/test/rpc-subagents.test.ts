@@ -270,7 +270,7 @@ describe("RPC subagent registry", () => {
 		}
 	});
 
-	test("prunes terminal lifecycle snapshots while retaining transcript selectors", () => {
+	test("retains terminal lifecycle snapshots and transcript selectors", () => {
 		const eventBus = new EventBus();
 		const registry = new RpcSubagentRegistry(eventBus, () => {});
 		const sessionFile = "/tmp/subagent.jsonl";
@@ -293,9 +293,39 @@ describe("RPC subagent registry", () => {
 			sessionFile,
 		} satisfies SubagentLifecyclePayload);
 
-		expect(registry.getSubagents()).toHaveLength(0);
+		expect(registry.getSubagents()).toMatchObject([{ id: "SubagentA", status: "completed", terminal: true }]);
 		expect(registry.resolveSessionFile({ subagentId: "SubagentA" })).toBe(sessionFile);
 		expect(registry.resolveSessionFile({ sessionFile })).toBe(sessionFile);
+		registry.dispose();
+	});
+
+	test("synthesizes orphan progress and bounds terminal retention to 256 rows", () => {
+		const eventBus = new EventBus();
+		const registry = new RpcSubagentRegistry(eventBus, () => {});
+		eventBus.emit(TASK_SUBAGENT_PROGRESS_CHANNEL, {
+			index: 0,
+			agent: "task",
+			agentSource: "bundled",
+			task: "orphan",
+			sessionFile: "/tmp/orphan.jsonl",
+			progress: createProgress({ id: "Orphan", task: "orphan" }),
+		} satisfies SubagentProgressPayload);
+		expect(registry.getSubagents()).toMatchObject([{ id: "Orphan", terminal: false }]);
+
+		for (let index = 0; index < 257; index++) {
+			const id = `Terminal${index}`;
+			eventBus.emit(TASK_SUBAGENT_PROGRESS_CHANNEL, {
+				index,
+				agent: "task",
+				agentSource: "bundled",
+				task: id,
+				progress: createProgress({ id, index, task: id, status: "completed" }),
+			} satisfies SubagentProgressPayload);
+		}
+		const terminal = registry.getSubagents().filter(snapshot => snapshot.terminal);
+		expect(terminal).toHaveLength(256);
+		expect(terminal.some(snapshot => snapshot.id === "Terminal0")).toBe(false);
+		expect(terminal.some(snapshot => snapshot.id === "Terminal256")).toBe(true);
 		registry.dispose();
 	});
 

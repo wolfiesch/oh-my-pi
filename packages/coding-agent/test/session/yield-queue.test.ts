@@ -178,6 +178,70 @@ describe("YieldQueue", () => {
 		finishTurn.resolve();
 		await flush;
 	});
+	test("settlement reschedules an idle flush skipped during the final streaming race", async () => {
+		const harness = createHarness(false);
+		harness.queue.register<Entry>("items", {
+			build: entries => userMessage(entries.map(entry => entry.id).join(",")),
+		});
+
+		harness.queue.enqueue("items", { id: "race" });
+		expect(harness.scheduledFlushes).toHaveLength(1);
+
+		harness.setStreaming(true);
+		await harness.scheduledFlushes[0]!();
+		expect(harness.queue.has("items")).toBe(true);
+		expect(harness.idleBatches).toHaveLength(0);
+
+		harness.setStreaming(false);
+		harness.queue.notifySettled();
+		harness.queue.notifySettled();
+		expect(harness.scheduledFlushes).toHaveLength(2);
+
+		await harness.scheduledFlushes[1]!();
+		harness.queue.notifySettled();
+		expect(harness.queue.has("items")).toBe(false);
+		expect(harness.scheduledFlushes).toHaveLength(2);
+		expect(harness.idleBatches.map(batch => batch.map(messageText))).toEqual([["race"]]);
+	});
+
+	test("settlement leaves skipIdleFlush entries for lazy delivery", () => {
+		const harness = createHarness(true);
+		harness.queue.register<Entry>("lazy", {
+			build: entries => userMessage(entries.map(entry => entry.id).join(",")),
+			skipIdleFlush: true,
+		});
+
+		harness.queue.enqueue("lazy", { id: "lazy" });
+		harness.setStreaming(false);
+		harness.queue.notifySettled();
+
+		expect(harness.scheduledFlushes).toHaveLength(0);
+		expect(harness.queue.has("lazy")).toBe(true);
+		expect(harness.queue.drainLazy().map(build => messageText(build()!))).toEqual(["lazy"]);
+	});
+
+	test("ordinary flushes preserve lazy-only entries when eligible entries coexist", async () => {
+		const harness = createHarness(true);
+		harness.queue.register<Entry>("eager", {
+			build: entries => userMessage(entries.map(entry => entry.id).join(",")),
+		});
+		harness.queue.register<Entry>("lazy", {
+			build: entries => userMessage(entries.map(entry => entry.id).join(",")),
+			skipIdleFlush: true,
+		});
+
+		harness.queue.enqueue("lazy", { id: "lazy" });
+		harness.queue.enqueue("eager", { id: "eager" });
+		harness.setStreaming(false);
+		harness.queue.notifySettled();
+		await harness.scheduledFlushes[0]!();
+		await harness.queue.flush("streaming");
+
+		expect(harness.idleBatches.map(batch => batch.map(messageText))).toEqual([["eager"]]);
+		expect(harness.streamingMessages).toEqual([]);
+		expect(harness.queue.has("lazy")).toBe(true);
+		expect(harness.queue.drainLazy().map(build => messageText(build()!))).toEqual(["lazy"]);
+	});
 
 	test("isStale drops stale entries and keeps survivors", async () => {
 		const harness = createHarness(true);

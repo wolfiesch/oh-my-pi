@@ -1,0 +1,87 @@
+{
+  "applicationApiVersion": 2,
+  "commands": [
+    {
+      "id": "rpc.command.get_capabilities",
+      "name": "get_capabilities",
+      "version": 1,
+      "scope": "host",
+      "execution": "sync",
+      "availability": "available",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "const": "get_capabilities" }
+        },
+        "required": ["type"],
+        "additionalProperties": false
+      },
+      "concurrencyClass": "serial",
+      "requiredFeatures": [],
+      "futureDescriptorField": { "safeToIgnore": true }
+    },
+    {
+      "id": "rpc.command.get_tool_inventory",
+      "name": "get_tool_inventory",
+      "version": 1,
+      "scope": "session",
+      "execution": "sync",
+      "availability": "available",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "const": "get_tool_inventory" }
+        },
+        "required": ["type"],
+        "additionalProperties": false
+      },
+      "concurrencyClass": "serial",
+      "requiredFeatures": []
+    },
+    {
+      "id": "rpc.command.set_tool_activation",
+      "name": "set_tool_activation",
+      "version": 1,
+      "scope": "session",
+      "execution": "sync",
+      "availability": "available",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "const": "set_tool_activation" },
+          "activate": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "x-maxUtf8Bytes": 256
+            },
+            "maxItems": 2048
+          },
+          "deactivate": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "x-maxUtf8Bytes": 256
+            },
+            "maxItems": 2048
+          }
+        },
+        "required": ["type"],
+        "additionalProperties": false
+      },
+      "concurrencyClass": "serial",
+      "requiredFeatures": []
+    }
+  ],
+  "events": ["ready", "agent_end", "tool_inventory_update", "future_event"],
+  "extensionUiMethods": ["confirm", "future_method"],
+  "hostProtocols": ["tools", "uris"],
+  "futureManifestField": true
+}

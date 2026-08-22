@@ -5,6 +5,7 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -192,5 +193,118 @@ describe("AgentSession steer idle drain", () => {
 		await session.abort();
 		await session.waitForIdle();
 		await running.catch(() => {});
+	});
+
+	it("defers an idle yield delivery until an IRC wake observer finishes settling", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const providerStarted = Promise.withResolvers<void>();
+		const releaseProvider = Promise.withResolvers<void>();
+		const queuedDeliveryStarted = Promise.withResolvers<void>();
+		let providerRunning = false;
+		let queuedDeliveryRunning = false;
+		const mock = createMockModel({
+			responses: [
+				async () => {
+					providerRunning = true;
+					providerStarted.resolve();
+					await releaseProvider.promise;
+					return { content: ["IRC wake complete"], stopReason: "stop" };
+				},
+				() => {
+					queuedDeliveryRunning = true;
+					queuedDeliveryStarted.resolve();
+					return { content: ["Queued delivery complete"], stopReason: "stop" };
+				},
+			],
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+
+		const callbackStarted = Promise.withResolvers<void>();
+		const releaseCallback = Promise.withResolvers<void>();
+		session.setIrcWakeTurnObserver(() => {
+			return async () => {
+				callbackStarted.resolve();
+				await releaseCallback.promise;
+			};
+		});
+		session.yieldQueue.register<string>("settlement-regression", {
+			build: entries => ({
+				role: "user",
+				content: `SETTLEMENT QUEUED: ${entries.join(", ")}`,
+				timestamp: Date.now(),
+			}),
+		});
+
+		const outcome = await session.deliverIrcMessage({
+			id: "irc-yield-settlement",
+			from: "peer",
+			to: "me",
+			body: "wake",
+			ts: Date.now(),
+		} as IrcMessage);
+		expect(outcome).toBe("woken");
+		vi.advanceTimersByTime(1);
+		for (let attempt = 0; attempt < 100 && !providerRunning; attempt++) {
+			await Promise.resolve();
+			vi.advanceTimersByTime(0);
+		}
+		expect(providerRunning).toBe(true);
+		await providerStarted.promise;
+		expect(session.activityPhase).toBe("provider");
+		expect(mock.calls).toHaveLength(1);
+
+		releaseProvider.resolve();
+		for (let attempt = 0; attempt < 100 && session.activityPhase !== "maintenance"; attempt++) {
+			await Promise.resolve();
+			vi.advanceTimersByTime(0);
+		}
+		await callbackStarted.promise;
+		expect(session.activityPhase).toBe("maintenance");
+		expect(session.isStreaming).toBe(false);
+		expect(session.hasPostPromptWork).toBe(true);
+		session.yieldQueue.enqueue("settlement-regression", "deliver once");
+		expect(session.yieldQueue.has("settlement-regression")).toBe(true);
+
+		let idleResolved = false;
+		const idle = session.waitForIdle().then(() => {
+			idleResolved = true;
+		});
+		await Promise.resolve();
+		expect(idleResolved).toBe(false);
+
+		// No replacement idle flush may run until the observer callback completes.
+		vi.advanceTimersByTime(1);
+		await Promise.resolve();
+		expect(mock.calls).toHaveLength(1);
+		expect(session.yieldQueue.has("settlement-regression")).toBe(true);
+
+		releaseCallback.resolve();
+		for (let attempt = 0; attempt < 100 && !queuedDeliveryRunning; attempt++) {
+			await Promise.resolve();
+			vi.advanceTimersByTime(1);
+		}
+		expect(queuedDeliveryRunning).toBe(true);
+		await queuedDeliveryStarted.promise;
+		await idle;
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(2);
+		expect(
+			mock.calls.filter(call => JSON.stringify(call.context.messages).includes("SETTLEMENT QUEUED")),
+		).toHaveLength(1);
+		expect(session.yieldQueue.has("settlement-regression")).toBe(false);
+		expect(session.activityPhase).toBe("idle");
+		expect(session.isStreaming).toBe(false);
+		expect(session.hasPostPromptWork).toBe(false);
 	});
 });

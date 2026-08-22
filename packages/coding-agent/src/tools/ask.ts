@@ -843,6 +843,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			body: "Waiting for input",
 			type: "ask",
 			urgency: "normal",
+			sound: "question",
 			actions: "focus",
 		});
 	}

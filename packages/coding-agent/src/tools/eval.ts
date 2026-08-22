@@ -202,6 +202,8 @@ export function getEvalToolDescription(options: EvalToolDescriptionOptions = {})
 
 export interface EvalToolOptions {
 	proxyExecutor?: EvalProxyExecutor;
+	/** Server-owned ID used to target cancellation of this execution. */
+	executionId?: string;
 }
 
 interface ResolvedBackend {
@@ -425,6 +427,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	};
 
 	readonly #proxyExecutor?: EvalProxyExecutor;
+	readonly #executionId?: string;
 
 	#paramsKey?: string;
 	#cachedParams?: typeof evalSchema;
@@ -442,6 +445,11 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		options?: EvalToolOptions,
 	) {
 		this.#proxyExecutor = options?.proxyExecutor;
+		this.#executionId = options?.executionId;
+	}
+
+	withExecutionId(executionId: string): EvalTool {
+		return new EvalTool(this.session, { proxyExecutor: this.#proxyExecutor, executionId });
 	}
 
 	async execute(
@@ -502,7 +510,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				sessionAbortController,
 				emitUpdate,
 			});
-			return session.trackEvalExecution?.(execution, sessionAbortController) ?? execution;
+			return session.trackEvalExecution?.(execution, sessionAbortController, this.#executionId) ?? execution;
 		};
 
 		const autoBgManager = session.asyncJobManager;

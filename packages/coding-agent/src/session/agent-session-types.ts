@@ -44,6 +44,8 @@ export const SHUTDOWN_CONSOLIDATE_BUDGET_MS = 1_500;
 /** Options controlling session disposal. */
 export interface AgentSessionDisposeOptions {
 	mnemopiConsolidateTimeoutMs?: number;
+	/** Leave process-scoped AsyncJobManager work running when only an RPC transport disconnects. */
+	preserveAsyncJobs?: boolean;
 	/**
 	 * Deadline for the settle/drain wait before the terminal memory release
 	 * (default 5s). The bounded-teardown paths (signal handlers, tests) may
@@ -164,6 +166,8 @@ export interface AgentSessionConfig {
 	memoryTaskDepth?: number;
 	/** Creates built-in memory tools for the current backend. */
 	createMemoryTools?: () => Promise<AgentTool[]>;
+	/** Creates a session-bound eval tool for host-controlled execution even when eval is not model-active. */
+	createEvalTool?: () => unknown;
 	/** Creates the built-in `computer` tool for session-scoped runtime enablement (see {@link AgentSession.setComputerToolEnabled}). */
 	createComputerTool?: () => Promise<AgentTool | null>;
 	/** Creates the private `think` scratchpad tool for runtime setting changes. */
@@ -306,6 +310,8 @@ export interface PromptOptions {
 	attribution?: MessageAttribution;
 	/** Skip pre-send compaction checks for this prompt. */
 	skipCompactionCheck?: boolean;
+	/** Stable caller-owned tag attached to the prompt's agent message. */
+	messageTag?: string;
 }
 
 /** Payload for {@link AgentSession.setPromptDropped}: a user prompt cancelled

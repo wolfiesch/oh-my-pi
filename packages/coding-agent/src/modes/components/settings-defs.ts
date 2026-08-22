@@ -95,59 +95,130 @@ export type SettingDef =
 // Condition Functions
 // ═══════════════════════════════════════════════════════════════════════════
 
-const CONDITIONS: Record<string, () => boolean> = {
+const CONDITIONS: Record<string, (settings?: Settings) => boolean> = {
 	macOS: () => process.platform === "darwin",
 	hasImageProtocol: () => !!TERMINAL.imageProtocol,
-	advisorEnabled: () => {
+	advisorEnabled: settings => {
 		try {
-			return Settings.instance.get("advisor.enabled") === true;
+			return (settings ?? Settings.instance).get("advisor.enabled") === true;
 		} catch {
 			return false;
 		}
 	},
-	hindsightActive: () => {
+	hindsightActive: settings => {
 		try {
-			return Settings.instance.get("memory.backend") === "hindsight";
+			return (settings ?? Settings.instance).get("memory.backend") === "hindsight";
 		} catch {
 			return false;
 		}
 	},
-	mnemopiActive: () => {
+	mnemopiActive: settings => {
 		try {
-			return Settings.instance.get("memory.backend") === "mnemopi";
+			return (settings ?? Settings.instance).get("memory.backend") === "mnemopi";
 		} catch {
 			return false;
 		}
 	},
-	autolearnActive: () => {
+	autolearnActive: settings => {
 		try {
-			return Settings.instance.get("autolearn.enabled") === true;
+			return (settings ?? Settings.instance).get("autolearn.enabled") === true;
 		} catch {
 			return false;
 		}
 	},
-	autoThinkingActive: () => {
+	autoThinkingActive: settings => {
 		try {
-			return Settings.instance.get("defaultThinkingLevel") === "auto";
+			return (settings ?? Settings.instance).get("defaultThinkingLevel") === "auto";
 		} catch {
 			return false;
 		}
 	},
-	usageAwareFallbackEnabled: () => {
+	usageAwareFallbackEnabled: settings => {
 		try {
-			return Settings.instance.get("retry.usageAwareFallback") === true;
+			return (settings ?? Settings.instance).get("retry.usageAwareFallback") === true;
 		} catch {
 			return false;
 		}
 	},
-	planModeEnabled: () => {
+	planModeEnabled: settings => {
 		try {
-			return Settings.instance.get("plan.enabled");
+			return (settings ?? Settings.instance).get("plan.enabled");
 		} catch {
 			return false;
 		}
 	},
 };
+
+/**
+ * Settings read by visibility predicates. External serializers use this map
+ * to refuse evaluation when a predicate would reveal a setting they cannot
+ * otherwise disclose; the built-in panel remains unrestricted.
+ */
+const CONDITION_SETTING_DEPENDENCIES: Record<string, readonly SettingPath[]> = {
+	hasImageProtocol: [],
+	advisorEnabled: ["advisor.enabled"],
+	hindsightActive: ["memory.backend"],
+	mnemopiActive: ["memory.backend"],
+	autolearnActive: ["autolearn.enabled"],
+	autoThinkingActive: ["defaultThinkingLevel"],
+	usageAwareFallbackEnabled: ["retry.usageAwareFallback"],
+	planModeEnabled: ["plan.enabled"],
+};
+
+export type SettingPanelControlKind = SettingDef["type"];
+
+/** The exact control kind used by the built-in settings panel, or `null` when config-only. */
+export function getSettingPanelControlKind(path: SettingPath): SettingPanelControlKind | null {
+	const ui = getUi(path);
+	if (!ui) return null;
+	switch (getType(path)) {
+		case "boolean":
+			return "boolean";
+		case "enum":
+			return ui.options === undefined ? "enum" : "submenu";
+		case "number":
+			return Array.isArray(ui.options) ? "submenu" : null;
+		case "string":
+			return ui.options === undefined ? "text" : "submenu";
+		case "array":
+			return Array.isArray(ui.options) ? "multiselect" : null;
+		case "record":
+			return path === "providers.maxInFlightRequests" ? "providerLimits" : "text";
+	}
+	return null;
+}
+
+/** Whether the built-in settings panel has a control for this schema entry. */
+export function isSettingPanelRenderable(path: SettingPath): boolean {
+	return getSettingPanelControlKind(path) !== null;
+}
+
+/** Evaluate visibility for an external serializer without crossing its disclosure boundary. */
+export function getSettingPanelVisibility(
+	path: SettingPath,
+	settings: Settings,
+	canReadSetting: (dependency: SettingPath) => boolean,
+): boolean | undefined {
+	const conditionName = getUi(path)?.condition;
+	if (conditionName === undefined) return true;
+	const condition = CONDITIONS[conditionName];
+	if (!condition) return undefined;
+	// A newly registered state-reading predicate is indeterminate for
+	// serialization until its dependencies are explicitly classified above.
+	if (!Object.hasOwn(CONDITION_SETTING_DEPENDENCIES, conditionName)) return undefined;
+	if (CONDITION_SETTING_DEPENDENCIES[conditionName].some(dependency => !canReadSetting(dependency))) return undefined;
+	return condition(settings);
+}
+
+/** Evaluate the same visibility condition used by the built-in settings panel. */
+export function isSettingPanelVisible(path: SettingPath, settings?: Settings): boolean {
+	const conditionName = getUi(path)?.condition;
+	if (conditionName === undefined) return true;
+	const condition = CONDITIONS[conditionName];
+	// Preserve the panel's established behavior for an unknown condition name:
+	// without a registered predicate, the setting remains unconditionally visible.
+	return condition ? condition(settings) : true;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Schema to UI Conversion
@@ -161,10 +232,11 @@ function resolveOptions(ui: AnyUiMetadata): OptionList | "runtime" | undefined {
 
 function pathToSettingDef(path: SettingPath): SettingDef | null {
 	const ui = getUi(path);
-	if (!ui) return null;
+	const control = getSettingPanelControlKind(path);
+	if (!ui || control === null) return null;
 
-	const schemaType = getType(path);
-	const condition = ui.condition ? CONDITIONS[ui.condition] : undefined;
+	const visibilityCondition = ui.condition ? CONDITIONS[ui.condition] : undefined;
+	const condition = visibilityCondition ? () => visibilityCondition() : undefined;
 	const base = {
 		path,
 		label: ui.label,
@@ -175,55 +247,29 @@ function pathToSettingDef(path: SettingPath): SettingDef | null {
 		condition,
 	};
 
-	if (schemaType === "boolean") {
-		return { ...base, type: "boolean" };
-	}
-
-	const options = resolveOptions(ui);
-
-	if (schemaType === "enum") {
-		if (options === undefined) {
+	switch (control) {
+		case "boolean":
+			return { ...base, type: "boolean" };
+		case "enum":
 			return { ...base, type: "enum", values: getEnumValues(path) ?? [] };
+		case "submenu": {
+			const options = resolveOptions(ui);
+			return { ...base, type: "submenu", options: !options || options === "runtime" ? [] : options };
 		}
-		// "runtime" is not a valid sentinel for enums — schema types prevent this,
-		// but treat defensively as an empty submenu.
-		return { ...base, type: "submenu", options: options === "runtime" ? [] : options };
-	}
-
-	if (schemaType === "number") {
-		// Numbers without options are intentionally hidden from the UI.
-		if (!options || options === "runtime") return null;
-		return { ...base, type: "submenu", options };
-	}
-
-	if (schemaType === "string") {
-		if (options === "runtime") {
-			// Empty list now; the selector layer (theme handling, etc.) injects choices.
-			return { ...base, type: "submenu", options: [] };
+		case "text":
+			return { ...base, type: "text", secret: isCredential(path) };
+		case "providerLimits":
+			return { ...base, type: "providerLimits" };
+		case "multiselect": {
+			const options = resolveOptions(ui);
+			return {
+				...base,
+				type: "multiselect",
+				options: !options || options === "runtime" ? [] : options,
+				ordered: ui.ordered === true,
+			};
 		}
-		if (options) {
-			return { ...base, type: "submenu", options };
-		}
-		// One classification drives both surfaces: a setting marked `credential`
-		// masks here too, so the panel cannot display one that only the CLI knows
-		// to redact.
-		return { ...base, type: "text", secret: isCredential(path) };
 	}
-
-	if (schemaType === "array") {
-		// Arrays without declared options stay config-file only (free-form lists
-		// like extension paths have no finite choice set to toggle).
-		if (!options || options === "runtime") return null;
-		return { ...base, type: "multiselect", options, ordered: ui.ordered === true };
-	}
-
-	if (schemaType === "record") {
-		return path === "providers.maxInFlightRequests"
-			? { ...base, type: "providerLimits" }
-			: { ...base, type: "text", secret: false };
-	}
-
-	return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

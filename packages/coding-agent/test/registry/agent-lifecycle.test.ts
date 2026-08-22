@@ -556,6 +556,40 @@ describe("AgentLifecycleManager", () => {
 		expect(stub.disposeCalls()).toBe(1);
 	});
 
+	it("never revives a same-id replacement while waiting for an older park", async () => {
+		const gate = deferred();
+		const original = makeSessionStub(() => gate.promise);
+		const replacement = makeSessionStub();
+		registerIdleSub("Race-Replaced", original.session, "/tmp/Race-Replaced.jsonl");
+		lifecycle.adopt("Race-Replaced", {
+			idleTtlMs: 0,
+			revive: async () => {
+				throw new Error("stale reviver must not run");
+			},
+		});
+		const expected = registry.get("Race-Replaced");
+		if (!expected) throw new Error("missing original ref");
+
+		const parking = lifecycle.park("Race-Replaced");
+		await Promise.resolve();
+		await Promise.resolve();
+		const resuming = lifecycle.ensureLive("Race-Replaced", expected);
+		registry.unregister("Race-Replaced", expected);
+		registry.register({
+			id: "Race-Replaced",
+			displayName: "replacement",
+			kind: "sub",
+			session: replacement.session,
+			status: "idle",
+		});
+
+		gate.resolve();
+		await parking;
+		await expect(resuming).rejects.toThrow(/changed during the lifecycle operation/);
+		expect(registry.get("Race-Replaced")?.session).toBe(replacement.session);
+		expect(replacement.disposeCalls()).toBe(0);
+	});
+
 	it("concurrent park calls coalesce into one dispose", async () => {
 		const stub = makeSessionStub();
 		registerIdleSub("Race-ParkOnce", stub.session);

@@ -21,6 +21,7 @@ import { formatDuration, formatNumber, sanitizeText } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
 import { discoverAuthStorage } from "../sdk";
+import { formatUsageReportAccountLabel } from "../slash-commands/helpers/active-oauth-account";
 
 const BAR_WIDTH = 28;
 
@@ -269,19 +270,6 @@ function limitTitle(limit: UsageLimit): string {
 	return `${label} (${windowLabel})`;
 }
 
-function reportAccountLabel(report: UsageReport, index: number): string {
-	const meta = report.metadata ?? {};
-	for (const key of ["email", "accountId", "projectId"] as const) {
-		const value = meta[key];
-		if (typeof value === "string" && value) return value;
-	}
-	for (const limit of report.limits) {
-		const scoped = limit.scope.accountId ?? limit.scope.projectId;
-		if (scoped) return scoped;
-	}
-	return `account ${index + 1}`;
-}
-
 /** Lowercased identity strings a report can be attributed to. */
 function reportIdentifiers(report: UsageReport): Set<string> {
 	const ids = new Set<string>();
@@ -396,7 +384,7 @@ function formatAccountHeader(
 ): string {
 	const status = aggregateStatus(report.limits);
 	const icon = STATUS_COLOR[status]("●");
-	const label = reportAccountLabel(report, index);
+	const label = formatUsageReportAccountLabel(report, index);
 	let header = `${icon} ${chalk.bold(redaction?.get(label) ?? label)}`;
 	const metaOrgName = report.metadata?.orgName;
 	const metaOrgId = report.metadata?.orgId;

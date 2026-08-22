@@ -344,4 +344,36 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			},
 		);
 	});
+
+	test("threads cancellation through remote API-key and OAuth upserts", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const initialResult = await client.fetchSnapshot();
+		if (initialResult.status !== 200) throw new Error("expected initial snapshot");
+		remote = new RemoteAuthCredentialStore({
+			client,
+			initialSnapshot: initialResult.snapshot,
+			streamSnapshots: false,
+		});
+		const upload = vi.spyOn(client, "uploadCredential");
+		for (const [provider, credential] of [
+			["cancelled-api-key", { type: "api_key", key: "api-secret", source: "login" }],
+			[
+				"cancelled-oauth",
+				{
+					type: "oauth",
+					access: "oauth-access-secret",
+					refresh: "oauth-refresh-secret",
+					expires: Date.now() + 60_000,
+				},
+			],
+		] as const) {
+			const abortController = new AbortController();
+			abortController.abort("test cancellation");
+			await expect(
+				remote.upsertAuthCredentialRemote(provider, credential, abortController.signal),
+			).rejects.toThrow();
+			expect(upload).toHaveBeenLastCalledWith(provider, credential, abortController.signal);
+			expect(storage!.hasAuth(provider)).toBeFalse();
+		}
+	});
 });

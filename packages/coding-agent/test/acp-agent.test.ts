@@ -144,6 +144,58 @@ class FakeAgentSession {
 		this.refreshSkillsCalls++;
 	}
 	planModeState: PlanModeState | undefined;
+	private pendingPlanApproval: { approvalId: string; planFilePath: string } | undefined;
+	readonly planMode = {
+		enter: async (options?: { planFilePath?: string; workflow?: "parallel" | "iterative" }): Promise<void> => {
+			if (this.planModeState?.enabled) return;
+			const planFilePath = options?.planFilePath ?? "local://PLAN.md";
+			const workflow = options?.workflow ?? "parallel";
+			this.planModeState = {
+				enabled: true,
+				paused: false,
+				planFilePath,
+				workflow,
+				reentry: this.planModeState !== undefined,
+			};
+			this.sessionManager.appendModeChange("plan", { planFilePath, workflow });
+		},
+		disable: async (): Promise<void> => {
+			this.planModeState = undefined;
+			this.planProposalHandler = undefined;
+			this.pendingPlanApproval = undefined;
+			this.sessionManager.appendModeChange("none");
+		},
+		promoteReviewedPlan: async (details: {
+			planFilePath: string;
+			title: string;
+		}): Promise<{ approvalId: string; planFilePath: string; title: string; planContent: string }> => {
+			const state = this.planModeState;
+			if (!state?.enabled) throw new Error("Plan mode is not active.");
+			if (state.planFilePath !== details.planFilePath) {
+				this.planModeState = { ...state, planFilePath: details.planFilePath };
+				this.sessionManager.appendModeChange("plan", {
+					planFilePath: details.planFilePath,
+					workflow: state.workflow ?? "parallel",
+				});
+			}
+			const approvalId = "test-plan-approval";
+			this.pendingPlanApproval = { approvalId, planFilePath: details.planFilePath };
+			return { approvalId, planFilePath: details.planFilePath, title: details.title, planContent: "test plan" };
+		},
+		resolveApproval: async (
+			approvalId: string,
+			decision: { kind: "approve" | "refine" | "reject" },
+		): Promise<void> => {
+			const approval = this.pendingPlanApproval;
+			if (!approval || approval.approvalId !== approvalId) throw new Error("Unknown plan approval.");
+			this.pendingPlanApproval = undefined;
+			if (decision.kind !== "approve") return;
+			this.planReferencePath = approval.planFilePath;
+			this.planModeState = undefined;
+			this.planProposalHandler = undefined;
+			this.sessionManager.appendModeChange("none");
+		},
+	};
 	waitForIdleCalls = 0;
 	waitForIdleBlocker: (() => Promise<void>) | undefined;
 	asyncJobDrain: ((options?: { timeoutMs?: number }) => Promise<boolean>) | undefined;
@@ -600,6 +652,14 @@ describe("ACP agent", () => {
 		firstSession?.sessionManager.appendMessage({ role: "user", content: "fork me", timestamp: Date.now() });
 		await firstSession?.sessionManager.flush();
 
+		await expect(
+			harness.agent.unstable_forkSession({
+				sessionId: first.sessionId,
+				cwd: harness.cwdB,
+				mcpServers: [],
+			}),
+		).rejects.toThrow(`already loaded for ${harness.cwdA}, not ${harness.cwdB}`);
+
 		const forked = await harness.agent.unstable_forkSession({
 			sessionId: first.sessionId,
 			cwd: harness.cwdA,
@@ -699,7 +759,9 @@ describe("ACP agent", () => {
 	});
 
 	it("plan-proposal handler approves the agent-named plan and exits plan mode on submit", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({
+			elicitationHandler: async () => ({ action: "accept", content: { value: "Approve and execute" } }),
+		});
 		Settings.instance.set("plan.enabled", true);
 
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });

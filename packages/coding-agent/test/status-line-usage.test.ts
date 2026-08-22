@@ -18,11 +18,16 @@ afterAll(() => {
 
 function makeComponent(
 	reports: unknown,
-	options: { provider?: string; activeIdentity?: { accountId?: string; email?: string; projectId?: string } } = {},
+	options: {
+		provider?: string;
+		modelId?: string;
+		activeIdentity?: { accountId?: string; email?: string; projectId?: string };
+	} = {},
 ): StatusLineComponent {
+	const model = { id: options.modelId ?? "test-model", contextWindow: 1000, provider: options.provider };
 	const component = new StatusLineComponent({
-		state: { messages: [], model: { contextWindow: 1000, provider: options.provider } },
-		model: { contextWindow: 1000, provider: options.provider },
+		state: { messages: [], model },
+		model,
 		sessionManager: {
 			getUsageStatistics: () => ({
 				input: 0,
@@ -78,6 +83,61 @@ describe("usage status-line segment", () => {
 		expect(content).toContain("7d");
 		expect(content).toContain("8%");
 		expect(content).toContain("5d 21h");
+		expect(content).toContain("█░░░░");
+	});
+
+	it("renders the active Antigravity model-family daily quota", async () => {
+		const now = Date.now();
+		const component = makeComponent(
+			[
+				{
+					provider: "google-antigravity",
+					metadata: { projectId: "active-project" },
+					limits: [
+						{
+							id: "google-antigravity:anthropic:default:daily",
+							scope: { windowId: "daily" },
+							window: { resetsAt: now + 90 * 60_000 },
+							amount: { usedFraction: 0.8 },
+						},
+						{
+							id: "google-antigravity:google:default:daily",
+							scope: { windowId: "daily" },
+							window: { resetsAt: now + 30 * 60_000 },
+							amount: { usedFraction: 0.27 },
+						},
+						{
+							id: "google-antigravity:openai:default:daily",
+							scope: { windowId: "daily" },
+							amount: { usedFraction: 0.1 },
+						},
+					],
+				},
+			],
+			{
+				provider: "google-antigravity",
+				modelId: "gemini-3.7-flash-tiered",
+				activeIdentity: { projectId: "active-project" },
+			},
+		);
+
+		component.refreshUsageInBackground();
+		await flushUsageRefresh();
+		const content = stripVTControlCharacters(component.getTopBorder(200).content);
+
+		expect(content).toContain("1d");
+		expect(content).toContain("█░░░░");
+		expect(content).toContain("27%");
+		expect(content).toContain("30m");
+		expect(content).not.toContain("80%");
+		expect(content).not.toContain("10%");
+	});
+
+	it("explains when the active model has no provider quota report", () => {
+		const result = renderSegment("usage", {
+			usage: { unavailable: true },
+		} as unknown as SegmentContext);
+		expect(stripVTControlCharacters(result.content)).toContain("quota n/a");
 	});
 
 	it("renders tiered usage fetched from provider reports", async () => {
@@ -110,6 +170,75 @@ describe("usage status-line segment", () => {
 		expect(content).toContain("8%");
 	});
 
+	it("renders active-provider usage on the optional second row", async () => {
+		const component = makeComponent([
+			{
+				limits: [
+					{ scope: { windowId: "5h" }, amount: { usedFraction: 0.24 } },
+					{ scope: { windowId: "7d" }, amount: { usedFraction: 0.08 } },
+				],
+			},
+		]);
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: [],
+			rightSegments: [],
+			secondaryLeftSegments: ["usage"],
+			secondaryRightSegments: ["context_pct"],
+			sessionAccent: false,
+		});
+
+		component.refreshUsageInBackground();
+		await flushUsageRefresh();
+		const top = stripVTControlCharacters(component.getTopBorder(200).content);
+		const secondary = component.render(200).map(stripVTControlCharacters);
+
+		expect(top).not.toContain("5h");
+		expect(secondary).toHaveLength(1);
+		expect(secondary[0]).toContain("5h");
+		expect(secondary[0]).toContain("24%");
+		expect(secondary[0]).toContain("7d");
+		expect(secondary[0]).toContain("8%");
+	});
+
+	it("separates above-editor secondary rows from standalone bottom-bar rows", async () => {
+		const component = makeComponent([
+			{
+				limits: [
+					{ scope: { windowId: "5h" }, amount: { usedFraction: 0.24 } },
+					{ scope: { windowId: "7d" }, amount: { usedFraction: 0.08 } },
+				],
+			},
+		]);
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["pi"],
+			rightSegments: [],
+			secondaryLeftSegments: ["usage"],
+			secondaryRightSegments: ["context_pct"],
+			sessionAccent: false,
+		});
+		component.refreshUsageInBackground();
+		await flushUsageRefresh();
+
+		// Box style (default): bottomBar is none
+		const aboveBox = component.above.render(200).map(stripVTControlCharacters);
+		const bottomBox = component.bottomBar.render(200).map(stripVTControlCharacters);
+		expect(aboveBox).toHaveLength(1);
+		expect(aboveBox[0]).toContain("5h");
+		expect(bottomBox).toHaveLength(0);
+
+		// Standalone style (e.g. borderless): bottomBar is full
+		component.setComposerStyle({ bottomBar: "full", bottomBarGap: false });
+		const aboveStandalone = component.above.render(200).map(stripVTControlCharacters);
+		const bottomStandalone = component.bottomBar.render(200).map(stripVTControlCharacters);
+		expect(aboveStandalone).toHaveLength(1);
+		expect(aboveStandalone[0]).toContain("5h");
+		expect(bottomStandalone).toHaveLength(1);
+		expect(bottomStandalone[0]).toContain("π");
+		expect(bottomStandalone[0]).not.toContain("5h");
+	});
+
 	it("prefers untiered windows and labels the displayed tiered window", async () => {
 		const component = makeComponent([
 			{
@@ -133,7 +262,7 @@ describe("usage status-line segment", () => {
 		expect(content).toContain("8%");
 	});
 
-	it("scopes fetched usage reports to the active provider and account", async () => {
+	it("renders every active-provider account and marks the session account", async () => {
 		const component = makeComponent(
 			[
 				{
@@ -146,31 +275,79 @@ describe("usage status-line segment", () => {
 				{
 					provider: "openai-codex",
 					metadata: { accountId: "other-account" },
-					limits: [{ scope: { windowId: "5h", tier: "other" }, amount: { usedFraction: 0.66 } }],
+					limits: [
+						{
+							id: "openai-codex:primary",
+							scope: { windowId: "7d" },
+							amount: { usedFraction: 0.66 },
+						},
+					],
 				},
 				{
 					provider: "openai-codex",
 					metadata: { accountId: "active-account" },
 					limits: [
-						{ scope: { windowId: "5h", tier: "prolite" }, amount: { usedFraction: 0.24 } },
-						{ scope: { windowId: "7d", tier: "prolite" }, amount: { usedFraction: 0.08 } },
+						{
+							id: "openai-codex:primary",
+							scope: { windowId: "7d" },
+							amount: { usedFraction: 0.24 },
+						},
 					],
 				},
 			],
-			{ provider: "openai-codex", activeIdentity: { accountId: "active-account" } },
+			{
+				provider: "openai-codex",
+				modelId: "gpt-5.6",
+				activeIdentity: { accountId: "active-account" },
+			},
 		);
 
 		component.refreshUsageInBackground();
 		await flushUsageRefresh();
 		const content = stripVTControlCharacters(component.getTopBorder(200).content);
 
-		expect(content).toContain("prolite");
+		expect(content).toContain("○other-acc");
+		expect(content).toContain("66%");
+		expect(content).toContain("●active-ac");
 		expect(content).toContain("24%");
-		expect(content).toContain("8%");
 		expect(content).not.toContain("99%");
 		expect(content).not.toContain("98%");
-		expect(content).not.toContain("66%");
-		expect(content).not.toContain("other");
+	});
+
+	it("uses the active Codex model meter for every account", async () => {
+		const reports = ["first@example.com", "second@example.com"].map((email, index) => ({
+			provider: "openai-codex",
+			metadata: { email },
+			limits: [
+				{
+					id: "openai-codex:primary",
+					scope: { windowId: "7d" },
+					amount: { usedFraction: index === 0 ? 0.11 : 0.12 },
+				},
+				{
+					id: "openai-codex:spark:primary",
+					scope: { windowId: "7d" },
+					amount: { usedFraction: index === 0 ? 0.31 : 0.32 },
+				},
+			],
+		}));
+		const component = makeComponent(reports, {
+			provider: "openai-codex",
+			modelId: "gpt-5.3-codex-spark",
+			activeIdentity: { email: "first@example.com" },
+		});
+
+		component.refreshUsageInBackground();
+		await flushUsageRefresh();
+		const content = stripVTControlCharacters(component.getTopBorder(100).content);
+
+		expect(content.length).toBeLessThanOrEqual(100);
+		expect(content).toContain("●first");
+		expect(content).toContain("31%");
+		expect(content).toContain("○second");
+		expect(content).toContain("32%");
+		expect(content).not.toContain("11%");
+		expect(content).not.toContain("12%");
 	});
 
 	it("invalidates cached usage when the active provider changes", async () => {
@@ -238,7 +415,7 @@ describe("usage status-line segment", () => {
 		expect(refreshed).toContain("24%");
 	});
 
-	it("keeps active-provider rate-limit header reports with account metadata", async () => {
+	it("keeps every provider rate-limit header report with account metadata", async () => {
 		const component = makeComponent(
 			[
 				{
@@ -262,11 +439,12 @@ describe("usage status-line segment", () => {
 		await flushUsageRefresh();
 		const content = stripVTControlCharacters(component.getTopBorder(200).content);
 
-		expect(content).toContain("5h");
+		expect(content).toContain("○other-acc");
+		expect(content).toContain("66%");
+		expect(content).toContain("●active-ac");
 		expect(content).toContain("24%");
 		expect(content).toContain("7d");
 		expect(content).toContain("8%");
-		expect(content).not.toContain("66%");
 	});
 
 	it("renders tiered limits with the tier label", () => {
@@ -310,11 +488,11 @@ describe("usage status-line segment", () => {
 		expect(result.content).toBe("");
 	});
 
-	it("hides usage without visible windows", () => {
+	it("explains usage without visible windows", () => {
 		const result = renderSegment("usage", { usage: {} } as unknown as SegmentContext);
 
-		expect(result.visible).toBe(false);
-		expect(result.content).toBe("");
+		expect(result.visible).toBe(true);
+		expect(stripVTControlCharacters(result.content)).toContain("quota n/a");
 	});
 
 	it("renders five-hour usage without seven-day usage", () => {
@@ -465,8 +643,8 @@ describe("usage status-line segment", () => {
 	it("uses a distinct error color at the eighty-percent threshold", () => {
 		const high = renderSegment("usage", { usage: { fiveHour: { percent: 80 } } } as unknown as SegmentContext);
 		const low = renderSegment("usage", { usage: { fiveHour: { percent: 24 } } } as unknown as SegmentContext);
-		const highWithoutValue = high.content.replace("80%", "PCT");
-		const lowWithoutValue = low.content.replace("24%", "PCT");
+		const highWithoutValue = high.content.replace(/[█░]+/g, "BAR").replace(/\d+%/, "PCT");
+		const lowWithoutValue = low.content.replace(/[█░]+/g, "BAR").replace(/\d+%/, "PCT");
 
 		expect(high.visible).toBe(true);
 		expect(low.visible).toBe(true);

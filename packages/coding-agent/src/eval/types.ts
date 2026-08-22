@@ -27,6 +27,7 @@ export interface EvalCellResult {
 	status: "pending" | "running" | "complete" | "error";
 	durationMs?: number;
 	exitCode?: number;
+	cancelled?: boolean;
 	statusEvents?: EvalStatusEvent[];
 	hasMarkdown?: boolean;
 }

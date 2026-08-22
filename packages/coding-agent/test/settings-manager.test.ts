@@ -16,6 +16,7 @@ import {
 	Settings,
 } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as discovery from "@oh-my-pi/pi-coding-agent/discovery";
+import { getSymbolPresetOverride } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AUTO_IMAGE_PROVIDER_ORDER } from "@oh-my-pi/pi-coding-agent/tools/image-providers";
 import { SEARCH_PROVIDER_ORDER } from "@oh-my-pi/pi-coding-agent/web/search/types";
@@ -248,6 +249,58 @@ describe("Settings", () => {
 			expect(fs.readdirSync(agentDir).some(name => name.endsWith(".tmp"))).toBe(false);
 			if (process.platform !== "win32") {
 				expect(fs.statSync(getConfigPath()).mode & 0o777).toBe(0o600);
+			}
+		});
+
+		it("does not publish or retain a transactional batch when its atomic write fails", async () => {
+			await writeSettings({
+				symbolPreset: "unicode",
+				statusLine: { sessionAccent: true },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const canonicalConfigPath = await fs.promises.realpath(getConfigPath());
+			const originalSymbolPreset = getSymbolPresetOverride();
+			let effectiveSignals = 0;
+			const unsubscribe = onStatusLineSessionAccentChanged(() => {
+				effectiveSignals += 1;
+			});
+			const rename = fs.promises.rename.bind(fs.promises);
+			const renameReached = Promise.withResolvers<void>();
+			const releaseRename = Promise.withResolvers<void>();
+			vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+				if (String(source).endsWith(".tmp") && String(target) === canonicalConfigPath) {
+					renameReached.resolve();
+					await releaseRename.promise;
+					throw new FsCodeError("EIO", "injected transactional write failure");
+				}
+				await rename(source, target);
+			});
+
+			try {
+				const transaction = settings.setPersistedBatch([
+					{ path: "symbolPreset", value: "ascii" },
+					{ path: "statusLine.sessionAccent", value: false },
+				]);
+				await renameReached.promise;
+				expect(settings.get("symbolPreset")).toBe("unicode");
+				expect(settings.get("statusLine.sessionAccent")).toBe(true);
+				expect(effectiveSignals).toBe(0);
+				expect(getSymbolPresetOverride()).toBe(originalSymbolPreset);
+
+				releaseRename.resolve();
+				await expect(transaction).rejects.toThrow("injected transactional write failure");
+				expect(settings.get("symbolPreset")).toBe("unicode");
+				expect(settings.get("statusLine.sessionAccent")).toBe(true);
+				expect(effectiveSignals).toBe(0);
+				expect(getSymbolPresetOverride()).toBe(originalSymbolPreset);
+
+				await settings.flush();
+				expect(await readSettings()).toEqual({
+					symbolPreset: "unicode",
+					statusLine: { sessionAccent: true },
+				});
+			} finally {
+				unsubscribe();
 			}
 		});
 

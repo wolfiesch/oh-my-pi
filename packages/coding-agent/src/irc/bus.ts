@@ -17,7 +17,7 @@
 
 import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { CustomMessage } from "../session/messages";
 
 export interface IrcMessage {
@@ -100,10 +100,13 @@ export class IrcBus {
 	 */
 	async send(
 		msg: Omit<IrcMessage, "id" | "ts">,
-		opts?: { expectsReply?: boolean; suppressRelay?: boolean },
+		opts?: { expectsReply?: boolean; suppressRelay?: boolean; expectedRef?: AgentRef },
 	): Promise<IrcDeliveryReceipt> {
 		const message: IrcMessage = { ...msg, id: Snowflake.next(), ts: Date.now() };
 		const ref = this.#registry.get(message.to);
+		if (opts?.expectedRef && ref !== opts.expectedRef) {
+			return { to: message.to, outcome: "failed", error: `Agent "${message.to}" changed before delivery.` };
+		}
 		if (!ref) {
 			return {
 				to: message.to,
@@ -145,7 +148,7 @@ export class IrcBus {
 		let revived = false;
 		if (needsLifecycleGate) {
 			try {
-				const liveSession = await lifecycle.ensureLive(message.to);
+				const liveSession = await lifecycle.ensureLive(message.to, opts?.expectedRef ?? ref);
 				// Revival = we did not keep the same live instance (parked start, or
 				// park completed and a fresh session was rebuilt).
 				revived = !priorSession || liveSession !== priorSession;
@@ -159,6 +162,9 @@ export class IrcBus {
 				};
 			}
 		}
+		if (opts?.expectedRef && this.#registry.get(message.to) !== opts.expectedRef) {
+			return { to: message.to, outcome: "failed", error: `Agent "${message.to}" changed before delivery.` };
+		}
 
 		// A pending `wait` from the recipient consumes the message directly —
 		// it is returned from their irc tool call and never hits the inbox or
@@ -170,7 +176,11 @@ export class IrcBus {
 			return { to: message.to, outcome: revived ? "revived" : "injected" };
 		}
 
-		const session = this.#registry.get(message.to)?.session;
+		const liveRef = this.#registry.get(message.to);
+		if (opts?.expectedRef && liveRef !== opts.expectedRef) {
+			return { to: message.to, outcome: "failed", error: `Agent "${message.to}" changed before delivery.` };
+		}
+		const session = liveRef?.session;
 		if (!session) {
 			return { to: message.to, outcome: "failed", error: `Agent "${message.to}" has no live session.` };
 		}

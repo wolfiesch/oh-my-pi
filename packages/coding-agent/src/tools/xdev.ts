@@ -193,14 +193,14 @@ const SUMMARY_ELLIPSIS = "…";
 const SUMMARY_ELLIPSIS_BYTES = Buffer.byteLength(SUMMARY_ELLIPSIS, "utf-8");
 
 /**
- * Bound a catalog summary for prompt rendering. External summaries are
- * third-party metadata inlined verbatim, so control characters are stripped
- * first, then the result is bounded in UTF-8 BYTES rather than characters (a
- * character bound is not a byte bound for multi-byte scripts). The cut lands
- * on a code point boundary, so the prompt never carries a partial code point.
+ * Sanitize and UTF-8 byte-bound untrusted tool metadata.
+ *
+ * External descriptions and summaries are third-party text, so control
+ * characters are stripped before truncation. The cut lands on a code point
+ * boundary and never returns a partial UTF-8 sequence.
  */
-function sanitizeCatalogSummary(summary: string, maxBytes?: number): string {
-	const cleaned = summary.replace(SUMMARY_CONTROL_CHARS, " ").trim();
+export function sanitizeExternalToolText(text: string, maxBytes?: number): string {
+	const cleaned = text.replace(SUMMARY_CONTROL_CHARS, " ").trim();
 	if (maxBytes === undefined || Buffer.byteLength(cleaned, "utf-8") <= maxBytes) return cleaned;
 	if (maxBytes <= 0) return "";
 	if (maxBytes < SUMMARY_ELLIPSIS_BYTES) return truncateHeadBytes(cleaned, maxBytes).text;
@@ -214,7 +214,7 @@ function promptCatalogSummary(inst: Tool, maxBytes?: number): string {
 			.split("\n")
 			.find(line => line.trim().length > 0)
 			?.trim() ?? inst.name;
-	return sanitizeCatalogSummary(summary, maxBytes) || inst.name;
+	return sanitizeExternalToolText(summary, maxBytes) || inst.name;
 }
 
 /** Compile the `tools.xdevInlineDevices` allowlist once per render, dropping

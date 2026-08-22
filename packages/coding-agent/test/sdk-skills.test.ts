@@ -260,6 +260,11 @@ This skill is added after session creation.
 		const unsubscribeCommandMetadata = session.subscribeCommandMetadataChanged(() => {
 			commandMetadataChanges++;
 		});
+		let toolInventoryChanges = 0;
+		const unsubscribeToolInventory = session.subscribeToolInventoryChanged(async () => {
+			toolInventoryChanges++;
+			throw new Error("expected async inventory listener rejection");
+		});
 
 		try {
 			const manageSkill = session.getToolByName("manage_skill");
@@ -293,9 +298,13 @@ This skill is added after session creation.
 			await expect(
 				readSkill!.execute("read-deleted-managed-skill", { path: "skill://runtime-managed-skill" }),
 			).rejects.toThrow(/Unknown skill/);
+			await session.setActiveToolsByName(["read"]);
+			await Promise.resolve();
+			expect(toolInventoryChanges).toBeGreaterThan(0);
 		} finally {
 			await session.dispose();
 			unsubscribeCommandMetadata();
+			unsubscribeToolInventory();
 			setAgentDir(originalAgentDir);
 		}
 	});

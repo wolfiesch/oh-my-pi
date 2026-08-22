@@ -4,6 +4,7 @@ import type { ProviderDefinition } from "./types";
 export const kimiCodeProvider = {
 	id: "kimi-code",
 	name: "Kimi Code",
+	deviceCodeFlow: true,
 	login: async (cb: OAuthLoginCallbacks) => {
 		// Lazy import: keep heavy OAuth flow modules out of the eager registry graph.
 		const { loginKimi } = await import("./oauth/kimi");

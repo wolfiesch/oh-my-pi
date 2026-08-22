@@ -305,4 +305,35 @@ describe("AgentSession queued steer delivery", () => {
 
 		expect(session.agent.peekSteeringQueue()).toEqual([]);
 	});
+	it("tags the exact active and queued prompt messages for targeted removal", async () => {
+		const { session } = await createSession([{ content: ["active response"], delayMs: 1_000 }]);
+		const activeTagged = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (
+				event.type === "message_start" &&
+				event.message.role === "user" &&
+				session.getMessageTag(event.message) === "operation-active"
+			) {
+				activeTagged.resolve();
+			}
+		});
+
+		const running = session.prompt("active", { messageTag: "operation-active" });
+		await activeTagged.promise;
+		await session.prompt("cancel this follow-up", {
+			streamingBehavior: "followUp",
+			messageTag: "operation-cancelled",
+		});
+		await session.prompt("preserve this follow-up", {
+			streamingBehavior: "followUp",
+			messageTag: "operation-preserved",
+		});
+
+		expect(session.removeQueuedMessagesByTag("operation-cancelled")).toBe(1);
+		expect(session.agent.peekFollowUpQueue()).toHaveLength(1);
+		expect(session.getMessageTag(session.agent.peekFollowUpQueue()[0]!)).toBe("operation-preserved");
+
+		await session.abort({ reason: USER_INTERRUPT_LABEL });
+		await running;
+	});
 });

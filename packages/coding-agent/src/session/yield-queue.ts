@@ -112,13 +112,27 @@ export class YieldQueue {
 		}
 	}
 
+	/**
+	 * Notify the queue that the owning session has fully settled. Entries queued
+	 * while streaming, or left behind when an idle flush lost a stream-to-idle
+	 * race, get exactly one new idle-flush opportunity.
+	 */
+	notifySettled(): void {
+		if (this.#options.isStreaming()) return;
+		for (const [kind, dispatcher] of this.#dispatchers) {
+			if (dispatcher.skipIdleFlush || (this.#entries.get(kind)?.length ?? 0) === 0) continue;
+			this.#scheduleIdleFlush();
+			return;
+		}
+	}
+
 	async flush(mode: YieldFlushMode): Promise<void> {
 		if (mode === "idle") {
 			this.#idleFlushPending = false;
 		}
 		const idleMessages: BuiltMessage[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
-			if (mode === "idle" && dispatcher.skipIdleFlush) continue;
+			if (dispatcher.skipIdleFlush) continue;
 			const entries = this.#drain(kind);
 			if (entries.length === 0) continue;
 			const built = this.#build(kind, dispatcher, entries);

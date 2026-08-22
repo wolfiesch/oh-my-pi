@@ -30,6 +30,9 @@ export interface StatusLineSettings {
 	preset?: StatusLinePreset;
 	leftSegments?: StatusLineSegmentId[];
 	rightSegments?: StatusLineSegmentId[];
+	/** Optional second status row rendered directly above the editor. */
+	secondaryLeftSegments?: StatusLineSegmentId[];
+	secondaryRightSegments?: StatusLineSegmentId[];
 	separator?: StatusLineSeparatorStyle;
 	segmentOptions?: StatusLineSegmentOptions;
 	showHookStatus?: boolean;
@@ -47,7 +50,15 @@ export interface StatusLineSettings {
 }
 
 export type EffectiveStatusLineSettings = Required<
-	Pick<StatusLineSettings, "leftSegments" | "rightSegments" | "separator" | "segmentOptions">
+	Pick<
+		StatusLineSettings,
+		| "leftSegments"
+		| "rightSegments"
+		| "secondaryLeftSegments"
+		| "secondaryRightSegments"
+		| "separator"
+		| "segmentOptions"
+	>
 > &
 	StatusLineSettings;
 
@@ -56,6 +67,24 @@ export type EffectiveStatusLineSettings = Required<
 // ═══════════════════════════════════════════════════════════════════════════
 
 export type RGB = readonly [number, number, number];
+
+export interface StatusUsageQuota {
+	unavailable?: boolean;
+	tier?: string;
+	daily?: { percent: number; resetMinutes?: number };
+	fiveHour?: { percent: number; resetMinutes?: number };
+	sevenDay?: { percent: number; resetHours?: number };
+	monthly?: { percent: number; resetHours?: number };
+}
+
+export interface StatusUsageAccount extends StatusUsageQuota {
+	label: string;
+	active: boolean;
+}
+
+export interface StatusUsage extends StatusUsageQuota {
+	accounts?: readonly StatusUsageAccount[];
+}
 
 export interface SegmentContext {
 	session: AgentSession;
@@ -133,12 +162,7 @@ export interface SegmentContext {
 	 * the worktree/branch is already shown by the git segment.
 	 */
 	worktree: { projectName: string; worktreeName: string } | null;
-	usage: {
-		tier?: string;
-		fiveHour?: { percent: number; resetMinutes?: number };
-		sevenDay?: { percent: number; resetHours?: number };
-		monthly?: { percent: number; resetHours?: number };
-	} | null;
+	usage: StatusUsage | null;
 }
 
 export interface RenderedSegment {

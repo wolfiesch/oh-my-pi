@@ -565,7 +565,7 @@ export const openaiCodexUsageProvider: UsageProvider = {
 // the 5h/weekly chat windows. Scoping the gating set this way keeps an exhausted
 // Spark meter from blocking a normal chat request (and vice versa), instead of
 // OR-ing every window and meter in the report into one provider-wide block.
-function scopeCodexLimitsForRequest(report: UsageReport, context?: CredentialRankingContext): UsageLimit[] {
+export function scopeCodexLimitsForRequest(report: UsageReport, context?: CredentialRankingContext): UsageLimit[] {
 	const isSparkRequest = isCodexSparkRequest(context);
 	return report.limits.filter(limit => {
 		if (limit.id === "openai-codex:primary" || limit.id === "openai-codex:secondary") {

@@ -161,6 +161,7 @@ import { containsUltrathink, ULTRATHINK_NOTICE } from "../modes/ultrathink";
 import { computeNonMessageTokens } from "../modes/utils/context-usage";
 import { containsWorkflow, renderWorkflowNotice } from "../modes/workflow";
 import { type PlanApprovalDetails, resolveApprovedPlan } from "../plan-mode/approved-plan";
+import { PlanModeController } from "../plan-mode/plan-controller";
 import { listPlanFiles, readPlanFile } from "../plan-mode/plan-files";
 import type { PlanModeState } from "../plan-mode/state";
 import goalModeContextPrompt from "../prompts/goals/goal-mode-context.md" with { type: "text" };
@@ -326,7 +327,11 @@ import {
 	queueChipText,
 	toRestoredQueuedMessage,
 } from "./queued-messages";
-import type { ServingModel } from "./retry-fallback-chains";
+import {
+	formatRetryFallbackSelector,
+	type RetryFallbackSelector,
+	type ServingModel,
+} from "./retry-fallback-chains";
 import { type AdvisorStats, SessionAdvisors, type SessionAdvisorsHost } from "./session-advisors";
 import type { BuildSessionContextOptions, SessionContext } from "./session-context";
 import { getRestorableSessionModels } from "./session-context";
@@ -343,8 +348,19 @@ import { cleanupEmptyMoveSession, copySessionArtifacts, type SessionManager } fr
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
+import {
+	type SessionQueueClearResult,
+	type SessionQueueLane,
+	SessionQueueService,
+	type SessionQueueSnapshot,
+} from "./session-queue-service";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
-import { SessionTools, type SessionToolsHost } from "./session-tools";
+import {
+	SessionTools,
+	type SessionToolsHost,
+	type ToolInventory,
+	type ToolInventoryChangedListener,
+} from "./session-tools";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { skillPromptTitleInput } from "./skill-title-input";
 import { ToolChoiceQueue } from "./tool-choice-queue";
@@ -477,6 +493,8 @@ export class AgentSession {
 	fileSnapshotStore?: InMemorySnapshotStore;
 	/** Per-session `CUT`/`PASTE` clipboard register shared across edit calls. */
 	editClipboard?: Clipboard;
+	/** Authoritative queue projection and read-filter-replace mutation boundary. */
+	readonly queueService: SessionQueueService;
 
 	#powerAssertion: MacOSPowerAssertion | undefined;
 
@@ -506,12 +524,16 @@ export class AgentSession {
 	#commandMetadataChangedListeners: CommandMetadataChangedListener[] = [];
 	#sessionChangeCallbacks = new Set<() => void>();
 	#observedSessionId: string | undefined;
+	#toolInventoryChangedListeners: ToolInventoryChangedListener[] = [];
 
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: CustomMessage[] = [];
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	#queuedMessageDrainScheduled = false;
+	/** Caller-owned tags and stable queue entry identities live in queueService WeakMaps. */
 	#planModeState: PlanModeState | undefined;
+	/** Authoritative plan transition owner shared by every host surface. */
+	readonly planMode: PlanModeController;
 	/** Session-scoped `/vision` override; undefined = follow persisted `inspect_image.mode`. */
 	#inspectImageModeOverride: InspectImageMode | undefined;
 	#vibeModeState: VibeModeState | undefined;
@@ -658,6 +680,9 @@ export class AgentSession {
 	readonly #streamingEditGuard: StreamingEditGuard;
 	readonly #loopGuards: LoopGuards;
 	#promptInFlightCount = 0;
+	/** Lazily shared by waitForIdle callers while session-owned prompt setup/finalization is still active. */
+	#promptInFlightSettled: Promise<void> | undefined;
+	#promptInFlightSettledResolve: (() => void) | undefined;
 	#abortInProgress = false;
 	// Wire-level agent_end emission deferred until #promptInFlightCount drops to 0.
 	// Internal extension hooks and post-emit work (auto-retry, auto-compaction, todo
@@ -668,6 +693,8 @@ export class AgentSession {
 	#promptGeneration = 0;
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
+	#inFlightSettledCallbacksDrain: Promise<void> | undefined;
+	#inFlightSettledCallbacksDrainResolve: (() => void) | undefined;
 	#sessionStopContinuationCount = 0;
 	#sessionStopHookActive = false;
 	#obfuscator: SecretObfuscator | undefined;
@@ -739,23 +766,81 @@ export class AgentSession {
 		if (this.#promptInFlightCount !== 0) return;
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
-		this.#flushPendingAgentEnd();
-		if (this.#inFlightSettledCallbacks.length === 0) {
+		this.#finishInFlightSettlement();
+		const resolve = this.#promptInFlightSettledResolve;
+		this.#promptInFlightSettled = undefined;
+		this.#promptInFlightSettledResolve = undefined;
+		resolve?.();
+	}
+
+	#waitForInFlightPrompts(): Promise<void> {
+		if (this.#promptInFlightCount === 0) return Promise.resolve();
+		if (!this.#promptInFlightSettled) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			this.#promptInFlightSettled = promise;
+			this.#promptInFlightSettledResolve = resolve;
+		}
+		return this.#promptInFlightSettled;
+	}
+
+	#finishInFlightSettlement(): void {
+		const hasActiveDrain = this.#inFlightSettledCallbacksDrain !== undefined;
+		if (!hasActiveDrain && this.#inFlightSettledCallbacks.length === 0) {
+			this.#notifyYieldQueueIfSettled();
+			this.#flushPendingAgentEnd();
 			this.#drainStrandedQueuedMessages();
 			return;
 		}
-		void this.#flushInFlightSettledCallbacks().finally(() => this.#drainStrandedQueuedMessages());
+
+		let startDrain = false;
+		if (!hasActiveDrain) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			this.#inFlightSettledCallbacksDrain = promise;
+			this.#inFlightSettledCallbacksDrainResolve = resolve;
+			startDrain = true;
+		}
+		// Preserve the wire ordering: pending agent_end is emitted before its
+		// settlement observers run, while the explicit drain state keeps the
+		// session authoritatively busy throughout those observers.
+		this.#flushPendingAgentEnd();
+		if (startDrain) void this.#flushInFlightSettledCallbacks();
+	}
+
+	#finalizeInFlightSettledCallbacksDrain(): void {
+		const resolve = this.#inFlightSettledCallbacksDrainResolve;
+		this.#inFlightSettledCallbacksDrain = undefined;
+		this.#inFlightSettledCallbacksDrainResolve = undefined;
+		this.#notifyYieldQueueIfSettled();
+		this.#drainStrandedQueuedMessages();
+		resolve?.();
+	}
+
+	#notifyYieldQueueIfSettled(): void {
+		if (
+			this.agent.state.isStreaming ||
+			this.#promptInFlightCount > 0 ||
+			this.#postPromptTasks.size > 0 ||
+			this.#inFlightSettledCallbacksDrain
+		)
+			return;
+		this.yieldQueue.notifySettled();
 	}
 
 	async #flushInFlightSettledCallbacks(): Promise<void> {
-		const callbacks = this.#inFlightSettledCallbacks;
-		this.#inFlightSettledCallbacks = [];
-		for (const callback of callbacks) {
-			try {
-				await callback();
-			} catch (error) {
-				logger.warn("In-flight settle callback failed", { error: String(error) });
+		try {
+			while (this.#inFlightSettledCallbacks.length > 0) {
+				const callbacks = this.#inFlightSettledCallbacks;
+				this.#inFlightSettledCallbacks = [];
+				for (const callback of callbacks) {
+					try {
+						await callback();
+					} catch (error) {
+						logger.warn("In-flight settle callback failed", { error: String(error) });
+					}
+				}
 			}
+		} finally {
+			this.#finalizeInFlightSettledCallbacksDrain();
 		}
 	}
 
@@ -836,17 +921,7 @@ export class AgentSession {
 		}
 		// Park only a *blocked* follow-up (one a user interrupt is intentionally holding); an
 		// already-resumable follow-up can ride the wake turn normally without reordering.
-		const parkedFollowUps =
-			this.agent.peekSteeringQueue().length === 0 &&
-			this.agent.peekFollowUpQueue().length > 0 &&
-			!this.#canAutoContinueForFollowUp()
-				? [...this.agent.peekFollowUpQueue()]
-				: [];
-		const parkedQueueDrainBlocked = parkedFollowUps.length > 0 && this.#queuedMessageDrainBlocked;
-		if (parkedFollowUps.length > 0) {
-			this.agent.replaceQueues([...this.agent.peekSteeringQueue()], []);
-			if (parkedQueueDrainBlocked) this.#queuedMessageDrainBlocked = false;
-		}
+		const parkedFollowUps = this.queueService.parkBlockedFollowUps(!this.#canAutoContinueForFollowUp());
 		let finishObservation: ((error?: unknown) => void | Promise<void>) | undefined;
 		try {
 			finishObservation = this.#ircWakeTurnObserver?.(records);
@@ -876,13 +951,7 @@ export class AgentSession {
 					turnError ??= error;
 					logger.warn("IRC wake turn recovery failed", { error: String(error) });
 				}
-				if (parkedFollowUps.length > 0) {
-					this.agent.replaceQueues(
-						[...this.agent.peekSteeringQueue()],
-						[...parkedFollowUps, ...this.agent.peekFollowUpQueue()],
-					);
-					this.#queuedMessageDrainBlocked ||= parkedQueueDrainBlocked;
-				}
+				this.queueService.restoreParkedFollowUps(parkedFollowUps);
 				this.#endInFlight(async () => {
 					try {
 						await finishObservation?.(turnError);
@@ -899,16 +968,7 @@ export class AgentSession {
 	 *  steered in just before the user stopped; real user follow-ups stay queued.
 	 *  Synchronous and await-free so it runs before the abort path polls the queue. */
 	#extractQueuedAdvisorCards(): CustomMessage[] {
-		const steering = this.agent.peekSteeringQueue();
-		const followUp = this.agent.peekFollowUpQueue();
-		const cards = [...steering, ...followUp].filter(isAdvisorCard);
-		if (cards.length === 0) return [];
-		this.agent.replaceQueues(
-			steering.filter(m => !isAdvisorCard(m)),
-			followUp.filter(m => !isAdvisorCard(m)),
-		);
-		this.#reconcileQueuedMessageDrain();
-		return cards;
+		return this.queueService.extractAdvisorCards();
 	}
 
 	/** Record a suppressed advisor concern as visible, persisted advice without
@@ -931,12 +991,7 @@ export class AgentSession {
 		this.#promptInFlightCount = 0;
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
-		this.#flushPendingAgentEnd();
-		if (this.#inFlightSettledCallbacks.length === 0) {
-			this.#drainStrandedQueuedMessages();
-			return;
-		}
-		void this.#flushInFlightSettledCallbacks().finally(() => this.#drainStrandedQueuedMessages());
+		this.#finishInFlightSettlement();
 	}
 
 	#flushPendingAgentEnd(): void {
@@ -991,6 +1046,7 @@ export class AgentSession {
 		this.#codeModeState = config.codeModeState ?? {};
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.queueService = new SessionQueueService(this.agent, () => this.#pendingNextTurnMessages.length);
 		this.#modelRegistry = config.modelRegistry;
 		this.#codexResetCoordinator = config.codexResetCoordinator ?? defaultCodexAutoRedeemCoordinator;
 		const bashHost: BashRunnerHost = {
@@ -1249,7 +1305,10 @@ export class AgentSession {
 			await this.#maintenance.maintainContextMidRun(messages, signal, context);
 		});
 		this.yieldQueue = new YieldQueue({
-			isStreaming: () => this.isStreaming,
+			isStreaming: () =>
+				this.agent.state.isStreaming ||
+				this.#promptInFlightCount > 0 ||
+				this.#inFlightSettledCallbacksDrain !== undefined,
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
@@ -1327,6 +1386,7 @@ export class AgentSession {
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			notifyCommandMetadataChanged: () => this.#notifyCommandMetadataChanged(),
+			notifyToolInventoryChanged: () => this.#notifyToolInventoryChanged(),
 			localProtocolOptions: () => this.#localProtocolOptions(),
 			getInspectImageModeOverride: () => this.#inspectImageModeOverride,
 			setInspectImageModeOverride: mode => {
@@ -1336,6 +1396,7 @@ export class AgentSession {
 		this.#tools = new SessionTools(sessionToolsHost, {
 			autoApprove: config.autoApprove,
 			toolRegistry: config.toolRegistry,
+			createEvalTool: config.createEvalTool,
 			createVibeTools: config.createVibeTools,
 			createComputerTool: config.createComputerTool,
 			createThinkTool: config.createThinkTool,
@@ -1631,6 +1692,7 @@ export class AgentSession {
 			effectiveServiceTier: model => this.#models.effectiveServiceTier(model),
 		};
 		this.#handoff = new SessionHandoff(handoffHost);
+		this.planMode = new PlanModeController(this);
 
 		this.#rehydrateCheckpointRewindState();
 
@@ -1770,8 +1832,12 @@ export class AgentSession {
 	setSessionBeforeSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
 		this.#sessionBeforeSwitchReconciler = reconciler ?? undefined;
 	}
-
 	#sessionSwitchReconciler: (() => Promise<void>) | undefined;
+
+	async #reconcileSessionMode(context?: SessionContext): Promise<void> {
+		await this.planMode.reconcileFromSession(context);
+		await this.#sessionSwitchReconciler?.();
+	}
 
 	setSessionSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
 		this.#sessionSwitchReconciler = reconciler ?? undefined;
@@ -3202,6 +3268,7 @@ export class AgentSession {
 				this.#postPromptTasks.delete(task);
 				if (this.#postPromptTasks.size === 0) {
 					this.#resolvePostPromptTasks();
+					this.#notifyYieldQueueIfSettled();
 				}
 			});
 	}
@@ -3787,6 +3854,26 @@ export class AgentSession {
 			}
 		}
 	}
+	subscribeToolInventoryChanged(listener: ToolInventoryChangedListener): () => void {
+		this.#toolInventoryChangedListeners.push(listener);
+		return () => {
+			const index = this.#toolInventoryChangedListeners.indexOf(listener);
+			if (index !== -1) this.#toolInventoryChangedListeners.splice(index, 1);
+		};
+	}
+
+	#notifyToolInventoryChanged(): void {
+		const listeners = [...this.#toolInventoryChangedListeners];
+		for (const listener of listeners) {
+			try {
+				void Promise.resolve(listener()).catch(err => {
+					logger.error("Tool inventory listener rejected", { err });
+				});
+			} catch (err) {
+				logger.error("Tool inventory listener threw", { err });
+			}
+		}
+	}
 
 	/**
 	 * Temporarily disconnect from agent events.
@@ -4083,13 +4170,18 @@ export class AgentSession {
 			logger.warn("Post-prompt tasks still draining at dispose deadline", { error: String(error) });
 		}
 		await this.#drainAutolearnCapture();
+		await this.planMode.clearTransientState({ restoreTools: false });
 		await this.#memory.transition;
 
 		const hindsightState = this.getHindsightSessionState();
 		const mnemopiState = setMnemopiSessionState(this, undefined);
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
+		if (options.preserveAsyncJobs) {
+			this.#unregisterAsyncDeliverySink?.();
+			this.#unregisterAsyncDeliverySink = undefined;
+		}
 		const results = await Promise.allSettled([
-			this.#disposeOwnedAsyncJobs(),
+			options.preserveAsyncJobs ? Promise.resolve(true) : this.#disposeOwnedAsyncJobs(),
 			this.#eval.disposeKernels(),
 			this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId()),
 			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),
@@ -4099,6 +4191,7 @@ export class AgentSession {
 			hindsightState?.flushRetainQueue() ?? Promise.resolve(),
 			this.#disposeMnemopi(mnemopiState, options.mnemopiConsolidateTimeoutMs),
 		]);
+		this.#eval.flushPending();
 		for (const result of results) {
 			if (result.status === "rejected") {
 				logger.warn("Session dispose subsystem failed during parallel teardown", {
@@ -4408,12 +4501,6 @@ export class AgentSession {
 		this.#queuedMessageDrainBlocked = false;
 	}
 
-	#reconcileQueuedMessageDrain(): void {
-		if (!this.agent.hasQueuedMessages()) {
-			this.#queuedMessageDrainBlocked = false;
-		}
-	}
-
 	async #runQueuedUsageAwarePreflight(signal?: AbortSignal): Promise<boolean> {
 		try {
 			const allowed = await this.#runUsageAwarePreflight(signal);
@@ -4495,15 +4582,47 @@ export class AgentSession {
 		return this.agent.state.isStreaming || this.#promptInFlightCount > 0;
 	}
 
+	/**
+	 * Authoritative session activity phase. Unlike `isStreaming`, this separates
+	 * the core provider loop from prompt settlement and tracked post-prompt work.
+	 */
+	get activityPhase(): "provider" | "maintenance" | "idle" {
+		if (this.agent.state.isStreaming) return "provider";
+		if (this.#promptInFlightCount > 0 || this.#postPromptTasks.size > 0 || this.#inFlightSettledCallbacksDrain)
+			return "maintenance";
+		return "idle";
+	}
+
 	get isAborting(): boolean {
 		return this.agent.isAborting;
 	}
 
 	/** Wait until streaming, event persistence, and deferred recovery work are fully settled. */
 	async waitForIdle(): Promise<void> {
-		await this.agent.waitForIdle();
-		await this.#advisors.waitForPendingCardEvents();
-		await this.#waitForPostPromptRecovery();
+		while (true) {
+			await this.agent.waitForIdle();
+			await this.#advisors.waitForPendingCardEvents();
+			await this.#waitForPostPromptRecovery();
+			const settlementCallbacks = this.#inFlightSettledCallbacksDrain;
+			if (settlementCallbacks) {
+				await settlementCallbacks;
+				continue;
+			}
+			if (this.#promptInFlightCount > 0) {
+				// The Agent can already be idle while its session wrapper is still
+				// running preflight or finalization. Block on that lifecycle edge
+				// instead of spinning microtasks, which starves timers and process I/O
+				// needed by the outstanding work.
+				await this.#waitForInFlightPrompts();
+				continue;
+			}
+			const postPromptTasks = this.#postPromptTasksPromise;
+			if (postPromptTasks) {
+				await postPromptTasks;
+				continue;
+			}
+			if (this.activityPhase === "idle") return;
+		}
 	}
 	/**
 	 * Prevent advisor notes from starting hidden primary turns while a headless
@@ -4587,6 +4706,10 @@ export class AgentSession {
 	getToolByName(name: string): AgentTool | undefined {
 		return this.#tools.getToolByName(name);
 	}
+	/** Returns a session-bound eval tool without changing the model-visible active tool set. */
+	getEvalToolForHost(): unknown {
+		return this.#tools.getEvalToolForHost();
+	}
 
 	/** Looks up an enabled eval-bridge tool with the session's permission gate applied. */
 	getToolForEvalBridge(name: string): AgentTool | undefined {
@@ -4641,6 +4764,10 @@ export class AgentSession {
 	/** Names of every registered tool. */
 	getAllToolNames(): string[] {
 		return this.#tools.getAllToolNames();
+	}
+	/** Current authoritative tool registry projected for remote clients. */
+	getToolInventory(applicationApiVersion: number): ToolInventory {
+		return this.#tools.getToolInventory(applicationApiVersion);
 	}
 
 	/** Full metadata for every registered tool, including source provenance (backs `getAllTools()`). */
@@ -4709,8 +4836,8 @@ export class AgentSession {
 	}
 
 	/** Selects enabled tools, ignoring names absent from the registry. */
-	setActiveToolsByName(toolNames: string[]): Promise<void> {
-		return this.#tools.setActiveToolsByName(toolNames);
+	setActiveToolsByName(toolNames: string[], allowToolRegistration = true): Promise<void> {
+		return this.#tools.setActiveToolsByName(toolNames, allowToolRegistration);
 	}
 
 	/** Restores an exact top-level versus `xd://` tool partition. */
@@ -4862,7 +4989,7 @@ export class AgentSession {
 	 * to avoid racing against the delivery turn.
 	 */
 	get hasPostPromptWork(): boolean {
-		return this.#postPromptTasks.size > 0;
+		return this.#postPromptTasks.size > 0 || this.#inFlightSettledCallbacksDrain !== undefined;
 	}
 
 	/** Register post-prompt work in tests without driving a full agent turn. */
@@ -5513,13 +5640,9 @@ export class AgentSession {
 			// Steer/follow-up the keyword notices BEFORE the queued user message so the
 			// model reads the steering notice ahead of the prompt it modifies.
 			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
+				await this.#queueCustomMessage(notice, streamingBehavior, undefined, options?.messageTag);
 			}
-			if (streamingBehavior === "followUp") {
-				await this.#queueUserMessage(expandedText, options?.images, "followUp");
-			} else {
-				await this.#queueUserMessage(expandedText, options?.images, "steer");
-			}
+			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, options?.messageTag);
 			return true;
 		}
 
@@ -5602,7 +5725,7 @@ export class AgentSession {
 
 	async promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice"> & {
+		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "messageTag"> & {
 			queueChipText?: string;
 			queueOnly?: boolean;
 		},
@@ -5639,9 +5762,9 @@ export class AgentSession {
 			if (!streamingBehavior) throw new AgentBusyError();
 
 			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
+				await this.#queueCustomMessage(notice, streamingBehavior, undefined, options.messageTag);
 			}
-			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText);
+			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText, options.messageTag);
 			return;
 		}
 		if (this.isStreaming) {
@@ -5649,9 +5772,9 @@ export class AgentSession {
 			if (!streamingBehavior) throw new AgentBusyError();
 
 			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
+				await this.#queueCustomMessage(notice, streamingBehavior, undefined, options?.messageTag);
 			}
-			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText);
+			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText, options?.messageTag);
 			return;
 		}
 
@@ -5674,7 +5797,7 @@ export class AgentSession {
 	async #promptWithMessage(
 		message: AgentMessage,
 		expandedText: string,
-		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck"> & {
+		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck" | "messageTag"> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
@@ -5684,6 +5807,7 @@ export class AgentSession {
 		// every pre-dispatch bail (generation bump from abort, disposal, usage
 		// preflight denial) exits silently, and prompt() uses the outcome to hand
 		// the typed text back to the host instead of losing it.
+		if (options?.messageTag) this.queueService.setTag(message, options.messageTag);
 		this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		try {
@@ -5909,6 +6033,7 @@ export class AgentSession {
 			// The per-turn before_agent_start override lives only for this turn.
 			this.#tools.clearTurnSystemPromptOverride();
 			this.#usagePreflightReadyForNextModelCall = false;
+			this.#eval.flushPending();
 			this.#endInFlight();
 		}
 	}
@@ -6152,6 +6277,7 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		mode: "steer" | "followUp",
+		messageTag?: string,
 	): Promise<void> {
 		// A queued user message (RPC/SDK/collab steer or follow-up, or a typed message
 		// while streaming) is a deliberate resume; re-enable advisor auto-resume that
@@ -6168,23 +6294,29 @@ export class AgentSession {
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
 		this.#allowQueuedMessageDrainRetry();
+		if (imageDescriptionNotice && messageTag) this.queueService.setTag(imageDescriptionNotice, messageTag);
+		const queuedMessage: AgentMessage =
+			mode === "followUp"
+				? {
+						role: "user",
+						content,
+						attribution: "user",
+						timestamp: Date.now(),
+					}
+				: {
+						role: "user",
+						content,
+						steering: true,
+						attribution: "user",
+						timestamp: Date.now(),
+					};
+		if (messageTag) this.queueService.setTag(queuedMessage, messageTag);
 		if (mode === "followUp") {
 			if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
-			this.agent.followUp({
-				role: "user",
-				content,
-				attribution: "user",
-				timestamp: Date.now(),
-			});
+			this.agent.followUp(queuedMessage);
 		} else {
 			if (imageDescriptionNotice) this.agent.steer(imageDescriptionNotice);
-			this.agent.steer({
-				role: "user",
-				content,
-				steering: true,
-				attribution: "user",
-				timestamp: Date.now(),
-			});
+			this.agent.steer(queuedMessage);
 		}
 		this.#scheduleIdleQueueDrain();
 	}
@@ -6375,6 +6507,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		deliverAs: "steer" | "followUp",
 		queueChipText?: string,
+		messageTag?: string,
 	): Promise<void> {
 		const details =
 			queueChipText !== undefined
@@ -6397,6 +6530,7 @@ export class AgentSession {
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
 		this.#allowQueuedMessageDrainRetry();
+		if (messageTag) this.queueService.setTag(normalizedAppMessage, messageTag);
 		if (deliverAs === "followUp") {
 			this.agent.followUp(normalizedAppMessage);
 		} else {
@@ -6563,37 +6697,31 @@ export class AgentSession {
 	 *  non-user steer (hidden goal/plan/budget, IRC/extension asides) is dropped, so abort()'s
 	 *  #drainStrandedQueuedMessages can't auto-resume the run the user just interrupted (the drain only
 	 *  fires while agent.hasQueuedMessages()). Plain Alt+Up dequeue preserves those non-user steers. */
-	clearQueue(options?: { forInterrupt?: boolean }): {
-		steering: RestoredQueuedMessage[];
-		followUp: RestoredQueuedMessage[];
-	} {
-		const steeringAll = this.agent.peekSteeringQueue();
-		const followUpAll = this.agent.peekFollowUpQueue();
-		const steering = steeringAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage);
-		const followUp = followUpAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage);
-		const keep: (m: AgentMessage) => boolean = options?.forInterrupt
-			? isAdvisorCard
-			: m => !isUserQueuedMessage(m) && !isHiddenUserCompanion(m);
-		this.agent.replaceQueues(steeringAll.filter(keep), followUpAll.filter(keep));
-		this.#reconcileQueuedMessageDrain();
-		return { steering, followUp };
+	clearQueue(options?: { lane?: SessionQueueLane | "all"; forInterrupt?: boolean }): SessionQueueClearResult {
+		return this.queueService.clear(options);
+	}
+	/** Return the stable caller tag attached to this exact message instance. */
+	getMessageTag(message: AgentMessage): string | undefined {
+		return this.queueService.getTag(message);
+	}
+
+	/** Remove only queued messages owned by `tag`, preserving unrelated queue entries. */
+	removeQueuedMessagesByTag(tag: string): number {
+		return this.queueService.removeByTag(tag);
 	}
 
 	/** Number of pending displayable messages (includes steering, follow-up, and next-turn messages).
 	 *  Reflects actual queued work (advisor cards included) — feeds hasPendingMessages()/RPC and the
 	 *  empty-submit abort gate. The user-restorable subset is surfaced by getQueuedMessages()/clearQueue(). */
 	get queuedMessageCount(): number {
-		return (
-			this.agent.peekSteeringQueue().filter(isDisplayableQueuedMessage).length +
-			this.agent.peekFollowUpQueue().filter(isDisplayableQueuedMessage).length +
-			this.#pendingNextTurnMessages.length
-		);
+		return this.queueService.snapshot().pendingCount;
 	}
 
 	getQueuedMessages(): { steering: readonly string[]; followUp: readonly string[] } {
+		const snapshot = this.queueService.snapshot();
 		return {
-			steering: this.agent.peekSteeringQueue().filter(isUserQueuedMessage).map(queueChipText),
-			followUp: this.agent.peekFollowUpQueue().filter(isUserQueuedMessage).map(queueChipText),
+			steering: snapshot.steering.map(entry => entry.text),
+			followUp: snapshot.followUp.map(entry => entry.text),
 		};
 	}
 
@@ -6603,39 +6731,11 @@ export class AgentSession {
 	 * Steps over agent-authored queued messages (advisor cards, hidden/internal steers).
 	 */
 	popLastQueuedMessage(): RestoredQueuedMessage | undefined {
-		const steering = this.agent.peekSteeringQueue();
-		const followUp = this.agent.peekFollowUpQueue();
-		const lastUserIndex = (queue: readonly AgentMessage[]): number => {
-			for (let i = queue.length - 1; i >= 0; i--) {
-				if (isUserQueuedMessage(queue[i])) return i;
-			}
-			return -1;
-		};
-		// Notices queue immediately before their user message, so dropping the popped
-		// prompt means also dropping the contiguous hidden-user companions right before
-		// it — companions of other queued prompts stay put.
-		const removeWithCompanions = (queue: readonly AgentMessage[], userIndex: number): AgentMessage[] => {
-			let start = userIndex;
-			while (start > 0 && isHiddenUserCompanion(queue[start - 1])) start--;
-			const next = queue.slice();
-			next.splice(start, userIndex - start + 1);
-			return next;
-		};
-		const fromSteer = lastUserIndex(steering);
-		if (fromSteer >= 0) {
-			const removed = steering[fromSteer];
-			this.agent.replaceQueues(removeWithCompanions(steering, fromSteer), followUp.slice());
-			this.#reconcileQueuedMessageDrain();
-			return toRestoredQueuedMessage(removed);
-		}
-		const fromFollowUp = lastUserIndex(followUp);
-		if (fromFollowUp >= 0) {
-			const removed = followUp[fromFollowUp];
-			this.agent.replaceQueues(steering.slice(), removeWithCompanions(followUp, fromFollowUp));
-			this.#reconcileQueuedMessageDrain();
-			return toRestoredQueuedMessage(removed);
-		}
-		return undefined;
+		return this.queueService.popLast();
+	}
+
+	getQueueSnapshot(): SessionQueueSnapshot {
+		return this.queueService.snapshot();
 	}
 
 	get skillsSettings(): SkillsSettings | undefined {
@@ -6903,7 +7003,7 @@ export class AgentSession {
 	 * @param options - Optional initial messages and parent session path
 	 * @returns true if completed, false if cancelled by hook
 	 */
-	async newSession(options?: NewSessionOptions): Promise<boolean> {
+	async newSession(options?: NewSessionOptions, beforeCommit?: () => void | Promise<void>): Promise<boolean> {
 		this.#assertVibeSessionTransitionAllowed("start a new session");
 		const previousSessionFile = this.sessionFile;
 
@@ -6918,6 +7018,9 @@ export class AgentSession {
 				return false;
 			}
 		}
+
+		await beforeCommit?.();
+		this.#eval.flushPending();
 
 		this.#disconnectFromAgent();
 		let advisorRecordersDetached = false;
@@ -6976,7 +7079,9 @@ export class AgentSession {
 			this.#planReferencePath = "local://PLAN.md";
 			this.#advisors.resetSessionState();
 			advisorRecordersDetached = false;
+
 			this.#reconnectToAgent();
+			await this.#reconcileSessionMode();
 			// The workspace-roots block must reflect the new session's directory set,
 			// not the previous session's — refresh before the next turn goes out.
 			await this.refreshBaseSystemPrompt();
@@ -7013,7 +7118,7 @@ export class AgentSession {
 	 * Unlike newSession(), this preserves all messages in the agent state.
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
-	async fork(): Promise<boolean> {
+	async fork(beforeCommit?: () => void | Promise<void>): Promise<boolean> {
 		this.#assertVibeSessionTransitionAllowed("fork the session");
 		const previousSessionFile = this.sessionFile;
 		const previousSessionId = this.sessionManager.getSessionId();
@@ -7029,6 +7134,7 @@ export class AgentSession {
 				return false;
 			}
 		}
+		await beforeCommit?.();
 
 		await this.#bash.flushPending();
 		// Flush current session to ensure all entries are written
@@ -7069,6 +7175,7 @@ export class AgentSession {
 			this.#advisors.reattachRecorderFeeds();
 			advisorRecordersDetached = false;
 			await this.#memory.resetContextForNewTranscript();
+			await this.#reconcileSessionMode();
 
 			// Emit session_switch event with reason "fork" to hooks
 			if (this.#extensionRunner) {
@@ -7737,8 +7844,8 @@ export class AgentSession {
 	/**
 	 * Track Python work started outside AgentSession.executePython so dispose can await and abort it too.
 	 */
-	trackEvalExecution<T>(execution: Promise<T>, abortController: AbortController): Promise<T> {
-		return this.#eval.trackExecution(execution, abortController);
+	trackEvalExecution<T>(execution: Promise<T>, abortController: AbortController, executionId?: string): Promise<T> {
+		return this.#eval.trackExecution(execution, abortController, executionId);
 	}
 
 	/**
@@ -7748,11 +7855,28 @@ export class AgentSession {
 		this.#eval.recordPythonResult(code, result, options);
 	}
 
+	/** Record a user-initiated eval through the existing session transcript authority. */
+	recordEvalResult(
+		result: Omit<PythonExecutionMessage, "role" | "timestamp"> & { timestamp?: number },
+	): PythonExecutionMessage {
+		return this.#eval.recordEvalResult(result);
+	}
+
+	/** Completed eval entries not yet appended because an agent turn is streaming. */
+	getPendingEvalMessages(): readonly PythonExecutionMessage[] {
+		return this.#eval.pendingMessages();
+	}
+
 	/**
 	 * Cancel running Python execution.
 	 */
 	abortEval(): void {
 		this.#eval.abort();
+	}
+
+	/** Cancel exactly one eval execution without affecting sibling kernels or runs. */
+	abortEvalExecution(executionId: string): boolean {
+		return this.#eval.abortExecution(executionId);
 	}
 
 	/** Whether a Python execution is currently running */
@@ -7971,7 +8095,7 @@ export class AgentSession {
 	 * Listeners are preserved and will continue receiving events.
 	 * @returns true if switch completed, false if cancelled by hook
 	 */
-	async switchSession(sessionPath: string): Promise<boolean> {
+	async switchSession(sessionPath: string, beforeCommit?: () => void | Promise<void>): Promise<boolean> {
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
@@ -7988,6 +8112,9 @@ export class AgentSession {
 				return false;
 			}
 		}
+
+		await beforeCommit?.();
+		this.#eval.flushPending();
 
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
@@ -8164,12 +8291,9 @@ export class AgentSession {
 			if (switchingToDifferentSession) {
 				await this.#memory.resetContextForNewTranscript();
 			}
-			if (switchingToDifferentSession || didReloadConversationChange) {
-				this.#clearSessionScopedToolState();
-			}
 			this.#reconnectToAgent();
 			try {
-				await this.#sessionSwitchReconciler?.();
+				await this.#reconcileSessionMode(sessionContext);
 			} catch (error) {
 				logger.warn("Failed to reconcile session mode after switch", {
 					targetSessionFile: sessionPath,
@@ -8195,6 +8319,11 @@ export class AgentSession {
 			if (switchingToDifferentSession) {
 				this.#advisors.restoreCost(await loadAdvisorTranscriptCosts(this.sessionFile));
 			}
+			// Preview invokers, forced tool choices, permission decisions, and
+			// announced mounts belong to the previous logical session. Defer
+			// clearing until every fallible switch step has completed so rollback
+			// preserves the previous session's pending decisions exactly.
+			this.#clearSessionScopedToolState();
 			this.#bash.finishSessionTransition(bashTransition, true);
 			if (previousSessionState.sessionId !== this.sessionManager.getSessionId()) {
 				this.#notifySessionChangeCallbacks();
@@ -8245,11 +8374,10 @@ export class AgentSession {
 				this.#emit({ type: "model_changed" });
 			}
 			this.#todo.syncFromBranch();
-			this.#advisors.resetAllRuntimes();
 			this.#advisors.reattachRecorderFeeds();
 			this.#reconnectToAgent();
 			try {
-				await this.#sessionSwitchReconciler?.();
+				await this.#reconcileSessionMode();
 			} catch (reconcileError) {
 				logger.warn("Failed to reconcile session mode after switch rollback", {
 					targetSessionFile: sessionPath,
@@ -8271,7 +8399,10 @@ export class AgentSession {
 	 *   - selectedImages: Image attachments of the selected user message (for editor draft restore)
 	 *   - cancelled: True if a hook cancelled the branch
 	 */
-	async branch(entryId: string): Promise<{
+	async branch(
+		entryId: string,
+		beforeCommit?: () => void | Promise<void>,
+	): Promise<{
 		selectedText: string;
 		selectedImages: ImageContent[];
 		cancelled: boolean;
@@ -8300,6 +8431,9 @@ export class AgentSession {
 			}
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 		}
+
+		await beforeCommit?.();
+		this.#eval.flushPending();
 
 		// Clear pending messages (bound to old session state)
 		this.#pendingNextTurnMessages = [];
@@ -8360,6 +8494,7 @@ export class AgentSession {
 				this.#advisors.resetSessionState();
 				this.#closeCodexProviderSessionsForHistoryRewrite();
 			}
+			await this.#reconcileSessionMode();
 
 			this.#advisors.reattachRecorderFeeds();
 			advisorRecordersDetached = false;
@@ -9631,6 +9766,23 @@ export class AgentSession {
 	 */
 	getAdvisorStatusOverview(): { configured: boolean; advisors: { name: string; status: AdvisorRuntimeStatus }[] } {
 		return this.#advisors.getAdvisorStatusOverview();
+	}
+
+	/**
+	 * Authoritative lightweight advisor state for external control surfaces.
+	 * Configured intent is kept separate from whether a live runtime exists.
+	 */
+	getAdvisorStateOverview(): {
+		configured: boolean;
+		active: boolean;
+		advisors: { name: string; status: AdvisorRuntimeStatus }[];
+	} {
+		const { advisors } = this.getAdvisorStatusOverview();
+		return {
+			configured: this.isAdvisorEnabled(),
+			active: this.isAdvisorActive(),
+			advisors,
+		};
 	}
 
 	/** Return cumulative cost recorded for the current session's advisor activity. */

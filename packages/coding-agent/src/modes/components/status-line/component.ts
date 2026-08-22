@@ -1,6 +1,8 @@
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
+import { getAntigravityCounterKeyForModel } from "@oh-my-pi/pi-ai/usage/google-antigravity";
+import { scopeCodexLimitsForRequest } from "@oh-my-pi/pi-ai/usage/openai-codex";
 import {
 	type Component,
 	type ComposerStyle,
@@ -13,7 +15,11 @@ import { adjustHsv, formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
 import { settings } from "../../../config/settings";
 import type { AgentSession } from "../../../session/agent-session";
 import type { OAuthAccountIdentity } from "../../../session/auth-storage";
-import { limitMatchesActiveAccount } from "../../../slash-commands/helpers/active-oauth-account";
+import {
+	formatUsageReportAccountLabel,
+	limitMatchesActiveAccount,
+	reportMatchesActiveAccount,
+} from "../../../slash-commands/helpers/active-oauth-account";
 import { type ActiveRepoContext, resolveActiveRepoContextSync } from "../../../utils/active-repo-context";
 import * as git from "../../../utils/git";
 import * as jj from "../../../utils/jj";
@@ -37,6 +43,7 @@ import type {
 	StatusLineSegmentId,
 	StatusLineSegmentOptions,
 	StatusLineSettings,
+	StatusUsage,
 } from "./types";
 
 const JJ_REFRESH_TTL_MS = 5000;
@@ -318,10 +325,6 @@ function hasPathSegment(segments: readonly StatusLineSegmentId[]): boolean {
 	return segments.includes("path");
 }
 
-function hasGitBackedSegment(segments: readonly StatusLineSegmentId[]): boolean {
-	return hasGitSegment(segments) || hasPrSegment(segments);
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // StatusLineComponent
 // ═══════════════════════════════════════════════════════════════════════════
@@ -434,12 +437,7 @@ export class StatusLineComponent implements Component {
 	#lastTokensPerSecondTimestamp: number | null = null;
 
 	// Provider usage caching (5-min TTL, OAuth/sub only)
-	#cachedUsage: {
-		tier?: string;
-		fiveHour?: { percent: number; resetMinutes?: number };
-		sevenDay?: { percent: number; resetHours?: number };
-		monthly?: { percent: number; resetHours?: number };
-	} | null = null;
+	#cachedUsage: StatusUsage | null = null;
 	#cachedUsageContextKey: string | null = null;
 	#usageFetchedAt = 0;
 	#usageInFlight = false;
@@ -462,6 +460,8 @@ export class StatusLineComponent implements Component {
 			preset: settings.get("statusLine.preset"),
 			leftSegments: settings.get("statusLine.leftSegments"),
 			rightSegments: settings.get("statusLine.rightSegments"),
+			secondaryLeftSegments: settings.get("statusLine.secondaryLeftSegments"),
+			secondaryRightSegments: settings.get("statusLine.secondaryRightSegments"),
 			separator: settings.get("statusLine.separator"),
 			showHookStatus: settings.get("statusLine.showHookStatus"),
 			segmentOptions: settings.getGroup("statusLine").segmentOptions,
@@ -477,9 +477,12 @@ export class StatusLineComponent implements Component {
 	}
 	#hasGitBackedSegment(): boolean {
 		const effectiveSettings = this.#resolveSettings();
-		return (
-			hasGitBackedSegment(effectiveSettings.leftSegments) || hasGitBackedSegment(effectiveSettings.rightSegments)
-		);
+		return [
+			...effectiveSettings.leftSegments,
+			...effectiveSettings.rightSegments,
+			...effectiveSettings.secondaryLeftSegments,
+			...effectiveSettings.secondaryRightSegments,
+		].some(segment => segment === "git" || segment === "pr");
 	}
 
 	#resolveActiveRepoCache(): ActiveRepoCache {
@@ -1233,13 +1236,17 @@ export class StatusLineComponent implements Component {
 		return this.#vibeWorkerTokenRate?.() ?? null;
 	}
 
-	#formatUsageContextKey(activeProvider: string | undefined, identity: OAuthAccountIdentity | undefined): string {
+	#formatUsageContextKey(
+		activeProvider: string | undefined,
+		activeModelId: string | undefined,
+		identity: OAuthAccountIdentity | undefined,
+	): string {
 		if (!activeProvider) return "";
-		// orgId is part of the key: rotating between two same-email Anthropic
-		// subscriptions must invalidate the cached usage immediately instead of
-		// showing the previous org's quota for the rest of the cache TTL.
+		// Model id is part of the key because providers such as Antigravity expose
+		// separate backend-family counters under the same account.
 		return [
 			activeProvider,
+			activeModelId ?? "",
 			identity?.accountId ?? "",
 			identity?.email ?? "",
 			identity?.projectId ?? "",
@@ -1248,11 +1255,12 @@ export class StatusLineComponent implements Component {
 	}
 
 	#getUsageContextKey(session: AgentSession): string {
-		const activeProvider = session.state.model?.provider ?? session.model?.provider;
+		const activeModel = session.state.model ?? session.model;
+		const activeProvider = activeModel?.provider;
 		const identity = activeProvider
 			? session.modelRegistry?.authStorage?.getOAuthAccountIdentity(activeProvider, session.sessionId)
 			: undefined;
-		return this.#formatUsageContextKey(activeProvider, identity);
+		return this.#formatUsageContextKey(activeProvider, activeModel?.id, identity);
 	}
 
 	/**
@@ -1310,12 +1318,13 @@ export class StatusLineComponent implements Component {
 			return;
 		}
 		this.#latestAppliedUsageRefreshSequence = sequence;
-		const activeProvider = session.state.model?.provider ?? session.model?.provider;
+		const activeModel = session.state.model ?? session.model;
+		const activeProvider = activeModel?.provider;
 		const activeIdentity =
 			activeProvider && session.modelRegistry?.authStorage
 				? session.modelRegistry.authStorage.getOAuthAccountIdentity(activeProvider, session.sessionId)
 				: undefined;
-		const normalized = this.#normalizeUsageReports(reports, activeProvider, activeIdentity);
+		const normalized = this.#normalizeUsageReports(reports, activeProvider, activeModel?.id, activeIdentity);
 		const resetSnapshot =
 			activeProvider === "openai-codex" ? this.#normalizeCodexResetSnapshot(reports, activeIdentity) : null;
 		const usageChanged = this.#cachedUsage !== normalized;
@@ -1325,7 +1334,7 @@ export class StatusLineComponent implements Component {
 		// some unrelated event (git resolve, keystroke, …) rebuilds it.
 		if (usageChanged) this.#onBranchChange?.();
 		if (!resetSnapshot) return;
-		const contextKey = this.#formatUsageContextKey(activeProvider, activeIdentity);
+		const contextKey = this.#formatUsageContextKey(activeProvider, activeModel?.id, activeIdentity);
 		const previous = this.#codexResetSnapshots.get(contextKey);
 		this.#codexResetSnapshots.set(contextKey, resetSnapshot);
 		if (!previous || !settings.get("tui.codexResetFireworks")) return;
@@ -1427,20 +1436,20 @@ export class StatusLineComponent implements Component {
 	#normalizeUsageReports(
 		reports: unknown,
 		activeProvider?: string,
+		activeModelId?: string,
 		activeIdentity?: OAuthAccountIdentity,
-	): {
-		tier?: string;
-		fiveHour?: { percent: number; resetMinutes?: number };
-		sevenDay?: { percent: number; resetHours?: number };
-		monthly?: { percent: number; resetHours?: number };
-	} | null {
+		includeAccounts = true,
+	): StatusUsage | null {
 		if (!Array.isArray(reports)) return null;
+		let daily: { percent: number; resetMinutes?: number } | undefined;
 		let fiveHour: { percent: number; resetMinutes?: number } | undefined;
 		let sevenDay: { percent: number; resetHours?: number } | undefined;
 		let monthly: { percent: number; resetHours?: number } | undefined;
+		let dailyTier: string | undefined;
 		let fiveHourTier: string | undefined;
 		let sevenDayTier: string | undefined;
 		let monthlyTier: string | undefined;
+		const providerReports: UsageReport[] = [];
 		let monthlyPriority = Number.POSITIVE_INFINITY;
 		const now = Date.now();
 		const cursorMonthlyPriority = (limitId: unknown): number => {
@@ -1458,22 +1467,40 @@ export class StatusLineComponent implements Component {
 			const limits = (report as { limits?: unknown }).limits;
 			if (!Array.isArray(limits)) continue;
 			const usageReport = report as UsageReport;
-			for (const limit of limits) {
-				if (!limit || typeof limit !== "object") continue;
-				if (activeIdentity && !limitMatchesActiveAccount(usageReport, limit as UsageLimit, activeIdentity)) {
+			providerReports.push(usageReport);
+			let scopedLimits: readonly UsageLimit[] = usageReport.limits;
+			if (provider === "google-antigravity") {
+				const counterKey = getAntigravityCounterKeyForModel(activeModelId);
+				if (counterKey) {
+					const matching = usageReport.limits.filter(limit =>
+						limit.id.toLowerCase().startsWith(`${provider}:${counterKey}:`),
+					);
+					const fallback = usageReport.limits.filter(limit =>
+						limit.id.toLowerCase().startsWith(`${provider}:default:`),
+					);
+					scopedLimits = matching.length > 0 ? matching : fallback;
+				}
+			}
+			if (provider === "openai-codex" && usageReport.limits.every(limit => typeof limit.id === "string")) {
+				scopedLimits = scopeCodexLimitsForRequest(usageReport, { modelId: activeModelId });
+			}
+			for (const l of scopedLimits) {
+				if (activeIdentity && !limitMatchesActiveAccount(usageReport, l, activeIdentity)) {
 					continue;
 				}
-				const l = limit as {
-					id?: string;
-					scope?: { windowId?: string; tier?: string };
-					window?: { resetsAt?: number; durationMs?: number };
-					amount?: { usedFraction?: number };
-				};
 				const fraction = l.amount?.usedFraction;
 				if (typeof fraction !== "number") continue;
 				const windowId = l.scope?.windowId;
 				const tier = l.scope?.tier;
 				const resetsAt = l.window?.resetsAt;
+				if (windowId === "daily" && (!daily || (dailyTier !== undefined && !tier))) {
+					daily = {
+						percent: fraction * 100,
+						resetMinutes:
+							typeof resetsAt === "number" ? Math.max(0, Math.round((resetsAt - now) / 60_000)) : undefined,
+					};
+					dailyTier = tier || undefined;
+				}
 				// Canonical window ids win. Fall back to the reported span (same
 				// tolerance as the 5h priority-boost check) so providers that emit
 				// non-canonical ids, and cache rows written before a provider was
@@ -1533,10 +1560,19 @@ export class StatusLineComponent implements Component {
 				}
 			}
 		}
-		if (!fiveHour && !sevenDay && !monthly) return null;
-		// Single compact label; prefer the five-hour tier if displayed windows ever disagree.
-		const effectiveTier = fiveHourTier ?? sevenDayTier ?? monthlyTier;
-		return { tier: effectiveTier, fiveHour, sevenDay, monthly };
+		const effectiveTier = dailyTier ?? fiveHourTier ?? sevenDayTier ?? monthlyTier;
+		const normalized: StatusUsage =
+			daily || fiveHour || sevenDay || monthly
+				? { tier: effectiveTier, daily, fiveHour, sevenDay, monthly }
+				: { unavailable: true };
+		if (!includeAccounts || providerReports.length < 2) return normalized;
+
+		normalized.accounts = providerReports.map((report, index) => ({
+			...this.#normalizeUsageReports([report], activeProvider, activeModelId, undefined, false),
+			label: formatUsageReportAccountLabel(report, index),
+			active: activeIdentity !== undefined ? reportMatchesActiveAccount(report, activeIdentity) : index === 0,
+		}));
+		return normalized;
 	}
 
 	/**
@@ -1734,11 +1770,15 @@ export class StatusLineComponent implements Component {
 		const rightSegments = useCustomSegments
 			? (this.#settings.rightSegments ?? presetDef.rightSegments)
 			: presetDef.rightSegments;
+		const secondaryLeftSegments = this.#settings.secondaryLeftSegments ?? [];
+		const secondaryRightSegments = this.#settings.secondaryRightSegments ?? [];
 
 		return {
 			...this.#settings,
 			leftSegments,
 			rightSegments,
+			secondaryLeftSegments,
+			secondaryRightSegments,
 			separator: this.#settings.separator ?? presetDef.separator,
 			segmentOptions: mergedSegmentOptions,
 		};
@@ -1767,17 +1807,19 @@ export class StatusLineComponent implements Component {
 		width: number,
 		layout: "box" | "plain-full" | "plain-left" | "plain-right" = "box",
 		previewTitle?: string,
+		leftSegments?: readonly StatusLineSegmentId[],
+		rightSegments?: readonly StatusLineSegmentId[],
+		includeTransientBadges = true,
 	): string {
 		const effectiveSettings = this.#resolveSettings();
+		const effectiveLeftSegments = leftSegments ?? effectiveSettings.leftSegments;
+		const effectiveRightSegments = rightSegments ?? effectiveSettings.rightSegments;
 		const plain = layout !== "box";
-		const includePath =
-			hasPathSegment(effectiveSettings.leftSegments) || hasPathSegment(effectiveSettings.rightSegments);
+		const includePath = hasPathSegment(effectiveLeftSegments) || hasPathSegment(effectiveRightSegments);
+		const includeContext = hasContextSegment(effectiveLeftSegments) || hasContextSegment(effectiveRightSegments);
 		const gitEnabled = this.#gitEnabled();
-		const includeGit =
-			gitEnabled &&
-			(hasGitSegment(effectiveSettings.leftSegments) || hasGitSegment(effectiveSettings.rightSegments));
-		const includePr =
-			gitEnabled && (hasPrSegment(effectiveSettings.leftSegments) || hasPrSegment(effectiveSettings.rightSegments));
+		const includeGit = gitEnabled && (hasGitSegment(effectiveLeftSegments) || hasGitSegment(effectiveRightSegments));
+		const includePr = gitEnabled && (hasPrSegment(effectiveLeftSegments) || hasPrSegment(effectiveRightSegments));
 		const ctx = this.#buildSegmentContext(
 			width,
 			effectiveSettings.segmentOptions,
@@ -1809,7 +1851,7 @@ export class StatusLineComponent implements Component {
 		// Collect visible segment contents
 		const leftParts: string[] = [];
 		const leftSegIds: StatusLineSegmentId[] = [];
-		const leftSegmentIds = layout === "plain-right" ? [] : effectiveSettings.leftSegments;
+		const leftSegmentIds = layout === "plain-right" ? [] : effectiveLeftSegments;
 		for (const segId of leftSegmentIds) {
 			if (subagentBadge && segId === "subagents") continue;
 			const rendered = renderSegment(segId, ctx);
@@ -1821,7 +1863,7 @@ export class StatusLineComponent implements Component {
 
 		const rightParts: string[] = [];
 		const rightSegIds: StatusLineSegmentId[] = [];
-		const rightSegmentIds = layout === "plain-left" ? [] : effectiveSettings.rightSegments;
+		const rightSegmentIds = layout === "plain-left" ? [] : effectiveRightSegments;
 		for (const segId of rightSegmentIds) {
 			if (subagentBadge && segId === "subagents") continue;
 			const rendered = renderSegment(segId, ctx);
@@ -1844,7 +1886,7 @@ export class StatusLineComponent implements Component {
 			removeContextSegments(rightParts, rightSegIds);
 		}
 
-		if (layout !== "plain-left") {
+		if (includeTransientBadges && layout !== "plain-left") {
 			const runningBackgroundJobs = this.session.getAsyncJobSnapshot()?.running.length ?? 0;
 			if (runningBackgroundJobs > 0) {
 				rightParts.unshift(theme.fg("statusLineSubagents", `${theme.icon.job} ${runningBackgroundJobs}`));
@@ -2234,15 +2276,28 @@ export class StatusLineComponent implements Component {
 		return lines;
 	}
 
-	render(width: number): readonly string[] {
+	/**
+	 * Renders secondary metrics and hook status rows placed directly above
+	 * the editor container.
+	 */
+	renderAbove(width: number): readonly string[] {
 		const lines: string[] = [];
-		if (this.#standalone && !this.#autocompleteActiveProbe?.()) {
-			const content = this.renderBottomBar(width, this.#standalone === "left-only" ? "left" : "full");
-			if (content) {
-				if (this.#standaloneGap) lines.push("");
-				lines.push(content);
+		const effectiveSettings = this.#resolveSettings();
+		if (effectiveSettings.secondaryLeftSegments.length > 0 || effectiveSettings.secondaryRightSegments.length > 0) {
+			let secondary = this.#buildStatusLine(
+				width,
+				"plain-full",
+				undefined,
+				effectiveSettings.secondaryLeftSegments,
+				effectiveSettings.secondaryRightSegments,
+				false,
+			);
+			if (this.#focusedAgentId && secondary) {
+				secondary = `\x1b[2m${secondary.replaceAll("\x1b[0m", "\x1b[0m\x1b[2m")}\x1b[22m`;
 			}
+			if (secondary) lines.push(secondary);
 		}
+
 		const showHooks = this.#settings.showHookStatus ?? true;
 		if (showHooks && this.#hookStatuses.size > 0) {
 			const hookLines = Array.from(this.#hookStatuses.entries())
@@ -2252,4 +2307,38 @@ export class StatusLineComponent implements Component {
 		}
 		return lines;
 	}
+
+	/**
+	 * Renders the standalone bottom bar row placed below the editor container
+	 * when using shapes with detached bottom status (e.g. borderless, pi, claude).
+	 */
+	renderBelow(width: number): readonly string[] {
+		const lines: string[] = [];
+		if (this.#standalone && !this.#autocompleteActiveProbe?.()) {
+			const content = this.renderBottomBar(width, this.#standalone === "left-only" ? "left" : "full");
+			if (content) {
+				if (this.#standaloneGap) lines.push("");
+				lines.push(content);
+			}
+		}
+		return lines;
+	}
+
+	/**
+	 * Composite render returning all rows (above + below) for standalone
+	 * test harnesses that do not mount distinct sub-components.
+	 */
+	render(width: number): readonly string[] {
+		return [...this.renderAbove(width), ...this.renderBelow(width)];
+	}
+
+	/** Component mounted above the editor for secondary metrics and hook statuses. */
+	readonly above: Component = {
+		render: (width: number) => this.renderAbove(width),
+	};
+
+	/** Component mounted below the editor for standalone bottom bars. */
+	readonly bottomBar: Component = {
+		render: (width: number) => this.renderBelow(width),
+	};
 }

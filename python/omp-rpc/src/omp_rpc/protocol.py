@@ -4,7 +4,7 @@ import base64
 import mimetypes
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Literal, NotRequired, TypedDict, TypeAlias, cast
+from typing import Any, Final, Literal, NotRequired, TypeAlias, TypedDict, cast
 
 JsonPrimitive: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
@@ -18,8 +18,50 @@ ThinkingLevel: TypeAlias = Literal[
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
+SessionActivityPhase: TypeAlias = Literal["provider", "maintenance", "idle"]
+SessionCatalogScope: TypeAlias = Literal["cwd", "all"]
+AdvisorRuntimeStatus: TypeAlias = Literal[
+    "running", "paused", "quota_exhausted", "error", "no_model"
+]
+RpcEvalLanguage: TypeAlias = Literal["py", "js", "rb", "jl"]
+RpcOperationCommand: TypeAlias = str
+SessionMode: TypeAlias = Literal["none", "plan", "plan_paused"]
+PlanWorkflow: TypeAlias = Literal["parallel", "iterative"]
+RpcOperationCancellationReason: TypeAlias = Literal[
+    "user", "replaced", "session_transition", "client_disconnected"
+]
+RpcOperationCancellationCode: TypeAlias = Literal[
+    "cancelled_by_client",
+    "replaced_by_prompt",
+    "session_changed",
+    "client_disconnected",
+]
+RpcCommandScope: TypeAlias = str
+RpcCommandExecution: TypeAlias = str
+RpcCommandAvailability: TypeAlias = str
+RpcCommandConcurrencyClass: TypeAlias = str
+RpcCommandConfirmation: TypeAlias = Literal["none", "required"]
+AgentKind: TypeAlias = Literal["main", "sub", "advisor"]
+AgentStatus: TypeAlias = Literal["running", "idle", "parked", "aborted"]
+AgentJobStatus: TypeAlias = Literal["running", "completed", "failed", "cancelled"]
+CancelAgentStatus: TypeAlias = Literal["cancelled", "not_found", "already_completed"]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
+QueueLane: TypeAlias = Literal["steering", "followUp"]
+JobType: TypeAlias = Literal["bash", "task"]
+JobStatus: TypeAlias = Literal["running", "completed", "failed", "cancelled"]
+CancelJobStatus: TypeAlias = Literal["cancelled", "not_found", "already_completed"]
+AgentSource: TypeAlias = Literal["bundled", "user", "project"]
+SubagentLifecycleStatus: TypeAlias = Literal[
+    "started", "completed", "failed", "aborted"
+]
+SubagentProgressStatus: TypeAlias = Literal[
+    "pending", "running", "completed", "failed", "aborted"
+]
+GoalStatus: TypeAlias = Literal[
+    "active", "paused", "budget-limited", "complete", "dropped"
+]
+ConfiguredThinkingLevel: TypeAlias = ThinkingLevel | Literal["auto"]
 WidgetPlacement: TypeAlias = Literal["aboveEditor", "belowEditor"]
 TodoStatus: TypeAlias = Literal[
     "pending", "in_progress", "completed", "abandoned", "blocked"
@@ -72,6 +114,14 @@ _EFFORT_VALUES: Final[frozenset[str]] = frozenset(
 _THINKING_LEVEL_VALUES: Final[frozenset[str]] = _EFFORT_VALUES | frozenset({"off"})
 _STEERING_MODE_VALUES: Final[frozenset[str]] = frozenset({"all", "one-at-a-time"})
 _INTERRUPT_MODE_VALUES: Final[frozenset[str]] = frozenset({"immediate", "wait"})
+_SESSION_ACTIVITY_PHASE_VALUES: Final[frozenset[str]] = frozenset(
+    {"provider", "maintenance", "idle"}
+)
+_ADVISOR_RUNTIME_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    {"running", "paused", "quota_exhausted", "error", "no_model"}
+)
+_SESSION_MODE_VALUES: Final[frozenset[str]] = frozenset({"none", "plan", "plan_paused"})
+_PLAN_WORKFLOW_VALUES: Final[frozenset[str]] = frozenset({"parallel", "iterative"})
 _STOP_REASON_VALUES: Final[frozenset[str]] = frozenset(
     {"stop", "length", "toolUse", "error", "aborted"}
 )
@@ -285,6 +335,17 @@ def _tuple_of_strings(values: object, *, field: str) -> tuple[str, ...] | None:
             raise ValueError(f"{field} must contain only strings")
         result.append(item)
     return tuple(result) or None
+
+
+def _required_string_tuple(values: object, *, field: str) -> tuple[str, ...]:
+    if not isinstance(values, list):
+        raise ValueError(f"{field} must be a list")
+    result: list[str] = []
+    for index, item in enumerate(values):
+        if not isinstance(item, str):
+            raise ValueError(f"{field}[{index}] must be a string")
+        result.append(item)
+    return tuple(result)
 
 
 def _parse_agent_message(payload: JsonObject, *, field: str) -> AgentMessage:
@@ -563,6 +624,7 @@ class BashExecutionMessage(TypedDict, total=False):
 
 class PythonExecutionMessage(TypedDict, total=False):
     role: Literal["pythonExecution"]
+    language: NotRequired[RpcEvalLanguage]
     code: str
     output: str
     exitCode: int | None
@@ -781,6 +843,54 @@ class ToolDescriptor:
 
 
 @dataclass(slots=True, frozen=True)
+class ToolSource:
+    kind: str
+    server_name: str | None = None
+    remote_name: str | None = None
+    extension_path: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ToolInventoryEntry:
+    name: str
+    label: str
+    description: str
+    parameters: JsonValue
+    presentation: str
+    load_mode: str
+    source: ToolSource
+    summary: str | None = None
+    hidden: bool | None = None
+    deferrable: bool | None = None
+    strict: bool | None = None
+    custom_wire_name: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ToolInventoryXdev:
+    prefix: str
+    mounted_count: int
+
+
+@dataclass(slots=True, frozen=True)
+class ToolInventory:
+    application_api_version: int
+    tools: tuple[ToolInventoryEntry, ...]
+    xdev: ToolInventoryXdev
+
+
+@dataclass(slots=True, frozen=True)
+class ToolActivationResult:
+    enabled_tool_names: tuple[str, ...]
+    active_tool_names: tuple[str, ...]
+    mounted_tool_names: tuple[str, ...]
+    activated: tuple[str, ...]
+    deactivated: tuple[str, ...]
+    inventory_available: bool
+    inventory: ToolInventory | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class TodoItem:
     id: str
     content: str
@@ -806,10 +916,289 @@ class ContextUsage:
 
 
 @dataclass(slots=True, frozen=True)
+class AdvisorRuntimeState:
+    name: str
+    status: AdvisorRuntimeStatus
+
+
+@dataclass(slots=True, frozen=True)
+class AdvisorState:
+    configured: bool
+    active: bool
+    advisors: tuple[AdvisorRuntimeState, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class PendingPlanApproval:
+    approval_id: str
+    title: str
+    plan_file_path: str
+
+
+@dataclass(slots=True, frozen=True)
+class PlanState:
+    mode: SessionMode
+    plan_file_path: str | None = None
+    workflow: PlanWorkflow | None = None
+    reentry: bool = False
+    awaiting_approval: PendingPlanApproval | None = None
+    plan_exists: bool | None = None
+    available_plan_files: tuple[str, ...] = ()
+    content: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class PlanApprovalResult:
+    approval_id: str
+    decision: Literal["approve", "refine", "reject"]
+    execution_dispatched: bool
+    plan_file_path: str
+    compaction: Literal["ok", "cancelled", "failed"] | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ModeChangeResult:
+    operation_id: str
+    accepted: bool
+    deferred: bool
+
+
+@dataclass(slots=True, frozen=True)
+class SessionQueueEntry:
+    entry_id: str
+    lane: QueueLane
+    text: str
+    operation_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SessionQueueSnapshot:
+    steering: tuple[SessionQueueEntry, ...]
+    follow_up: tuple[SessionQueueEntry, ...]
+    row_count: int
+    displayable_count: int
+    pending_count: int
+    pending_next_turn_count: int
+
+
+@dataclass(slots=True, frozen=True)
+class QueuedMessage:
+    text: str
+    images: tuple[ImageContent, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class QueueRemoveResult:
+    removed: QueuedMessage
+    queue: SessionQueueSnapshot
+
+
+@dataclass(slots=True, frozen=True)
+class SessionQueueClearResult:
+    steering: tuple[QueuedMessage, ...]
+    follow_up: tuple[QueuedMessage, ...]
+    snapshot: SessionQueueSnapshot
+
+
+@dataclass(slots=True, frozen=True)
+class JobSnapshot:
+    id: str
+    type: JobType
+    status: JobStatus
+    label: str
+    duration_ms: float
+    queued: bool | None = None
+    resolved_model: str | None = None
+    result_text: str | None = None
+    result_truncated: bool | None = None
+    error_text: str | None = None
+    error_truncated: bool | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AgentActivitySnapshot:
+    id: str
+    age_ms: float
+    parent_id: str | None = None
+    activity: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class JobListResult:
+    jobs: tuple[JobSnapshot, ...]
+    agents: tuple[AgentActivitySnapshot, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class CancelJobOutcome:
+    id: str
+    status: CancelJobStatus
+    message: str
+
+
+@dataclass(slots=True, frozen=True)
+class CancelJobResult:
+    outcomes: tuple[CancelJobOutcome, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class AvailableCommandInput:
+    hint: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AvailableSubcommand:
+    name: str
+    description: str | None = None
+    usage: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AvailableCommand:
+    name: str
+    source: Literal["builtin", "skill", "extension", "custom", "mcp_prompt", "file"]
+    aliases: tuple[str, ...] = ()
+    description: str | None = None
+    input: AvailableCommandInput | None = None
+    subcommands: tuple[AvailableSubcommand, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class Goal:
+    id: str
+    objective: str
+    status: GoalStatus
+    tokens_used: int
+    time_used_seconds: float
+    created_at: float
+    updated_at: float
+    token_budget: int | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class GoalModeState:
+    enabled: bool
+    mode: Literal["active", "exiting"]
+    goal: Goal
+    reason: Literal["completed"] | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SubagentLifecycle:
+    id: str
+    agent: str
+    agent_source: AgentSource
+    status: SubagentLifecycleStatus
+    index: int
+    description: str | None = None
+    session_file: str | None = None
+    parent_tool_call_id: str | None = None
+    detached: bool | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AgentRecentTool:
+    tool: str
+    args: str
+    end_ms: float
+
+
+@dataclass(slots=True, frozen=True)
+class AgentProgress:
+    index: int
+    id: str
+    agent: str
+    agent_source: AgentSource
+    status: SubagentProgressStatus
+    task: str
+    recent_tools: tuple[AgentRecentTool, ...]
+    recent_output: tuple[str, ...]
+    tool_count: int
+    requests: int
+    tokens: int
+    cost: float
+    duration_ms: float
+    assignment: str | None = None
+    description: str | None = None
+    last_intent: str | None = None
+    current_tool: str | None = None
+    current_tool_args: str | None = None
+    current_tool_start_ms: float | None = None
+    context_tokens: int | None = None
+    context_window: int | None = None
+    resolved_model: str | None = None
+    resolved_model_is_fallback: bool | None = None
+    retry_state: JsonObject | None = None
+    retry_failure: JsonObject | None = None
+    inflight_task_details: JsonObject | None = None
+    model_override: str | tuple[str, ...] | None = None
+    extracted_tool_data: JsonObject | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SubagentProgress:
+    index: int
+    agent: str
+    agent_source: AgentSource
+    task: str
+    progress: AgentProgress
+    parent_tool_call_id: str | None = None
+    assignment: str | None = None
+    session_file: str | None = None
+    detached: bool | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AgentSnapshot:
+    id: str
+    display_name: str
+    kind: AgentKind
+    status: AgentStatus
+    session_file: str | None
+    created_at: int
+    last_activity: int
+    has_live_session: bool
+    parent_id: str | None = None
+    activity: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AgentResult:
+    agent_id: str
+    source: Literal["registry", "job"]
+    agent_status: AgentStatus
+    truncated: bool
+    job_status: AgentJobStatus | None = None
+    result_text: str | None = None
+    error_text: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AgentSendResult:
+    delivered: bool
+    outcome: Literal["injected", "woken", "revived", "failed"] | None = None
+    error: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AgentReleaseResult:
+    released: bool
+    tombstone: bool
+
+
+@dataclass(slots=True, frozen=True)
+class CancelAgentResult:
+    id: str
+    status: CancelAgentStatus
+    message: str
+
+
+@dataclass(slots=True, frozen=True)
 class SessionState:
     model: ModelInfo | None
     thinking_level: ThinkingLevel | None
     is_streaming: bool
+    activity_phase: SessionActivityPhase
     is_compacting: bool
     steering_mode: SteeringMode
     follow_up_mode: SteeringMode
@@ -820,6 +1209,8 @@ class SessionState:
     auto_compaction_enabled: bool
     message_count: int
     queued_message_count: int
+    mode: SessionMode = "none"
+    plan: PlanState | None = None
     todo_phases: tuple[TodoPhase, ...] = ()
     system_prompt: tuple[str, ...] = ()
     dump_tools: tuple[ToolDescriptor, ...] = ()
@@ -827,6 +1218,7 @@ class SessionState:
     fast_mode_active: bool = False
     tokens_per_second: float | None = None
     context_usage: ContextUsage | None = None
+    advisor: AdvisorState | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -911,12 +1303,305 @@ class SessionStats:
 
 
 @dataclass(slots=True, frozen=True)
+class SessionCatalogEntry:
+    path: str
+    id: str
+    cwd: str
+    created_at: str
+    updated_at: str
+    message_count: int
+    size: int
+    title: str | None = None
+    parent_session_path: str | None = None
+    status: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SessionCatalogPage:
+    sessions: tuple[SessionCatalogEntry, ...]
+    total: int
+    next_cursor: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SessionWorkspace:
+    cwd: str
+    directories: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class SessionInfoResult:
+    session: SessionCatalogEntry
+    workspace: SessionWorkspace
+    active: bool
+
+
+@dataclass(slots=True, frozen=True)
+class SessionWorkspaceRoot:
+    cwd: str
+    count: int
+    latest: str
+    exists: bool
+
+
+@dataclass(slots=True, frozen=True)
+class ResumeSessionResult:
+    cancelled: bool
+    session_file: str | None
+    cwd: str
+    cwd_changed: bool
+
+
+@dataclass(slots=True, frozen=True)
+class ForkSessionResult:
+    cancelled: bool
+    session_file: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class RenameSessionResult:
+    renamed: bool
+    active: bool
+
+
+@dataclass(slots=True, frozen=True)
+class DeleteSessionError:
+    code: Literal["delete_failed"]
+    message: str
+
+
+@dataclass(slots=True, frozen=True)
+class DeleteSessionResult:
+    deleted: bool
+    cancelled: bool
+    was_active: bool
+    new_session_started: bool
+    delete_error: DeleteSessionError | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SettingsChange:
+    path: str
+    value: JsonValue
+
+
+@dataclass(slots=True, frozen=True)
+class SettingSnapshotEntry:
+    path: str
+    type: str
+    default: JsonValue | None
+    value: JsonValue | None
+    redacted: bool
+    configured: bool | None
+    values: tuple[str, ...] | None
+    description: str | None
+    ui: JsonObject | None
+
+
+@dataclass(slots=True, frozen=True)
+class SettingsTabSnapshot:
+    id: str
+    label: str
+    icon: str
+    groups: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class SettingsSnapshot:
+    tabs: tuple[SettingsTabSnapshot, ...]
+    settings: tuple[SettingSnapshotEntry, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class SettingsUpdateEvent:
+    type: Literal["settings_update"] = "settings_update"
+
+
+@dataclass(slots=True, frozen=True)
+class RpcCapabilityDisabledReason:
+    code: str
+    message: str
+
+
+@dataclass(slots=True, frozen=True)
+class RpcCommandCapability:
+    id: str
+    name: str
+    version: int
+    scope: RpcCommandScope
+    execution: RpcCommandExecution
+    availability: RpcCommandAvailability
+    confirmation: RpcCommandConfirmation
+    required_features: tuple[str, ...]
+    input_schema: JsonObject | None = None
+    output_schema: JsonObject | None = None
+    concurrency_class: RpcCommandConcurrencyClass | None = None
+    disabled_reason: RpcCapabilityDisabledReason | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class RpcCapabilityManifest:
+    application_api_version: int
+    commands: tuple[RpcCommandCapability, ...]
+    events: tuple[str, ...]
+    extension_ui_methods: tuple[str, ...]
+    host_protocols: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
 class ReadyEvent:
     protocol_version: int | None = None
     supported_protocol_versions: tuple[int, ...] | None = None
     max_frame_bytes: int | None = None
     max_reassembled_frame_bytes: int | None = None
+    capabilities: RpcCapabilityManifest | None = None
     type: Literal["ready"] = "ready"
+
+
+@dataclass(slots=True, frozen=True)
+class ProviderAuthMethodCapability:
+    method: str
+    available: bool
+    exclusive: bool
+
+
+@dataclass(slots=True, frozen=True)
+class ProviderAuthIdentity:
+    email: str | None = None
+    account_id: str | None = None
+    project_id: str | None = None
+    org_id: str | None = None
+    org_name: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ProviderAuthState:
+    provider_id: str
+    name: str
+    authenticated: bool
+    disabled: bool
+    available: bool
+    methods: tuple[ProviderAuthMethodCapability, ...]
+    credential_origin: str | None = None
+    unavailable_reason: str | None = None
+    identity: ProviderAuthIdentity | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ProviderAuthRequest:
+    operation_id: str
+    request_id: str
+    provider_id: str
+    method: Literal["open_url"]
+    url: str
+    launch_url: str | None = None
+    instructions: str | None = None
+    type: Literal["provider_auth_request"] = "provider_auth_request"
+
+
+@dataclass(slots=True, frozen=True)
+class ProviderAuthUpdate:
+    state: ProviderAuthState
+    type: Literal["provider_auth_update"] = "provider_auth_update"
+
+
+@dataclass(slots=True, frozen=True)
+class EvalHistoryEntry:
+    language: RpcEvalLanguage
+    code: str
+    output: str
+    cancelled: bool
+    truncated: bool
+    timestamp: float
+    exit_code: int | None = None
+    exclude_from_context: bool | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class EvalOutputEvent:
+    operation_id: str
+    sequence: int
+    chunk: str
+    truncated: bool
+    type: Literal["eval_output"] = "eval_output"
+
+
+@dataclass(slots=True, frozen=True)
+class EvalCompleteEvent:
+    operation_id: str
+    result: EvalHistoryEntry
+    type: Literal["eval_complete"] = "eval_complete"
+
+
+@dataclass(slots=True, frozen=True)
+class OperationStartedEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    started_at: float
+    request_id: str | None = None
+    type: Literal["operation_started"] = "operation_started"
+
+
+@dataclass(slots=True, frozen=True)
+class OperationCompletedEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    agent_invoked: bool
+    settled_at: float
+    state: ProviderAuthState | None = None
+    request_id: str | None = None
+    type: Literal["operation_completed"] = "operation_completed"
+
+
+@dataclass(slots=True, frozen=True)
+class OperationFailedEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    error: str
+    settled_at: float
+    request_id: str | None = None
+    code: str | None = None
+    type: Literal["operation_failed"] = "operation_failed"
+
+
+@dataclass(slots=True, frozen=True)
+class OperationCancelledEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    reason: RpcOperationCancellationReason
+    code: RpcOperationCancellationCode
+    settled_at: float
+    request_id: str | None = None
+    type: Literal["operation_cancelled"] = "operation_cancelled"
+
+
+RpcOperationTerminalEvent: TypeAlias = (
+    OperationCompletedEvent | OperationFailedEvent | OperationCancelledEvent
+)
+RpcOperationEvent: TypeAlias = OperationStartedEvent | RpcOperationTerminalEvent
+
+
+@dataclass(slots=True, frozen=True)
+class ActiveOperation:
+    operation_id: str
+    command: RpcOperationCommand
+    status: str
+    accepted_at: float
+    request_id: str | None = None
+    started_at: float | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class OperationsSnapshot:
+    active: tuple[ActiveOperation, ...]
+    recent: tuple[RpcOperationTerminalEvent, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class CancelOperationResult:
+    operation_id: str
+    status: str
+    terminal: RpcOperationTerminalEvent | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -937,8 +1622,24 @@ class ExtensionUiRequest:
     placeholder: str | None = None
     prefill: str | None = None
     timeout: int | None = None
+    sensitive: bool | None = None
+    operation_id: str | None = None
+    purpose: str | None = None
+    provider_id: str | None = None
     prompt_style: bool | None = None
     target_id: str | None = None
+    command: (
+        Literal[
+            "cancel_agent",
+            "release_agent",
+            "eval_execute",
+            "bash",
+            "cancel_job",
+            "delete_session",
+            "remove_provider_auth",
+        ]
+        | None
+    ) = None
     notify_type: NotifyType | None = None
     status_key: str | None = None
     status_text: str | None = None
@@ -1113,6 +1814,142 @@ class TodoAutoClearEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class ToolInventoryUpdateEvent:
+    type: Literal["tool_inventory_update"] = "tool_inventory_update"
+
+
+@dataclass(slots=True, frozen=True)
+class PromptResultEvent:
+    agent_invoked: bool
+    id: str | None = None
+    operation_id: str | None = None
+    type: Literal["prompt_result"] = "prompt_result"
+
+
+@dataclass(slots=True, frozen=True)
+class AvailableCommandsUpdateEvent:
+    commands: tuple[AvailableCommand, ...]
+    type: Literal["available_commands_update"] = "available_commands_update"
+
+
+@dataclass(slots=True, frozen=True)
+class CommandOutputEvent:
+    text: str
+    type: Literal["command_output"] = "command_output"
+
+
+@dataclass(slots=True, frozen=True)
+class SessionInfoUpdateEvent:
+    session_id: str
+    mode: SessionMode
+    title: str | None = None
+    type: Literal["session_info_update"] = "session_info_update"
+
+
+@dataclass(slots=True, frozen=True)
+class ConfigUpdateEvent:
+    model: ModelInfo | None = None
+    thinking_level: ThinkingLevel | None = None
+    advisor: AdvisorState | None = None
+    type: Literal["config_update"] = "config_update"
+
+
+@dataclass(slots=True, frozen=True)
+class SubagentLifecycleEvent:
+    payload: SubagentLifecycle
+    type: Literal["subagent_lifecycle"] = "subagent_lifecycle"
+
+
+@dataclass(slots=True, frozen=True)
+class SubagentProgressEvent:
+    payload: SubagentProgress
+    type: Literal["subagent_progress"] = "subagent_progress"
+
+
+@dataclass(slots=True, frozen=True)
+class SubagentEvent:
+    id: str
+    event: RpcNotification
+    type: Literal["subagent_event"] = "subagent_event"
+
+
+@dataclass(slots=True, frozen=True)
+class ModelChangedEvent:
+    type: Literal["model_changed"] = "model_changed"
+
+
+@dataclass(slots=True, frozen=True)
+class IrcMessageEvent:
+    message: CustomMessage
+    type: Literal["irc_message"] = "irc_message"
+
+
+@dataclass(slots=True, frozen=True)
+class NoticeEvent:
+    level: NotifyType
+    message: str
+    source: str | None = None
+    type: Literal["notice"] = "notice"
+
+
+@dataclass(slots=True, frozen=True)
+class ThinkingLevelChangedEvent:
+    thinking_level: ThinkingLevel | None
+    configured: ConfiguredThinkingLevel | None = None
+    resolved: ThinkingLevel | None = None
+    type: Literal["thinking_level_changed"] = "thinking_level_changed"
+
+
+@dataclass(slots=True, frozen=True)
+class GoalUpdatedEvent:
+    goal: Goal | None
+    state: GoalModeState | None = None
+    type: Literal["goal_updated"] = "goal_updated"
+
+
+@dataclass(slots=True, frozen=True)
+class PlanStateUpdateEvent:
+    state: PlanState
+    type: Literal["plan_state_update"] = "plan_state_update"
+
+
+@dataclass(slots=True, frozen=True)
+class PlanApprovalRequestEvent:
+    approval_id: str
+    plan_file_path: str
+    title: str
+    plan_content: str
+    type: Literal["plan_approval_request"] = "plan_approval_request"
+
+
+@dataclass(slots=True, frozen=True)
+class PlanApprovalSettledEvent:
+    approval_id: str
+    result: PlanApprovalResult
+    type: Literal["plan_approval_settled"] = "plan_approval_settled"
+
+
+@dataclass(slots=True, frozen=True)
+class AgentRegistryUpdateEvent:
+    change: Literal["registered", "status_changed", "removed"]
+    agent: AgentSnapshot
+    type: Literal["agent_registry_update"] = "agent_registry_update"
+
+
+@dataclass(slots=True, frozen=True)
+class QueueUpdateEvent:
+    queue: SessionQueueSnapshot
+    type: Literal["queue_update"] = "queue_update"
+
+
+@dataclass(slots=True, frozen=True)
+class JobUpdateEvent:
+    jobs: tuple[JobSnapshot, ...]
+    agents: tuple[AgentActivitySnapshot, ...]
+    type: Literal["job_update"] = "job_update"
+
+
+@dataclass(slots=True, frozen=True)
 class UnknownNotification:
     payload: JsonObject
     type: Literal["unknown"] = "unknown"
@@ -1139,13 +1976,39 @@ RpcAgentEvent: TypeAlias = (
     | TtsrTriggeredEvent
     | TodoReminderEvent
     | TodoAutoClearEvent
+    | ModelChangedEvent
+    | IrcMessageEvent
+    | NoticeEvent
+    | ThinkingLevelChangedEvent
+    | GoalUpdatedEvent
 )
 
 RpcNotification: TypeAlias = (
     ReadyEvent
+    | RpcOperationEvent
+    | EvalOutputEvent
+    | EvalCompleteEvent
+    | ProviderAuthRequest
+    | ProviderAuthUpdate
     | ExtensionUiRequest
     | ExtensionError
+    | SettingsUpdateEvent
+    | ToolInventoryUpdateEvent
+    | PromptResultEvent
+    | AvailableCommandsUpdateEvent
+    | CommandOutputEvent
+    | SessionInfoUpdateEvent
+    | ConfigUpdateEvent
+    | SubagentLifecycleEvent
+    | SubagentProgressEvent
+    | SubagentEvent
+    | AgentRegistryUpdateEvent
+    | QueueUpdateEvent
+    | JobUpdateEvent
     | RpcAgentEvent
+    | PlanStateUpdateEvent
+    | PlanApprovalRequestEvent
+    | PlanApprovalSettledEvent
     | UnknownNotification
 )
 
@@ -1313,6 +2176,117 @@ def parse_tool_descriptor(payload: JsonObject) -> ToolDescriptor:
     )
 
 
+_TOOL_PRESENTATION_VALUES: Final[frozenset[str]] = frozenset(
+    {"active", "mounted", "registered"}
+)
+_TOOL_LOAD_MODE_VALUES: Final[frozenset[str]] = frozenset({"essential", "discoverable"})
+
+
+def parse_tool_inventory(payload: JsonObject) -> ToolInventory:
+    raw_api_version = payload.get("applicationApiVersion")
+    if not isinstance(raw_api_version, int) or isinstance(raw_api_version, bool):
+        raise ValueError("tool_inventory.applicationApiVersion must be an integer")
+
+    raw_xdev = _clone_json_object(payload.get("xdev"), field="tool_inventory.xdev")
+    raw_mounted_count = raw_xdev.get("mountedCount")
+    if (
+        not isinstance(raw_mounted_count, int)
+        or isinstance(raw_mounted_count, bool)
+        or raw_mounted_count < 0
+    ):
+        raise ValueError(
+            "tool_inventory.xdev.mountedCount must be a non-negative integer"
+        )
+
+    entries: list[ToolInventoryEntry] = []
+    for index, raw_entry in enumerate(
+        _clone_json_objects(payload.get("tools"), field="tool_inventory.tools")
+    ):
+        raw_source = _clone_json_object(
+            raw_entry.get("source"),
+            field=f"tool_inventory.tools[{index}].source",
+        )
+        entries.append(
+            ToolInventoryEntry(
+                name=_require_str(raw_entry, "name"),
+                label=_require_str(raw_entry, "label"),
+                description=_require_str(raw_entry, "description"),
+                parameters=_clone_json_value(
+                    raw_entry.get("parameters"),
+                    field=f"tool_inventory.tools[{index}].parameters",
+                ),
+                presentation=_require_literal(
+                    raw_entry.get("presentation"),
+                    _TOOL_PRESENTATION_VALUES,
+                    field=f"tool_inventory.tools[{index}].presentation",
+                ),
+                load_mode=_require_literal(
+                    raw_entry.get("loadMode"),
+                    _TOOL_LOAD_MODE_VALUES,
+                    field=f"tool_inventory.tools[{index}].loadMode",
+                ),
+                source=ToolSource(
+                    # Source kinds are intentionally open for forward compatibility.
+                    kind=_require_str(raw_source, "kind"),
+                    server_name=_optional_str(raw_source, "serverName"),
+                    remote_name=_optional_str(raw_source, "remoteName"),
+                    extension_path=_optional_str(raw_source, "extensionPath"),
+                ),
+                summary=_optional_str(raw_entry, "summary"),
+                hidden=_optional_bool(raw_entry, "hidden"),
+                deferrable=_optional_bool(raw_entry, "deferrable"),
+                strict=_optional_bool(raw_entry, "strict"),
+                custom_wire_name=_optional_str(raw_entry, "customWireName"),
+            )
+        )
+
+    return ToolInventory(
+        application_api_version=raw_api_version,
+        tools=tuple(entries),
+        xdev=ToolInventoryXdev(
+            prefix=_require_str(raw_xdev, "prefix"),
+            mounted_count=raw_mounted_count,
+        ),
+    )
+
+
+def parse_tool_activation_result(payload: JsonObject) -> ToolActivationResult:
+    inventory_available = _require_bool(payload, "inventoryAvailable")
+    raw_inventory = payload.get("inventory")
+    if inventory_available:
+        inventory = parse_tool_inventory(
+            _clone_json_object(raw_inventory, field="tool_activation.inventory")
+        )
+    else:
+        if raw_inventory is not None:
+            raise ValueError(
+                "tool_activation.inventory must be absent when inventoryAvailable is false"
+            )
+        inventory = None
+    return ToolActivationResult(
+        enabled_tool_names=_required_string_tuple(
+            payload.get("enabledToolNames"),
+            field="tool_activation.enabledToolNames",
+        ),
+        active_tool_names=_required_string_tuple(
+            payload.get("activeToolNames"),
+            field="tool_activation.activeToolNames",
+        ),
+        mounted_tool_names=_required_string_tuple(
+            payload.get("mountedToolNames"),
+            field="tool_activation.mountedToolNames",
+        ),
+        activated=_required_string_tuple(
+            payload.get("activated"), field="tool_activation.activated"
+        ),
+        deactivated=_required_string_tuple(
+            payload.get("deactivated"), field="tool_activation.deactivated"
+        ),
+        inventory_available=inventory_available,
+        inventory=inventory,
+    )
+
+
 def parse_todo_item(payload: JsonObject) -> TodoItem:
     return TodoItem(
         id=str(payload.get("id", "")),
@@ -1355,12 +2329,200 @@ def parse_todo_phases(payload: JsonValue | None) -> tuple[TodoPhase, ...]:
     return tuple(parse_todo_phase(cast(JsonObject, item)) for item in payload)
 
 
+def parse_advisor_state(payload: object) -> AdvisorState | None:
+    if not isinstance(payload, dict):
+        return None
+    configured = payload.get("configured")
+    active = payload.get("active")
+    raw_advisors = payload.get("advisors")
+    if (
+        not isinstance(configured, bool)
+        or not isinstance(active, bool)
+        or not isinstance(raw_advisors, list)
+    ):
+        return None
+    advisors: list[AdvisorRuntimeState] = []
+    for item in raw_advisors:
+        if not isinstance(item, dict):
+            return None
+        name = item.get("name")
+        status = item.get("status")
+        if (
+            not isinstance(name, str)
+            or not isinstance(status, str)
+            or status not in _ADVISOR_RUNTIME_STATUS_VALUES
+        ):
+            return None
+        advisors.append(
+            AdvisorRuntimeState(name=name, status=cast(AdvisorRuntimeStatus, status))
+        )
+    return AdvisorState(configured=configured, active=active, advisors=tuple(advisors))
+
+
+def _parse_session_activity_phase(payload: JsonObject) -> SessionActivityPhase:
+    if "activityPhase" not in payload:
+        # Legacy isStreaming conflates provider work with prompt settlement.
+        # Preserve terminal idle, but never claim provider activity without the
+        # authoritative field.
+        return "maintenance" if bool(payload.get("isStreaming", False)) else "idle"
+    value = payload["activityPhase"]
+    if isinstance(value, str) and value in _SESSION_ACTIVITY_PHASE_VALUES:
+        return cast(SessionActivityPhase, value)
+    # Present null, invalid values, and future phases are conservatively treated
+    # as non-idle maintenance so an additive or malformed server response cannot
+    # make an older client report terminal idle.
+    return "maintenance"
+
+
+def parse_plan_state(payload: JsonObject) -> PlanState:
+    raw_mode = payload.get("mode", "none")
+    mode = cast(
+        SessionMode,
+        raw_mode
+        if isinstance(raw_mode, str) and raw_mode in _SESSION_MODE_VALUES
+        else "none",
+    )
+    raw_workflow = payload.get("workflow")
+    workflow = cast(
+        PlanWorkflow | None,
+        raw_workflow
+        if isinstance(raw_workflow, str) and raw_workflow in _PLAN_WORKFLOW_VALUES
+        else None,
+    )
+    raw_approval = payload.get("awaitingApproval")
+    approval = None
+    if isinstance(raw_approval, dict):
+        approval_payload = cast(JsonObject, raw_approval)
+        approval = PendingPlanApproval(
+            approval_id=_require_str(approval_payload, "approvalId"),
+            title=_require_str(approval_payload, "title"),
+            plan_file_path=_require_str(approval_payload, "planFilePath"),
+        )
+    raw_files = payload.get("availablePlanFiles")
+    files = (
+        tuple(value for value in raw_files if isinstance(value, str))
+        if isinstance(raw_files, list)
+        else ()
+    )
+    return PlanState(
+        mode=mode,
+        plan_file_path=_optional_str(payload, "planFilePath"),
+        workflow=workflow,
+        reentry=bool(payload.get("reentry", False)),
+        awaiting_approval=approval,
+        plan_exists=cast(bool | None, payload.get("planExists"))
+        if isinstance(payload.get("planExists"), bool)
+        else None,
+        available_plan_files=files,
+        content=_optional_str(payload, "content"),
+    )
+
+
+def parse_agent_snapshot(payload: JsonObject) -> AgentSnapshot:
+    kind = _require_literal(
+        payload.get("kind"), frozenset({"main", "sub", "advisor"}), field="agent.kind"
+    )
+    status = _require_literal(
+        payload.get("status"),
+        frozenset({"running", "idle", "parked", "aborted"}),
+        field="agent.status",
+    )
+    created_at = payload.get("createdAt")
+    last_activity = payload.get("lastActivity")
+    if isinstance(created_at, bool) or not isinstance(created_at, int):
+        raise ValueError("agent.createdAt must be an integer")
+    if isinstance(last_activity, bool) or not isinstance(last_activity, int):
+        raise ValueError("agent.lastActivity must be an integer")
+    return AgentSnapshot(
+        id=_require_str(payload, "id"),
+        display_name=_require_str(payload, "displayName"),
+        kind=cast(AgentKind, kind),
+        status=cast(AgentStatus, status),
+        session_file=_optional_str(payload, "sessionFile"),
+        created_at=created_at,
+        last_activity=last_activity,
+        has_live_session=_require_bool(payload, "hasLiveSession"),
+        parent_id=_optional_str(payload, "parentId"),
+        activity=_optional_str(payload, "activity"),
+    )
+
+
+def parse_agent_result(payload: JsonObject) -> AgentResult:
+    source = _require_literal(
+        payload.get("source"),
+        frozenset({"registry", "job"}),
+        field="agentResult.source",
+    )
+    agent_status = _require_literal(
+        payload.get("agentStatus"),
+        frozenset({"running", "idle", "parked", "aborted"}),
+        field="agentResult.agentStatus",
+    )
+    raw_job_status = _optional_literal(
+        payload.get("jobStatus"),
+        frozenset({"running", "completed", "failed", "cancelled"}),
+        field="agentResult.jobStatus",
+    )
+    return AgentResult(
+        agent_id=_require_str(payload, "agentId"),
+        source=cast(Literal["registry", "job"], source),
+        agent_status=cast(AgentStatus, agent_status),
+        truncated=_require_bool(payload, "truncated"),
+        job_status=cast(AgentJobStatus | None, raw_job_status),
+        result_text=_optional_str(payload, "resultText"),
+        error_text=_optional_str(payload, "errorText"),
+    )
+
+
+def parse_agent_send_result(payload: JsonObject) -> AgentSendResult:
+    raw_outcome = _optional_literal(
+        payload.get("outcome"),
+        frozenset({"injected", "woken", "revived", "failed"}),
+        field="agentSend.outcome",
+    )
+    return AgentSendResult(
+        delivered=_require_bool(payload, "delivered"),
+        outcome=cast(
+            Literal["injected", "woken", "revived", "failed"] | None, raw_outcome
+        ),
+        error=_optional_str(payload, "error"),
+    )
+
+
+def parse_agent_release_result(payload: JsonObject) -> AgentReleaseResult:
+    return AgentReleaseResult(
+        released=_require_bool(payload, "released"),
+        tombstone=_require_bool(payload, "tombstone"),
+    )
+
+
+def parse_cancel_agent_result(payload: JsonObject) -> CancelAgentResult:
+    status = _require_literal(
+        payload.get("status"),
+        frozenset({"cancelled", "not_found", "already_completed"}),
+        field="cancelAgent.status",
+    )
+    return CancelAgentResult(
+        id=_require_str(payload, "id"),
+        status=cast(CancelAgentStatus, status),
+        message=_require_str(payload, "message"),
+    )
+
+
 def parse_session_state(payload: JsonObject) -> SessionState:
     dump_tools = tuple(
         parse_tool_descriptor(_clone_json_object(item, field="dumpTools[]"))
         for item in cast(list[Any], payload.get("dumpTools") or [])
     )
     return SessionState(
+        mode=parse_plan_state(
+            cast(
+                JsonObject, payload.get("plan") or {"mode": payload.get("mode", "none")}
+            )
+        ).mode,
+        plan=parse_plan_state(cast(JsonObject, payload["plan"]))
+        if isinstance(payload.get("plan"), dict)
+        else None,
         model=parse_model_info(cast(JsonObject | None, payload.get("model"))),
         thinking_level=cast(
             ThinkingLevel | None,
@@ -1371,6 +2533,7 @@ def parse_session_state(payload: JsonObject) -> SessionState:
             ),
         ),
         is_streaming=bool(payload.get("isStreaming", False)),
+        activity_phase=_parse_session_activity_phase(payload),
         is_compacting=bool(payload.get("isCompacting", False)),
         steering_mode=cast(
             SteeringMode,
@@ -1415,6 +2578,7 @@ def parse_session_state(payload: JsonObject) -> SessionState:
                 payload.get("contextUsage"), field="sessionState.contextUsage"
             )
         ),
+        advisor=parse_advisor_state(payload.get("advisor")),
     )
 
 
@@ -1436,6 +2600,140 @@ def parse_fast_mode_result(payload: JsonObject) -> FastModeResult:
     return FastModeResult(
         enabled=_require_bool(payload, "enabled"),
         active=_require_bool(payload, "active"),
+    )
+
+
+def parse_settings_snapshot(payload: JsonObject) -> SettingsSnapshot:
+    raw_tabs = payload.get("tabs")
+    raw_settings = payload.get("settings")
+    if not isinstance(raw_tabs, list):
+        raise ValueError("settings.tabs must be a list")
+    if not isinstance(raw_settings, list):
+        raise ValueError("settings.settings must be a list")
+
+    tabs: list[SettingsTabSnapshot] = []
+    for index, raw_tab in enumerate(raw_tabs):
+        tab = _clone_json_object(raw_tab, field=f"settings.tabs[{index}]")
+        tabs.append(
+            SettingsTabSnapshot(
+                id=_require_str(tab, "id"),
+                label=_require_str(tab, "label"),
+                icon=_require_str(tab, "icon"),
+                groups=_optional_str_list(tab, "groups") or (),
+            )
+        )
+
+    entries: list[SettingSnapshotEntry] = []
+    for index, raw_entry in enumerate(raw_settings):
+        entry = _clone_json_object(raw_entry, field=f"settings.settings[{index}]")
+        raw_values = entry.get("values")
+        values = None
+        if raw_values is not None:
+            if not isinstance(raw_values, list) or any(
+                not isinstance(item, str) for item in raw_values
+            ):
+                raise ValueError(f"settings.settings[{index}].values must be strings")
+            values = tuple(raw_values)
+        configured = entry.get("configured")
+        if configured is not None and not isinstance(configured, bool):
+            raise ValueError(f"settings.settings[{index}].configured must be a boolean")
+        entries.append(
+            SettingSnapshotEntry(
+                path=_require_str(entry, "path"),
+                type=_require_str(entry, "type"),
+                default=cast(JsonValue | None, entry.get("default")),
+                value=cast(JsonValue | None, entry.get("value")),
+                redacted=entry.get("redacted") is True,
+                configured=cast(bool | None, configured),
+                values=values,
+                description=_optional_str(entry, "description"),
+                ui=_optional_json_object(
+                    entry.get("ui"), field=f"settings.settings[{index}].ui"
+                ),
+            )
+        )
+    return SettingsSnapshot(tabs=tuple(tabs), settings=tuple(entries))
+
+
+def parse_rpc_capability_manifest(payload: JsonObject) -> RpcCapabilityManifest:
+    raw_api_version = payload.get("applicationApiVersion")
+    if not isinstance(raw_api_version, int) or isinstance(raw_api_version, bool):
+        raise ValueError("capabilities.applicationApiVersion must be an integer")
+
+    def string_tuple(value: object, *, field: str) -> tuple[str, ...]:
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must be a list")
+        result: list[str] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, str):
+                raise ValueError(f"{field}[{index}] must be a string")
+            result.append(item)
+        return tuple(result)
+
+    raw_commands = payload.get("commands")
+    if not isinstance(raw_commands, list):
+        raise ValueError("capabilities.commands must be a list")
+    commands: list[RpcCommandCapability] = []
+    for index, raw_command in enumerate(raw_commands):
+        field = f"capabilities.commands[{index}]"
+        command = _clone_json_object(raw_command, field=field)
+        version = command.get("version")
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise ValueError(f"{field}.version must be an integer")
+
+        raw_disabled_reason = command.get("disabledReason")
+        disabled_reason = None
+        if raw_disabled_reason is not None:
+            reason = _clone_json_object(
+                raw_disabled_reason, field=f"{field}.disabledReason"
+            )
+            disabled_reason = RpcCapabilityDisabledReason(
+                code=_require_str(reason, "code"),
+                message=_require_str(reason, "message"),
+            )
+
+        commands.append(
+            RpcCommandCapability(
+                id=_require_str(command, "id"),
+                name=_require_str(command, "name"),
+                version=version,
+                scope=_require_str(command, "scope"),
+                execution=_require_str(command, "execution"),
+                availability=_require_str(command, "availability"),
+                confirmation=cast(
+                    RpcCommandConfirmation,
+                    _require_literal(
+                        command.get("confirmation", "none"),
+                        frozenset({"none", "required"}),
+                        field=f"{field}.confirmation",
+                    ),
+                ),
+                required_features=string_tuple(
+                    command.get("requiredFeatures"),
+                    field=f"{field}.requiredFeatures",
+                ),
+                input_schema=_optional_json_object(
+                    command.get("inputSchema"), field=f"{field}.inputSchema"
+                ),
+                output_schema=_optional_json_object(
+                    command.get("outputSchema"), field=f"{field}.outputSchema"
+                ),
+                concurrency_class=_optional_str(command, "concurrencyClass"),
+                disabled_reason=disabled_reason,
+            )
+        )
+
+    return RpcCapabilityManifest(
+        application_api_version=raw_api_version,
+        commands=tuple(commands),
+        events=string_tuple(payload.get("events"), field="capabilities.events"),
+        extension_ui_methods=string_tuple(
+            payload.get("extensionUiMethods"),
+            field="capabilities.extensionUiMethods",
+        ),
+        host_protocols=string_tuple(
+            payload.get("hostProtocols"), field="capabilities.hostProtocols"
+        ),
     )
 
 
@@ -1526,6 +2824,129 @@ def parse_session_stats(payload: JsonObject) -> SessionStats:
     )
 
 
+def parse_session_catalog_entry(payload: JsonObject) -> SessionCatalogEntry:
+    return SessionCatalogEntry(
+        path=_require_str(payload, "path"),
+        id=_require_str(payload, "id"),
+        cwd=_require_str(payload, "cwd"),
+        title=_optional_str(payload, "title"),
+        parent_session_path=_optional_str(payload, "parentSessionPath"),
+        created_at=_require_str(payload, "createdAt"),
+        updated_at=_require_str(payload, "updatedAt"),
+        message_count=int(payload.get("messageCount", 0)),
+        size=int(payload.get("size", 0)),
+        status=_optional_str(payload, "status"),
+    )
+
+
+def parse_session_catalog_page(payload: JsonObject) -> SessionCatalogPage:
+    raw_sessions = payload.get("sessions")
+    if not isinstance(raw_sessions, list):
+        raise ValueError("sessions must be an array")
+    raw_total = payload.get("total")
+    if not isinstance(raw_total, int) or isinstance(raw_total, bool) or raw_total < 0:
+        raise ValueError("total must be a non-negative integer")
+    return SessionCatalogPage(
+        sessions=tuple(
+            parse_session_catalog_entry(cast(JsonObject, item))
+            for item in raw_sessions
+            if isinstance(item, dict)
+        ),
+        total=raw_total,
+        next_cursor=_optional_str(payload, "nextCursor"),
+    )
+
+
+def parse_session_info_result(payload: JsonObject) -> SessionInfoResult:
+    raw_session = payload.get("session")
+    raw_workspace = payload.get("workspace")
+    if not isinstance(raw_session, dict) or not isinstance(raw_workspace, dict):
+        raise ValueError(
+            "session info response must contain session and workspace objects"
+        )
+    raw_directories = raw_workspace.get("directories")
+    if not isinstance(raw_directories, list) or not all(
+        isinstance(item, str) for item in raw_directories
+    ):
+        raise ValueError("workspace.directories must be an array of strings")
+    return SessionInfoResult(
+        session=parse_session_catalog_entry(cast(JsonObject, raw_session)),
+        workspace=SessionWorkspace(
+            cwd=_require_str(cast(JsonObject, raw_workspace), "cwd"),
+            directories=tuple(cast(list[str], raw_directories)),
+        ),
+        active=_require_bool(payload, "active"),
+    )
+
+
+def parse_session_workspace_roots(
+    payload: JsonObject,
+) -> tuple[SessionWorkspaceRoot, ...]:
+    raw_roots = payload.get("roots")
+    if not isinstance(raw_roots, list):
+        raise ValueError("roots must be an array")
+    roots: list[SessionWorkspaceRoot] = []
+    for item in raw_roots:
+        if not isinstance(item, dict):
+            raise ValueError("roots[] must be an object")
+        root = cast(JsonObject, item)
+        roots.append(
+            SessionWorkspaceRoot(
+                cwd=_require_str(root, "cwd"),
+                count=int(root.get("count", 0)),
+                latest=_require_str(root, "latest"),
+                exists=_require_bool(root, "exists"),
+            )
+        )
+    return tuple(roots)
+
+
+def parse_resume_session_result(payload: JsonObject) -> ResumeSessionResult:
+    return ResumeSessionResult(
+        cancelled=_require_bool(payload, "cancelled"),
+        session_file=_optional_str(payload, "sessionFile"),
+        cwd=_require_str(payload, "cwd"),
+        cwd_changed=_require_bool(payload, "cwdChanged"),
+    )
+
+
+def parse_fork_session_result(payload: JsonObject) -> ForkSessionResult:
+    return ForkSessionResult(
+        cancelled=_require_bool(payload, "cancelled"),
+        session_file=_optional_str(payload, "sessionFile"),
+    )
+
+
+def parse_rename_session_result(payload: JsonObject) -> RenameSessionResult:
+    return RenameSessionResult(
+        renamed=_require_bool(payload, "renamed"),
+        active=_require_bool(payload, "active"),
+    )
+
+
+def parse_delete_session_result(payload: JsonObject) -> DeleteSessionResult:
+    raw_error = payload.get("deleteError")
+    delete_error: DeleteSessionError | None = None
+    if raw_error is not None:
+        if not isinstance(raw_error, dict):
+            raise ValueError("deleteError must be an object")
+        error = cast(JsonObject, raw_error)
+        code = _require_literal(
+            error.get("code"), frozenset({"delete_failed"}), field="deleteError.code"
+        )
+        delete_error = DeleteSessionError(
+            code=cast(Literal["delete_failed"], code),
+            message=_require_str(error, "message"),
+        )
+    return DeleteSessionResult(
+        deleted=_require_bool(payload, "deleted"),
+        cancelled=_require_bool(payload, "cancelled"),
+        was_active=_require_bool(payload, "wasActive"),
+        new_session_started=_require_bool(payload, "newSessionStarted"),
+        delete_error=delete_error,
+    )
+
+
 def parse_context_usage(payload: JsonObject | None) -> ContextUsage | None:
     if payload is None:
         return None
@@ -1533,6 +2954,47 @@ def parse_context_usage(payload: JsonObject | None) -> ContextUsage | None:
         tokens=int(payload.get("tokens", 0)),
         context_window=int(payload.get("contextWindow", 0)),
         percent=float(payload.get("percent", 0.0)),
+    )
+
+
+def parse_provider_auth_state(payload: JsonObject) -> ProviderAuthState:
+    raw_methods = payload.get("methods")
+    methods: list[ProviderAuthMethodCapability] = []
+    if isinstance(raw_methods, list):
+        for raw_method in raw_methods:
+            if not isinstance(raw_method, dict) or not isinstance(
+                raw_method.get("method"), str
+            ):
+                continue
+            methods.append(
+                ProviderAuthMethodCapability(
+                    method=raw_method["method"],
+                    available=raw_method.get("available") is True,
+                    exclusive=raw_method.get("exclusive") is True,
+                )
+            )
+    raw_identity = payload.get("identity")
+    identity = (
+        ProviderAuthIdentity(
+            email=_optional_str(raw_identity, "email"),
+            account_id=_optional_str(raw_identity, "accountId"),
+            project_id=_optional_str(raw_identity, "projectId"),
+            org_id=_optional_str(raw_identity, "orgId"),
+            org_name=_optional_str(raw_identity, "orgName"),
+        )
+        if isinstance(raw_identity, dict)
+        else None
+    )
+    return ProviderAuthState(
+        provider_id=_require_str(payload, "providerId"),
+        name=_require_str(payload, "name"),
+        authenticated=payload.get("authenticated") is True,
+        disabled=payload.get("disabled") is True,
+        available=payload.get("available") is True,
+        credential_origin=_optional_str(payload, "credentialOrigin"),
+        unavailable_reason=_optional_str(payload, "unavailableReason"),
+        identity=identity,
+        methods=tuple(methods),
     )
 
 
@@ -1558,8 +3020,39 @@ def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
         placeholder=_optional_str(payload, "placeholder"),
         prefill=_optional_str(payload, "prefill"),
         timeout=_optional_int(payload, "timeout"),
+        sensitive=_optional_bool(payload, "sensitive"),
+        operation_id=_optional_str(payload, "operationId"),
+        purpose=_optional_str(payload, "purpose"),
+        provider_id=_optional_str(payload, "providerId"),
         prompt_style=_optional_bool(payload, "promptStyle"),
         target_id=_optional_str(payload, "targetId"),
+        command=cast(
+            Literal[
+                "cancel_agent",
+                "release_agent",
+                "eval_execute",
+                "bash",
+                "cancel_job",
+                "delete_session",
+                "remove_provider_auth",
+            ]
+            | None,
+            _optional_literal(
+                payload.get("command"),
+                frozenset(
+                    {
+                        "cancel_agent",
+                        "release_agent",
+                        "eval_execute",
+                        "bash",
+                        "cancel_job",
+                        "delete_session",
+                        "remove_provider_auth",
+                    }
+                ),
+                field="extension_ui_request.command",
+            ),
+        ),
         notify_type=cast(
             NotifyType | None,
             _optional_literal(
@@ -1597,6 +3090,386 @@ def parse_extension_error(payload: JsonObject) -> ExtensionError:
     )
 
 
+def parse_eval_history_entry(payload: JsonObject) -> EvalHistoryEntry:
+    language = cast(
+        RpcEvalLanguage,
+        _require_literal(
+            payload.get("language"),
+            frozenset({"py", "js", "rb", "jl"}),
+            field="eval.language",
+        ),
+    )
+    cancelled = _optional_bool(payload, "cancelled")
+    truncated = _optional_bool(payload, "truncated")
+    timestamp = _optional_float(payload, "timestamp")
+    if cancelled is None or truncated is None or timestamp is None:
+        raise ValueError("eval result requires cancelled, truncated, and timestamp")
+    return EvalHistoryEntry(
+        language=language,
+        code=_require_str(payload, "code"),
+        output=_require_str(payload, "output"),
+        exit_code=_optional_int(payload, "exitCode"),
+        cancelled=cancelled,
+        truncated=truncated,
+        timestamp=timestamp,
+        exclude_from_context=_optional_bool(payload, "excludeFromContext"),
+    )
+
+
+def _require_int_value(payload: JsonObject, field: str) -> int:
+    value = _optional_int(payload, field)
+    if value is None:
+        raise ValueError(f"{field} must be an integer")
+    return value
+
+
+def _require_number_value(payload: JsonObject, field: str) -> float:
+    value = _optional_float(payload, field)
+    if value is None:
+        raise ValueError(f"{field} must be a number")
+    return value
+
+
+def _parse_image_content(payload: object, *, field: str) -> ImageContent:
+    image = _clone_json_object(payload, field=field)
+    if image.get("type") != "image":
+        raise ValueError(f"{field}.type must be image")
+    _require_str(image, "mimeType")
+    _require_str(image, "data")
+    return cast(ImageContent, image)
+
+
+def _parse_queued_message(payload: object, *, field: str) -> QueuedMessage:
+    message = _clone_json_object(payload, field=field)
+    raw_images = message.get("images")
+    if raw_images is None:
+        images: tuple[ImageContent, ...] = ()
+    elif isinstance(raw_images, list):
+        images = tuple(
+            _parse_image_content(item, field=f"{field}.images[{index}]")
+            for index, item in enumerate(raw_images)
+        )
+    else:
+        raise ValueError(f"{field}.images must be an array")
+    return QueuedMessage(text=_require_str(message, "text"), images=images)
+
+
+def parse_mode_change_result(payload: JsonObject) -> ModeChangeResult:
+    accepted = _require_bool(payload, "accepted")
+    if not accepted:
+        raise ValueError("set_mode.accepted must be true")
+    return ModeChangeResult(
+        operation_id=_require_str(payload, "operationId"),
+        accepted=True,
+        deferred=_require_bool(payload, "deferred"),
+    )
+
+
+def parse_session_queue_entry(payload: JsonObject) -> SessionQueueEntry:
+    lane = _require_literal(
+        payload.get("lane"),
+        frozenset({"steering", "followUp"}),
+        field="queue.entry.lane",
+    )
+    return SessionQueueEntry(
+        entry_id=_require_str(payload, "entryId"),
+        lane=cast(QueueLane, lane),
+        text=_require_str(payload, "text"),
+        operation_id=_optional_str(payload, "operationId"),
+    )
+
+
+def parse_session_queue_snapshot(payload: JsonObject) -> SessionQueueSnapshot:
+    def parse_lane(field: str) -> tuple[SessionQueueEntry, ...]:
+        raw_entries = payload.get(field)
+        if not isinstance(raw_entries, list):
+            raise ValueError(f"queue.{field} must be an array")
+        entries = tuple(
+            parse_session_queue_entry(
+                _clone_json_object(item, field=f"queue.{field}[{index}]")
+            )
+            for index, item in enumerate(raw_entries)
+        )
+        expected_lane: QueueLane = "steering" if field == "steering" else "followUp"
+        if any(entry.lane != expected_lane for entry in entries):
+            raise ValueError(f"queue.{field} entries must use lane {expected_lane}")
+        return entries
+
+    return SessionQueueSnapshot(
+        steering=parse_lane("steering"),
+        follow_up=parse_lane("followUp"),
+        row_count=_require_int_value(payload, "rowCount"),
+        displayable_count=_require_int_value(payload, "displayableCount"),
+        pending_count=_require_int_value(payload, "pendingCount"),
+        pending_next_turn_count=_require_int_value(payload, "pendingNextTurnCount"),
+    )
+
+
+def parse_queue_remove_result(payload: JsonObject) -> QueueRemoveResult:
+    return QueueRemoveResult(
+        removed=_parse_queued_message(
+            payload.get("removed"), field="remove_queued_message.removed"
+        ),
+        queue=parse_session_queue_snapshot(
+            _clone_json_object(
+                payload.get("queue"), field="remove_queued_message.queue"
+            )
+        ),
+    )
+
+
+def parse_session_queue_clear_result(payload: JsonObject) -> SessionQueueClearResult:
+    def parse_messages(field: str) -> tuple[QueuedMessage, ...]:
+        values = payload.get(field)
+        if not isinstance(values, list):
+            raise ValueError(f"clear_queue.{field} must be an array")
+        return tuple(
+            _parse_queued_message(item, field=f"clear_queue.{field}[{index}]")
+            for index, item in enumerate(values)
+        )
+
+    return SessionQueueClearResult(
+        steering=parse_messages("steering"),
+        follow_up=parse_messages("followUp"),
+        snapshot=parse_session_queue_snapshot(
+            _clone_json_object(payload.get("snapshot"), field="clear_queue.snapshot")
+        ),
+    )
+
+
+def parse_job_snapshot(payload: JsonObject) -> JobSnapshot:
+    job_type = _require_literal(
+        payload.get("type"), frozenset({"bash", "task"}), field="job.type"
+    )
+    status = _require_literal(
+        payload.get("status"),
+        frozenset({"running", "completed", "failed", "cancelled"}),
+        field="job.status",
+    )
+    return JobSnapshot(
+        id=_require_str(payload, "id"),
+        type=cast(JobType, job_type),
+        status=cast(JobStatus, status),
+        label=_require_str(payload, "label"),
+        duration_ms=_require_number_value(payload, "durationMs"),
+        queued=_optional_bool(payload, "queued"),
+        resolved_model=_optional_str(payload, "resolvedModel"),
+        result_text=_optional_str(payload, "resultText"),
+        result_truncated=_optional_bool(payload, "resultTruncated"),
+        error_text=_optional_str(payload, "errorText"),
+        error_truncated=_optional_bool(payload, "errorTruncated"),
+    )
+
+
+def parse_agent_activity_snapshot(payload: JsonObject) -> AgentActivitySnapshot:
+    return AgentActivitySnapshot(
+        id=_require_str(payload, "id"),
+        age_ms=_require_number_value(payload, "ageMs"),
+        parent_id=_optional_str(payload, "parentId"),
+        activity=_optional_str(payload, "activity"),
+    )
+
+
+def parse_job_list_result(payload: JsonObject) -> JobListResult:
+    raw_jobs = payload.get("jobs")
+    raw_agents = payload.get("agents")
+    if not isinstance(raw_jobs, list) or not isinstance(raw_agents, list):
+        raise ValueError("list_jobs jobs and agents must be arrays")
+    return JobListResult(
+        jobs=tuple(
+            parse_job_snapshot(_clone_json_object(item, field=f"jobs[{index}]"))
+            for index, item in enumerate(raw_jobs)
+        ),
+        agents=tuple(
+            parse_agent_activity_snapshot(
+                _clone_json_object(item, field=f"agents[{index}]")
+            )
+            for index, item in enumerate(raw_agents)
+        ),
+    )
+
+
+def parse_cancel_job_result(payload: JsonObject) -> CancelJobResult:
+    raw_outcomes = payload.get("outcomes")
+    if not isinstance(raw_outcomes, list):
+        raise ValueError("cancel_job.outcomes must be an array")
+    outcomes: list[CancelJobOutcome] = []
+    for index, item in enumerate(raw_outcomes):
+        outcome = _clone_json_object(item, field=f"cancel_job.outcomes[{index}]")
+        status = _require_literal(
+            outcome.get("status"),
+            frozenset({"cancelled", "not_found", "already_completed"}),
+            field=f"cancel_job.outcomes[{index}].status",
+        )
+        outcomes.append(
+            CancelJobOutcome(
+                id=_require_str(outcome, "id"),
+                status=cast(CancelJobStatus, status),
+                message=_require_str(outcome, "message"),
+            )
+        )
+    return CancelJobResult(outcomes=tuple(outcomes))
+
+
+def _parse_available_command(payload: object, *, field: str) -> AvailableCommand:
+    command = _clone_json_object(payload, field=field)
+    source = _require_literal(
+        command.get("source"),
+        frozenset({"builtin", "skill", "extension", "custom", "mcp_prompt", "file"}),
+        field=f"{field}.source",
+    )
+    raw_aliases = command.get("aliases")
+    aliases = (
+        ()
+        if raw_aliases is None
+        else _required_string_tuple(raw_aliases, field=f"{field}.aliases")
+    )
+    raw_input = command.get("input")
+    input_model = None
+    if raw_input is not None:
+        input_payload = _clone_json_object(raw_input, field=f"{field}.input")
+        input_model = AvailableCommandInput(hint=_optional_str(input_payload, "hint"))
+    raw_subcommands = command.get("subcommands")
+    subcommands: tuple[AvailableSubcommand, ...] = ()
+    if raw_subcommands is not None:
+        if not isinstance(raw_subcommands, list):
+            raise ValueError(f"{field}.subcommands must be an array")
+        parsed_subcommands: list[AvailableSubcommand] = []
+        for index, item in enumerate(raw_subcommands):
+            subcommand = _clone_json_object(item, field=f"{field}.subcommands[{index}]")
+            parsed_subcommands.append(
+                AvailableSubcommand(
+                    name=_require_str(subcommand, "name"),
+                    description=_optional_str(subcommand, "description"),
+                    usage=_optional_str(subcommand, "usage"),
+                )
+            )
+        subcommands = tuple(parsed_subcommands)
+    return AvailableCommand(
+        name=_require_str(command, "name"),
+        source=cast(
+            Literal["builtin", "skill", "extension", "custom", "mcp_prompt", "file"],
+            source,
+        ),
+        aliases=aliases,
+        description=_optional_str(command, "description"),
+        input=input_model,
+        subcommands=subcommands,
+    )
+
+
+def _parse_goal(payload: object, *, field: str) -> Goal:
+    goal = _clone_json_object(payload, field=field)
+    status = _require_literal(
+        goal.get("status"),
+        frozenset({"active", "paused", "budget-limited", "complete", "dropped"}),
+        field=f"{field}.status",
+    )
+    return Goal(
+        id=_require_str(goal, "id"),
+        objective=_require_str(goal, "objective"),
+        status=cast(GoalStatus, status),
+        token_budget=_optional_int(goal, "tokenBudget"),
+        tokens_used=_require_int_value(goal, "tokensUsed"),
+        time_used_seconds=_require_number_value(goal, "timeUsedSeconds"),
+        created_at=_require_number_value(goal, "createdAt"),
+        updated_at=_require_number_value(goal, "updatedAt"),
+    )
+
+
+def _parse_goal_mode_state(payload: object, *, field: str) -> GoalModeState:
+    state = _clone_json_object(payload, field=field)
+    mode = _require_literal(
+        state.get("mode"), frozenset({"active", "exiting"}), field=f"{field}.mode"
+    )
+    reason = _optional_literal(
+        state.get("reason"), frozenset({"completed"}), field=f"{field}.reason"
+    )
+    return GoalModeState(
+        enabled=_require_bool(state, "enabled"),
+        mode=cast(Literal["active", "exiting"], mode),
+        reason=cast(Literal["completed"] | None, reason),
+        goal=_parse_goal(state.get("goal"), field=f"{field}.goal"),
+    )
+
+
+def _parse_agent_progress(payload: object, *, field: str) -> AgentProgress:
+    progress = _clone_json_object(payload, field=field)
+    source = _require_literal(
+        progress.get("agentSource"),
+        frozenset({"bundled", "user", "project"}),
+        field=f"{field}.agentSource",
+    )
+    status = _require_literal(
+        progress.get("status"),
+        frozenset({"pending", "running", "completed", "failed", "aborted"}),
+        field=f"{field}.status",
+    )
+    raw_model_override = progress.get("modelOverride")
+    model_override: str | tuple[str, ...] | None
+    if raw_model_override is None or isinstance(raw_model_override, str):
+        model_override = raw_model_override
+    elif isinstance(raw_model_override, list) and all(
+        isinstance(model, str) for model in raw_model_override
+    ):
+        model_override = tuple(raw_model_override)
+    else:
+        raise ValueError(f"{field}.modelOverride must be a string or array of strings")
+    raw_recent_tools = progress.get("recentTools")
+    if not isinstance(raw_recent_tools, list):
+        raise ValueError(f"{field}.recentTools must be an array")
+    recent_tools: list[AgentRecentTool] = []
+    for index, item in enumerate(raw_recent_tools):
+        tool = _clone_json_object(item, field=f"{field}.recentTools[{index}]")
+        recent_tools.append(
+            AgentRecentTool(
+                tool=_require_str(tool, "tool"),
+                args=_require_str(tool, "args"),
+                end_ms=_require_number_value(tool, "endMs"),
+            )
+        )
+    return AgentProgress(
+        index=_require_int_value(progress, "index"),
+        id=_require_str(progress, "id"),
+        agent=_require_str(progress, "agent"),
+        agent_source=cast(AgentSource, source),
+        status=cast(SubagentProgressStatus, status),
+        task=_require_str(progress, "task"),
+        assignment=_optional_str(progress, "assignment"),
+        description=_optional_str(progress, "description"),
+        last_intent=_optional_str(progress, "lastIntent"),
+        current_tool=_optional_str(progress, "currentTool"),
+        current_tool_args=_optional_str(progress, "currentToolArgs"),
+        current_tool_start_ms=_optional_float(progress, "currentToolStartMs"),
+        recent_tools=tuple(recent_tools),
+        recent_output=_required_string_tuple(
+            progress.get("recentOutput"), field=f"{field}.recentOutput"
+        ),
+        tool_count=_require_int_value(progress, "toolCount"),
+        requests=_require_int_value(progress, "requests"),
+        tokens=_require_int_value(progress, "tokens"),
+        context_tokens=_optional_int(progress, "contextTokens"),
+        context_window=_optional_int(progress, "contextWindow"),
+        cost=_require_number_value(progress, "cost"),
+        duration_ms=_require_number_value(progress, "durationMs"),
+        resolved_model=_optional_str(progress, "resolvedModel"),
+        resolved_model_is_fallback=_optional_bool(progress, "resolvedModelIsFallback"),
+        retry_state=_optional_json_object(
+            progress.get("retryState"), field=f"{field}.retryState"
+        ),
+        retry_failure=_optional_json_object(
+            progress.get("retryFailure"), field=f"{field}.retryFailure"
+        ),
+        inflight_task_details=_optional_json_object(
+            progress.get("inflightTaskDetails"), field=f"{field}.inflightTaskDetails"
+        ),
+        model_override=model_override,
+        extracted_tool_data=_optional_json_object(
+            progress.get("extractedToolData"), field=f"{field}.extractedToolData"
+        ),
+    )
+
+
 def parse_notification(payload: JsonObject) -> RpcNotification:
     event_type = payload.get("type")
     if event_type == "ready":
@@ -1609,6 +3482,14 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             ):
                 raise ValueError("ready.supportedProtocolVersions must be integers")
             supported_versions = tuple(raw_versions)
+        raw_capabilities = payload.get("capabilities")
+        capabilities = (
+            parse_rpc_capability_manifest(
+                _clone_json_object(raw_capabilities, field="ready.capabilities")
+            )
+            if raw_capabilities is not None
+            else None
+        )
         return ReadyEvent(
             protocol_version=_optional_int(payload, "protocolVersion"),
             supported_protocol_versions=supported_versions,
@@ -1616,11 +3497,392 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             max_reassembled_frame_bytes=_optional_int(
                 payload, "maxReassembledFrameBytes"
             ),
+            capabilities=capabilities,
         )
     if event_type == "extension_ui_request":
         return parse_extension_ui_request(payload)
+    if event_type == "provider_auth_request":
+        method = _require_str(payload, "method")
+        if method != "open_url":
+            raise ValueError("provider_auth_request.method must be open_url")
+        return ProviderAuthRequest(
+            operation_id=_require_str(payload, "operationId"),
+            request_id=_require_str(payload, "requestId"),
+            provider_id=_require_str(payload, "providerId"),
+            method="open_url",
+            url=_require_str(payload, "url"),
+            launch_url=_optional_str(payload, "launchUrl"),
+            instructions=_optional_str(payload, "instructions"),
+        )
+    if event_type == "provider_auth_update":
+        state = payload.get("state")
+        if not isinstance(state, dict):
+            raise ValueError("provider_auth_update.state must be an object")
+        return ProviderAuthUpdate(state=parse_provider_auth_state(state))
     if event_type == "extension_error":
         return parse_extension_error(payload)
+    if event_type == "settings_update":
+        return SettingsUpdateEvent()
+    if event_type == "tool_inventory_update":
+        return ToolInventoryUpdateEvent()
+    if event_type == "prompt_result":
+        return PromptResultEvent(
+            id=_optional_str(payload, "id"),
+            operation_id=_optional_str(payload, "operationId"),
+            agent_invoked=_require_bool(payload, "agentInvoked"),
+        )
+    if event_type == "available_commands_update":
+        raw_commands = payload.get("commands")
+        if not isinstance(raw_commands, list):
+            raise ValueError("available_commands_update.commands must be an array")
+        return AvailableCommandsUpdateEvent(
+            commands=tuple(
+                _parse_available_command(
+                    item, field=f"available_commands_update.commands[{index}]"
+                )
+                for index, item in enumerate(raw_commands)
+            )
+        )
+    if event_type == "command_output":
+        return CommandOutputEvent(text=_require_str(payload, "text"))
+    if event_type == "session_info_update":
+        return SessionInfoUpdateEvent(
+            title=_optional_str(payload, "title"),
+            session_id=_require_str(payload, "sessionId"),
+            mode=cast(
+                SessionMode,
+                _require_literal(
+                    payload.get("mode"),
+                    _SESSION_MODE_VALUES,
+                    field="session_info_update.mode",
+                ),
+            ),
+        )
+    if event_type == "config_update":
+        raw_model = payload.get("model")
+        model = (
+            parse_model_info(_clone_json_object(raw_model, field="config_update.model"))
+            if raw_model is not None
+            else None
+        )
+        raw_advisor = payload.get("advisor")
+        advisor = None
+        if raw_advisor is not None:
+            advisor_payload = _clone_json_object(
+                raw_advisor, field="config_update.advisor"
+            )
+            advisor = parse_advisor_state(advisor_payload)
+            if advisor is None:
+                raise ValueError("config_update.advisor must be a valid advisor state")
+        return ConfigUpdateEvent(
+            model=model,
+            thinking_level=cast(
+                ThinkingLevel | None,
+                _optional_literal(
+                    payload.get("thinkingLevel"),
+                    _THINKING_LEVEL_VALUES,
+                    field="config_update.thinkingLevel",
+                ),
+            ),
+            advisor=advisor,
+        )
+    if event_type == "subagent_lifecycle":
+        lifecycle = _clone_json_object(
+            payload.get("payload"), field="subagent_lifecycle.payload"
+        )
+        source = _require_literal(
+            lifecycle.get("agentSource"),
+            frozenset({"bundled", "user", "project"}),
+            field="subagent_lifecycle.payload.agentSource",
+        )
+        status = _require_literal(
+            lifecycle.get("status"),
+            frozenset({"started", "completed", "failed", "aborted"}),
+            field="subagent_lifecycle.payload.status",
+        )
+        return SubagentLifecycleEvent(
+            payload=SubagentLifecycle(
+                id=_require_str(lifecycle, "id"),
+                agent=_require_str(lifecycle, "agent"),
+                agent_source=cast(AgentSource, source),
+                status=cast(SubagentLifecycleStatus, status),
+                index=_require_int_value(lifecycle, "index"),
+                description=_optional_str(lifecycle, "description"),
+                session_file=_optional_str(lifecycle, "sessionFile"),
+                parent_tool_call_id=_optional_str(lifecycle, "parentToolCallId"),
+                detached=_optional_bool(lifecycle, "detached"),
+            )
+        )
+    if event_type == "subagent_progress":
+        progress_payload = _clone_json_object(
+            payload.get("payload"), field="subagent_progress.payload"
+        )
+        source = _require_literal(
+            progress_payload.get("agentSource"),
+            frozenset({"bundled", "user", "project"}),
+            field="subagent_progress.payload.agentSource",
+        )
+        return SubagentProgressEvent(
+            payload=SubagentProgress(
+                index=_require_int_value(progress_payload, "index"),
+                agent=_require_str(progress_payload, "agent"),
+                agent_source=cast(AgentSource, source),
+                task=_require_str(progress_payload, "task"),
+                progress=_parse_agent_progress(
+                    progress_payload.get("progress"),
+                    field="subagent_progress.payload.progress",
+                ),
+                parent_tool_call_id=_optional_str(progress_payload, "parentToolCallId"),
+                assignment=_optional_str(progress_payload, "assignment"),
+                session_file=_optional_str(progress_payload, "sessionFile"),
+                detached=_optional_bool(progress_payload, "detached"),
+            )
+        )
+    if event_type == "subagent_event":
+        subagent_payload = _clone_json_object(
+            payload.get("payload"), field="subagent_event.payload"
+        )
+        nested_event = _clone_json_object(
+            subagent_payload.get("event"), field="subagent_event.payload.event"
+        )
+        return SubagentEvent(
+            id=_require_str(subagent_payload, "id"),
+            event=parse_notification(nested_event),
+        )
+    if event_type == "plan_state_update":
+        return PlanStateUpdateEvent(
+            state=parse_plan_state(
+                _clone_json_object(
+                    payload.get("state"), field="plan_state_update.state"
+                )
+            )
+        )
+    if event_type == "plan_approval_request":
+        return PlanApprovalRequestEvent(
+            approval_id=_require_str(payload, "approvalId"),
+            plan_file_path=_require_str(payload, "planFilePath"),
+            title=_require_str(payload, "title"),
+            plan_content=_require_str(payload, "planContent"),
+        )
+    if event_type == "plan_approval_settled":
+        result_payload = _clone_json_object(
+            payload.get("result"), field="plan_approval_settled.result"
+        )
+        return PlanApprovalSettledEvent(
+            approval_id=_require_str(payload, "approvalId"),
+            result=PlanApprovalResult(
+                approval_id=_require_str(result_payload, "approvalId"),
+                decision=cast(
+                    Literal["approve", "refine", "reject"],
+                    _require_literal(
+                        result_payload.get("decision"),
+                        frozenset({"approve", "refine", "reject"}),
+                        field="plan_approval_settled.result.decision",
+                    ),
+                ),
+                execution_dispatched=_require_bool(
+                    result_payload, "executionDispatched"
+                ),
+                plan_file_path=_require_str(result_payload, "planFilePath"),
+                compaction=cast(
+                    Literal["ok", "cancelled", "failed"] | None,
+                    _optional_literal(
+                        result_payload.get("compaction"),
+                        frozenset({"ok", "cancelled", "failed"}),
+                        field="plan_approval_settled.result.compaction",
+                    ),
+                ),
+            ),
+        )
+    if event_type == "eval_output":
+        sequence = _optional_int(payload, "sequence")
+        truncated = _optional_bool(payload, "truncated")
+        if sequence is None or sequence < 0 or truncated is None:
+            raise ValueError("eval_output sequence/truncated is invalid")
+        return EvalOutputEvent(
+            operation_id=_require_str(payload, "operationId"),
+            sequence=sequence,
+            chunk=_require_str(payload, "chunk"),
+            truncated=truncated,
+        )
+    if event_type == "eval_complete":
+        result = _clone_json_object(payload.get("result"), field="eval_complete.result")
+        return EvalCompleteEvent(
+            operation_id=_require_str(payload, "operationId"),
+            result=parse_eval_history_entry(result),
+        )
+    if event_type == "agent_registry_update":
+        change = _require_literal(
+            payload.get("change"),
+            frozenset({"registered", "status_changed", "removed"}),
+            field="agent_registry_update.change",
+        )
+        raw_agent = payload.get("agent")
+        if not isinstance(raw_agent, dict):
+            raise ValueError("agent_registry_update.agent must be an object")
+        return AgentRegistryUpdateEvent(
+            change=cast(Literal["registered", "status_changed", "removed"], change),
+            agent=parse_agent_snapshot(cast(JsonObject, raw_agent)),
+        )
+    if event_type == "queue_update":
+        return QueueUpdateEvent(
+            queue=parse_session_queue_snapshot(
+                _clone_json_object(payload.get("queue"), field="queue_update.queue")
+            )
+        )
+    if event_type == "job_update":
+        result = parse_job_list_result(
+            {"jobs": payload.get("jobs"), "agents": payload.get("agents")}
+        )
+        return JobUpdateEvent(jobs=result.jobs, agents=result.agents)
+    if event_type in {
+        "operation_started",
+        "operation_completed",
+        "operation_failed",
+        "operation_cancelled",
+    }:
+        operation_id = _require_str(payload, "operationId")
+        command = _require_str(payload, "command")
+        request_id = _optional_str(payload, "requestId")
+        if event_type == "operation_started":
+            started_at = _optional_float(payload, "startedAt")
+            if started_at is None:
+                raise ValueError("operation_started.startedAt must be a number")
+            return OperationStartedEvent(
+                operation_id=operation_id,
+                request_id=request_id,
+                command=command,
+                started_at=started_at,
+            )
+        settled_at = _optional_float(payload, "settledAt")
+        if settled_at is None:
+            raise ValueError(f"{event_type}.settledAt must be a number")
+        if event_type == "operation_completed":
+            agent_invoked = _optional_bool(payload, "agentInvoked")
+            if agent_invoked is None:
+                raise ValueError("operation_completed.agentInvoked must be a boolean")
+            raw_data = payload.get("data")
+            state: ProviderAuthState | None = None
+            if isinstance(raw_data, dict) and isinstance(raw_data.get("state"), dict):
+                state = parse_provider_auth_state(raw_data["state"])
+            return OperationCompletedEvent(
+                operation_id=operation_id,
+                request_id=request_id,
+                command=command,
+                agent_invoked=agent_invoked,
+                settled_at=settled_at,
+                state=state,
+            )
+        if event_type == "operation_failed":
+            return OperationFailedEvent(
+                operation_id=operation_id,
+                request_id=request_id,
+                command=command,
+                error=_require_str(payload, "error"),
+                code=_optional_str(payload, "code"),
+                settled_at=settled_at,
+            )
+        return OperationCancelledEvent(
+            operation_id=operation_id,
+            request_id=request_id,
+            command=command,
+            reason=cast(
+                RpcOperationCancellationReason,
+                _require_literal(
+                    payload.get("reason"),
+                    frozenset(
+                        {
+                            "user",
+                            "replaced",
+                            "session_transition",
+                            "client_disconnected",
+                        }
+                    ),
+                    field="operation_cancelled.reason",
+                ),
+            ),
+            code=cast(
+                RpcOperationCancellationCode,
+                _require_literal(
+                    payload.get("code"),
+                    frozenset(
+                        {
+                            "cancelled_by_client",
+                            "replaced_by_prompt",
+                            "session_changed",
+                            "client_disconnected",
+                        }
+                    ),
+                    field="operation_cancelled.code",
+                ),
+            ),
+            settled_at=settled_at,
+        )
+    if event_type == "model_changed":
+        return ModelChangedEvent()
+    if event_type == "irc_message":
+        message = _parse_agent_message(
+            _clone_json_object(payload.get("message"), field="irc_message.message"),
+            field="irc_message.message",
+        )
+        if message.get("role") != "custom":
+            raise ValueError("irc_message.message.role must be custom")
+        return IrcMessageEvent(message=cast(CustomMessage, message))
+    if event_type == "notice":
+        return NoticeEvent(
+            level=cast(
+                NotifyType,
+                _require_literal(
+                    payload.get("level"), _NOTIFY_TYPE_VALUES, field="notice.level"
+                ),
+            ),
+            message=_require_str(payload, "message"),
+            source=_optional_str(payload, "source"),
+        )
+    if event_type == "thinking_level_changed":
+        return ThinkingLevelChangedEvent(
+            thinking_level=cast(
+                ThinkingLevel | None,
+                _optional_literal(
+                    payload.get("thinkingLevel"),
+                    _THINKING_LEVEL_VALUES,
+                    field="thinking_level_changed.thinkingLevel",
+                ),
+            ),
+            configured=cast(
+                ConfiguredThinkingLevel | None,
+                _optional_literal(
+                    payload.get("configured"),
+                    _THINKING_LEVEL_VALUES | frozenset({"auto"}),
+                    field="thinking_level_changed.configured",
+                ),
+            ),
+            resolved=cast(
+                ThinkingLevel | None,
+                _optional_literal(
+                    payload.get("resolved"),
+                    _THINKING_LEVEL_VALUES,
+                    field="thinking_level_changed.resolved",
+                ),
+            ),
+        )
+    if event_type == "goal_updated":
+        if "goal" not in payload:
+            raise ValueError("goal_updated.goal is required")
+        raw_goal = payload.get("goal")
+        raw_state = payload.get("state")
+        return GoalUpdatedEvent(
+            goal=(
+                _parse_goal(raw_goal, field="goal_updated.goal")
+                if raw_goal is not None
+                else None
+            ),
+            state=(
+                _parse_goal_mode_state(raw_state, field="goal_updated.state")
+                if raw_state is not None
+                else None
+            ),
+        )
     if event_type == "agent_start":
         return AgentStartEvent()
     if event_type == "agent_end":

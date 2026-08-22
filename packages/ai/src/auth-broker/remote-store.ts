@@ -681,8 +681,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	 * snapshot, and the global snapshot is then refreshed in the background so
 	 * any concurrent peer (refresh, generation bump) stays in sync.
 	 */
-	async upsertAuthCredentialRemote(provider: string, credential: AuthCredential): Promise<StoredAuthCredential[]> {
-		const { entries } = await this.#client.uploadCredential(provider, credential);
+	async upsertAuthCredentialRemote(
+		provider: string,
+		credential: AuthCredential,
+		signal?: AbortSignal,
+	): Promise<StoredAuthCredential[]> {
+		const { entries } = await this.#client.uploadCredential(provider, credential, signal);
 		this.#applyProviderEntries(provider, entries);
 		this.#maybeRefreshSnapshot("upload");
 		return this.listAuthCredentials(provider);

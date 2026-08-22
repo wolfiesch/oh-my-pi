@@ -11,23 +11,32 @@ import textwrap
 import threading
 import time
 import unittest
+from pathlib import Path
+from typing import cast
 
 from omp_rpc import (
     AgentEndEvent,
+    ExtensionUiRequest,
     RpcClient,
     RpcCommandError,
     RpcConcurrencyError,
     RpcError,
+    RpcTimeoutError,
     host_tool,
 )
 from omp_rpc.client import _RpcFrameDecoder
+from omp_rpc.protocol import JsonObject, JsonValue, SessionState
 
+CAPABILITY_MANIFEST_JSON = (
+    Path(__file__).parent / "fixtures" / "rpc-capability-manifest.json"
+).read_text(encoding="utf-8")
 
 FAKE_SERVER = textwrap.dedent(
     """
     import json
     import sys
     import time
+    capability_manifest = json.loads(__CAPABILITY_MANIFEST_JSON__)
 
     def usage():
         return {
@@ -82,9 +91,12 @@ FAKE_SERVER = textwrap.dedent(
 
     def current_state():
         return {
+            "mode": session_mode,
+            "plan": plan_state,
             "model": model_info(model_id, model_provider),
             "thinkingLevel": thinking_level,
             "isStreaming": False,
+            "activityPhase": "idle",
             "isCompacting": False,
             "steeringMode": steering_mode,
             "followUpMode": follow_up_mode,
@@ -259,6 +271,8 @@ FAKE_SERVER = textwrap.dedent(
     auto_retry_enabled = True
     session_name = "Scratchpad"
     last_assistant_text = None
+    session_mode = "none"
+    plan_state = {"mode": "none"}
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()
@@ -270,11 +284,243 @@ FAKE_SERVER = textwrap.dedent(
         request_id = command.get("id")
 
         if command_type == "extension_ui_response":
-            emit_prompt_turn("ui acknowledged")
+            if command["id"] in {"ui-privileged", "ui-bash"}:
+                expected_operation_id = (
+                    "operation-bash"
+                    if command["id"] == "ui-bash"
+                    else "operation-eval"
+                )
+                text = (
+                    "ui correlated"
+                    if command.get("operationId") == expected_operation_id
+                    else "ui correlation missing"
+                )
+                emit_prompt_turn(text)
+            else:
+                emit_prompt_turn("ui acknowledged")
             continue
 
-        if command_type == "get_state":
+        if command_type == "get_capabilities":
+            respond(
+                request_id,
+                "get_capabilities",
+                capability_manifest,
+            )
+        elif command_type == "get_tool_inventory":
+            print(json.dumps({"type": "tool_inventory_update"}), flush=True)
+            respond(
+                request_id,
+                "get_tool_inventory",
+                {
+                    "applicationApiVersion": 2,
+                    "tools": [],
+                    "xdev": {"prefix": "xd://", "mountedCount": 0},
+                },
+            )
+        elif command_type == "set_tool_activation":
+            print(json.dumps({"type": "tool_inventory_update"}), flush=True)
+            activated = command.get("activate", [])
+            respond(
+                request_id,
+                "set_tool_activation",
+                {
+                    "enabledToolNames": ["read", *activated],
+                    "activeToolNames": ["read", *activated],
+                    "mountedToolNames": [],
+                    "activated": activated,
+                    "deactivated": command.get("deactivate", []),
+                    "inventoryAvailable": False,
+                    "futureResultField": True,
+                },
+            )
+        elif command_type == "get_state":
             respond(request_id, "get_state", current_state())
+        elif command_type == "get_advisor_state":
+            respond(
+                request_id,
+                "get_advisor_state",
+                {
+                    "configured": True,
+                    "active": False,
+                    "advisors": [{"name": "reviewer", "status": "no_model"}],
+                },
+            )
+        elif command_type == "set_advisor_enabled":
+            enabled = command.get("enabled") is True
+            respond(
+                request_id,
+                "set_advisor_enabled",
+                {
+                    "configured": enabled,
+                    "active": False,
+                    "advisors": [
+                        {
+                            "name": "reviewer",
+                            "status": "no_model" if enabled else "paused",
+                        }
+                    ],
+                },
+            )
+        elif command_type == "set_mode":
+            session_mode = command["mode"]
+            plan_state = {
+                "mode": session_mode,
+                "planFilePath": command.get("planFilePath", "local://PLAN.md"),
+                "workflow": command.get("workflow", "parallel"),
+            }
+            operation_id = "operation-set-mode"
+            respond(
+                request_id,
+                "set_mode",
+                {
+                    "operationId": operation_id,
+                    "accepted": True,
+                    "deferred": command.get("when") == "next_idle",
+                },
+            )
+            print(
+                json.dumps(
+                    {
+                        "type": "operation_started",
+                        "operationId": operation_id,
+                        "requestId": request_id,
+                        "command": "set_mode",
+                        "startedAt": 1,
+                    }
+                ),
+                flush=True,
+            )
+            print(
+                json.dumps(
+                    {
+                        "type": "operation_completed",
+                        "operationId": operation_id,
+                        "requestId": request_id,
+                        "command": "set_mode",
+                        "agentInvoked": False,
+                        "settledAt": 2,
+                    }
+                ),
+                flush=True,
+            )
+        elif command_type == "get_plan":
+            respond(request_id, "get_plan", plan_state)
+        elif command_type == "get_queue":
+            queue_snapshot = {
+                "steering": [
+                    {
+                        "entryId": "queue-1",
+                        "lane": "steering",
+                        "text": "Steer now",
+                        "operationId": "operation-prompt",
+                    }
+                ],
+                "followUp": [],
+                "rowCount": 1,
+                "displayableCount": 1,
+                "pendingCount": 1,
+                "pendingNextTurnCount": 0,
+            }
+            print(
+                json.dumps({"type": "queue_update", "queue": queue_snapshot}),
+                flush=True,
+            )
+            respond(request_id, "get_queue", queue_snapshot)
+        elif command_type == "remove_queued_message":
+            respond(
+                request_id,
+                "remove_queued_message",
+                {
+                    "removed": {"text": "Steer now"},
+                    "queue": {
+                        "steering": [],
+                        "followUp": [],
+                        "rowCount": 0,
+                        "displayableCount": 0,
+                        "pendingCount": 0,
+                        "pendingNextTurnCount": 0,
+                    },
+                },
+            )
+        elif command_type == "reorder_queued_message":
+            respond(
+                request_id,
+                "reorder_queued_message",
+                {
+                    "steering": [],
+                    "followUp": [],
+                    "rowCount": 0,
+                    "displayableCount": 0,
+                    "pendingCount": 0,
+                    "pendingNextTurnCount": 0,
+                },
+            )
+        elif command_type == "clear_queue":
+            empty_queue = {
+                "steering": [],
+                "followUp": [],
+                "rowCount": 0,
+                "displayableCount": 0,
+                "pendingCount": 0,
+                "pendingNextTurnCount": 0,
+            }
+            respond(
+                request_id,
+                "clear_queue",
+                {"steering": [], "followUp": [], "snapshot": empty_queue},
+            )
+        elif command_type == "list_jobs":
+            jobs = [
+                {
+                    "id": "job-1",
+                    "type": "task",
+                    "status": "running",
+                    "label": "Review",
+                    "durationMs": 25,
+                    "queued": False,
+                }
+            ]
+            agents = [{"id": "AgentA", "ageMs": 50, "activity": "Reading"}]
+            print(
+                json.dumps({"type": "job_update", "jobs": jobs, "agents": agents}),
+                flush=True,
+            )
+            respond(request_id, "list_jobs", {"jobs": jobs, "agents": agents})
+        elif command_type == "get_job":
+            respond(
+                request_id,
+                "get_job",
+                {
+                    "job": {
+                        "id": "job-1",
+                        "type": "task",
+                        "status": "running",
+                        "label": "Review",
+                        "durationMs": 25,
+                    }
+                },
+            )
+        elif command_type == "cancel_job":
+            respond(
+                request_id,
+                "cancel_job",
+                {
+                    "outcomes": [
+                        {
+                            "id": command["jobIds"][0],
+                            "status": "cancelled",
+                            "message": "Cancelled",
+                        }
+                    ]
+                },
+            )
+        elif command_type == "resolve_plan_approval":
+            operation_id = "operation-resolve-plan"
+            respond(
+                request_id,
+                "resolve_plan_approval",
+                {"operationId": operation_id, "accepted": True},
+            )
         elif command_type == "set_host_tools":
             registered_host_tools = command.get("tools", [])
             respond(
@@ -413,6 +659,38 @@ FAKE_SERVER = textwrap.dedent(
             if message == "needs confirm":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-2", "method": "confirm", "title": "Confirm", "message": "Continue?"}), flush=True)
                 continue
+            if message == "needs privileged confirm":
+                print(
+                    json.dumps(
+                        {
+                            "type": "extension_ui_request",
+                            "id": "ui-privileged",
+                            "method": "confirm",
+                            "title": "Run eval code?",
+                            "message": "display(2 + 2)",
+                            "operationId": "operation-eval",
+                            "command": "eval_execute",
+                        }
+                    ),
+                    flush=True,
+                )
+                continue
+            if message == "needs bash confirmation":
+                print(
+                    json.dumps(
+                        {
+                            "type": "extension_ui_request",
+                            "id": "ui-bash",
+                            "method": "confirm",
+                            "title": "Run bash command?",
+                            "message": "printf hello",
+                            "operationId": "operation-bash",
+                            "command": "bash",
+                        }
+                    ),
+                    flush=True,
+                )
+                continue
             if message == "needs cancel":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-3", "method": "editor", "title": "Edit", "placeholder": "value"}), flush=True)
                 continue
@@ -500,6 +778,12 @@ FAKE_SERVER = textwrap.dedent(
         else:
             respond(request_id, command_type, success=False, error=f"unsupported: {command_type}")
     """
+).replace("__CAPABILITY_MANIFEST_JSON__", repr(CAPABILITY_MANIFEST_JSON))
+
+STALLED_STATE_SERVER = FAKE_SERVER.replace(
+    'elif command_type == "get_state":\n'
+    '        respond(request_id, "get_state", current_state())',
+    'elif command_type == "get_state":\n        continue',
 )
 
 
@@ -874,6 +1158,180 @@ FORWARD_COMPAT_SERVER = textwrap.dedent(
     """
 )
 
+OPERATION_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    print(json.dumps({"type": "ready"}), flush=True)
+    sequence = 0
+    active = {}
+    recent = {}
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        if command["type"] == "cancel_operation":
+            operation_id = command["operationId"]
+            terminal = recent.get(operation_id)
+            if operation_id in active:
+                request_id = active.pop(operation_id)
+                terminal = {
+                    "type": "operation_cancelled",
+                    "operationId": operation_id,
+                    "requestId": request_id,
+                    "command": "prompt",
+                    "reason": "user",
+                    "code": "cancelled_by_client",
+                    "settledAt": sequence + 0.5,
+                }
+                recent[operation_id] = terminal
+                print(json.dumps(terminal), flush=True)
+            status = (
+                "not_found"
+                if terminal is None
+                else "cancelled"
+                if terminal["type"] == "operation_cancelled"
+                else "completed"
+                if terminal["type"] == "operation_completed"
+                else "failed"
+            )
+            data = {"operationId": operation_id, "status": status}
+            if terminal is not None:
+                data["terminal"] = terminal
+            print(
+                json.dumps(
+                    {
+                        "id": command.get("id"),
+                        "type": "response",
+                        "command": "cancel_operation",
+                        "success": True,
+                        "data": data,
+                    }
+                ),
+                flush=True,
+            )
+            continue
+        if command["type"] == "get_operations":
+            print(
+                json.dumps(
+                    {
+                        "id": command.get("id"),
+                        "type": "response",
+                        "command": "get_operations",
+                        "success": True,
+                        "data": {
+                            "active": [
+                                {
+                                    "operationId": operation_id,
+                                    "requestId": request_id,
+                                    "command": "prompt",
+                                    "status": "started",
+                                    "acceptedAt": 1,
+                                    "startedAt": 2,
+                                }
+                                for operation_id, request_id in active.items()
+                            ],
+                            "recent": list(recent.values()),
+                        },
+                    }
+                ),
+                flush=True,
+            )
+            continue
+        if command["type"] != "prompt":
+            continue
+        sequence += 1
+        operation_id = f"operation-{sequence}"
+        request_id = command.get("id")
+        print(
+            json.dumps(
+                {
+                    "id": request_id,
+                    "type": "response",
+                    "command": "prompt",
+                    "success": True,
+                    "data": {"operationId": operation_id, "accepted": True},
+                }
+            ),
+            flush=True,
+        )
+        print(
+            json.dumps(
+                {
+                    "type": "operation_started",
+                    "operationId": operation_id,
+                    "requestId": request_id,
+                    "command": "prompt",
+                    "startedAt": sequence,
+                }
+            ),
+            flush=True,
+        )
+        active[operation_id] = request_id
+        if command["message"] == "malformed operation":
+            active.pop(operation_id, None)
+            print(
+                json.dumps(
+                    {
+                        "type": "operation_completed",
+                        "operationId": operation_id,
+                        "requestId": request_id,
+                        "command": "prompt",
+                        "agentInvoked": False,
+                        "settledAt": "invalid",
+                    }
+                ),
+                flush=True,
+            )
+            continue
+        if command["message"] == "hold":
+            continue
+        if command["message"] == "local":
+            terminal = {
+                "type": "operation_completed",
+                "operationId": operation_id,
+                "requestId": request_id,
+                "command": "prompt",
+                "agentInvoked": False,
+                "settledAt": sequence + 0.5,
+            }
+        elif command["message"] == "fail":
+            terminal = {
+                "type": "operation_failed",
+                "operationId": operation_id,
+                "requestId": request_id,
+                "command": "prompt",
+                "error": "fixture scheduling failure",
+                "code": "prompt_scheduling_failed",
+                "settledAt": sequence + 0.5,
+            }
+        else:
+            print(json.dumps({"type": "agent_start"}), flush=True)
+            print(
+                json.dumps(
+                    {"type": "agent_end", "messages": [], "isTerminal": False}
+                ),
+                flush=True,
+            )
+            print(
+                json.dumps(
+                    {"type": "agent_end", "messages": [], "isTerminal": True}
+                ),
+                flush=True,
+            )
+            terminal = {
+                "type": "operation_completed",
+                "operationId": operation_id,
+                "requestId": request_id,
+                "command": "prompt",
+                "agentInvoked": True,
+                "settledAt": sequence + 0.5,
+            }
+        active.pop(operation_id, None)
+        recent[operation_id] = terminal
+        print(json.dumps(terminal), flush=True)
+    """
+)
+
 
 class RpcClientTests(unittest.TestCase):
     def make_client(self, server: str = FAKE_SERVER, **kwargs: object) -> RpcClient:
@@ -958,11 +1416,20 @@ class RpcClientTests(unittest.TestCase):
 
     def test_get_state_and_bash(self) -> None:
         with self.make_client() as client:
+            capabilities = client.get_capabilities()
+            self.assertEqual(capabilities.application_api_version, 2)
+            self.assertEqual(
+                capabilities.commands[0].id, "rpc.command.get_capabilities"
+            )
+            self.assertEqual(capabilities.commands[0].name, "get_capabilities")
+            self.assertEqual(capabilities.commands[0].concurrency_class, "serial")
+
             state = client.get_state()
             self.assertEqual(state.session_id, "fake-session")
             self.assertEqual(
                 state.model.id if state.model else None, "claude-sonnet-4-5"
             )
+            self.assertEqual(state.activity_phase, "idle")
             self.assertFalse(state.fast_mode_enabled)
             self.assertTrue(state.fast_mode_active)
             self.assertEqual(state.tokens_per_second, 7.25)
@@ -977,6 +1444,359 @@ class RpcClientTests(unittest.TestCase):
 
             self.assertFalse(result.enabled)
             self.assertTrue(result.active)
+
+    def test_session_catalog_methods_parse_results_and_preserve_scope(self) -> None:
+        session = {
+            "path": "/sessions/session.jsonl",
+            "id": "session-1",
+            "cwd": "/workspace",
+            "title": "Investigation",
+            "createdAt": "2026-08-01T00:00:00.000Z",
+            "updatedAt": "2026-08-01T01:00:00.000Z",
+            "messageCount": 4,
+            "size": 512,
+            "status": "complete",
+        }
+        responses: dict[str, JsonObject] = {
+            "list_sessions": {
+                "sessions": [session],
+                "total": 1,
+                "nextCursor": "cursor-2",
+            },
+            "get_session_info": {
+                "session": session,
+                "workspace": {"cwd": "/workspace", "directories": ["/workspace"]},
+                "active": False,
+            },
+            "list_workspace_roots": {
+                "roots": [
+                    {
+                        "cwd": "/workspace",
+                        "count": 1,
+                        "latest": "2026-08-01T01:00:00.000Z",
+                        "exists": True,
+                    }
+                ]
+            },
+            "resume_session": {
+                "cancelled": False,
+                "cwd": "/workspace",
+                "cwdChanged": True,
+            },
+            "fork_session": {
+                "cancelled": False,
+                "sessionFile": "/sessions/fork.jsonl",
+            },
+            "rename_session": {"renamed": True, "active": False},
+            "delete_session": {
+                "deleted": False,
+                "cancelled": False,
+                "wasActive": True,
+                "newSessionStarted": True,
+                "deleteError": {
+                    "code": "delete_failed",
+                    "message": "permission denied",
+                },
+            },
+        }
+
+        class CatalogClient(RpcClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls: list[tuple[str, dict[str, JsonValue]]] = []
+
+            def _request(self, command_type: str, **payload: JsonValue) -> JsonObject:
+                self.calls.append((command_type, payload))
+                return responses[command_type]
+
+        client = CatalogClient()
+        page = client.list_sessions(
+            scope="all",
+            cwd="/workspace",
+            cursor="cursor-1",
+            limit=25,
+            search="bug",
+        )
+        info = client.get_session_info("session-1", scope="cwd", cwd="/workspace")
+        roots = client.list_workspace_roots()
+        resumed = client.resume_session(
+            "/sessions/session.jsonl", scope="all", cwd="/workspace"
+        )
+        forked = client.fork_session()
+        renamed = client.rename_session(
+            "session-1", "Renamed", scope="cwd", cwd="/workspace"
+        )
+        deleted = client.delete_session("session-1", scope="cwd", cwd="/workspace")
+
+        self.assertEqual(page.sessions[0].title, "Investigation")
+        self.assertEqual(page.next_cursor, "cursor-2")
+        self.assertFalse(hasattr(page.sessions[0], "first_message"))
+        self.assertEqual(info.workspace.directories, ("/workspace",))
+        self.assertFalse(info.active)
+        self.assertTrue(roots[0].exists)
+        self.assertTrue(resumed.cwd_changed)
+        self.assertIsNone(resumed.session_file)
+        self.assertEqual(forked.session_file, "/sessions/fork.jsonl")
+        self.assertTrue(renamed.renamed)
+        self.assertFalse(deleted.deleted)
+        self.assertTrue(deleted.new_session_started)
+        self.assertEqual(
+            deleted.delete_error.code if deleted.delete_error else None, "delete_failed"
+        )
+        self.assertEqual(
+            client.calls[0],
+            (
+                "list_sessions",
+                {
+                    "scope": "all",
+                    "cwd": "/workspace",
+                    "cursor": "cursor-1",
+                    "limit": 25,
+                    "search": "bug",
+                },
+            ),
+        )
+
+    def test_advisor_state_methods_preserve_authoritative_runtime_state(self) -> None:
+        with self.make_client() as client:
+            configured = client.get_advisor_state()
+            disabled = client.set_advisor_enabled(False)
+
+        self.assertTrue(configured.configured)
+        self.assertFalse(configured.active)
+        self.assertEqual(configured.advisors[0].status, "no_model")
+        self.assertFalse(disabled.configured)
+        self.assertFalse(disabled.active)
+        self.assertEqual(disabled.advisors[0].status, "paused")
+
+    def test_wait_for_idle_does_not_fast_path_while_streaming(self) -> None:
+        client = RpcClient()
+        client._agent_streaming = True
+        with self.assertRaises(RpcTimeoutError):
+            client.wait_for_idle(timeout=0)
+
+    def test_wait_for_idle_reconciles_accepted_follow_up_after_stale_agent_end(
+        self,
+    ) -> None:
+        class ContinuationClient(RpcClient):
+            state_reads = 0
+
+            def _request(self, _command_type: str, **_payload: JsonValue) -> JsonObject:
+                return {}
+
+            def _get_state(self, timeout: float | None = None) -> SessionState:
+                del timeout
+                self.state_reads += 1
+                activity_phase = "maintenance" if self.state_reads == 1 else "idle"
+                queued_message_count = 1 if self.state_reads == 1 else 0
+                return cast(
+                    SessionState,
+                    type(
+                        "State",
+                        (),
+                        {
+                            "activity_phase": activity_phase,
+                            "queued_message_count": queued_message_count,
+                        },
+                    )(),
+                )
+
+        client = ContinuationClient()
+        client.follow_up("queued")
+        client._agent_streaming = False
+
+        client.wait_for_idle(timeout=0.5)
+
+        self.assertEqual(client.state_reads, 2)
+
+    def test_wait_for_idle_bounds_stalled_state_read_by_its_timeout(self) -> None:
+        with self.make_client(STALLED_STATE_SERVER) as client:
+            client.follow_up("queued")
+            started_at = time.monotonic()
+
+            with self.assertRaisesRegex(
+                RpcTimeoutError, "Timed out waiting for RPC client to become idle"
+            ):
+                client.wait_for_idle(timeout=0.05)
+
+            self.assertLess(time.monotonic() - started_at, 1.0)
+
+    def test_prompt_operations_settle_without_guessing_from_agent_end(self) -> None:
+        terminal_types: list[str] = []
+        with self.make_client(OPERATION_SERVER) as client:
+            client.on_operation_terminal(
+                lambda event: terminal_types.append(event.type)
+            )
+
+            local = client.prompt_and_wait("local", timeout=2.0)
+            normal = client.prompt_and_wait("normal", timeout=2.0)
+
+        self.assertEqual(local.events, ())
+        self.assertEqual(
+            [event.type for event in normal.events],
+            ["agent_start", "agent_end", "agent_end"],
+        )
+        self.assertEqual(terminal_types, ["operation_completed", "operation_completed"])
+
+    def test_prompt_operation_failure_is_correlated_without_changing_return(
+        self,
+    ) -> None:
+        terminal_types: list[str] = []
+        with self.make_client(OPERATION_SERVER) as client:
+            client.on_operation_terminal(
+                lambda event: terminal_types.append(event.type)
+            )
+            turn = client.prompt_and_wait("fail", timeout=2.0)
+
+        self.assertEqual(turn.events, ())
+        self.assertEqual(terminal_types, ["operation_failed"])
+
+    def test_operation_state_is_current_for_listeners_and_malformed_terminal(
+        self,
+    ) -> None:
+        started_with_active_state: list[bool] = []
+        unknown_errors: list[str | None] = []
+        with self.make_client(OPERATION_SERVER) as client:
+            client.on_operation_started(
+                lambda event: started_with_active_state.append(
+                    event.operation_id in client._active_operation_ids
+                )
+            )
+            client.on_unknown_notification(
+                lambda event: unknown_errors.append(event.parse_error)
+            )
+            operation_id = client.prompt("malformed operation")
+            self.assertIsNotNone(operation_id)
+            with self.assertRaisesRegex(
+                RpcError, "Failed to parse terminal operation_completed"
+            ):
+                client.wait_for_idle(timeout=1.0)
+            self.assertNotIn(operation_id, client._active_operation_ids)
+
+        self.assertEqual(started_with_active_state, [True])
+        self.assertEqual(len(unknown_errors), 1)
+        self.assertIn("settledAt", unknown_errors[0] or "")
+
+    def test_wait_for_idle_tracks_local_prompt_operation(self) -> None:
+        with self.make_client(OPERATION_SERVER) as client:
+            operation_id = client.prompt("local")
+            self.assertIsNotNone(operation_id)
+            client.wait_for_idle(timeout=2.0)
+
+    def test_snapshot_operation_terminals_share_live_history_bound(self) -> None:
+        class SnapshotClient(RpcClient):
+            def _request(self, command_type: str, **payload: JsonValue) -> JsonObject:
+                self.assert_request(command_type, payload)
+                return {
+                    "active": [],
+                    "recent": [
+                        {
+                            "type": "operation_completed",
+                            "operationId": f"snapshot-{index}",
+                            "command": "prompt",
+                            "agentInvoked": False,
+                            "settledAt": index,
+                        }
+                        for index in range(140)
+                    ],
+                }
+
+            @staticmethod
+            def assert_request(
+                command_type: str, payload: dict[str, JsonValue]
+            ) -> None:
+                if command_type != "get_operations" or payload:
+                    raise AssertionError("unexpected snapshot request")
+
+        client = SnapshotClient()
+        snapshot = client.get_operations()
+
+        self.assertEqual(len(snapshot.recent), 140)
+        self.assertEqual(len(client._operation_results), 128)
+        self.assertNotIn("snapshot-0", client._operation_results)
+        self.assertIn("snapshot-139", client._operation_results)
+
+    def test_get_tool_inventory_uses_typed_parser(self) -> None:
+        class InventoryClient(RpcClient):
+            def _request(self, command_type: str, **payload: JsonValue) -> JsonObject:
+                if command_type != "get_tool_inventory" or payload:
+                    raise AssertionError("unexpected inventory request")
+                return {
+                    "applicationApiVersion": 2,
+                    "tools": [
+                        {
+                            "name": "read",
+                            "label": "Read",
+                            "description": "Read files",
+                            "parameters": {"type": "object"},
+                            "presentation": "active",
+                            "loadMode": "essential",
+                            "source": {"kind": "builtin"},
+                        }
+                    ],
+                    "xdev": {"prefix": "xd://", "mountedCount": 0},
+                }
+
+        inventory = InventoryClient().get_tool_inventory()
+        self.assertEqual(inventory.application_api_version, 2)
+        self.assertEqual(inventory.tools[0].source.kind, "builtin")
+
+    def test_set_tool_activation_sends_optional_lists_and_parses_achieved_state(
+        self,
+    ) -> None:
+        requests: list[tuple[str, dict[str, JsonValue]]] = []
+
+        class ActivationClient(RpcClient):
+            def _request(self, command_type: str, **payload: JsonValue) -> JsonObject:
+                requests.append((command_type, payload))
+                return {
+                    "enabledToolNames": ["read", "hidden_tool"],
+                    "activeToolNames": ["read"],
+                    "mountedToolNames": ["hidden_tool"],
+                    "activated": ["hidden_tool"],
+                    "deactivated": [],
+                    "inventoryAvailable": False,
+                    "futureResultField": True,
+                }
+
+        result = ActivationClient().set_tool_activation(
+            activate=["hidden_tool"], deactivate=[]
+        )
+        self.assertEqual(
+            requests,
+            [
+                (
+                    "set_tool_activation",
+                    {"activate": ["hidden_tool"], "deactivate": []},
+                )
+            ],
+        )
+        self.assertEqual(result.enabled_tool_names, ("read", "hidden_tool"))
+        self.assertEqual(result.mounted_tool_names, ("hidden_tool",))
+        self.assertEqual(result.activated, ("hidden_tool",))
+        self.assertFalse(result.inventory_available)
+
+    def test_set_tool_activation_delivers_one_inventory_update(self) -> None:
+        inventory_updates: list[str] = []
+        with self.make_client() as client:
+            client.on_tool_inventory_update(
+                lambda event: inventory_updates.append(event.type)
+            )
+            result = client.set_tool_activation(activate=["hidden_tool"])
+        self.assertEqual(result.activated, ("hidden_tool",))
+        self.assertEqual(inventory_updates, ["tool_inventory_update"])
+
+    def test_tool_inventory_update_has_dedicated_listener_not_agent_event(self) -> None:
+        inventory_updates: list[str] = []
+        agent_events: list[str] = []
+        with self.make_client() as client:
+            client.on_tool_inventory_update(
+                lambda event: inventory_updates.append(event.type)
+            )
+            client.on_event(lambda event: agent_events.append(event.type))
+            client.get_tool_inventory()
+        self.assertEqual(inventory_updates, ["tool_inventory_update"])
+        self.assertNotIn("tool_inventory_update", agent_events)
 
     def test_prompt_and_wait_returns_assistant_text(self) -> None:
         with self.make_client() as client:
@@ -1112,6 +1932,32 @@ class RpcClientTests(unittest.TestCase):
 
         self.assertEqual(seen_methods, ["input"])
 
+    def test_install_headless_ui_preserves_privileged_correlation(self) -> None:
+        with self.make_client() as client:
+            client.install_headless_ui(confirm=True)
+            turn = client.prompt_and_wait("needs privileged confirm", timeout=2.0)
+
+        self.assertEqual(turn.require_assistant_text(), "ui correlated")
+
+    def test_bash_confirmation_stays_typed_and_correlated(self) -> None:
+        requests = []
+        unknown_notifications = []
+
+        with self.make_client() as client:
+            client.on_unknown_notification(unknown_notifications.append)
+            client.install_headless_ui(
+                confirm=True,
+                on_request=requests.append,
+            )
+            turn = client.prompt_and_wait("needs bash confirmation", timeout=2.0)
+
+        self.assertEqual(len(requests), 1)
+        self.assertIsInstance(requests[0], ExtensionUiRequest)
+        self.assertEqual(requests[0].command, "bash")
+        self.assertEqual(requests[0].operation_id, "operation-bash")
+        self.assertEqual(unknown_notifications, [])
+        self.assertEqual(turn.require_assistant_text(), "ui correlated")
+
     def test_ready_and_typed_event_listeners(self) -> None:
         ready_types: list[str] = []
         event_types: list[str] = []
@@ -1148,6 +1994,58 @@ class RpcClientTests(unittest.TestCase):
 
             state = client.get_state()
             self.assertEqual(state.todo_phases[0].tasks[1].content, "Exercise edits")
+
+    def test_plan_workflow_commands(self) -> None:
+        started_operations = []
+        with self.make_client() as client:
+            client.on_operation_started(started_operations.append)
+            operation_id = client.set_mode(
+                "plan",
+                plan_file_path="local://REVIEW.md",
+                workflow="iterative",
+            )
+            self.assertEqual(operation_id.operation_id, "operation-set-mode")
+            self.assertTrue(operation_id.accepted)
+            self.assertFalse(operation_id.deferred)
+            state = client.get_state()
+            self.assertEqual(state.mode, "plan")
+            self.assertEqual(state.plan.plan_file_path, "local://REVIEW.md")
+
+            plan = client.get_plan()
+            self.assertEqual(plan.workflow, "iterative")
+            approval_operation = client.resolve_plan_approval(
+                "approval-1",
+                "refine",
+                feedback="Revise the rollback section.",
+            )
+            self.assertEqual(approval_operation, "operation-resolve-plan")
+        self.assertEqual(started_operations[0].operation_id, "operation-set-mode")
+
+    def test_queue_and_job_commands_return_typed_models(self) -> None:
+        agent_events = []
+        queue_updates = []
+        job_updates = []
+        with self.make_client() as client:
+            client.on_event(agent_events.append)
+            client.on_queue_update(queue_updates.append)
+            client.on_job_update(job_updates.append)
+            queue = client.get_queue()
+            self.assertEqual(queue.steering[0].entry_id, "queue-1")
+            self.assertEqual(queue.steering[0].operation_id, "operation-prompt")
+            removed = client.remove_queued_message("queue-1")
+            self.assertEqual(removed.removed.text, "Steer now")
+            cleared = client.clear_queue("all")
+            self.assertEqual(cleared.snapshot.pending_count, 0)
+            jobs = client.list_jobs()
+            self.assertEqual(jobs.jobs[0].duration_ms, 25.0)
+            self.assertEqual(jobs.agents[0].activity, "Reading")
+            self.assertEqual(client.get_job("job-1").label, "Review")
+            cancelled = client.cancel_jobs(["job-1"])
+            self.assertEqual(cancelled.outcomes[0].status, "cancelled")
+
+        self.assertEqual(queue_updates[0].queue.row_count, 1)
+        self.assertEqual(job_updates[0].jobs[0].id, "job-1")
+        self.assertEqual(agent_events, [])
 
     def test_model_mode_and_session_commands(self) -> None:
         with self.make_client() as client:
@@ -1353,9 +2251,7 @@ class RpcClientTests(unittest.TestCase):
             client.on_unknown_notification(
                 lambda event: unknown_errors.append(event.parse_error)
             )
-            with self.assertRaisesRegex(
-                RpcError, "Failed to parse terminal agent_end"
-            ):
+            with self.assertRaisesRegex(RpcError, "Failed to parse terminal agent_end"):
                 client.prompt_and_wait("malformed terminal", timeout=1.0)
 
         self.assertEqual(len(unknown_errors), 1)
@@ -1685,6 +2581,64 @@ class TerminatesProcessGroupTests(unittest.TestCase):
             first,
             "grandchild kept running after stop() — process group leaked",
         )
+
+
+class ProviderAuthClientTests(unittest.TestCase):
+    class StubClient(RpcClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[tuple[str, JsonObject]] = []
+
+        def _request(self, command_type: str, **payload: JsonValue) -> JsonObject:
+            self.calls.append((command_type, payload))
+            if command_type == "list_provider_auth":
+                return {
+                    "providers": [
+                        {
+                            "providerId": "openrouter",
+                            "name": "OpenRouter",
+                            "authenticated": False,
+                            "disabled": False,
+                            "available": True,
+                            "methods": [
+                                {
+                                    "method": "future_method",
+                                    "available": True,
+                                    "exclusive": True,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            if command_type == "begin_provider_auth":
+                return {"operationId": "operation-auth", "accepted": True}
+            if command_type == "cancel_provider_auth":
+                return {"operationId": "operation-auth", "status": "future_status"}
+            if command_type == "remove_provider_auth":
+                return {
+                    "state": {
+                        "providerId": "openrouter",
+                        "name": "OpenRouter",
+                        "authenticated": False,
+                        "disabled": False,
+                        "available": True,
+                        "methods": [],
+                    }
+                }
+            return {}
+
+    def test_provider_auth_commands_and_future_values(self) -> None:
+        client = self.StubClient()
+        inventory = client.list_provider_auth()
+        self.assertEqual(inventory[0].methods[0].method, "future_method")
+        operation_id = client.begin_provider_auth("openrouter", "future_method")
+        self.assertIn(operation_id, client._active_operation_ids)
+
+        self.assertEqual(
+            client.cancel_provider_auth(operation_id).status, "future_status"
+        )
+        self.assertFalse(client.remove_provider_auth("openrouter").authenticated)
+        self.assertNotIn("secret-test-value", repr(inventory))
 
 
 if __name__ == "__main__":

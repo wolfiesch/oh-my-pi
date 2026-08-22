@@ -7,11 +7,12 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
-import type { AsyncJob, AsyncJobManager, AsyncJobType } from "../../async";
+import { type AsyncJob, type AsyncJobManager, JobProjectionService } from "../../async";
 import { settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
 import type { Theme } from "../../modes/theme/theme";
+import type { AgentRef } from "../../registry/agent-registry";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
 import type { ToolSession } from "..";
@@ -95,34 +96,14 @@ export function visibleJobs(manager: AsyncJobManager, ids: string[], ownerId: st
  * and remove the only discovery path for the id.
  */
 export function runningAgentsOutsideJobs(session: ToolSession): AgentActivitySnapshot[] {
-	const registry = session.agentRegistry;
-	if (!registry) return [];
-	const selfId = session.getAgentId?.() ?? undefined;
-	// Cover = the caller's RUNNING jobs only. A settled job still sitting in
-	// delivery retention must not hide its agent if that agent was re-woken
-	// (e.g. via a hub message) and is running again without a job.
-	const covered = new Set<string>();
 	const manager = session.asyncJobManager;
-	if (manager) {
-		for (const job of manager.getRunningJobs(selfId ? { ownerId: selfId } : undefined)) {
-			covered.add(job.id);
-			if (job.agentId) covered.add(job.agentId);
-		}
-	}
-	const now = Date.now();
-	const out: AgentActivitySnapshot[] = [];
-	for (const ref of registry.list()) {
-		if (ref.kind !== "sub" || ref.status !== "running") continue;
-		if (ref.id === selfId || covered.has(ref.id)) continue;
-		out.push({
-			id: ref.id,
-			...(ref.parentId ? { parentId: ref.parentId } : {}),
-			...(ref.activity ? { activity: ref.activity } : {}),
-			ageMs: Math.max(0, now - ref.createdAt),
-			live: registry.isRunning(ref),
-		});
-	}
-	return out;
+	if (!manager) return [];
+	return new JobProjectionService({
+		manager,
+		ownerId: session.getAgentId?.() ?? undefined,
+		registry: session.agentRegistry,
+		lifecycle: session.agentLifecycle?.(),
+	}).list().agents;
 }
 
 /** Model-facing lines for the running-agents section shared by `jobs` and empty-wait results. */
@@ -145,52 +126,18 @@ function describeAgents(agents: AgentActivitySnapshot[]): string[] {
 
 interface TrackedJobLike {
 	id: string;
-	type: AsyncJobType;
-	status: string;
-	label: string;
-	startTime: number;
-	latestDetails?: Record<string, unknown>;
-	resultText?: string;
-	errorText?: string;
 }
 
 export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobSnapshot[] {
-	const now = Date.now();
-	return jobs.map(j => {
-		const current = session.asyncJobManager?.getJob(j.id);
-		const latest = current ?? j;
-		let resolvedModel: string | undefined;
-		if (latest.type === "task") {
-			const progressValue = latest.latestDetails?.progress;
-			if (Array.isArray(progressValue)) {
-				let progressRecord: Record<string, unknown> | undefined;
-				for (const item of progressValue) {
-					if (!item || typeof item !== "object") continue;
-					const candidate = item as Record<string, unknown>;
-					if (!progressRecord) progressRecord = candidate;
-					if (candidate.id === latest.id) {
-						progressRecord = candidate;
-						break;
-					}
-				}
-				const modelValue = progressRecord?.resolvedModel;
-				if (typeof modelValue === "string") {
-					const trimmed = modelValue.trim();
-					if (trimmed) resolvedModel = trimmed;
-				}
-			}
-		}
-		return {
-			id: latest.id,
-			type: latest.type,
-			status: latest.status as JobSnapshot["status"],
-			label: latest.label,
-			durationMs: Math.max(0, now - latest.startTime),
-			...(resolvedModel ? { resolvedModel } : {}),
-			...(latest.resultText ? { resultText: latest.resultText } : {}),
-			...(latest.errorText ? { errorText: latest.errorText } : {}),
-		};
-	});
+	const manager = session.asyncJobManager;
+	if (!manager) return [];
+	const current = jobs.map(job => manager.getJob(job.id)).filter((job): job is AsyncJob => job !== undefined);
+	return new JobProjectionService({
+		manager,
+		ownerId: session.getAgentId?.() ?? undefined,
+		registry: session.agentRegistry,
+		lifecycle: session.agentLifecycle?.(),
+	}).project(current);
 }
 
 export function buildJobResult(
@@ -324,41 +271,13 @@ export async function executeCancel(
 	ownerId: string | undefined,
 	ids: string[],
 ): Promise<AgentToolResult<CoordinationDetails>> {
-	const ownerFilter = ownerId ? { ownerId } : undefined;
-	const cancelOutcomes: CancelOutcome[] = [];
-	for (const id of ids) {
-		const existing = manager.getJob(id);
-		if (!existing || (ownerId && existing.ownerId !== ownerId)) {
-			// No job by this id (or it belongs to another agent): a budget-aborted
-			// keep-alive subagent lives on as a jobless registration long after its
-			// job row is reaped, so let cancel reach the agent registration too.
-			cancelOutcomes.push(await cancelAgentRegistration(session, ownerId, id));
-			continue;
-		}
-		if (existing.status !== "running") {
-			// The job row settled but may still be inside the retention window.
-			// The agent registration behind it (job id == agent id for task
-			// spawns) can outlive the row as an idle/parked zombie — try the
-			// registration kill before reporting the row as already done.
-			const regOutcome = await cancelAgentRegistration(session, ownerId, id);
-			cancelOutcomes.push(
-				regOutcome.status === "cancelled"
-					? regOutcome
-					: {
-							id,
-							status: "already_completed",
-							message: `Background job ${id} is already ${existing.status}.`,
-						},
-			);
-			continue;
-		}
-		const cancelled = manager.cancel(id, ownerFilter);
-		cancelOutcomes.push(
-			cancelled
-				? { id, status: "cancelled", message: `Cancelled background job ${id}.` }
-				: { id, status: "already_completed", message: `Background job ${id} is already completed.` },
-		);
-	}
+	const projection = new JobProjectionService({
+		manager,
+		ownerId,
+		registry: session.agentRegistry,
+		lifecycle: session.agentLifecycle?.(),
+	});
+	const cancelOutcomes = await projection.cancel(ids);
 	return buildJobResult(session, manager, "cancel", visibleJobs(manager, ids, ownerId), cancelOutcomes);
 }
 
@@ -371,13 +290,18 @@ export async function executeCancel(
  * cross-agent kills stay impossible; a bare test/SDK caller (no owner id) may
  * target any sub. Never touches Main, the caller, or advisor transcripts.
  */
-async function cancelAgentRegistration(
-	session: ToolSession,
+export async function cancelAgentRegistration(
+	session: Pick<ToolSession, "agentRegistry" | "agentLifecycle">,
 	ownerId: string | undefined,
 	id: string,
+	expected?: AgentRef,
+	options: { allowTransitiveOwnership?: boolean } = {},
 ): Promise<CancelOutcome> {
 	const registry = session.agentRegistry;
 	const ref = registry?.get(id);
+	if (expected && ref !== expected) {
+		return { id, status: "not_found", message: `Agent ${id} changed before it could be cancelled.` };
+	}
 	if (ref?.kind !== "sub") {
 		return { id, status: "not_found", message: `Background job not found: ${id}` };
 	}
@@ -385,7 +309,15 @@ async function cancelAgentRegistration(
 		return { id, status: "not_found", message: `Cannot cancel yourself (${id}).` };
 	}
 	if (ownerId && ref.parentId !== ownerId) {
-		return { id, status: "not_found", message: `Agent ${id} was not spawned by you and cannot be cancelled.` };
+		let parentId = ref.parentId;
+		const visited = new Set<string>();
+		while (options.allowTransitiveOwnership && parentId && !visited.has(parentId) && parentId !== ownerId) {
+			visited.add(parentId);
+			parentId = registry?.get(parentId)?.parentId;
+		}
+		if (parentId !== ownerId) {
+			return { id, status: "not_found", message: `Agent ${id} was not spawned by you and cannot be cancelled.` };
+		}
 	}
 	const lifecycle = session.agentLifecycle?.();
 	try {
@@ -393,10 +325,10 @@ async function cancelAgentRegistration(
 			await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
 		}
 		if (lifecycle) {
-			await lifecycle.release(id);
+			await lifecycle.release(id, ref);
 		} else {
 			await ref.session?.dispose();
-			registry?.unregister(id);
+			registry?.unregister(id, ref);
 		}
 	} catch (error) {
 		return {
@@ -407,15 +339,20 @@ async function cancelAgentRegistration(
 	}
 	return { id, status: "cancelled", message: `Cancelled agent ${id} (killed session, dropped registration).` };
 }
-
 /** `jobs`: read-only snapshot of every job plus the jobless running-agent roster. */
 export function executeJobsSnapshot(
 	session: ToolSession,
 	manager: AsyncJobManager,
 	ownerId: string | undefined,
 ): AgentToolResult<CoordinationDetails> {
-	const jobs = manager.getAllJobs(ownerId ? { ownerId } : undefined);
-	return buildJobResult(session, manager, "jobs", jobs, [], runningAgentsOutsideJobs(session));
+	const projection = new JobProjectionService({
+		manager,
+		ownerId,
+		registry: session.agentRegistry,
+		lifecycle: session.agentLifecycle?.(),
+	});
+	const { jobs, agents } = projection.list();
+	return buildJobResult(session, manager, "jobs", jobs, [], agents);
 }
 
 // =============================================================================

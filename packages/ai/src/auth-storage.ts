@@ -538,7 +538,11 @@ export interface AuthCredentialStore {
 	 * Implementations MUST update the in-memory snapshot before returning so the
 	 * post-write read path is consistent.
 	 */
-	upsertAuthCredentialRemote?(provider: string, credential: AuthCredential): Promise<StoredAuthCredential[]>;
+	upsertAuthCredentialRemote?(
+		provider: string,
+		credential: AuthCredential,
+		signal?: AbortSignal,
+	): Promise<StoredAuthCredential[]>;
 	/**
 	 * Optional async write hook for replace-all semantics (e.g. API-key login
 	 * overwriting any previous keys for the same provider). When present,
@@ -2666,9 +2670,9 @@ export class AuthStorage {
 		}
 	}
 
-	async #upsertOAuthCredential(provider: string, credential: OAuthCredential): Promise<void> {
+	async #upsertOAuthCredential(provider: string, credential: OAuthCredential, signal?: AbortSignal): Promise<void> {
 		const stored = this.#store.upsertAuthCredentialRemote
-			? await this.#store.upsertAuthCredentialRemote(provider, credential)
+			? await this.#store.upsertAuthCredentialRemote(provider, credential, signal)
 			: this.#store.upsertAuthCredentialForProvider(provider, credential);
 		this.#setStoredCredentials(
 			provider,
@@ -2926,6 +2930,11 @@ export class AuthStorage {
 			onAuth: (info: OAuthAuthInfo) => void;
 			/** onPrompt is required for some providers (github-copilot, openai-codex) */
 			onPrompt: (prompt: { message: string; placeholder?: string }) => Promise<string>;
+			/**
+			 * Synchronous transition into the uninterruptible persistence phase.
+			 * Callers must reject cancellation after this hook returns.
+			 */
+			beforePersist?: () => void;
 		},
 	): Promise<OAuthLoginIdentity | undefined> {
 		// Only paste-code providers (fixed non-loopback redirect, e.g. GitLab Duo
@@ -2944,7 +2953,7 @@ export class AuthStorage {
 		if (!def?.login) {
 			throw new AIError.ConfigurationError(`Unknown OAuth provider: ${provider}`);
 		}
-		const result = await def.login({
+		let result: OAuthCredentials | string | undefined = await def.login({
 			onAuth: ctrl.onAuth,
 			onProgress: ctrl.onProgress,
 			onPrompt: ctrl.onPrompt,
@@ -2952,15 +2961,29 @@ export class AuthStorage {
 			signal: ctrl.signal,
 			fetch: ctrl.fetch,
 		});
+		// A provider may finish after cancellation even when its own polling
+		// implementation does not observe AbortSignal. Gate persistence here so
+		// cancelled/disconnected headless flows can never commit credentials.
+		if (ctrl.signal?.aborted) {
+			result = undefined;
+			throw new AIError.LoginCancelledError();
+		}
 		if (typeof result === "string") {
 			// Some flows (e.g. ollama) return "" to signal that no key was entered.
 			if (!result) {
 				return undefined;
 			}
-			const newCredential: ApiKeyCredential = { type: "api_key", key: result, source: "login" };
+			ctrl.beforePersist?.();
+			let newCredential: ApiKeyCredential | undefined = {
+				type: "api_key",
+				key: result,
+				source: "login",
+			};
+			result = undefined;
 			const stored = this.#store.upsertAuthCredentialRemote
 				? await this.#store.upsertAuthCredentialRemote(provider, newCredential)
 				: this.#store.upsertAuthCredentialForProvider(provider, newCredential);
+			newCredential = undefined;
 			this.#setStoredCredentials(
 				provider,
 				stored.map(entry => ({ id: entry.id, credential: entry.credential })),
@@ -2971,18 +2994,27 @@ export class AuthStorage {
 		// Stamp the interactive-login instant: providers with an absolute grant
 		// lifetime (Anthropic) need it to surface re-login deadlines, and token
 		// refreshes only ever merge over this credential without clearing it.
-		const newCredential: OAuthCredential = { type: "oauth", ...result, authorizedAt: Date.now() };
-		// Use #upsertOAuthCredential to upsert the new credential.
-		// Any legacy api_key rows from older versions will be cleaned up so they do not
-		// shadow the new OAuth row, while preserving other active OAuth credentials.
-		await this.#upsertOAuthCredential(def.storeCredentialsAs ?? provider, newCredential);
-		return {
+		let newCredential: OAuthCredential | undefined = {
+			type: "oauth",
+			...result,
+			authorizedAt: Date.now(),
+		};
+		result = undefined;
+		const storageProvider = def.storeCredentialsAs ?? provider;
+		const identity: OAuthLoginIdentity = {
 			type: "oauth",
 			email: newCredential.email,
 			accountId: newCredential.accountId,
 			orgId: newCredential.orgId,
 			orgName: newCredential.orgName,
 		};
+		// Use #upsertOAuthCredential to upsert the new credential.
+		// Any legacy api_key rows from older versions will be cleaned up so they do not
+		// shadow the new OAuth row, while preserving other active OAuth credentials.
+		ctrl.beforePersist?.();
+		await this.#upsertOAuthCredential(storageProvider, newCredential);
+		newCredential = undefined;
+		return identity;
 	}
 
 	/**

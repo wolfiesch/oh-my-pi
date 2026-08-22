@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added optional `statusLine.secondaryLeftSegments` and `statusLine.secondaryRightSegments` rows, so dense custom status layouts can keep active-model quota visible without crowding the editor border. The `usage` segment now renders compact quota bars for every account under the active provider, marks the account used by the current session, supports daily provider windows, scopes shared Antigravity and Codex reports to the active model family, and explains when quota reporting is unavailable.
+- Added server-owned RPC operation lifecycles with accepted/started timing, exactly-once completed, failed, or cancelled outcomes, targeted idempotent cancellation, and bounded operation snapshots for reconciliation.
+- Added an authoritative RPC `get_state.activityPhase` (`provider`, `maintenance`, or `idle`) so hosts can distinguish provider completion from post-turn maintenance and terminal idle without changing legacy `isStreaming` semantics.
+- Added a runtime-validated RPC command registry and capability manifest with stable command identities, derived input schemas, live availability, execution scope, feature requirements, and serial/concurrent/control scheduling metadata in the ready frame and TypeScript/Python client APIs.
+- Added RPC session and workspace catalog commands (`list_sessions`, `get_session_info`, `list_workspace_roots`, `resume_session`, `fork_session`, `rename_session`, `delete_session`) that share one cursor-paged, cwd- or workspace-scoped view of persisted sessions with the interactive picker.
+- Added authoritative RPC advisor state and control: `get_state` reports whether advisors are configured and effectively active, `get_advisor_state` and `set_advisor_enabled` read and toggle the roster, and each advisor carries a `running`, `paused`, `quota_exhausted`, `error`, or `no_model` status instead of a single opaque flag.
+- Added a `get_settings` RPC command that describes the settings schema to an external client, optionally scoped to one settings tab. Metadata is returned for every setting because `SETTINGS_SCHEMA` is compiled-in public information; a configured value is disclosed only for settings the schema explicitly marks `rpcReadable`, and everything else carries `redacted: true` with no value and no configured status. The initial allowlist covers the appearance tab's boolean and enum settings. `RpcClient.getSettings()` exposes it to TypeScript consumers. The snapshot carries the rendering metadata a client would otherwise have to duplicate: `ui.options` (including the literal `"runtime"` marker for registry-populated choices), `ui.ordered`, and the top-level `description` used by settings with no panel entry.
+- Added RPC tool inventory and activation control: `get_tool_inventory` reports every known tool with its enabled, active, and mounted state, and `set_tool_activation` atomically reconciles one session's enabled set, refusing to change tools while the session is streaming, compacting, or running an operation.
+- Added structured RPC plan workflows: `set_mode` enters, pauses, or leaves plan mode behind a server-owned operation, `get_plan` reports the authoritative plan state, and `resolve_plan_approval` approves, refines, or rejects a pending approval with explicit context preservation, compaction, execution model role, and edited content. Plan entry, exit, and approval settlement now run through one controller, so an interrupted transition restores the previous tools, model, and plan state instead of stranding the session.
+- Added RPC provider authentication control: `list_provider_auth` projects the login registry without secrets, `begin_provider_auth` runs an OAuth callback, paste-code, device-code, or API-key flow behind a server-owned operation with correlated `provider_auth_request` prompts, `cancel_provider_auth` cancels only before the credential write commits, and `remove_provider_auth` deletes a stored credential behind a host confirmation. Credential changes emit `provider_auth_update` for every provider that shares the affected credential store.
+- Added managed RPC eval execution and history: `eval_execute` runs code in the session kernel behind a server-owned operation whose host confirmation is bound to the issued operation id, streams `eval_output` chunks with a bounded canonical transcript, and settles as `eval_complete`; `get_eval_history` replays recorded entries. The host-facing eval tool is resolved without changing the model-visible active tool set, so execution never mutates tool activation.
+- Added RPC subagent lifecycle and control: `list_agents`, `get_agent`, and `get_agent_result` project live and parked delegated agents with identity, status, progress, and result metadata, `send_agent_message` delivers steering, `park_agent`/`resume_agent` and `release_agent` manage keep-alive refs, and `cancel_agent` cancels a delegated run with an authoritative outcome. Lifecycle and progress frames are correlated to their registry entries in the TypeScript and Python clients.
+
+### Changed
+
+- Ask prompts now request an audible question alert while waiting for user input, with a terminal bell fallback when the active notification protocol cannot carry sound.
+- Replaced the RPC `get_login_providers` and `login` commands with the provider authentication family (`list_provider_auth`, `begin_provider_auth`, `cancel_provider_auth`, `remove_provider_auth`), which reports per-provider method availability and runs interactive logins behind a cancelable server-owned operation.
+
+### Fixed
+
+- Fixed the TypeScript RPC client silently dropping prompt results, extension output and errors, session/config updates, host URI requests, and unknown future frames.
+
 ## [18.0.0] - 2026-08-22
 
 ### Added

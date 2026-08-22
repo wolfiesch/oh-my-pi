@@ -64,6 +64,7 @@ import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } fro
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
+import { listCatalogSessionInfo, listCatalogSessionInfoPage, SessionCatalogError } from "../../session/session-catalog";
 import type { UsageStatistics } from "../../session/session-entries";
 import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
@@ -717,14 +718,22 @@ export class AcpAgent implements Agent {
 		for (const record of this.#sessions.values()) {
 			await record.session.sessionManager.flush();
 		}
-		const sessions = await this.#listStoredSessions(params.cwd ?? undefined);
-		const offset = this.#parseCursor(params.cursor ?? undefined);
-		const paged = sessions.slice(offset, offset + SESSION_PAGE_SIZE);
-		const nextOffset = offset + paged.length;
-		return {
-			sessions: paged.map(session => this.#toSessionInfo(session)),
-			nextCursor: nextOffset < sessions.length ? String(nextOffset) : undefined,
-		};
+		try {
+			const page = await listCatalogSessionInfoPage({
+				scope: params.cwd ? "cwd" : "all",
+				cwd: params.cwd ?? undefined,
+				cursor: params.cursor ?? undefined,
+				limit: SESSION_PAGE_SIZE,
+			});
+			return {
+				sessions: page.sessions.map(session => this.#toSessionInfo(session)),
+				nextCursor: page.nextCursor,
+			};
+		} catch (error) {
+			if (error instanceof SessionCatalogError && error.code === "invalid_cursor")
+				throw new Error(`Invalid ACP session cursor: ${params.cursor}`);
+			throw error;
+		}
 	}
 
 	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -761,7 +770,7 @@ export class AcpAgent implements Agent {
 
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
-		this.#applyModeChange(record.session, params.modeId);
+		await this.#applyModeChange(record.session, params.modeId);
 		await this.#connection.sessionUpdate({
 			sessionId: record.session.sessionId,
 			update: this.#buildCurrentModeUpdate(record.session),
@@ -778,7 +787,7 @@ export class AcpAgent implements Agent {
 
 		switch (params.configId) {
 			case MODE_CONFIG_ID:
-				this.#applyModeChange(record.session, params.value);
+				await this.#applyModeChange(record.session, params.value);
 				break;
 			case MODEL_CONFIG_ID:
 				await this.#setModelById(record.session, params.value);
@@ -1258,6 +1267,19 @@ export class AcpAgent implements Agent {
 
 	async #forkManagedSession(params: ForkSessionRequest): Promise<ManagedSessionRecord> {
 		const sourcePath = await this.#resolveForkSourceSessionPath(params.sessionId);
+		const loaded = this.#sessions.get(params.sessionId);
+		if (loaded) {
+			this.#assertMatchingCwd(loaded.session, params.cwd);
+		} else {
+			const stored = await this.#findStoredSessionById(params.sessionId);
+			if (!stored) throw new Error(`ACP session not found: ${params.sessionId}`);
+			const requestedCwd = path.resolve(params.cwd);
+			if (path.resolve(stored.cwd) !== requestedCwd) {
+				throw new Error(
+					`ACP session ${params.sessionId} belongs to ${path.resolve(stored.cwd)}, not ${requestedCwd}`,
+				);
+			}
+		}
 		const { session, setToolUIContext } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(params.cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
@@ -1827,27 +1849,20 @@ export class AcpAgent implements Agent {
 		return session.getPlanModeState()?.enabled ? ACP_PLAN_MODE_ID : ACP_DEFAULT_MODE_ID;
 	}
 
-	#applyModeChange(session: AgentSession, modeId: string): void {
+	async #applyModeChange(session: AgentSession, modeId: string): Promise<void> {
 		const availableModes = this.#getAvailableModes(session);
 		if (!availableModes.some(mode => mode.id === modeId)) {
 			throw new Error(`Unsupported ACP mode: ${modeId}`);
 		}
 		if (modeId === ACP_PLAN_MODE_ID) {
 			const previous = session.getPlanModeState();
-			session.setPlanModeState({
-				enabled: true,
+			await session.planMode.enter({
 				planFilePath: previous?.planFilePath ?? DEFAULT_PLAN_FILE_URL,
 				workflow: previous?.workflow ?? "parallel",
-				reentry: previous !== undefined,
 			});
-			// Mirror `InteractiveMode.#enterPlanMode`: register the plan-proposal
-			// handler that consumes `xd://propose` writes from plan mode. Without
-			// this, proposal dispatch falls through and plan mode has no approval
-			// path (issue #1869).
-			session.setPlanProposalHandler?.(title => this.#handleAcpPlanProposal(session, title));
+			session.setPlanProposalHandler(title => this.#handleAcpPlanProposal(session, title));
 		} else {
-			session.setPlanProposalHandler?.(null);
-			session.setPlanModeState(undefined);
+			await session.planMode.disable();
 		}
 	}
 
@@ -1859,10 +1874,9 @@ export class AcpAgent implements Agent {
 	 * when supported), and on approval keeps the chosen plan path, exits plan
 	 * mode, and notifies the client so the agent regains full tools.
 	 *
-	 * Mirrors `InteractiveMode.#handlePlanProposal` for the parts the agent sees
+	 * Mirrors `InteractiveMode.handlePlanApproval` for the parts the agent sees
 	 * (same `PlanApprovalDetails` shape). Clients without form-mode elicitation
-	 * get an auto-approve so plan mode is never stranded — the agent always has
-	 * a way out.
+	 * fail closed and keep plan mode active for refinement.
 	 */
 	async #handleAcpPlanProposal(session: AgentSession, title: string): Promise<AgentToolResult<unknown>> {
 		const state = session.getPlanModeState();
@@ -1879,6 +1893,11 @@ export class AcpAgent implements Agent {
 			readPlan: url => this.#readAcpPlanFile(session, url),
 			listPlanFiles: () => this.#listAcpLocalPlanFiles(session),
 		});
+		const approval = await session.planMode.promoteReviewedPlan({
+			planFilePath,
+			title: resolvedTitle,
+			planExists: true,
+		});
 		const approved = await this.#requestAcpPlanApprovalChoice(session.sessionId, resolvedTitle, planContent);
 		const details: PlanApprovalDetails = {
 			planFilePath,
@@ -1889,9 +1908,7 @@ export class AcpAgent implements Agent {
 			// Rejection keeps plan mode active for another planning turn. Promote the
 			// reviewed path into plan-mode state so the next `#buildPlanModeMessage()`
 			// targets the plan just reviewed, not the stale state path.
-			if (state.planFilePath !== planFilePath) {
-				session.setPlanModeState({ ...state, planFilePath });
-			}
+			await session.planMode.resolveApproval(approval.approvalId, { kind: "refine" });
 			const normalizedTitle = normalizePlanTitle(resolvedTitle).title;
 			return {
 				content: [
@@ -1906,9 +1923,11 @@ export class AcpAgent implements Agent {
 		// Approved. Set the plan reference so the next turn injects the plan
 		// content as context (the file keeps its agent-chosen name — no rename),
 		// then exit plan mode so the agent regains full tools.
-		session.setPlanReferencePath(planFilePath);
-		session.setPlanProposalHandler?.(null);
-		session.setPlanModeState(undefined);
+		await session.planMode.resolveApproval(approval.approvalId, {
+			kind: "approve",
+			preserveContext: true,
+			compactBeforeExecute: false,
+		});
 		try {
 			await this.#connection.sessionUpdate({
 				sessionId: session.sessionId,
@@ -1979,14 +1998,13 @@ export class AcpAgent implements Agent {
 	 * Ask the ACP client to confirm plan approval. Returns `true` only on an
 	 * explicit `APPROVE_OPTION` selection. Refine, dismissal (`undefined`), or
 	 * any unrecognized value falls through to refine semantics — the caller
-	 * keeps plan mode active and surfaces guidance text to the agent. Clients
-	 * without `elicitation.form` support auto-approve because there is no
-	 * confirmation surface available; without that, plan mode would strand
-	 * the agent (the bug this method exists to fix).
+	 * keeps plan mode active and surfaces guidance text to the agent. Without
+	 * `elicitation.form` support, fail closed and keep plan mode active; absence
+	 * of an approval capability must never grant write access.
 	 */
 	async #requestAcpPlanApprovalChoice(sessionId: string, title: string, planContent: string): Promise<boolean> {
 		const supportsForm = this.#clientCapabilities?.elicitation?.form != null;
-		if (!supportsForm) return true;
+		if (!supportsForm) return false;
 		// Include a short preview of the plan so the user has context in the
 		// dialog. Keep the body bounded — Zed renders elicitation messages
 		// inline and a multi-thousand-line plan blows out the dialog.
@@ -2193,8 +2211,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async #listStoredSessions(cwd?: string): Promise<StoredSessionInfo[]> {
-		const sessions = cwd ? await SessionManager.list(cwd) : await SessionManager.listAll();
-		return sessions.sort((left, right) => right.modified.getTime() - left.modified.getTime());
+		return listCatalogSessionInfo(cwd ? { scope: "cwd", cwd } : { scope: "all" });
 	}
 
 	async #findStoredSession(sessionId: string, cwd: string): Promise<StoredSessionInfo | undefined> {
@@ -2214,17 +2231,6 @@ export class AcpAgent implements Agent {
 	async #findStoredSessionById(sessionId: string): Promise<StoredSessionInfo | undefined> {
 		const sessions = await this.#listStoredSessions();
 		return sessions.find(session => session.id === sessionId);
-	}
-
-	#parseCursor(cursor: string | undefined): number {
-		if (!cursor) {
-			return 0;
-		}
-		const parsed = Number.parseInt(cursor, 10);
-		if (!Number.isFinite(parsed) || parsed < 0) {
-			throw new Error(`Invalid ACP session cursor: ${cursor}`);
-		}
-		return parsed;
 	}
 
 	async #replaySessionHistory(record: ManagedSessionRecord): Promise<void> {

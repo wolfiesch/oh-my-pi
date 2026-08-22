@@ -89,6 +89,24 @@ function createDelayedSession(
 		setPlanModeState: (state: PlanModeState | undefined) => {
 			planModeState = state;
 		},
+		planMode: {
+			enter: async ({
+				planFilePath = "local://PLAN.md",
+				workflow = "parallel",
+			}: {
+				planFilePath?: string;
+				workflow?: "parallel" | "iterative";
+			}) => {
+				planModeState = { enabled: true, paused: false, planFilePath, workflow, reentry: false };
+				modeChanges.push({ mode: "plan", data: { planFilePath, workflow } });
+				planProposalHandler = async title => {
+					const details = { planFilePath: `local://${title}-plan.md`, title, planExists: true };
+					planModeState = { ...planModeState!, planFilePath: details.planFilePath };
+					modeChanges.push({ mode: "plan", data: { planFilePath: details.planFilePath, workflow } });
+					return { content: [{ type: "text" as const, text: "Plan ready for review." }], details };
+				};
+			},
+		},
 		preparePlanForReview: async (title: string) => {
 			const details = { planFilePath: `local://${title}-plan.md`, title, planExists: true };
 			return { content: [{ type: "text" as const, text: "Plan ready for review." }], details };

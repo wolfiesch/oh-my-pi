@@ -496,7 +496,12 @@ describe("InteractiveMode goal mode integration", () => {
 
 	it("refuses /goal while plan mode is active", async () => {
 		const showWarning = vi.spyOn(harness.mode, "showWarning");
-		harness.mode.planModeEnabled = true;
+		harness.session.setPlanModeState({
+			...(harness.session.getPlanModeState() ?? {}),
+			enabled: true,
+			paused: false,
+			planFilePath: harness.session.getPlanModeState()?.planFilePath ?? "local://PLAN.md",
+		});
 
 		await harness.mode.handleGoalModeCommand("Ship the release");
 

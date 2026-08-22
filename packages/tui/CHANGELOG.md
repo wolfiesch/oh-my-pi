@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Added a terminal bell fallback for structured notification sounds on OSC 9, unconfirmed OSC 99, and cmux surfaces.
+
 ## [18.0.0] - 2026-08-22
 
 ### Breaking Changes

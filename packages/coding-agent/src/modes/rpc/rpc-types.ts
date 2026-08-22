@@ -7,10 +7,42 @@
 import type { AgentMessage, AgentToolResult, ThinkingLevel, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
+import type { AdvisorRuntimeStatus } from "../../advisor";
+import type { SettingTab } from "../../config/settings-schema";
+import type { SettingsSnapshot } from "../../config/settings-snapshot";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
+import type {
+	AgentControlRegistryUpdate,
+	AgentControlReleaseResult,
+	AgentControlResult,
+	AgentControlSendResult,
+	AgentControlSnapshot,
+} from "../../registry/agent-control";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type {
+	SessionCatalogEntry,
+	SessionCatalogPage,
+	SessionCatalogScope,
+	SessionWorkspaceRoot,
+} from "../../session/session-catalog";
+import type {
+	SessionQueueClearResult,
+	SessionQueueLane,
+	SessionQueueSnapshot,
+} from "../../session/session-queue-service";
+import type { ToolInventory } from "../../session/session-tools";
+import type { AgentActivitySnapshot, CancelOutcome, JobSnapshot } from "../../tools/hub/types";
+
+export type {
+	ToolInventory,
+	ToolInventoryEntry,
+	ToolInventoryPresentation,
+	ToolInventorySource,
+} from "../../session/session-tools";
+
 import type { FileEntry } from "../../session/session-entries";
+import type { SessionWorkspace } from "../../session/session-workspace";
 import type { AvailableSlashCommandSource } from "../../slash-commands/available-commands";
 import type {
 	AgentProgress,
@@ -21,6 +53,13 @@ import type {
 import type { TodoPhase } from "../../tools/todo";
 import type { RpcMessagesPage } from "./rpc-messages";
 
+export type RpcJsonValue = string | number | boolean | null | RpcJsonValue[] | { [key: string]: RpcJsonValue };
+
+export interface RpcSettingsChange {
+	path: string;
+	value: RpcJsonValue;
+}
+
 // ============================================================================
 // RPC Commands (stdin)
 // ============================================================================
@@ -28,6 +67,7 @@ import type { RpcMessagesPage } from "./rpc-messages";
 export type RpcCommand =
 	// Protocol
 	| { id?: string; type: "negotiate_protocol"; protocolVersion: number }
+	| { id?: string; type: "get_capabilities" }
 
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
@@ -35,18 +75,75 @@ export type RpcCommand =
 	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
+	| { id?: string; type: "cancel_operation"; operationId: string }
+	| {
+			id?: string;
+			type: "eval_execute";
+			language: RpcEvalLanguage;
+			code: string;
+			title?: string;
+			timeout?: number;
+			reset?: boolean;
+			excludeFromContext?: boolean;
+	  }
+	| { id?: string; type: "get_eval_history"; limit?: number }
 	| { id?: string; type: "new_session"; parentSession?: string }
-
+	| {
+			id?: string;
+			type: "set_mode";
+			mode: RpcSessionMode;
+			planFilePath?: string;
+			workflow?: RpcPlanWorkflow;
+			when?: "immediate" | "next_idle";
+	  }
+	| { id?: string; type: "get_plan" }
+	| {
+			id?: string;
+			type: "resolve_plan_approval";
+			approvalId: string;
+			decision: "approve" | "refine" | "reject";
+			preserveContext?: boolean;
+			compactBeforeExecute?: boolean;
+			executionModelRole?: string;
+			editedContent?: string;
+			feedback?: string;
+	  }
 	// State
 	| { id?: string; type: "get_state" }
+	| { id?: string; type: "get_operations" }
+	| { id?: string; type: "get_tool_inventory" }
+	| { id?: string; type: "set_tool_activation"; activate?: string[]; deactivate?: string[] }
+	| { id?: string; type: "list_provider_auth" }
+	| { id?: string; type: "begin_provider_auth"; providerId: string; method: RpcProviderAuthMethod }
+	| { id?: string; type: "cancel_provider_auth"; operationId: string }
+	| { id?: string; type: "remove_provider_auth"; providerId: string }
 	| { id?: string; type: "set_fast_mode"; enabled: boolean }
+	| { id?: string; type: "get_advisor_state" }
+	| { id?: string; type: "set_advisor_enabled"; enabled: boolean }
 	| { id?: string; type: "get_available_commands" }
+	| { id?: string; type: "get_settings"; tab?: SettingTab }
+	| { id?: string; type: "set_settings"; changes: RpcSettingsChange[] }
 	| { id?: string; type: "set_todos"; phases: TodoPhase[] }
 	| { id?: string; type: "set_host_tools"; tools: RpcHostToolDefinition[] }
 	| { id?: string; type: "set_host_uri_schemes"; schemes: RpcHostUriSchemeDefinition[] }
 	| { id?: string; type: "set_subagent_subscription"; level: RpcSubagentSubscriptionLevel }
 	| { id?: string; type: "get_subagents" }
 	| { id?: string; type: "get_subagent_messages"; subagentId?: string; sessionFile?: string; fromByte?: number }
+	| { id?: string; type: "list_agents"; includeAdvisors?: boolean }
+	| { id?: string; type: "get_agent"; agentId: string }
+	| { id?: string; type: "get_agent_result"; agentId: string }
+	| { id?: string; type: "send_agent_message"; agentId: string; message: string; replyTo?: string }
+	| { id?: string; type: "park_agent"; agentId: string }
+	| { id?: string; type: "resume_agent"; agentId: string }
+	| { id?: string; type: "cancel_agent"; agentId: string }
+	| { id?: string; type: "release_agent"; agentId: string; tombstone?: boolean }
+	| { id?: string; type: "get_queue" }
+	| { id?: string; type: "remove_queued_message"; entryId: string }
+	| { id?: string; type: "reorder_queued_message"; entryId: string; toIndex: number }
+	| { id?: string; type: "clear_queue"; lane?: SessionQueueLane | "all" }
+	| { id?: string; type: "list_jobs" }
+	| { id?: string; type: "get_job"; jobId: string }
+	| { id?: string; type: "cancel_job"; jobIds: string[] }
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
@@ -82,24 +179,99 @@ export type RpcCommand =
 	| { id?: string; type: "get_branch_messages" }
 	| { id?: string; type: "get_last_assistant_text" }
 	| { id?: string; type: "set_session_name"; name: string }
+	| {
+			id?: string;
+			type: "list_sessions";
+			scope?: SessionCatalogScope;
+			cwd?: string;
+			cursor?: string;
+			limit?: number;
+			search?: string;
+	  }
+	| { id?: string; type: "get_session_info"; session: string; scope?: SessionCatalogScope; cwd?: string }
+	| { id?: string; type: "list_workspace_roots" }
+	| { id?: string; type: "resume_session"; session: string; scope?: SessionCatalogScope; cwd?: string }
+	| { id?: string; type: "fork_session" }
+	| { id?: string; type: "rename_session"; session: string; name: string; scope?: SessionCatalogScope; cwd?: string }
+	| { id?: string; type: "delete_session"; session: string; scope?: SessionCatalogScope; cwd?: string }
 	| { id?: string; type: "handoff"; customInstructions?: string }
 
 	// Messages
 	| { id?: string; type: "get_messages" }
-	| { id?: string; type: "get_messages_page"; cursor?: string; limit?: number }
-
-	// Login
-	| { id?: string; type: "get_login_providers" }
-	| { id?: string; type: "login"; providerId: string };
+	| { id?: string; type: "get_messages_page"; cursor?: string; limit?: number };
 
 // ============================================================================
 // RPC State
 // ============================================================================
 
+export type RpcSessionActivityPhase = "provider" | "maintenance" | "idle";
+export interface RpcAdvisorState {
+	configured: boolean;
+	active: boolean;
+	advisors: Array<{ name: string; status: AdvisorRuntimeStatus }>;
+}
+
+export type RpcSessionMode = "none" | "plan" | "plan_paused";
+export type RpcPlanWorkflow = "parallel" | "iterative";
+
+export interface RpcPendingPlanApproval {
+	approvalId: string;
+	title: string;
+	planFilePath: string;
+}
+
+export interface RpcPlanState {
+	mode: RpcSessionMode;
+	planFilePath?: string;
+	workflow?: RpcPlanWorkflow;
+	reentry?: boolean;
+	awaitingApproval?: RpcPendingPlanApproval;
+	planExists?: boolean;
+	availablePlanFiles?: string[];
+	content?: string;
+}
+
+export interface RpcModeChangeResult {
+	operationId: string;
+	accepted: true;
+	deferred: boolean;
+}
+
+export interface RpcPlanApprovalResult {
+	approvalId: string;
+	decision: "approve" | "refine" | "reject";
+	executionDispatched: boolean;
+	planFilePath: string;
+	compaction?: "ok" | "cancelled" | "failed";
+}
+
+export interface RpcPlanStateUpdateFrame {
+	type: "plan_state_update";
+	state: RpcPlanState;
+}
+
+export interface RpcPlanApprovalRequestFrame {
+	type: "plan_approval_request";
+	approvalId: string;
+	planFilePath: string;
+	title: string;
+	planContent: string;
+}
+
+export interface RpcPlanApprovalSettledFrame {
+	type: "plan_approval_settled";
+	approvalId: string;
+	result: RpcPlanApprovalResult;
+}
+
 export interface RpcSessionState {
+	mode: RpcSessionMode;
+	plan?: RpcPlanState;
 	model?: Model;
 	thinkingLevel: ThinkingLevel | undefined;
 	isStreaming: boolean;
+	/** Provider generation, post-turn maintenance, or terminal idle. */
+	activityPhase: RpcSessionActivityPhase;
 	isCompacting: boolean;
 	steeringMode: "all" | "one-at-a-time";
 	followUpMode: "all" | "one-at-a-time";
@@ -119,6 +291,49 @@ export interface RpcSessionState {
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
 	/** Current context window usage. */
 	contextUsage?: ContextUsage;
+	advisor?: RpcAdvisorState;
+}
+export type RpcProviderAuthMethod = "oauth_callback" | "paste_code" | "device_code" | "api_key";
+export type RpcProviderAuthCredentialOrigin = "runtime" | "config" | "oauth" | "api_key" | "env" | "fallback";
+
+export interface RpcProviderAuthMethodCapability {
+	method: RpcProviderAuthMethod;
+	available: boolean;
+	exclusive: true;
+}
+
+export interface RpcProviderAuthState {
+	providerId: string;
+	name: string;
+	credentialOrigin?: RpcProviderAuthCredentialOrigin;
+	authenticated: boolean;
+	disabled: boolean;
+	available: boolean;
+	unavailableReason?: string;
+	identity?: {
+		email?: string;
+		accountId?: string;
+		projectId?: string;
+		orgId?: string;
+		orgName?: string;
+	};
+	methods: RpcProviderAuthMethodCapability[];
+}
+
+export interface RpcProviderAuthRequestFrame {
+	type: "provider_auth_request";
+	operationId: string;
+	requestId: string;
+	providerId: string;
+	method: "open_url";
+	url: string;
+	launchUrl?: string;
+	instructions?: string;
+}
+
+export interface RpcProviderAuthUpdateFrame {
+	type: "provider_auth_update";
+	state: RpcProviderAuthState;
 }
 
 export interface RpcAvailableSlashCommand {
@@ -134,11 +349,220 @@ export interface RpcAvailableCommandsUpdateFrame {
 	type: "available_commands_update";
 	commands: RpcAvailableSlashCommand[];
 }
+export interface RpcToolInventoryUpdateFrame {
+	type: "tool_inventory_update";
+}
+export interface RpcQueueUpdateFrame {
+	type: "queue_update";
+	queue: SessionQueueSnapshot;
+}
+
+export interface RpcJobUpdateFrame {
+	type: "job_update";
+	jobs: JobSnapshot[];
+	agents: AgentActivitySnapshot[];
+}
+
+export interface RpcJobListResult {
+	jobs: JobSnapshot[];
+	agents: AgentActivitySnapshot[];
+}
+
+export type { SessionQueueClearResult, SessionQueueSnapshot };
+
+export interface RpcToolActivationResult {
+	/** Enabled names after authoritative reconciliation (top-level plus mounted). */
+	enabledToolNames: string[];
+	/** Top-level names after authoritative reconciliation. */
+	activeToolNames: string[];
+	/** Names mounted under `xd://` after authoritative reconciliation. */
+	mountedToolNames: string[];
+	/** Actual enabled-set additions, not an echo of the request. */
+	activated: string[];
+	/** Actual enabled-set removals, not an echo of the request. */
+	deactivated: string[];
+	inventoryAvailable: boolean;
+	/** Present only when the just-committed authoritative inventory is representable. */
+	inventory?: ToolInventory;
+}
 
 export interface RpcPromptResultFrame {
 	type: "prompt_result";
 	id?: string;
+	operationId?: string;
 	agentInvoked: boolean;
+}
+
+export interface RpcEvalHistoryEntry {
+	language: RpcEvalLanguage;
+	code: string;
+	output: string;
+	exitCode: number | undefined;
+	cancelled: boolean;
+	truncated: boolean;
+	timestamp: number;
+	excludeFromContext?: boolean;
+}
+
+export interface RpcEvalOutputFrame {
+	type: "eval_output";
+	operationId: string;
+	sequence: number;
+	chunk: string;
+	truncated: boolean;
+}
+
+export interface RpcEvalCompleteFrame {
+	type: "eval_complete";
+	operationId: string;
+	result: RpcEvalHistoryEntry;
+}
+
+export type RpcEvalLanguage = "py" | "js" | "rb" | "jl";
+export type RpcOperationCommand =
+	| "prompt"
+	| "abort_and_prompt"
+	| "set_mode"
+	| "resolve_plan_approval"
+	| "provider_auth"
+	| "eval_execute";
+export type RpcOperationCancellationReason = "user" | "replaced" | "session_transition" | "client_disconnected";
+export type RpcOperationCancellationCode =
+	| "cancelled_by_client"
+	| "replaced_by_prompt"
+	| "session_changed"
+	| "client_disconnected";
+
+interface RpcOperationFrameBase {
+	operationId: string;
+	requestId?: string;
+	command: RpcOperationCommand;
+}
+
+export interface RpcOperationStartedFrame extends RpcOperationFrameBase {
+	type: "operation_started";
+	startedAt: number;
+}
+
+export type RpcOperationTerminalFrame =
+	| (RpcOperationFrameBase & {
+			type: "operation_completed";
+			agentInvoked: boolean;
+			settledAt: number;
+			data?: { state: RpcProviderAuthState };
+	  })
+	| (RpcOperationFrameBase & {
+			type: "operation_failed";
+			error: string;
+			code?: string;
+			settledAt: number;
+	  })
+	| (RpcOperationFrameBase & {
+			type: "operation_cancelled";
+			reason: RpcOperationCancellationReason;
+			code: RpcOperationCancellationCode;
+			settledAt: number;
+	  });
+
+export interface RpcOperationAccepted {
+	operationId: string;
+	accepted: true;
+}
+
+export interface RpcActiveOperation extends RpcOperationFrameBase {
+	status: "accepted" | "started";
+	acceptedAt: number;
+	startedAt?: number;
+}
+
+export interface RpcOperationsSnapshot {
+	active: RpcActiveOperation[];
+	recent: RpcOperationTerminalFrame[];
+}
+
+export type RpcCancelOperationResult =
+	| {
+			operationId: string;
+			status: "cancelled" | "completed" | "failed";
+			terminal: RpcOperationTerminalFrame;
+	  }
+	| { operationId: string; status: "not_found" };
+export interface RpcCommandOutputFrame {
+	type: "command_output";
+	text: string;
+}
+
+export interface RpcSessionInfoUpdateFrame {
+	type: "session_info_update";
+	title?: string;
+	sessionId: string;
+	mode: RpcSessionMode;
+}
+
+export interface RpcConfigUpdateFrame {
+	type: "config_update";
+	model?: Model;
+	thinkingLevel?: ThinkingLevel;
+	advisor?: RpcAdvisorState;
+}
+
+/** Pull-only invalidation signal; clients should call get_settings for current values. */
+export interface RpcSettingsUpdateFrame {
+	type: "settings_update";
+}
+
+export interface RpcExtensionErrorFrame {
+	type: "extension_error";
+	extensionPath: string;
+	event: string;
+	error: string;
+}
+
+export type RpcCommandSchedulingClass = "serial" | "concurrent" | "control";
+export type RpcCommandScope = "host" | "session" | "turn" | "agent";
+export type RpcCommandExecution = "sync" | "operation" | "host-only" | "unavailable";
+export type RpcCommandConfirmation = "none" | "required";
+export type RpcCommandAvailability = "available" | "conditional" | "unavailable";
+export type RpcCommandConcurrencyClass = RpcCommandSchedulingClass;
+
+export interface RpcCapabilityDisabledReason {
+	code: string;
+	message: string;
+}
+
+export interface RpcInputSchema {
+	type: "object";
+	properties: Record<string, Record<string, unknown>>;
+	required: string[];
+	additionalProperties: false;
+}
+
+interface RpcCommandCapabilityBase {
+	/** Stable protocol identity. Unlike the display name, this must never be repurposed. */
+	id: string;
+	name: RpcCommandType;
+	version: number;
+	scope: RpcCommandScope;
+	execution: RpcCommandExecution;
+	inputSchema?: RpcInputSchema;
+	outputSchema?: RpcInputSchema;
+	concurrencyClass?: RpcCommandConcurrencyClass;
+	confirmation: RpcCommandConfirmation;
+	requiredFeatures: string[];
+}
+
+export type RpcCommandCapability = RpcCommandCapabilityBase &
+	(
+		| { availability: "available" | "conditional"; disabledReason?: never }
+		| { availability: "unavailable"; disabledReason: RpcCapabilityDisabledReason }
+	);
+
+export interface RpcCapabilityManifest {
+	applicationApiVersion: number;
+	commands: RpcCommandCapability[];
+	events: RpcEventType[];
+	extensionUiMethods: RpcExtensionUIMethod[];
+	hostProtocols: string[];
 }
 
 export interface RpcReadyFrame {
@@ -147,6 +571,8 @@ export interface RpcReadyFrame {
 	supportedProtocolVersions: [1, 2];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
+	/** Present on servers with application-level capability discovery. */
+	capabilities?: RpcCapabilityManifest;
 }
 
 export interface RpcChunkFrame {
@@ -160,6 +586,37 @@ export interface RpcChunkFrame {
 
 export interface RpcHandoffResult {
 	savedPath?: string;
+}
+
+export interface RpcSessionInfoResult {
+	session: SessionCatalogEntry;
+	workspace: SessionWorkspace;
+	active: boolean;
+}
+
+export interface RpcResumeSessionResult {
+	cancelled: boolean;
+	sessionFile?: string;
+	cwd: string;
+	cwdChanged: boolean;
+}
+
+export interface RpcForkSessionResult {
+	cancelled: boolean;
+	sessionFile?: string;
+}
+
+export interface RpcRenameSessionResult {
+	renamed: boolean;
+	active: boolean;
+}
+
+export interface RpcDeleteSessionResult {
+	deleted: boolean;
+	cancelled: boolean;
+	wasActive: boolean;
+	newSessionStarted: boolean;
+	deleteError?: { code: "delete_failed"; message: string };
 }
 
 export type RpcSubagentSubscriptionLevel = "off" | "progress" | "events";
@@ -177,6 +634,8 @@ export interface RpcSubagentSnapshot {
 	lastUpdate: number;
 	progress?: AgentProgress;
 	parentToolCallId?: string;
+	/** True once the projected lifecycle is terminal; terminal rows remain queryable in a bounded ring. */
+	terminal: boolean;
 }
 
 export interface RpcSubagentMessagesResult {
@@ -186,6 +645,15 @@ export interface RpcSubagentMessagesResult {
 	reset: boolean;
 	entries: FileEntry[];
 	messages: AgentMessage[];
+}
+
+export type RpcAgentSnapshot = AgentControlSnapshot;
+export type RpcAgentResult = AgentControlResult;
+export type RpcAgentSendResult = AgentControlSendResult;
+export type RpcAgentReleaseResult = AgentControlReleaseResult;
+
+export interface RpcAgentRegistryUpdateFrame extends AgentControlRegistryUpdate {
+	type: "agent_registry_update";
 }
 
 // ============================================================================
@@ -202,17 +670,101 @@ export type RpcResponse =
 			success: true;
 			data: { protocolVersion: 2 };
 	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_capabilities";
+			success: true;
+			data: RpcCapabilityManifest;
+	  }
 
 	// Prompting (async - events follow)
-	| { id?: string; type: "response"; command: "prompt"; success: true; data?: { agentInvoked: boolean } }
+	| { id?: string; type: "response"; command: "prompt"; success: true; data: RpcOperationAccepted }
 	| { id?: string; type: "response"; command: "steer"; success: true }
 	| { id?: string; type: "response"; command: "follow_up"; success: true }
 	| { id?: string; type: "response"; command: "abort"; success: true }
-	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
+	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true; data: RpcOperationAccepted }
+	| {
+			id?: string;
+			type: "response";
+			command: "cancel_operation";
+			success: true;
+			data: RpcCancelOperationResult;
+	  }
+	| { id?: string; type: "response"; command: "eval_execute"; success: true; data: RpcOperationAccepted }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_eval_history";
+			success: true;
+			data: { entries: RpcEvalHistoryEntry[] };
+	  }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
+	| { id?: string; type: "response"; command: "set_mode"; success: true; data: RpcModeChangeResult }
+	| { id?: string; type: "response"; command: "get_plan"; success: true; data: RpcPlanState }
+	| {
+			id?: string;
+			type: "response";
+			command: "resolve_plan_approval";
+			success: true;
+			data: RpcOperationAccepted;
+	  }
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+	| { id?: string; type: "response"; command: "get_operations"; success: true; data: RpcOperationsSnapshot }
+	| { id?: string; type: "response"; command: "get_advisor_state"; success: true; data: RpcAdvisorState }
+	| { id?: string; type: "response"; command: "set_advisor_enabled"; success: true; data: RpcAdvisorState }
+	| { id?: string; type: "response"; command: "get_tool_inventory"; success: true; data: ToolInventory }
+	| {
+			id?: string;
+			type: "response";
+			command: "set_tool_activation";
+			success: true;
+			data: RpcToolActivationResult;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "list_provider_auth";
+			success: true;
+			data: { providers: RpcProviderAuthState[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "begin_provider_auth";
+			success: true;
+			data: RpcOperationAccepted;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "cancel_provider_auth";
+			success: true;
+			data: RpcCancelOperationResult;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "remove_provider_auth";
+			success: true;
+			data: { state: RpcProviderAuthState };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "list_provider_auth";
+			success: true;
+			data: { providers: RpcProviderAuthState[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "begin_provider_auth";
+			success: true;
+			data: RpcOperationAccepted;
+	  }
 	| {
 			id?: string;
 			type: "response";
@@ -251,6 +803,80 @@ export type RpcResponse =
 			success: true;
 			data: RpcSubagentMessagesResult;
 	  }
+	| { id?: string; type: "response"; command: "get_queue"; success: true; data: SessionQueueSnapshot }
+	| {
+			id?: string;
+			type: "response";
+			command: "remove_queued_message";
+			success: true;
+			data: { removed: { text: string; images?: ImageContent[] }; queue: SessionQueueSnapshot };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "reorder_queued_message";
+			success: true;
+			data: SessionQueueSnapshot;
+	  }
+	| { id?: string; type: "response"; command: "clear_queue"; success: true; data: SessionQueueClearResult }
+	| { id?: string; type: "response"; command: "list_jobs"; success: true; data: RpcJobListResult }
+	| { id?: string; type: "response"; command: "get_job"; success: true; data: { job: JobSnapshot | null } }
+	| {
+			id?: string;
+			type: "response";
+			command: "cancel_job";
+			success: true;
+			data: { outcomes: CancelOutcome[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "list_agents";
+			success: true;
+			data: { agents: RpcAgentSnapshot[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_agent";
+			success: true;
+			data: { agent: RpcAgentSnapshot };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_agent_result";
+			success: true;
+			data: RpcAgentResult;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "send_agent_message";
+			success: true;
+			data: RpcAgentSendResult;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "park_agent" | "resume_agent";
+			success: true;
+			data: { agent: RpcAgentSnapshot };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "cancel_agent";
+			success: true;
+			data: { id: string; status: "cancelled" | "not_found" | "already_completed"; message: string };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "release_agent";
+			success: true;
+			data: RpcAgentReleaseResult;
+	  }
 
 	// Model
 	| {
@@ -273,6 +899,20 @@ export type RpcResponse =
 			command: "get_available_models";
 			success: true;
 			data: { models: Model[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_settings";
+			success: true;
+			data: SettingsSnapshot;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "set_settings";
+			success: true;
+			data: SettingsSnapshot;
 	  }
 
 	// Thinking
@@ -305,6 +945,19 @@ export type RpcResponse =
 	// Session
 	| { id?: string; type: "response"; command: "get_session_stats"; success: true; data: SessionStats }
 	| { id?: string; type: "response"; command: "export_html"; success: true; data: { path: string } }
+	| { id?: string; type: "response"; command: "list_sessions"; success: true; data: SessionCatalogPage }
+	| { id?: string; type: "response"; command: "get_session_info"; success: true; data: RpcSessionInfoResult }
+	| {
+			id?: string;
+			type: "response";
+			command: "list_workspace_roots";
+			success: true;
+			data: { roots: SessionWorkspaceRoot[] };
+	  }
+	| { id?: string; type: "response"; command: "resume_session"; success: true; data: RpcResumeSessionResult }
+	| { id?: string; type: "response"; command: "fork_session"; success: true; data: RpcForkSessionResult }
+	| { id?: string; type: "response"; command: "rename_session"; success: true; data: RpcRenameSessionResult }
+	| { id?: string; type: "response"; command: "delete_session"; success: true; data: RpcDeleteSessionResult }
 	| { id?: string; type: "response"; command: "switch_session"; success: true; data: { cancelled: boolean } }
 	| { id?: string; type: "response"; command: "branch"; success: true; data: { text: string; cancelled: boolean } }
 	| {
@@ -327,16 +980,6 @@ export type RpcResponse =
 	// Messages
 	| { id?: string; type: "response"; command: "get_messages"; success: true; data: { messages: AgentMessage[] } }
 	| { id?: string; type: "response"; command: "get_messages_page"; success: true; data: RpcMessagesPage }
-
-	// Login
-	| {
-			id?: string;
-			type: "response";
-			command: "get_login_providers";
-			success: true;
-			data: { providers: Array<{ id: string; name: string; available: boolean; authenticated: boolean }> };
-	  }
-	| { id?: string; type: "response"; command: "login"; success: true; data: { providerId: string } }
 
 	// Error response (any command can fail); `code` is an optional machine-readable reason.
 	| { id?: string; type: "response"; command: string; success: false; error: string; code?: string };
@@ -362,7 +1005,7 @@ export interface RpcSubagentEventFrame {
 
 export type RpcSubagentFrame = RpcSubagentLifecycleFrame | RpcSubagentProgressFrame | RpcSubagentEventFrame;
 
-export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame;
+export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame | RpcAgentRegistryUpdateFrame;
 
 // ============================================================================
 // Extension UI Events (stdout)
@@ -383,7 +1026,24 @@ export type RpcExtensionUIRequest =
 			optionDetails?: RpcExtensionUISelectOptionDetail[];
 			timeout?: number;
 	  }
-	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }
+	| {
+			type: "extension_ui_request";
+			id: string;
+			method: "confirm";
+			title: string;
+			message: string;
+			timeout?: number;
+			/** Server-issued correlation for privileged RPC mutations. */
+			operationId?: string;
+			command?:
+				| "cancel_agent"
+				| "release_agent"
+				| "eval_execute"
+				| "bash"
+				| "cancel_job"
+				| "delete_session"
+				| "remove_provider_auth";
+	  }
 	| {
 			type: "extension_ui_request";
 			id: string;
@@ -391,6 +1051,10 @@ export type RpcExtensionUIRequest =
 			title: string;
 			placeholder?: string;
 			timeout?: number;
+			sensitive?: boolean;
+			operationId?: string;
+			purpose?: "provider_auth";
+			providerId?: string;
 	  }
 	| {
 			type: "extension_ui_request";
@@ -546,9 +1210,131 @@ export interface RpcHostUriResult {
 /** Response to an extension UI request */
 export type RpcExtensionUIResponse =
 	| { type: "extension_ui_response"; id: string; value: string }
-	| { type: "extension_ui_response"; id: string; confirmed: boolean }
+	| { type: "extension_ui_response"; id: string; confirmed: boolean; operationId?: string }
 	| { type: "extension_ui_response"; id: string; cancelled: true; timedOut?: boolean };
 
+type RpcManifestEvent =
+	| RpcReadyFrame
+	| RpcPromptResultFrame
+	| RpcAvailableCommandsUpdateFrame
+	| RpcAgentRegistryUpdateFrame
+	| RpcToolInventoryUpdateFrame
+	| RpcEvalOutputFrame
+	| RpcEvalCompleteFrame
+	| RpcOperationStartedFrame
+	| RpcOperationTerminalFrame
+	| RpcPlanStateUpdateFrame
+	| RpcPlanApprovalRequestFrame
+	| RpcPlanApprovalSettledFrame
+	| RpcProviderAuthRequestFrame
+	| RpcProviderAuthUpdateFrame
+	| RpcSessionEventFrame
+	| RpcExtensionUIRequest
+	| RpcSettingsUpdateFrame
+	| RpcQueueUpdateFrame
+	| RpcJobUpdateFrame
+	| RpcHostToolCallRequest
+	| RpcHostToolCancelRequest
+	| RpcHostUriRequest
+	| RpcHostUriCancelRequest
+	| {
+			type:
+				| "command_output"
+				| "session_info_update"
+				| "config_update"
+				| "extension_error"
+				| "notice"
+				| "goal_updated";
+	  };
+
+function eventInventory<const T extends readonly RpcManifestEvent["type"][]>(
+	events: T & (Exclude<RpcManifestEvent["type"], T[number]> extends never ? unknown : never),
+): T {
+	return events;
+}
+
+/** Event names advertised by capability discovery, exhaustively linked to RPC output event discriminants. */
+export const RPC_EVENT_TYPES = eventInventory([
+	"ready",
+	"prompt_result",
+	"available_commands_update",
+	"tool_inventory_update",
+	"eval_output",
+	"eval_complete",
+	"queue_update",
+	"job_update",
+	"operation_started",
+	"operation_completed",
+	"operation_failed",
+	"operation_cancelled",
+	"plan_state_update",
+	"plan_approval_request",
+	"plan_approval_settled",
+	"provider_auth_request",
+	"provider_auth_update",
+	"command_output",
+	"session_info_update",
+	"config_update",
+	"settings_update",
+	"extension_ui_request",
+	"extension_error",
+	"host_tool_call",
+	"host_tool_cancel",
+	"host_uri_request",
+	"host_uri_cancel",
+	"subagent_lifecycle",
+	"agent_registry_update",
+	"subagent_progress",
+	"subagent_event",
+	"agent_start",
+	"agent_end",
+	"turn_start",
+	"turn_end",
+	"message_start",
+	"message_update",
+	"message_end",
+	"tool_execution_start",
+	"tool_execution_update",
+	"tool_execution_end",
+	"auto_compaction_start",
+	"auto_compaction_end",
+	"auto_retry_start",
+	"auto_retry_end",
+	"retry_fallback_applied",
+	"retry_fallback_succeeded",
+	"model_changed",
+	"ttsr_triggered",
+	"todo_reminder",
+	"todo_auto_clear",
+	"irc_message",
+	"notice",
+	"thinking_level_changed",
+	"goal_updated",
+] as const);
+
+export type RpcEventType = (typeof RPC_EVENT_TYPES)[number];
+export type RpcExtensionUIMethod = RpcExtensionUIRequest["method"];
+
+function extensionUiMethodInventory<const T extends readonly RpcExtensionUIMethod[]>(
+	methods: T & (Exclude<RpcExtensionUIMethod, T[number]> extends never ? unknown : never),
+): T {
+	return methods;
+}
+
+/** Extension UI method inventory, exhaustively linked to RpcExtensionUIRequest. */
+export const RPC_EXTENSION_UI_METHODS = extensionUiMethodInventory([
+	"select",
+	"confirm",
+	"input",
+	"editor",
+	"cancel",
+	"notify",
+	"setStatus",
+	"setWidget",
+	"setTitle",
+	"set_editor_text",
+	"open_url",
+] as const);
 // ============================================================================
 // Helper type for extracting command types
 // ============================================================================

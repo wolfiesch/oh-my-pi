@@ -743,6 +743,46 @@ describe("AuthStorage OAuth login upgrade and multi-account coexistence", () => 
 		}
 	});
 
+	it("enters the commit boundary before uninterruptible remote OAuth persistence", async () => {
+		if (!tempDir) throw new Error("test setup failed");
+		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "remote-oauth-signal.db"));
+		let receivedSignal: AbortSignal | undefined;
+		Object.assign(store, {
+			upsertAuthCredentialRemote: async (provider: string, credential: OAuthCredential, signal?: AbortSignal) => {
+				receivedSignal = signal;
+				return store.upsertAuthCredentialForProvider(provider, credential);
+			},
+		});
+		const authStorage = new AuthStorage(store);
+		registerOAuthProvider({
+			id: "unit-login-upgrade",
+			name: "Unit Login Upgrade",
+			sourceId: "auth-storage-login-upgrade-test",
+			login: async () => ({
+				refresh: "remote-refresh-token",
+				access: "remote-access-token",
+				expires: Date.now() + 60_000,
+			}),
+			refreshToken: async credentials => credentials,
+		});
+		const abortController = new AbortController();
+		let beforePersistCalls = 0;
+		try {
+			await authStorage.login("unit-login-upgrade", {
+				onAuth: () => {},
+				onPrompt: async () => "",
+				signal: abortController.signal,
+				beforePersist: () => {
+					beforePersistCalls += 1;
+				},
+			});
+			expect(beforePersistCalls).toBe(1);
+			expect(receivedSignal).toBeUndefined();
+		} finally {
+			authStorage.close();
+		}
+	});
+
 	it("keeps existing NVIDIA API keys active when login adds another key", async () => {
 		if (!tempDir) throw new Error("test setup failed");
 

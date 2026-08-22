@@ -41,9 +41,52 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "protocolVersion": 1,
   "supportedProtocolVersions": [1, 2],
   "maxFrameBytes": 1048576,
-  "maxReassembledFrameBytes": 67108864
+  "maxReassembledFrameBytes": 67108864,
+  "capabilities": {
+    "applicationApiVersion": 1,
+    "commands": [
+      {
+        "id": "rpc.command.get_capabilities",
+        "name": "get_capabilities",
+        "version": 1,
+        "scope": "host",
+        "execution": "sync",
+        "availability": "available",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string" },
+            "type": { "const": "get_capabilities" }
+          },
+          "required": ["type"],
+          "additionalProperties": false
+        },
+        "concurrencyClass": "serial",
+        "confirmation": "none",
+        "requiredFeatures": []
+      }
+    ],
+    "events": ["ready", "agent_start", "agent_end"],
+    "extensionUiMethods": ["select", "confirm", "input"],
+    "hostProtocols": ["tools", "uris"]
+  }
 }
 ```
+
+The example capability arrays are abbreviated. The actual ready frame contains
+the complete startup snapshot. Hosts can query current, session-dependent
+availability at any time with `{ id?, type: "get_capabilities" }`.
+
+Command `id` is the stable protocol identity; `name` is the command sent in the
+`type` field. `scope`, `execution`, and `availability` describe where and how the
+command can run. An unavailable command includes a machine-readable
+`disabledReason: { code, message }`; conditional commands declare their
+`requiredFeatures` without pretending that a runtime prerequisite is always met.
+`inputSchema` is derived from the same field definitions used for
+wire validation. `outputSchema` and `concurrencyClass` are omitted when the
+server cannot advertise them truthfully. `confirmation` is `"required"` for
+commands that only proceed after the host confirms an `extension_ui_request`,
+and `"none"` otherwise. Command versions are assigned per registry entry.
 
 Clients that support protocol v2 SHOULD immediately send:
 
@@ -78,9 +121,10 @@ Legacy clients may ignore the added ready fields and remain on v1. V1 retains it
 6. Host URI requests/cancellations (`host_uri_request`, `host_uri_cancel`)
 7. Extension errors (`{ type: "extension_error", extensionPath, event, error }`)
 8. Available-commands updates (`{ type: "available_commands_update", commands }`), emitted at startup and whenever command metadata changes
-9. Prompt lifecycle hints (`{ type: "prompt_result", id?, agentInvoked }`) for scheduled prompts that later resolve without invoking the agent
-10. Subagent frames (`subagent_lifecycle`, `subagent_progress`, `subagent_event`), gated by `set_subagent_subscription`
-11. Builtin slash-command side channels (`command_output`, `session_info_update`, `config_update`)
+9. Operation lifecycle frames (`operation_started`, `operation_completed`, `operation_failed`, `operation_cancelled`)
+10. Legacy prompt lifecycle hints (`{ type: "prompt_result", id?, operationId?, agentInvoked }`) for local-only prompts
+11. Subagent frames (`subagent_lifecycle`, `subagent_progress`, `subagent_event`), gated by `set_subagent_subscription`
+12. Builtin slash-command side channels (`command_output`, `session_info_update`, `config_update`)
 
 ### Inbound frame categories (stdin)
 
@@ -98,15 +142,33 @@ All commands accept optional `id?: string`.
 
 Important edge behavior from runtime:
 
-- Unknown command responses are emitted with `id: undefined` (even if the request had an `id`).
-- Malformed JSON and synchronous dispatch failures emit `command: "parse"` with `id: undefined`. Exceptions while handling a recognized command emit a failure with that command's `type` and `id`.
-- `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails.
-- `prompt` success responses may include `data.agentInvoked`. `false` means the prompt completed locally without an agent turn; `true` means the prompt produced agent lifecycle events; omitted means the host must rely on session events for completion.
-- `abort_and_prompt` does not currently emit `data.agentInvoked` or `prompt_result`; hosts should treat it as the legacy abort-then-schedule path and rely on session events or same-id scheduling errors.
+- Runtime validation rejects unknown commands and malformed fields before a
+  handler runs. Error responses preserve a valid request `id` and use
+  `code: "unsupported_command"` or `code: "invalid_request"`.
+- Each command's registry entry owns its internal dispatch scheduling and its
+  advertised `concurrencyClass`. `serial` commands preserve input order,
+  `concurrent` commands may run independently, and `control` commands can
+  overtake blocked serial work so abort and steering remain responsive.
+- Invalid JSON or reassembly errors that cannot yield a valid request object emit
+  `command: "parse"` with `id: undefined`.
+- `prompt` and `abort_and_prompt` synchronously acknowledge accepted work with
+  server-generated `data.operationId` and `data.accepted: true`.
+- The request `id`, operation ID, and any session turn ID are distinct
+  identities and are never derived from one another.
+- `operation_started` is emitted only when accepted work actually begins.
+- Every accepted operation emits exactly one terminal `operation_completed`,
+  `operation_failed`, or `operation_cancelled` frame. Post-accept scheduling
+  failures are terminal operation frames, not a second response using the
+  already-consumed request ID.
+- `agent_end` remains a streaming session event. It is not the operation
+  completion primitive, and `agent_end.isTerminal: false` never settles a wait.
 
 ## Command Schema (canonical)
 
-`RpcCommand` is defined in `packages/coding-agent/src/modes/rpc/rpc-types.ts`:
+`RpcCommand` is defined in `packages/coding-agent/src/modes/rpc/rpc-types.ts`. Runtime field
+validation, examples, versions, and scheduling are defined exhaustively in
+`packages/coding-agent/src/modes/rpc/rpc-command-registry.ts`; the type checker rejects a registry
+that omits a command:
 
 ### Prompting
 
@@ -115,23 +177,101 @@ Important edge behavior from runtime:
 - `{ id?, type: "follow_up", message: string, images?: ImageContent[] }`
 - `{ id?, type: "abort" }`
 - `{ id?, type: "abort_and_prompt", message: string, images?: ImageContent[] }`
+- `{ id?, type: "cancel_operation", operationId: string }`
 - `{ id?, type: "new_session", parentSession?: string }`
 
 ### Protocol
 
 - `{ id?, type: "negotiate_protocol", protocolVersion: 2 }`
+- `{ id?, type: "get_capabilities" }`
 
 ### State
 
+- `{ id?, type: "get_operations" }`
 - `{ id?, type: "get_state" }`
 - `{ id?, type: "set_fast_mode", enabled: boolean }`
 - `{ id?, type: "get_available_commands" }`
+- `{ id?, type: "get_settings", tab?: SettingTab }`
+- `{ id?, type: "set_settings", changes: RpcSettingsChange[] }`
 - `{ id?, type: "set_todos", phases: TodoPhase[] }`
 - `{ id?, type: "set_host_tools", tools: RpcHostToolDefinition[] }`
 - `{ id?, type: "set_host_uri_schemes", schemes: RpcHostUriSchemeDefinition[] }`
 - `{ id?, type: "set_subagent_subscription", level: "off" | "progress" | "events" }`
 - `{ id?, type: "get_subagents" }`
 - `{ id?, type: "get_subagent_messages", subagentId?: string, sessionFile?: string, fromByte?: number }`
+
+### Advisors
+
+- `{ id?, type: "get_advisor_state" }`
+- `{ id?, type: "set_advisor_enabled", enabled: boolean }`
+
+`get_advisor_state` reports whether advisors are configured and whether they are
+effectively active, and gives every advisor a `running`, `paused`,
+`quota_exhausted`, `error`, or `no_model` status instead of one opaque flag.
+`get_state` carries the same configured/active pair so a host can render advisor
+availability without a second round trip.
+
+### Tools
+
+- `{ id?, type: "get_tool_inventory" }`
+- `{ id?, type: "set_tool_activation", activate?: string[], deactivate?: string[] }`
+
+`get_tool_inventory` reports every known tool with its enabled, active, and
+mounted state, including tools mounted by extensions and MCP servers.
+`set_tool_activation` reconciles the session's enabled set atomically: unknown
+tool names fail with `invalid_request` and change nothing, and a session that is
+streaming, compacting, or running an operation answers `session_busy` rather
+than mutating tools underneath in-flight work.
+
+### Plan
+
+- `{ id?, type: "set_mode", mode: "none" | "plan" | "plan_paused", planFilePath?: string, workflow?: "parallel" | "iterative", when?: "immediate" | "next_idle" }`
+- `{ id?, type: "get_plan" }`
+- `{ id?, type: "resolve_plan_approval", approvalId: string, decision: "approve" | "refine" | "reject", preserveContext?: boolean, compactBeforeExecute?: boolean, executionModelRole?: string, editedContent?: string, feedback?: string }`
+
+`set_mode` and `resolve_plan_approval` are server-owned operations: the response
+carries `operationId` and `accepted`, and the transition settles through
+`operation_completed`, `operation_failed`, or `operation_cancelled`. `when:
+"next_idle"` defers entry until the current turn finishes. Plan state is pushed
+as `plan_state_update`, a pending approval arrives as `plan_approval_request`,
+and its outcome arrives as `plan_approval_settled`. Once a mode or approval
+operation reaches its commit phase, `cancel_operation` answers
+`operation_commit_in_progress` so a half-applied transition never reports a
+cancelled terminal.
+
+### Eval
+
+- `{ id?, type: "eval_execute", language: "py" | "js" | "rb" | "jl", code: string, title?: string, timeout?: number, reset?: boolean, excludeFromContext?: boolean }`
+- `{ id?, type: "get_eval_history", limit?: number }`
+
+`eval_execute` is a confirmation-gated server-owned operation: the host
+confirmation is bound to the issued `operationId`, output streams as
+`eval_output` chunks with a bounded canonical transcript, and the run settles as
+`eval_complete`. Execution resolves the host-facing eval tool without changing
+the model-visible active tool set, so running code never mutates tool
+activation. `get_eval_history` replays recorded entries newest last.
+
+### Subagents
+
+- `{ id?, type: "list_agents", includeAdvisors?: boolean }`
+- `{ id?, type: "get_agent", agentId: string }`
+- `{ id?, type: "get_agent_result", agentId: string }`
+- `{ id?, type: "send_agent_message", agentId: string, message: string, replyTo?: string }`
+- `{ id?, type: "park_agent", agentId: string }`
+- `{ id?, type: "resume_agent", agentId: string }`
+- `{ id?, type: "release_agent", agentId: string, tombstone?: boolean }`
+- `{ id?, type: "cancel_agent", agentId: string }`
+
+These commands require the `agent-control` feature. `list_agents` and `get_agent`
+project live and parked delegated agents with identity, status, and progress, and
+`get_agent_result` returns the recorded result once a run finishes.
+`send_agent_message` delivers steering to a running agent. `park_agent` parks a
+live agent so its transcript survives, `resume_agent` revives a parked one, and
+`release_agent` unregisters it, optionally leaving a tombstone. `release_agent`
+and `cancel_agent` are confirmation-gated because both end a delegated run.
+Lifecycle and progress arrive as `subagent_lifecycle`, `subagent_progress`,
+`subagent_event`, and `agent_registry_update` frames correlated to registry
+entries.
 
 ### Model
 
@@ -150,6 +290,25 @@ Important edge behavior from runtime:
 - `{ id?, type: "set_follow_up_mode", mode: "all" | "one-at-a-time" }`
 - `{ id?, type: "set_interrupt_mode", mode: "immediate" | "wait" }`
 
+### Queue and jobs
+
+- `{ id?, type: "get_queue" }`
+- `{ id?, type: "remove_queued_message", entryId: string }`
+- `{ id?, type: "reorder_queued_message", entryId: string, toIndex: number }`
+- `{ id?, type: "clear_queue", lane?: "steering" | "followUp" | "all" }`
+- `{ id?, type: "list_jobs" }`
+- `{ id?, type: "get_job", jobId: string }`
+- `{ id?, type: "cancel_job", jobIds: string[] }`
+
+Queue commands project and mutate the steering and follow-up lanes that `steer`
+and `follow_up` feed, and every mutation is echoed as `queue_update`. An entry id
+that no longer exists fails with `stale_queue_entry`, and a `toIndex` outside the
+lane fails with `invalid_queue_position`; neither partially applies. Job commands
+share one owner-filtered view and cancellation boundary with the Agent Hub, so a
+host sees exactly the background bash and task jobs the session owns and receives
+`job_update` instead of scraping interactive output. `cancel_job` takes 1 to 64
+unique ids and is confirmation-gated.
+
 ### Compaction
 
 - `{ id?, type: "compact", customInstructions?: string }`
@@ -165,12 +324,11 @@ Important edge behavior from runtime:
 - `{ id?, type: "bash", command: string }`
 - `{ id?, type: "abort_bash" }`
 
-`bash` is dispatched concurrently: the RPC server continues reading commands
-while the shell command runs, so `abort_bash` (or any other command) sent
-during a long-running `bash` is handled without waiting for it to finish on
-its own. The `bash` response is emitted when the command completes; hosts
-correlate it via `id`. Ordering across concurrent commands is not guaranteed
-— clients MUST match responses on `id`, not on emission order.
+`bash` is dispatched concurrently. Control commands such as `abort_bash`,
+`abort_retry`, `abort`, `steer`, and `follow_up` can also overtake blocked
+serial work. The server therefore continues reading commands while long-running
+work is active. Ordering across concurrent/control responses is not guaranteed;
+clients MUST correlate responses by `id`, not emission order.
 
 ### Session
 
@@ -182,6 +340,25 @@ correlate it via `id`. Ordering across concurrent commands is not guaranteed
 - `{ id?, type: "get_last_assistant_text" }`
 - `{ id?, type: "set_session_name", name: string }`
 - `{ id?, type: "handoff", customInstructions?: string }`
+
+### Session catalog
+
+- `{ id?, type: "list_sessions", scope?: "cwd" | "all", cwd?: string, cursor?: string, limit?: number, search?: string }`
+- `{ id?, type: "get_session_info", session: string, scope?: "cwd" | "all", cwd?: string }`
+- `{ id?, type: "list_workspace_roots" }`
+- `{ id?, type: "rename_session", session: string, name: string, scope?: "cwd" | "all", cwd?: string }`
+- `{ id?, type: "resume_session", session: string, scope?: "cwd" | "all", cwd?: string }`
+- `{ id?, type: "fork_session" }`
+- `{ id?, type: "delete_session", session: string, scope?: "cwd" | "all", cwd?: string }`
+
+These commands share one catalog with the interactive session picker. `scope`
+defaults to `"cwd"` and resolves against `cwd`, which defaults to the active
+session's working directory. `list_sessions` returns a page with an opaque
+`nextCursor`; cursors expire and are bounded per connection. `session` accepts a
+session ID prefix or a path, and an ambiguous reference fails with
+`session_ambiguous` rather than picking a match. `delete_session` is
+confirmation-gated and answers `confirmation_required` unless the host echoes
+the server-issued `operationId` with `confirmed: true`.
 
 ### Messages
 
@@ -196,6 +373,45 @@ The bundled TypeScript `RpcClient.getMessages()` and Python `RpcClient.get_messa
 
 - `{ id?, type: "get_login_providers" }`
 - `{ id?, type: "login", providerId: string }`
+
+### Provider Authentication
+
+- `{ id?, type: "list_provider_auth" }`
+- `{ id?, type: "begin_provider_auth", providerId: string, method: "oauth_callback" | "paste_code" | "device_code" | "api_key" }`
+- `{ id?, type: "cancel_provider_auth", operationId: string }`
+- `{ id?, type: "remove_provider_auth", providerId: string }`
+
+`list_provider_auth` projects the registry without secrets: each entry carries
+`providerId`, `name`, `authenticated`, `disabled`, `available`, an optional
+`credentialOrigin` and `unavailableReason`, the signed-in `identity`, and the
+`methods` this provider actually supports. A provider whose login flow cannot run
+headlessly reports `available: false` with `unavailableReason` instead of
+advertising a method that would fail.
+
+`begin_provider_auth` is a server-owned operation: the response carries
+`operationId` and `accepted`, and the flow settles through
+`operation_completed`, `operation_failed`, or `operation_cancelled`. One
+authentication or credential mutation runs at a time per connection; a second
+attempt fails with `provider_auth_busy`. Interactive steps arrive as
+`provider_auth_request` events (`method: "open_url"`) or, for paste-code and
+API-key entry, as `extension_ui_request` input prompts correlated by
+`operationId`. Every credential change emits `provider_auth_update` for each
+affected provider, because providers that share a credential store change
+together.
+
+`cancel_provider_auth` is accepted only before the credential write begins. Once
+persistence starts, the operation is protected and cancellation returns
+`provider_auth_commit_in_progress` so a durable credential never reports a
+cancelled terminal.
+
+`remove_provider_auth` is confirmation-gated: the server sends an
+`extension_ui_request` with `command: "remove_provider_auth"` and the
+server-issued `operationId`, names the credential store and every provider that
+shares it, and removes nothing until the host echoes that exact `operationId`
+with `confirmed: true`. Declined or unanswered confirmations fail with
+`confirmation_required`. Only `oauth` and `api_key` origins are removable;
+environment, config, and fallback credentials fail with
+`provider_auth_origin_not_removable`.
 
 ## Response Schema
 
@@ -216,21 +432,58 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
   "type": "response",
   "command": "prompt",
   "success": true,
-  "data": { "agentInvoked": false }
+  "data": {
+    "operationId": "op_123",
+    "accepted": true
+  }
 }
 ```
 
-`data.agentInvoked: false` is a completion signal for local-only prompts, including slash commands that produce output without starting an agent turn. `data.agentInvoked: true` means the prompt produced agent lifecycle events; those events can be emitted before or after the prompt response depending on the command path. Older runtimes may omit `data`; hosts should then rely on `agent_end`, custom message completion, or `prompt_result`.
+The acknowledgement is followed by exactly one correlated terminal frame:
 
-`prompt_result` is emitted when a prompt was accepted immediately but later resolves as local-only:
+Work beginning is a separate event:
 
 ```json
-{ "type": "prompt_result", "id": "req_1", "agentInvoked": false }
+{ "type": "operation_started", "operationId": "op_123", "requestId": "req_1", "command": "prompt", "startedAt": 1785661200000 }
 ```
 
-Local-only slash commands may emit `command_output` frames before completing via `data.agentInvoked: false` or a later `prompt_result`. They do not emit `agent_end`.
+```json
+{
+  "type": "operation_completed",
+  "operationId": "op_123",
+  "requestId": "req_1",
+  "command": "prompt",
+  "agentInvoked": false,
+  "settledAt": 1785661200100
+}
+```
+
+Failures and cancellation use the same correlation key:
+
+```json
+{ "type": "operation_failed", "operationId": "op_123", "requestId": "req_1", "command": "prompt", "error": "No model configured", "code": "prompt_scheduling_failed", "settledAt": 1785661200100 }
+{ "type": "operation_cancelled", "operationId": "op_123", "requestId": "req_1", "command": "prompt", "reason": "user", "code": "cancelled_by_client", "settledAt": 1785661200100 }
+```
+
+Local-only slash commands may emit `command_output` and the legacy
+`prompt_result` hint before their operation completes; they do not need to emit
+`agent_end`. `cancel_operation` is target-specific and idempotently returns the
+authoritative terminal outcome. `get_operations` returns live accepted/started
+operations plus up to 128 recent terminal outcomes retained for five minutes,
+allowing a client that missed frames to reconcile.
 
 ### `get_state` payload
+
+`activityPhase` is the authoritative activity signal:
+
+- `provider`: the core provider loop is streaming.
+- `maintenance`: provider streaming has stopped, but the prompt is still
+  settling or tracked post-prompt work remains.
+- `idle`: neither provider nor maintenance work remains.
+
+The legacy `isStreaming` field is unchanged and remains `true` for both provider
+streaming and an in-flight prompt, so use `activityPhase` when the distinction
+matters.
 
 `tokensPerSecond` is a number when output throughput is available and `null`
 otherwise. `fastModeEnabled` reports the session setting, while
@@ -250,6 +503,7 @@ is re-armed.
   "model": { "provider": "...", "id": "..." },
   "thinkingLevel": "off|minimal|low|medium|high|xhigh|max",
   "isStreaming": false,
+  "activityPhase": "provider|maintenance|idle",
   "isCompacting": false,
   "steeringMode": "all|one-at-a-time",
   "followUpMode": "all|one-at-a-time",
@@ -356,6 +610,106 @@ The corresponding `get_state` result reports the same computed state:
 {
   "fastModeEnabled": false,
   "fastModeActive": true
+}
+```
+
+### `get_settings` payload
+
+Describes the settings schema. Pass `tab` to scope the result to one settings
+tab; an unknown tab fails with code `invalid_tab` rather than returning an
+empty list. The unscoped response is roughly 90 KB, inside the v1 frame limit.
+
+Metadata is returned for every setting because `SETTINGS_SCHEMA` is compiled-in
+public information. **A configured value is disclosed only when the schema
+marks that setting `rpcReadable`.** That annotation is the only grant, and it
+is never inferred from a setting's name or type, so a newly added setting is
+withheld until someone opts it in deliberately. `secret` is an independent
+deny applied on top: a setting marked both is still withheld.
+
+Initial coverage is deliberately narrow: only the appearance tab's boolean and
+enum settings are marked `rpcReadable`, so every other setting currently
+returns as redacted. Coverage widens by annotating settings in later changes.
+
+Withheld entries carry `redacted: true` and omit both `value` and `configured`:
+whether a credential is configured is user state, not schema metadata.
+`default` is omitted when a setting has no default, so the wire has one shape.
+
+Rendering metadata is carried so a client does not have to duplicate the
+schema. `tabs` preserves the canonical tab order, labels, icons, and ordered
+section groups; settings with no group render before those sections.
+`ui.control` is the canonical built-in control kind (`boolean`, `enum`,
+`submenu`, `text`, `providerLimits`, or `multiselect`), and is `null` for
+config-only entries. `ui.renderable` is true exactly when `ui.control` is
+non-null. Entries without `ui` metadata are also non-renderable.
+`ui.visible` reports current panel visibility after the server evaluates any
+private condition, and is `false` when the setting is not renderable. Condition
+names are not exposed on the wire. `ui.options` holds a fixed choice list or the
+literal string `"runtime"` when choices come from a runtime registry such as
+the theme list. `ui.ordered` marks selections whose order is meaningful. A
+setting with no UI metadata keeps its prose in a top-level `description`.
+
+```json
+{
+  "id": "req_3",
+  "type": "response",
+  "command": "get_settings",
+  "success": true,
+  "data": {
+    "tabs": [
+      {
+        "id": "appearance",
+        "label": "Appearance",
+        "icon": "tab.appearance",
+        "groups": ["Theme", "Status Line", "Display", "Images"]
+      }
+    ],
+    "settings": [
+      {
+        "path": "colorBlindMode",
+        "type": "boolean",
+        "default": false,
+        "value": true,
+        "configured": true,
+        "ui": {
+          "tab": "appearance",
+          "group": "Theme",
+          "label": "Color-Blind Mode",
+          "description": "Use blue instead of green for diff additions",
+          "renderable": true,
+          "control": "boolean",
+          "visible": true
+        }
+      },
+      {
+        "path": "theme.dark",
+        "type": "string",
+        "default": "titanium",
+        "redacted": true,
+        "ui": {
+          "tab": "appearance",
+          "group": "Theme",
+          "label": "Dark Theme",
+          "description": "Theme used when the terminal has a dark background",
+          "renderable": true,
+          "control": "submenu",
+          "visible": true,
+          "options": "runtime"
+        }
+      },
+      {
+        "path": "tui.maxInlineImageColumns",
+        "type": "number",
+        "default": 100,
+        "description": "Maximum width in terminal columns for inline images (default 100). Set to 0 for unlimited (bounded only by terminal width).",
+        "redacted": true
+      },
+      {
+        "path": "auth.broker.token",
+        "type": "string",
+        "redacted": true
+      }
+    ]
+  }
 }
 ```
 
@@ -540,19 +894,22 @@ byte zero and reports `reset: true`.
 
 This is the most important operational behavior.
 
-### Immediate ack vs completion
+### Acceptance vs completion
 
-`prompt` and `abort_and_prompt` are **acknowledged immediately**:
+Once `prompt` or `abort_and_prompt` accepts asynchronous work, its single
+response carries an operation ID:
 
 ```json
-{ "id": "req_1", "type": "response", "command": "prompt", "success": true }
+{ "id": "req_1", "type": "response", "command": "prompt", "success": true, "data": { "operationId": "op_123", "accepted": true } }
 ```
 
 That means:
 
 - command acceptance != run completion
-- agent turns complete only on `agent_end` frames where `isTerminal !== false`
-- local-only prompts complete via `data.agentInvoked: false` on the response or via a later `prompt_result`
+- all accepted prompt-like operations settle through one correlated
+  `operation_completed`, `operation_failed`, or `operation_cancelled`
+- `agent_end` continues to describe the session stream but does not settle an
+  operation by itself
 
 ### While streaming
 
@@ -579,6 +936,18 @@ From `packages/agent/src/agent.ts` defaults:
 - `set_interrupt_mode`
   - `"immediate"`: tool execution checks steering between tool calls; pending steering can abort remaining tool calls in the turn
   - `"wait"`: defer steering until turn completion
+
+### Session transitions
+
+`new_session`, `switch_session`, `fork_session`, `branch`, `resume_session`, and
+`delete_session` fence the session they replace. Pending bash confirmations are
+abandoned, in-flight `bash` and `eval_execute` work is cancelled and awaited
+before the swap, and a transition refuses to start while a provider
+authentication, mode, or plan approval commit is in flight (`session_busy`).
+While a transition runs, `prompt`, `abort_and_prompt`, `steer`, `follow_up`,
+`bash`, and `eval_execute` answer `session_busy`, and asynchronous work that
+completes after the swap is discarded instead of settling against the new
+session.
 
 ## Extension UI Sub-Protocol
 
@@ -616,15 +985,39 @@ Example:
 }
 ```
 
+Privileged commands add a server-issued `operationId` and the `command` being
+confirmed:
+
+```json
+{
+  "type": "extension_ui_request",
+  "id": "124",
+  "method": "confirm",
+  "title": "Delete session?",
+  "message": "Permanently delete session \"Investigation\" and its artifacts?",
+  "timeout": 30000,
+  "operationId": "01901234",
+  "command": "delete_session"
+}
+```
+
 ### Inbound response
 
 `RpcExtensionUIResponse` (`type: "extension_ui_response"`):
 
 - `{ type: "extension_ui_response", id: string, value: string }`
-- `{ type: "extension_ui_response", id: string, confirmed: boolean }`
+- `{ type: "extension_ui_response", id: string, confirmed: boolean, operationId?: string }`
 - `{ type: "extension_ui_response", id: string, cancelled: true, timedOut?: boolean }`
 
 If a dialog has a timeout, RPC mode resolves to a default value when timeout/abort fires.
+
+A privileged confirmation only counts when the response echoes the exact
+`operationId` from the request. A missing, stale, or mismatched `operationId`,
+a declined dialog, an expiry, and a disconnect all fail closed, and the
+originating command answers with the `confirmation_required` error code. The
+capability manifest marks these commands with `confirmation: "required"` so
+hosts can present the prompt before the round trip instead of discovering the
+requirement from an error.
 
 ## Host Tool Sub-Protocol
 

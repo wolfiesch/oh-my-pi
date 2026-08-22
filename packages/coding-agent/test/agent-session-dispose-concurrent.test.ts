@@ -203,6 +203,36 @@ describe("AgentSession concurrent disposal", () => {
 		expect(closeAt).toBeGreaterThan(order.indexOf("mnemopi:end"));
 	});
 
+	it("separates provider activity, post-turn maintenance, and terminal idle", async () => {
+		const current = createSession();
+		let providerStreaming = false;
+		Object.defineProperty(current.agent.state, "isStreaming", {
+			configurable: true,
+			get: () => providerStreaming,
+			set: value => {
+				providerStreaming = value;
+			},
+		});
+
+		expect(current.activityPhase).toBe("idle");
+		expect(current.isStreaming).toBe(false);
+
+		providerStreaming = true;
+		expect(current.activityPhase).toBe("provider");
+		expect(current.isStreaming).toBe(true);
+
+		const maintenance = Promise.withResolvers<void>();
+		current.trackPostPromptTaskForTests(maintenance.promise);
+		providerStreaming = false;
+		expect(current.activityPhase).toBe("maintenance");
+		expect(current.isStreaming).toBe(false);
+
+		maintenance.resolve();
+		await flushMicrotasks();
+		expect(current.activityPhase).toBe("idle");
+		expect(current.isStreaming).toBe(false);
+	});
+
 	it("bounds post-prompt work that ignores abort", async () => {
 		vi.useFakeTimers();
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});

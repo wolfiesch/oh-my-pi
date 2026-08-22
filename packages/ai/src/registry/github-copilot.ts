@@ -4,6 +4,7 @@ import type { ProviderDefinition } from "./types";
 export const githubCopilotProvider = {
 	id: "github-copilot",
 	name: "GitHub Copilot",
+	deviceCodeFlow: true,
 	login: async (cb: OAuthLoginCallbacks) => {
 		// Lazy import: keep heavy OAuth flow modules out of the eager registry graph.
 		const { loginGitHubCopilot } = await import("./oauth/github-copilot");
