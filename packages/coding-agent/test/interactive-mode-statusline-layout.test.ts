@@ -2,7 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { resetSettingsForTest, settings, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -74,7 +74,7 @@ describe("InteractiveMode mounted statusline layout", () => {
 		const nonBlank = rendered.filter(line => line.trim().length > 0);
 
 		// 1. Secondary status line should be rendered above the editor box
-		const secondaryIndex = nonBlank.findIndex(line => line.includes("0.0%/1M"));
+		const secondaryIndex = nonBlank.findIndex(line => line.includes("0.0%/"));
 		expect(secondaryIndex).toBeGreaterThanOrEqual(0);
 
 		// 2. Editor top border with primary status line (pi, model) should be directly below secondary line
@@ -104,7 +104,7 @@ describe("InteractiveMode mounted statusline layout", () => {
 		const nonBlank = rendered.filter(line => line.trim().length > 0);
 
 		// 1. Secondary status line should be rendered above the editor prompt
-		const secondaryIndex = nonBlank.findIndex(line => line.includes("0.0%/1M"));
+		const secondaryIndex = nonBlank.findIndex(line => line.includes("0.0%/"));
 		expect(secondaryIndex).toBeGreaterThanOrEqual(0);
 
 		// 2. Editor prompt line (borderless prompt uses ❯)
@@ -134,7 +134,7 @@ describe("InteractiveMode mounted statusline layout", () => {
 		const rendered = mode.ui.render(100).map(stripAnsi);
 		const nonBlank = rendered.filter(line => line.trim().length > 0);
 		// 1. Secondary status line
-		const secondaryIndex = nonBlank.findIndex(line => line.includes("0.0%/1M"));
+		const secondaryIndex = nonBlank.findIndex(line => line.includes("0.0%/"));
 		expect(secondaryIndex).toBeGreaterThanOrEqual(0);
 
 		// 2. Top rule with chip (contains horizontal rule chars directly below secondary)

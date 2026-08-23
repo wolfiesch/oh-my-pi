@@ -1134,7 +1134,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.statusLine.watchBranch(() => {
 			this.ui.requestRender();
 		});
-		this.composer.setStatusComponent(this.statusLine);
+		this.composer.setStatusComponent(this.statusLine.bottomBar);
 
 		this.composer.setRuntimeChildren([
 			this.chatContainer,
@@ -1158,8 +1158,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.statusLine.above,
 			this.editorContainer,
 			this.hookWidgetContainerBelow,
-			// Standalone bottom bar sits below the editor for shapes with detached bottom status.
-			this.statusLine.bottomBar,
 		]);
 		this.ui.setFocus(this.editor);
 		this.syncComposerShape();
@@ -1990,6 +1988,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			preset: settings.get("statusLine.preset"),
 			leftSegments: settings.get("statusLine.leftSegments"),
 			rightSegments: settings.get("statusLine.rightSegments"),
+			secondaryLeftSegments: settings.get("statusLine.secondaryLeftSegments"),
+			secondaryRightSegments: settings.get("statusLine.secondaryRightSegments"),
 			separator: settings.get("statusLine.separator"),
 			showHookStatus: settings.get("statusLine.showHookStatus"),
 			sessionAccent: settings.get("statusLine.sessionAccent"),
