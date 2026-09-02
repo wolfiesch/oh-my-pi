@@ -125,6 +125,17 @@ function resolveBrowserKind(params: BrowserParams, session: ToolSession): Browse
 	const headless = session.settings.get("browser.headless") as boolean;
 	return { kind: "headless", headless };
 }
+/** Whether a cmux failure means the browser surface is unavailable rather than the requested page failing. */
+export function isCmuxUnavailableError(error: unknown): boolean {
+	let current: unknown = error;
+	for (let depth = 0; depth < 4 && current instanceof Error; depth++) {
+		const code = (current as NodeJS.ErrnoException).code;
+		if (code && ["ENOENT", "ECONNREFUSED", "ECONNRESET", "EPIPE", "ENOTSOCK"].includes(code)) return true;
+		if (/\bcmux\b.*(?:connect|socket|unavailable)|browser\.open_split|surface_id/i.test(current.message)) return true;
+		current = current.cause;
+	}
+	return false;
+}
 
 /**
  * Browser tool: stateful, multi-tab. Three actions:
@@ -256,8 +267,10 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		details: BrowserToolDetails,
 		timeoutMs: number,
 		signal?: AbortSignal,
+		kindOverride?: BrowserKind,
 	): Promise<AgentToolResult<BrowserToolDetails>> {
-		const kind = resolveBrowserKind(params, this.session);
+		const startedAt = performance.now();
+		const kind = kindOverride ?? resolveBrowserKind(params, this.session);
 		details.browser = kind.kind;
 
 		// If a tab with this name already exists on a different browser kind, fail fast — caller must close first.
@@ -347,6 +360,15 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 			details.result = lines.join("\n");
 			return toolResult(details).text(lines.join("\n")).done();
 		} catch (error) {
+			// A stale cmux environment can outlive its browser surface. Automatic
+			// cmux selection must not make browser automation unusable: retry the
+			// same open once on the ordinary browser backend, while preserving the
+			// caller's original deadline and never masking page/navigation errors.
+			if (kind.kind === "cmux" && !signal?.aborted && !timeoutSignal.aborted && isCmuxUnavailableError(error)) {
+				const remainingMs = Math.max(1, Math.ceil(timeoutMs - (performance.now() - startedAt)));
+				const headless = this.session.settings.get("browser.headless") as boolean;
+				return this.#open(name, params, details, remainingMs, signal, { kind: "headless", headless });
+			}
 			// Caller cancellation stays a ToolAbortError; the requested timeout
 			// becomes a timeout ToolError; anything else passes through unchanged.
 			if (signal?.aborted) throw error instanceof ToolAbortError ? error : new ToolAbortError();

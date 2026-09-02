@@ -24,10 +24,10 @@ function makeComponent(
 		activeIdentity?: { accountId?: string; email?: string; projectId?: string };
 	} = {},
 ): StatusLineComponent {
-	const model = { id: options.modelId ?? "test-model", contextWindow: 1000, provider: options.provider };
+	const model = { id: options.modelId, contextWindow: 1000, provider: options.provider };
 	const component = new StatusLineComponent({
-		state: { messages: [], model: { id: options.modelId, contextWindow: 1000, provider: options.provider } },
-		model: { id: options.modelId, contextWindow: 1000, provider: options.provider },
+		state: { messages: [], model },
+		model,
 		sessionManager: {
 			getUsageStatistics: () => ({
 				input: 0,
@@ -229,7 +229,7 @@ describe("usage status-line segment", () => {
 		expect(bottomBox).toHaveLength(0);
 
 		// Standalone style (e.g. borderless): bottomBar is full
-		component.setComposerStyle({ bottomBar: "full", bottomBarGap: false });
+		component.setComposerStyle({ bottomBar: "full", bottomBarGap: false, statusAttachment: "top-border" });
 		const aboveStandalone = component.above.render(200).map(stripVTControlCharacters);
 		const bottomStandalone = component.bottomBar.render(200).map(stripVTControlCharacters);
 		expect(aboveStandalone).toHaveLength(1);

@@ -17,7 +17,7 @@ import type { RenderResultOptions } from "../../extensibility/custom-tools/types
 import { IrcAwaitTargetStopped, IrcBus, type IrcDeliveryReceipt, type IrcMessage } from "../../irc/bus";
 import type { Theme } from "../../modes/theme/theme";
 import { type AgentRef, type AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
-import { ensurePersistedRoster, isCurrentSessionRosterRef, registerPersistedSubagents } from "../../registry/persisted-agents";
+import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../../registry/persisted-agents";
 import { canSpawnAtDepth } from "../../task/types";
 import { Ellipsis, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
 import {
@@ -226,7 +226,13 @@ export interface HubSendParams {
 }
 
 export async function executeSend(
-	deps: { registry: AgentRegistry; senderId: string; settings: Settings; sessionFileHint?: string | null; expectedTarget?: AgentRef },
+	deps: {
+		registry: AgentRegistry;
+		senderId: string;
+		settings: Settings;
+		sessionFileHint?: string | null;
+		expectedTarget?: AgentRef;
+	},
 	params: HubSendParams,
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<CoordinationDetails>> {

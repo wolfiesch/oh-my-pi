@@ -7,7 +7,7 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
-import { type AsyncJob, type AsyncJobManager, JobProjectionService } from "../../async";
+import { type AsyncJob, type AsyncJobManager, type AsyncJobType, JobProjectionService } from "../../async";
 import { settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
@@ -126,6 +126,13 @@ function describeAgents(agents: AgentActivitySnapshot[]): string[] {
 
 interface TrackedJobLike {
 	id: string;
+	type: AsyncJobType;
+	status: string;
+	label: string;
+	startTime: number;
+	latestDetails?: Record<string, unknown>;
+	resultText?: string;
+	errorText?: string;
 }
 
 export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobSnapshot[] {
@@ -381,14 +388,8 @@ export function executeJobsSnapshot(
 	manager: AsyncJobManager,
 	ownerId: string | undefined,
 ): AgentToolResult<CoordinationDetails> {
-	const projection = new JobProjectionService({
-		manager,
-		ownerId,
-		registry: session.agentRegistry,
-		lifecycle: session.agentLifecycle?.(),
-	});
-	const { jobs, agents } = projection.list();
-	return buildJobResult(session, manager, "jobs", jobs, [], agents);
+	const jobs = manager.getAllJobs(ownerId ? { ownerId } : undefined);
+	return buildJobResult(session, manager, "jobs", jobs, [], runningAgentsOutsideJobs(session));
 }
 
 // =============================================================================

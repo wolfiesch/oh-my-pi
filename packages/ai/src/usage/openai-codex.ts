@@ -572,9 +572,14 @@ export function scopeCodexLimitsForRequest(report: UsageReport, context?: Creden
 		if (limit.id === "openai-codex:primary" || limit.id === "openai-codex:secondary") {
 			return !isSparkRequest;
 		}
-		// Additional metered features have ids of the form `openai-codex:<slug>:<key>`.
-		const slug = limit.id.split(":")[1];
-		return slug === "spark" ? isSparkRequest : false;
+		if (typeof limit.id === "string") {
+			// Additional metered features have ids of the form `openai-codex:<slug>:<key>`.
+			const slug = limit.id.split(":")[1];
+			if (slug === "spark") return isSparkRequest;
+		}
+		const tier = limit.scope?.tier;
+		if (tier === "spark") return isSparkRequest;
+		return !isSparkRequest;
 	});
 }
 

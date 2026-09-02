@@ -633,8 +633,7 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		await Bun.write(resolvedPlanPath, "# Draft plan\n\noriginal body\n");
 
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		activatePlanMode(session, planFilePath);
 		const edited = "# Auto QA\n\nSave the final plan.\n\n## Verify\n\n- run focused tests\n";
 		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, _options, dialogOptions) => {
 			dialogOptions?.onPlanEdited?.(edited);

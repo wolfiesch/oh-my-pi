@@ -503,8 +503,6 @@ export class SessionTools {
 	#codeModeDirectWireSignature: string | undefined;
 	/** Direct partition of the last applied Code Mode surface; undefined when inactive. */
 	#codeModeDirectToolNames: readonly string[] | undefined;
-	/** Whether eval was added only as the current Code Mode transport. */
-	#codeModeInjectedEval = false;
 	#committedToolInventory: CommittedToolInventory;
 	#toolInventoryObjectIds = new WeakMap<object, number>();
 	#nextToolInventoryObjectId = 1;

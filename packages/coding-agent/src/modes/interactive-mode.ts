@@ -58,7 +58,7 @@ import { restartArgv } from "../cli/flag-tables";
 import type { CollabGuestLink } from "../collab/guest";
 import type { CollabHost } from "../collab/host";
 import { formatKeyHint, KeybindingsManager } from "../config/keybindings";
-import { formatModelString, type ResolvedModelRoleValue } from "../config/model-resolver";
+import { formatModelString } from "../config/model-resolver";
 import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
 import {
 	isSettingsInitialized,
@@ -97,8 +97,6 @@ import { type PlanApprovalDetails, resolvePlanTitle } from "../plan-mode/approve
 import type { PendingPlanApproval } from "../plan-mode/plan-controller";
 import guidedGoalInterviewPrompt from "../prompts/goals/guided-goal-interview.md" with { type: "text" };
 import planFilenamePrompt from "../prompts/system/plan-filename.md" with { type: "text" };
-import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
-import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
 import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import {
 	type AgentSession,
@@ -733,7 +731,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	readonly #startupChangelog: StartupChangelogSelection | undefined;
 	/** Header components below the config warnings + welcome, retained so a live config-warning change can rebuild the header (#10048). */
 	#headerAfter: readonly Component[] = [];
-	#planModePreviousTools: string[] | undefined;
 	#goalModePreviousTools: string[] | undefined;
 	#vibeModePreviousTools: string[] | undefined;
 	#vibeModeOwnerScope: VibeOwnerScope | undefined;
@@ -3093,73 +3090,22 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (options?.interruptActiveTurn && this.session.isStreaming) {
 			await this.session.runModeExitTeardown(async () => {
 				await this.session.abort({ reason: USER_INTERRUPT_LABEL });
-				await this.#tearDownPlanMode(options);
+				if (options?.paused) {
+					await this.session.planMode.pause();
+				} else {
+					await this.session.planMode.disable();
+				}
+				this.lastAssistantUsage = undefined;
+				this.#updatePlanModeStatus();
+				if (!options?.silent) this.showStatus(options?.paused ? "Plan mode paused." : "Plan mode disabled.");
 			});
 			return;
 		}
-		await this.#tearDownPlanMode(options);
-	}
-
-	async #tearDownPlanMode(options?: {
-		silent?: boolean;
-		paused?: boolean;
-		deferModelRestore?: boolean;
-	}): Promise<void> {
-		const planModeState = this.session.getPlanModeState();
-		const planModeTools = this.session.getEnabledToolNames();
-		const planModeMountedTools = this.session.getMountedXdevToolNames();
-		const planModeModelState = this.session.model
-			? { model: this.session.model, thinkingLevel: this.session.configuredThinkingLevel() }
-			: undefined;
-		this.session.setPlanModeState(undefined);
-		try {
-			if (this.#planModePreviousTools !== undefined) {
-				await this.session.setActiveToolsByName(this.#planModePreviousTools);
-			}
-			if (this.#planModePreviousModelState && !options?.deferModelRestore) {
-				await this.#restorePlanPreviousModel(this.#planModePreviousModelState);
-			}
-			// If #applyPlanModeModel queued a deferred switch to the plan-role model
-			// (because the session was streaming on entry), drop it now: we are
-			// leaving plan mode, so flushing it on the next agent_end would land the
-			// session on the plan-role model after the user has exited plan mode
-			// (issue #816). This runs even when deferModelRestore is set
-			// (compact-approval path): otherwise the stale plan switch survives and
-			// flushPendingModelSwitch() later clobbers the restored/execution model.
-			if (this.#planModePreviousModelState) this.#clearPendingPlanModelSwitch();
-		} catch (error) {
-			this.session.setPlanModeState(planModeState);
-			if (
-				planModeModelState &&
-				(!modelsAreEqual(this.session.model, planModeModelState.model) ||
-					this.session.configuredThinkingLevel() !== planModeModelState.thinkingLevel)
-			) {
-				try {
-					await this.#restorePlanPreviousModel(planModeModelState);
-				} catch (rollbackError) {
-					logger.warn("Failed to restore plan model after plan exit failure", { error: String(rollbackError) });
-				}
-			}
-			const enabledTools = this.session.getEnabledToolNames();
-			const mountedTools = this.session.getMountedXdevToolNames();
-			if (
-				enabledTools.length !== planModeTools.length ||
-				enabledTools.some((name, index) => name !== planModeTools[index]) ||
-				mountedTools.length !== planModeMountedTools.length ||
-				mountedTools.some((name, index) => name !== planModeMountedTools[index])
-			) {
-				try {
-					await this.session.setActiveToolPresentation(planModeTools, planModeMountedTools);
-				} catch (rollbackError) {
-					logger.warn("Failed to restore plan tools after plan exit failure", { error: String(rollbackError) });
-				}
-			}
-			throw error;
+		if (options?.paused) {
+			await this.session.planMode.pause();
+		} else {
+			await this.session.planMode.disable();
 		}
-		this.session.setPlanProposalHandler?.(null);
-		this.planModeEnabled = false;
-		// Suppress cache-miss marker on the next turn: plan exit changes the system
-		// prompt, which predictably invalidates the cache.
 		this.lastAssistantUsage = undefined;
 		this.#updatePlanModeStatus();
 		if (!options?.silent) this.showStatus(options?.paused ? "Plan mode paused." : "Plan mode disabled.");

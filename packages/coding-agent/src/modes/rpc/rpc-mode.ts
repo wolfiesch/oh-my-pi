@@ -597,7 +597,7 @@ export async function handleRpcSessionChange(
 		}
 
 		case "switch_session": {
-			const cancelled = !(await session.switchSession(command.sessionPath, beforeCommit));
+			const cancelled = !(await session.switchSession(command.sessionPath, { beforeCommit }));
 			if (!cancelled) subagentRegistry?.clear();
 			return { type: "switch_session", data: { cancelled } };
 		}
@@ -959,7 +959,7 @@ export async function runRpcMode(
 	const frameEncoder = new RpcFrameEncoder();
 	const getCapabilityManifest = () => {
 		const features = new Set<string>();
-		if (eventBus) features.add("subagent-event-bus");
+		if (subagentEventBus) features.add("subagent-event-bus");
 		features.add("agent-control");
 		if (session.asyncJobManager && session.getAgentId()) features.add("job-control");
 		if (session.model && serviceTierFamily(session.model)) features.add("model.fast-mode");
@@ -1857,18 +1857,16 @@ export async function runRpcMode(
 				const entries = [...session.messages, ...session.getPendingEvalMessages()]
 					.filter((message): message is PythonExecutionMessage => message.role === "pythonExecution")
 					.slice(-limit)
-					.map(
-						(message): RpcEvalHistoryEntry => ({
-							language: message.language ?? "py",
-							code: message.code.slice(0, 262_144),
-							output: message.output.length > 262_144 ? message.output.slice(-262_144) : message.output,
-							exitCode: message.exitCode,
-							cancelled: message.cancelled,
-							truncated: message.truncated || message.output.length > 262_144,
-							timestamp: message.timestamp,
-							excludeFromContext: message.excludeFromContext,
-						}),
-					);
+					.map((message): RpcEvalHistoryEntry => ({
+						language: message.language ?? "py",
+						code: message.code.slice(0, 262_144),
+						output: message.output.length > 262_144 ? message.output.slice(-262_144) : message.output,
+						exitCode: message.exitCode,
+						cancelled: message.cancelled,
+						truncated: message.truncated || message.output.length > 262_144,
+						timestamp: message.timestamp,
+						excludeFromContext: message.excludeFromContext,
+					}));
 				return success(id, "get_eval_history", { entries });
 			}
 

@@ -5,7 +5,13 @@
  */
 
 import path from "node:path";
-import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
+import type {
+	AgentEvent,
+	AgentIdentity,
+	AgentMessage,
+	AgentTelemetryConfig,
+	AgentToolResult,
+} from "@oh-my-pi/pi-agent-core";
 import { EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
@@ -844,6 +850,29 @@ function getUsageTokens(usage: unknown): number {
 	return firstNumberField(record, ["totalTokens", "total_tokens"]) ?? 0;
 }
 
+function stringifyMcpProxyText(value: unknown): string {
+	if (typeof value === "string") return value;
+	try {
+		return JSON.stringify(value) ?? String(value);
+	} catch {
+		return String(value);
+	}
+}
+
+/**
+ * MCP adapters occasionally return a text block whose `text` payload is a
+ * structured object. Normalize that provider drift at the proxy boundary so
+ * downstream renderers can safely apply string operations.
+ */
+function normalizeMcpProxyResult(result: AgentToolResult<unknown>): AgentToolResult<unknown> {
+	const content = result.content.map(block => {
+		const candidate = block as { type?: unknown; text?: unknown };
+		if (candidate.type !== "text" || typeof candidate.text === "string") return block;
+		return { ...block, text: stringifyMcpProxyText(candidate.text) };
+	});
+	return { ...result, content };
+}
+
 /**
  * Create proxy tools that reuse the parent's MCP connections.
  *
@@ -888,12 +917,13 @@ export function createMCPProxyTools(mcpManager: MCPManager): CustomTool[] {
 					const timeoutController = new AbortController();
 					const timeoutSignal = timeoutController.signal;
 					const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-					return await withAbortTimeout(
+					const result = await withAbortTimeout(
 						Promise.resolve(source.execute(toolCallId, params, onUpdate, ctx, combinedSignal)),
 						MCP_CALL_TIMEOUT_MS,
 						signal,
 						timeoutController,
 					);
+					return normalizeMcpProxyResult(result);
 				} catch (error) {
 					if (error instanceof ToolAbortError) {
 						throw error;
@@ -950,6 +980,10 @@ export function createSubagentSettings(
 			// Subagents run headless — there is no UI to confirm prompts against, so
 			// the parent task approval is the authorization boundary. Use yolo mode
 			// to preserve unattended subagent execution. User `tools.approval` policies still apply.
+			// Device tools stay available, but subagents receive a name-only
+			// catalog and load schemas on demand instead of inheriting the
+			// parent's full MCP/device descriptions.
+			"tools.xdevDocs": "catalog",
 			"tools.approvalMode": "yolo",
 			// Subagents run unadvised by default; runSubprocess opts a spawn back in
 			// per agent (frontmatter `advisor` / `task.agentAdvisor`) via overrides.

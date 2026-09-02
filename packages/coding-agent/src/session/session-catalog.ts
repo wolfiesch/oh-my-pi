@@ -192,7 +192,7 @@ export function setSessionCatalogSnapshotEntryLimitForTesting(limit: number): ()
 	sessionCatalogSnapshotEntryMax = limit;
 	enforceSnapshotBounds();
 	return () => {
-		for (const sessions of [...sessionCatalogSnapshotGroups.keys()]) removeSnapshotGroup(sessions);
+		for (const sessions of sessionCatalogSnapshotGroups.keys()) removeSnapshotGroup(sessions);
 		sessionCatalogSnapshotEntryMax = DEFAULT_SESSION_CATALOG_SNAPSHOT_ENTRY_MAX;
 	};
 }

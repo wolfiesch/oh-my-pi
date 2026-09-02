@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { resolveCmuxKind } from "@oh-my-pi/pi-coding-agent/tools/browser";
+import { isCmuxUnavailableError, resolveCmuxKind } from "@oh-my-pi/pi-coding-agent/tools/browser";
 
 describe("resolveCmuxKind", () => {
 	it("returns a cmux kind from environment socket settings", () => {
@@ -46,5 +46,16 @@ describe("resolveCmuxKind", () => {
 
 	it("settings can disable cmux when the env override is unset", () => {
 		expect(resolveCmuxKind({ settingEnabled: false }, { CMUX_SOCKET_PATH: "/tmp/cmux.sock" })).toBeNull();
+	});
+});
+
+describe("isCmuxUnavailableError", () => {
+	it("recognizes stale sockets and missing browser surfaces", () => {
+		expect(isCmuxUnavailableError(Object.assign(new Error("connect failed"), { code: "ECONNREFUSED" }))).toBe(true);
+		expect(isCmuxUnavailableError(new Error("cmux browser.open_split did not return a surface_id"))).toBe(true);
+	});
+
+	it("does not retry ordinary page failures on another backend", () => {
+		expect(isCmuxUnavailableError(new Error("Navigation failed: net::ERR_NAME_NOT_RESOLVED"))).toBe(false);
 	});
 });

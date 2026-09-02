@@ -1272,7 +1272,6 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-
 	"display.shimmer": {
 		type: "enum",
 		rpcWritable: true,

@@ -72,6 +72,11 @@ describe("createSubagentSettings advisor default", () => {
 		// Other roles from the parent snapshot survive the advisor override.
 		expect(child.getModelRole("smol")).toBe("openai/gpt-5-mini");
 	});
+
+	it("uses name-only device docs for subagent prompts", () => {
+		const parent = Settings.isolated({ "tools.xdevDocs": "inline" });
+		expect(createSubagentSettings(parent).get("tools.xdevDocs")).toBe("catalog");
+	});
 });
 
 /** Minimal current-version session JSONL: header + one user/assistant exchange. */

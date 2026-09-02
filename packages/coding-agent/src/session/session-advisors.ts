@@ -2177,3 +2177,4 @@ export class SessionAdvisors {
 			.join("\n\n");
 	}
 }
+export type { AdvisorRuntimeStatus };

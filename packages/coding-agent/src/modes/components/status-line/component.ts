@@ -1,12 +1,11 @@
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
-import { getAntigravityCounterKeyForModel } from "@oh-my-pi/pi-ai/usage/google-antigravity";
-import { scopeCodexLimitsForRequest } from "@oh-my-pi/pi-ai/usage/openai-codex";
 import {
 	getAntigravityCounterKeyForModel,
 	scopeAntigravityLimitsForModel,
 } from "@oh-my-pi/pi-ai/usage/google-antigravity";
+import { scopeCodexLimitsForRequest } from "@oh-my-pi/pi-ai/usage/openai-codex";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import {
 	type Component,
@@ -1544,7 +1543,9 @@ export class StatusLineComponent implements Component {
 			const limits =
 				provider === "google-antigravity" && activeAntigravityCounter
 					? scopeAntigravityLimitsForModel(usageReport, context)
-					: reportLimits;
+					: provider === "openai-codex"
+						? scopeCodexLimitsForRequest(usageReport, context)
+						: reportLimits;
 			for (const limit of limits) {
 				if (
 					!limit ||
@@ -1688,7 +1689,7 @@ export class StatusLineComponent implements Component {
 		const normalized: StatusUsage = { tier: selectedGroup.tier, fiveHour, daily, sevenDay, monthly };
 		if (includeAccounts && providerReports.length > 1) {
 			normalized.accounts = providerReports.map((report, index) => ({
-				...(this.#normalizeUsageReports([report], { provider: context.provider, modelId: context.modelId }, false) ?? {}),
+				...this.#normalizeUsageReports([report], { provider: context.provider, modelId: context.modelId }, false),
 				label: formatUsageReportAccountLabel(report, index),
 				active: context.identity !== undefined ? reportMatchesActiveAccount(report, context.identity) : index === 0,
 			}));
@@ -1928,7 +1929,6 @@ export class StatusLineComponent implements Component {
 		const effectiveRightSegments = rightSegments ?? effectiveSettings.rightSegments;
 		const plain = layout !== "box" && layout !== "band";
 		const includePath = hasPathSegment(effectiveLeftSegments) || hasPathSegment(effectiveRightSegments);
-		const includeContext = hasContextSegment(effectiveLeftSegments) || hasContextSegment(effectiveRightSegments);
 		const gitEnabled = this.#gitEnabled();
 		const includeGit = gitEnabled && (hasGitSegment(effectiveLeftSegments) || hasGitSegment(effectiveRightSegments));
 		const includePr = gitEnabled && (hasPrSegment(effectiveLeftSegments) || hasPrSegment(effectiveRightSegments));

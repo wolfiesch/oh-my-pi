@@ -9,9 +9,7 @@ import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { ResolvedModelRoleValue } from "../config/model-resolver";
 import { resolveLocalUrlToPath } from "../internal-urls";
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
-import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with {
-	type: "text",
-};
+import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
 import type { AgentSession, ResolvedRoleModel } from "../session/agent-session";
 import type { SessionContext } from "../session/session-context";
 import type { ConfiguredThinkingLevel } from "../thinking";

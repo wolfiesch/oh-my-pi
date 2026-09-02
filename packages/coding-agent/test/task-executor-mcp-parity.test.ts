@@ -9,6 +9,7 @@ import { DeferredMCPTool, MCPTool } from "../src/mcp/tool-bridge";
 import type { MCPServerConnection, MCPToolDefinition } from "../src/mcp/types";
 import { customToolToDefinition } from "../src/sdk";
 import { createMCPProxyTools } from "../src/task/executor";
+import { ToolAbortError } from "../src/tools/tool-errors";
 import { createMockConnection, createMockTransport } from "./mcp-test-utils";
 
 type CapturedRequest = { method: string; params: Record<string, unknown> | undefined };
@@ -148,5 +149,68 @@ describe("Task MCP proxy parity", () => {
 
 		expect(freshCalls).toHaveLength(1);
 		expect(staleCalls).toHaveLength(0);
+	});
+
+	it("normalizes structured text payloads before downstream rendering", async () => {
+		const manager = new MCPManager(process.cwd());
+		const source = {
+			name: "mcp__srv_comment",
+			label: "Comment",
+			description: "Comment",
+			parameters: STRICT_TOOL.inputSchema,
+			strict: false,
+			mcpServerName: "srv",
+			mcpToolName: "comment",
+			execute: vi.fn(async () => ({
+				content: [{ type: "text", text: { answer: "ok" } }],
+				details: {},
+			})),
+		};
+		vi.spyOn(manager, "getTools").mockReturnValue([source as never]);
+
+		const [proxy] = createMCPProxyTools(manager);
+		if (!proxy?.execute) {
+			expect.unreachable("proxy tool missing execute");
+			return;
+		}
+		const result = await proxy.execute("call-1", { body: "x" }, undefined, unusedContext, undefined);
+
+		expect(result.content).toEqual([{ type: "text", text: '{"answer":"ok"}' }]);
+	});
+
+	it("passes cancellation to the live MCP call and does not retry", async () => {
+		const manager = new MCPManager(process.cwd());
+		let receivedSignal: AbortSignal | undefined;
+		const source = {
+			name: "mcp__srv_comment",
+			label: "Comment",
+			description: "Comment",
+			parameters: STRICT_TOOL.inputSchema,
+			strict: false,
+			mcpServerName: "srv",
+			mcpToolName: "comment",
+			execute: vi.fn(
+				async (_toolCallId: string, _params: unknown, _onUpdate: unknown, _ctx: unknown, signal?: AbortSignal) => {
+					receivedSignal = signal;
+					return await new Promise<never>((_resolve, reject) => {
+						signal?.addEventListener("abort", () => reject(new ToolAbortError()), { once: true });
+					});
+				},
+			),
+		};
+		vi.spyOn(manager, "getTools").mockReturnValue([source as never]);
+
+		const [proxy] = createMCPProxyTools(manager);
+		if (!proxy?.execute) {
+			expect.unreachable("proxy tool missing execute");
+			return;
+		}
+		const controller = new AbortController();
+		const pending = proxy.execute("call-1", { body: "x" }, undefined, unusedContext, controller.signal);
+		controller.abort();
+
+		await expect(pending).rejects.toBeInstanceOf(ToolAbortError);
+		expect(receivedSignal?.aborted).toBe(true);
+		expect(source.execute).toHaveBeenCalledTimes(1);
 	});
 });

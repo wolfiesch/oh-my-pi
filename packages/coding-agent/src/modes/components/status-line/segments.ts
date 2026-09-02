@@ -813,9 +813,6 @@ const usageSegment: StatusLineSegment = {
 			});
 			return { content: withIcon(theme.icon.time, accounts.join(theme.sep.dot)), visible: true };
 		}
-		if (u.unavailable || (!u.fiveHour && !u.daily && !u.sevenDay && !u.monthly)) {
-			return { content: "", visible: false };
-		}
 		return { content: withIcon(theme.icon.time, renderUsageQuota(u, true)), visible: true };
 	},
 };

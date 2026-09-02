@@ -323,20 +323,10 @@ import {
 } from "./messages";
 import { ModelControls, type ModelControlsHost } from "./model-controls";
 import { isPrewalkPlanNudge, PrewalkCoordinator, type PrewalkCoordinatorHost } from "./prewalk";
+import { isAdvisorCard, isUserQueuedMessage } from "./queued-messages";
+import type { ServingModel } from "./retry-fallback-chains";
 import {
-	isAdvisorCard,
-	isDisplayableQueuedMessage,
-	isHiddenUserCompanion,
-	isUserQueuedMessage,
-	queueChipText,
-	toRestoredQueuedMessage,
-} from "./queued-messages";
-import {
-	formatRetryFallbackSelector,
-	type RetryFallbackSelector,
-	type ServingModel,
-} from "./retry-fallback-chains";
-import {
+	type AdvisorRuntimeStatus,
 	type AdvisorStats,
 	type AdvisorStatusOverviewEntry,
 	SessionAdvisors,
@@ -5950,11 +5940,24 @@ export class AgentSession {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
 			if (streamingBehavior === "followUp") {
-				await this.#queueUserMessage(expandedText, options?.images, "followUp", submittedAt);
+				await this.#queueUserMessage(
+					expandedText,
+					options?.images,
+					"followUp",
+					submittedAt,
+					undefined,
+					options?.messageTag,
+				);
 			} else {
-				await this.#queueUserMessage(expandedText, options?.images, "steer", submittedAt);
+				await this.#queueUserMessage(
+					expandedText,
+					options?.images,
+					"steer",
+					submittedAt,
+					undefined,
+					options?.messageTag,
+				);
 			}
-			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, options?.messageTag);
 			return true;
 		}
 
@@ -6634,9 +6637,9 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		mode: "steer" | "followUp",
-		messageTag?: string,
 		timestamp?: number,
 		preprocessed?: { images: ImageContent[] | undefined; descriptionNotice: CustomMessage | undefined },
+		messageTag?: string,
 	): Promise<void> {
 		// A queued user message (RPC/SDK/collab steer or follow-up, or a typed message
 		// while streaming) is a deliberate resume; re-enable advisor auto-resume that
@@ -8510,7 +8513,7 @@ export class AgentSession {
 			}
 		}
 
-		await beforeCommit?.();
+		await options?.beforeCommit?.();
 		this.#eval.flushPending();
 
 		this.#disconnectFromAgent();
