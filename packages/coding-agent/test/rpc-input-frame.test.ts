@@ -235,7 +235,6 @@ describe("dispatchRpcInputFrame", () => {
 
 describe("RpcInputDispatcher", () => {
 	test("control frames resolve extension UI requests while an ordinary command is active", async () => {
-		let depsRef: RpcInputFrameDeps;
 		const { deps, outputs } = makeDeps(async command => {
 			if (command.type !== "prompt") throw new Error(`unexpected command type: ${command.type}`);
 			await requestExtensionInput(depsRef, "ui-active", "Continue?");
@@ -247,7 +246,7 @@ describe("RpcInputDispatcher", () => {
 				data: { operationId: `operation-${command.id}`, accepted: true },
 			};
 		});
-		depsRef = deps;
+		const depsRef = deps;
 		const dispatcher = new RpcInputDispatcher({ deps });
 
 		dispatcher.dispatch({ id: "prompt-1", type: "prompt", message: "ask extension" });
@@ -503,7 +502,6 @@ describe("RpcInputDispatcher", () => {
 		const disconnectMessage = "RPC client disconnected before extension UI response completed";
 		const pendingExtensionRequests = new RpcPendingExtensionRequests();
 		const started: string[] = [];
-		let depsRef: RpcInputFrameDeps;
 		const { deps, outputs } = makeDeps(
 			async command => {
 				if (command.type !== "prompt") throw new Error(`unexpected command type: ${command.type}`);
@@ -519,7 +517,7 @@ describe("RpcInputDispatcher", () => {
 			},
 			{ pendingExtensionRequests },
 		);
-		depsRef = deps;
+		const depsRef = deps;
 		const dispatcher = new RpcInputDispatcher({ deps });
 
 		dispatcher.dispatch({ id: "active", type: "prompt", message: "active dialog" });

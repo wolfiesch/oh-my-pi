@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
+import { toolWireSchema } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -441,6 +442,18 @@ describe("TodoTool operations", () => {
 	});
 });
 
+describe("TodoTool provider schema", () => {
+	it("advertises items for single-phase init and append", () => {
+		expect(toolWireSchema(new TodoTool(createSession()))).toMatchObject({
+			properties: {
+				items: {
+					description: "tasks for single-phase init or append",
+				},
+			},
+		});
+	});
+});
+
 describe("TodoTool lenient init shapes", () => {
 	it("accepts a flattened init with bare items and no phase", async () => {
 		const tool = new TodoTool(createSession());
@@ -633,7 +646,12 @@ describe("todoToolRenderer.renderResult phase collapsing", () => {
 	}
 	function innerLines(component: Component): string[] {
 		const lines = Bun.stripANSI(component.render(100).join("\n")).split("\n");
-		return lines.slice(1, -1).map(line => line.replace(/^│/, "").replace(/│\s*$/, "").trim());
+		return lines.slice(1, -1).map(line =>
+			line
+				.replace(/^│/, "")
+				.replace(/│\s*$/, "")
+				.trim(),
+		);
 	}
 	it("collapses untouched phases to a one-line summary while expanding the active phase", async () => {
 		const result = await buildThreePhaseAfterDone();

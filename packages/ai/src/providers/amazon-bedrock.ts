@@ -10,7 +10,7 @@
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { mapEffortToAnthropicAdaptiveEffort, requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
-import { $flag, fetchWithRetry, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
+import { $flag, fetchWithRetry, logger, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import { resolveAwsBearerToken } from "../registry/aws";
@@ -30,7 +30,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types";
-import { normalizeSystemPrompts, normalizeToolCallId, resolveCacheRetention } from "../utils";
+import { isRecord, normalizeSystemPrompts, normalizeToolCallId, resolveCacheRetention } from "../utils";
 import { resolveAwsAmbientRegion } from "../utils/aws-profile";
 import {
 	clearStreamingPartialJson,
@@ -45,6 +45,7 @@ import { toolWireSchema } from "../utils/schema/wire";
 import { invalidateAwsCredentialCache, resolveAwsCredentials } from "./aws-credentials";
 import { decodeEventStream } from "./aws-eventstream";
 import { signRequest } from "./aws-sigv4";
+import { parseAnthropicInputTransformations, THINKING_BINDING_CONTROLS_BETA } from "./anthropic-wire";
 import { transformMessages } from "./transform-messages";
 
 /**
@@ -62,11 +63,24 @@ const BEDROCK_RESERVED_HEADERS = new Set(["content-type", "accept", "authorizati
 
 export type BedrockThinkingDisplay = "summarized" | "omitted";
 
+/** Bedrock guardrail trace verbosity, mirrors the Converse `guardrailConfig.trace` values. */
+export type BedrockGuardrailTrace = "enabled" | "disabled" | "enabled_full";
+
 export interface BedrockOptions extends StreamOptions {
 	region?: string;
 	profile?: string;
 	/** Amazon Bedrock API key sent as `Authorization: Bearer`, ahead of SigV4 credential resolution. */
 	bearerToken?: string;
+	/**
+	 * Amazon Bedrock Guardrail id or ARN. When set, the Converse request carries a
+	 * `guardrailConfig` so accounts that gate `bedrock:InvokeModel*` on the
+	 * `bedrock:GuardrailIdentifier` condition key stop returning an explicit deny.
+	 */
+	guardrailIdentifier?: string;
+	/** Guardrail version to apply. Defaults to `"DRAFT"` when a guardrail is set. */
+	guardrailVersion?: string;
+	/** Guardrail trace verbosity. Left unset (Bedrock default) unless provided. */
+	guardrailTrace?: BedrockGuardrailTrace;
 	toolChoice?: "auto" | "any" | "none" | { type: "tool"; name: string };
 	/* See https://docs.aws.amazon.com/bedrock/latest/userguide/inference-reasoning.html for supported models. */
 	reasoning?: Effort;
@@ -151,24 +165,27 @@ function regionServesGeo(region: string, geo: string): boolean {
 
 /**
  * Resolve the Bedrock runtime region for a request. An explicit per-request
- * region and an ARN-embedded region win outright. Otherwise, for a geo-prefixed
- * cross-region inference profile (`us.`/`eu.`/`apac.`/`au.`/`jp.`/`us-gov.`), an
- * ambient region (`AWS_REGION` / `AWS_DEFAULT_REGION`) is honored only when it
- * can serve the profile's geo; a mismatched or absent ambient region is
- * corrected to the geo default so an `eu.`/`apac.` profile never POSTs to a `us`
- * endpoint (and vice versa). `global.` profiles have no geo entry, so the
- * ambient region (or `us-east-1`) is used unchanged.
+ * region and an ARN-embedded model region win outright. Otherwise, for a
+ * geo-prefixed cross-region inference profile (`us.`/`eu.`/`apac.`/`au.`/`jp.`/
+ * `us-gov.`), an ambient region (`AWS_REGION` / `AWS_DEFAULT_REGION`) is
+ * honored only when it can serve the profile's geo. If the ambient region is
+ * absent or mismatched, a same-geo guardrail ARN region is used when available;
+ * otherwise the geo default is used. `global.` profiles have no geo entry, so
+ * the ambient region (or, when absent, a guardrail ARN's region or
+ * `us-east-1`) is used unchanged.
  */
 function resolveBedrockRegion(modelId: string, options: BedrockOptions): string {
 	const explicit = options.region || inferRegionFromBedrockArn(modelId);
 	if (explicit) return explicit;
 	const ambient = resolveAwsAmbientRegion(options.profile);
+	const guardrailRegion = inferRegionFromBedrockArn(options.guardrailIdentifier ?? "");
 	const geo = inferenceProfileGeo(modelId);
 	if (geo) {
 		if (ambient && regionServesGeo(ambient, geo)) return ambient;
+		if (guardrailRegion && regionServesGeo(guardrailRegion, geo)) return guardrailRegion;
 		return INFERENCE_PROFILE_GEO_DEFAULT_REGION[geo];
 	}
-	return ambient || "us-east-1";
+	return ambient || guardrailRegion || "us-east-1";
 }
 
 type Block = (TextContent | ThinkingContent | ToolCall) & {
@@ -253,12 +270,20 @@ interface BedrockToolPlan {
 	sentinelInjected: boolean;
 }
 
+interface WireGuardrailConfig {
+	guardrailIdentifier: string;
+	guardrailVersion: string;
+	trace?: BedrockGuardrailTrace;
+}
+
 interface ConverseStreamRequest {
 	messages: WireMessage[];
 	system?: SystemContent[];
 	inferenceConfig?: { maxTokens?: number; temperature?: number; topP?: number };
 	toolConfig?: WireToolConfig;
+	guardrailConfig?: WireGuardrailConfig;
 	additionalModelRequestFields?: Record<string, unknown>;
+	additionalModelResponseFieldPaths?: string[];
 }
 
 // Streaming events (snake_case matches the JSON envelope key, but Bedrock uses camelCase).
@@ -282,6 +307,7 @@ interface ContentBlockStopEvent {
 }
 interface MessageStopEvent {
 	stopReason?: string;
+	additionalModelResponseFields?: unknown;
 }
 interface MetadataEvent {
 	usage?: {
@@ -331,15 +357,27 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			const promptCachePolicy = resolvePromptCachePolicy(model, cacheRetention);
 			const convertedMessages = convertMessages(context, model, promptCachePolicy);
 			const toolPlan = planToolConfig(context.tools, options.toolChoice, convertedMessages);
-			const toolConfig = toolPlan.toolConfig;
+			let toolConfig = toolPlan.toolConfig;
 			const sentinelInjected = toolPlan.sentinelInjected;
 			let additionalModelRequestFields = buildAdditionalModelRequestFields(model, options);
+			const prefixMismatchBehavior = model.thinking?.prefixBinding
+				? (options.anthropicPrefixMismatchBehavior ?? "drop_block")
+				: undefined;
 
-			// Bedrock rejects thinking + forced tool_choice ("any" or specific tool).
-			// When tool_choice forces tool use, disable thinking to avoid API errors.
+			// Bedrock rejects thinking + forced tool_choice. Fable's adaptive
+			// thinking cannot be disabled, so downgrade its forced choice instead.
 			if (toolConfig?.toolChoice && additionalModelRequestFields) {
 				const tc = toolConfig.toolChoice;
-				if (tc.any || tc.tool) additionalModelRequestFields = undefined;
+				if (tc.any || tc.tool) {
+					if (prefixMismatchBehavior) toolConfig = { ...toolConfig, toolChoice: { auto: {} } };
+					else additionalModelRequestFields = undefined;
+				}
+			}
+			if (prefixMismatchBehavior) {
+				additionalModelRequestFields = applyBedrockThinkingBinding(
+					additionalModelRequestFields,
+					prefixMismatchBehavior,
+				);
 			}
 
 			let commandInput: ConverseStreamRequest = {
@@ -351,7 +389,9 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					topP: options.topP,
 				},
 				toolConfig,
+				guardrailConfig: buildGuardrailConfig(options),
 				additionalModelRequestFields,
+				...(prefixMismatchBehavior ? { additionalModelResponseFieldPaths: ["/input_transformations"] } : {}),
 			};
 			const replacementInput = await options?.onPayload?.(commandInput, model);
 			if (replacementInput !== undefined) commandInput = replacementInput as ConverseStreamRequest;
@@ -522,12 +562,33 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					}
 					case "messageStop": {
 						const ev = payload as MessageStopEvent;
+						const responseFields = isRecord(ev.additionalModelResponseFields)
+							? ev.additionalModelResponseFields
+							: undefined;
+						const transformations = parseAnthropicInputTransformations(responseFields?.input_transformations);
+						if (transformations.length > 0) {
+							output.inputTransformations = transformations;
+							for (const transformation of transformations) {
+								if (transformation.reason !== "prefix_binding_mismatch") continue;
+								logger.warn("bedrock: dropped thinking block after conversation prefix changed", {
+									model: model.id,
+									path: transformation.path,
+								});
+							}
+						}
 						// A sentinel-only request must never surface a tool-use stop:
 						// no real tool exists for the agent to dispatch.
 						output.stopReason =
 							sentinelInjected && ev.stopReason === "tool_use" ? "stop" : mapStopReason(ev.stopReason);
 						if (output.stopReason === "error") {
-							output.errorMessage = `Generation failed with stop reason: ${ev.stopReason ?? "unknown"}`;
+							// A guardrail block ends the turn with `guardrail_intervened` and often no
+							// content — surface it explicitly so it never reads as an empty completion.
+							output.errorMessage =
+								ev.stopReason === "guardrail_intervened"
+									? `Response blocked by Amazon Bedrock guardrail (stop reason: ${ev.stopReason}).`
+									: ev.stopReason === "content_filtered"
+										? `Response filtered by Amazon Bedrock content filters (stop reason: ${ev.stopReason}).`
+										: `Generation failed with stop reason: ${ev.stopReason ?? "unknown"}`;
 						}
 						break;
 					}
@@ -768,6 +829,8 @@ function resolvePromptCachePolicy(
 	}
 
 	return {
+		// This emitter has only two placement sites (final user and system); the
+		// provider's wire-level maximum remains authoritative in catalog compat.
 		remainingCheckpoints: Math.min(configuredMaximum, 2),
 		...(cacheRetention === "long" && model.compat.supportsLongPromptCacheRetention ? { ttl: "1h" } : {}),
 	};
@@ -856,8 +919,8 @@ function convertMessages(
 							});
 							break;
 						case "thinking":
-							// Skip empty thinking blocks
-							if (c.thinking.trim().length === 0) continue;
+							// Hidden thinking has empty display text but a load-bearing signature.
+							if (c.thinking.trim().length === 0 && !c.thinkingSignature) continue;
 							// A captured signature is authoritative even when the model id is an opaque ARN:
 							// only a model that itself streamed a signature (Claude) can have one, so replay
 							// it as signed reasoningContent regardless of how the id is spelled.
@@ -1018,6 +1081,39 @@ function mapStopReason(reason: string | undefined): StopReason {
 	}
 }
 
+/**
+ * Build the Converse `guardrailConfig` block when a guardrail identifier is set.
+ * The version defaults to `"DRAFT"` (Bedrock's editable working draft) and the
+ * trace is passed through untouched — leaving it undefined keeps Bedrock's own
+ * default rather than forcing a value.
+ */
+function buildGuardrailConfig(options: BedrockOptions): WireGuardrailConfig | undefined {
+	if (!options.guardrailIdentifier) return undefined;
+	return {
+		guardrailIdentifier: options.guardrailIdentifier,
+		guardrailVersion: options.guardrailVersion ?? "DRAFT",
+		...(options.guardrailTrace === undefined ? {} : { trace: options.guardrailTrace }),
+	};
+}
+
+function applyBedrockThinkingBinding(
+	fields: Record<string, unknown> | undefined,
+	behavior: "drop_block" | "error",
+): Record<string, unknown> {
+	const result = { ...fields };
+	const thinking: Record<string, unknown> = isRecord(result.thinking) ? { ...result.thinking } : { type: "adaptive" };
+	thinking.block_binding = { prefix_mismatch_behavior: behavior };
+	result.thinking = thinking;
+	const betas = Array.isArray(result.anthropic_beta)
+		? result.anthropic_beta.filter((beta): beta is string => typeof beta === "string")
+		: [];
+	if (!betas.includes(THINKING_BINDING_CONTROLS_BETA)) {
+		betas.push(THINKING_BINDING_CONTROLS_BETA);
+	}
+	result.anthropic_beta = betas;
+	return result;
+}
+
 function buildAdditionalModelRequestFields(
 	model: Model<"bedrock-converse-stream">,
 	options: BedrockOptions,
@@ -1041,6 +1137,15 @@ function buildAdditionalModelRequestFields(
 			thinking: adaptive,
 			output_config: { effort },
 		};
+	}
+
+	if (mode === "effort") {
+		// OpenAI-schema models on Bedrock (the GPT-5.x SKUs) reject the
+		// Anthropic budget block with `unknown_parameter: 'thinking'` and take
+		// `reasoning.effort` instead — same effort vocabulary the catalog
+		// already bakes (low/medium/high/xhigh/max).
+		const level = requireSupportedEffort(model, reasoning);
+		return { reasoning: { effort: model.thinking?.effortMap?.[level] ?? level } };
 	}
 
 	const level = requireSupportedEffort(model, reasoning);

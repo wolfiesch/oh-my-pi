@@ -37,12 +37,11 @@ export async function abortableOAuthSleep(ms: number, signal: AbortSignal | unde
 	}
 
 	const { promise, resolve, reject } = Promise.withResolvers<void>();
-	let timer: Timer | undefined;
 	const onAbort = () => {
 		clearTimeout(timer);
 		reject(new AIError.LoginCancelledError(DEVICE_FLOW_CANCEL_MESSAGE));
 	};
-	timer = setTimeout(() => {
+	const timer = setTimeout(() => {
 		signal.removeEventListener("abort", onAbort);
 		resolve();
 	}, ms);

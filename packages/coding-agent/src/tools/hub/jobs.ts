@@ -129,15 +129,43 @@ interface TrackedJobLike {
 }
 
 export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobSnapshot[] {
-	const manager = session.asyncJobManager;
-	if (!manager) return [];
-	const current = jobs.map(job => manager.getJob(job.id)).filter((job): job is AsyncJob => job !== undefined);
-	return new JobProjectionService({
-		manager,
-		ownerId: session.getAgentId?.() ?? undefined,
-		registry: session.agentRegistry,
-		lifecycle: session.agentLifecycle?.(),
-	}).project(current);
+	const now = Date.now();
+	return jobs.map(j => {
+		const current = session.asyncJobManager?.getJob(j.id);
+		const latest = current ?? j;
+		const resultConsumed = session.asyncJobManager?.isJobResultConsumed(latest.id) === true;
+		let resolvedModel: string | undefined;
+		if (latest.type === "task") {
+			const progressValue = latest.latestDetails?.progress;
+			if (Array.isArray(progressValue)) {
+				let progressRecord: Record<string, unknown> | undefined;
+				for (const item of progressValue) {
+					if (!item || typeof item !== "object") continue;
+					const candidate = item as Record<string, unknown>;
+					if (!progressRecord) progressRecord = candidate;
+					if (candidate.id === latest.id) {
+						progressRecord = candidate;
+						break;
+					}
+				}
+				const modelValue = progressRecord?.resolvedModel;
+				if (typeof modelValue === "string") {
+					const trimmed = modelValue.trim();
+					if (trimmed) resolvedModel = trimmed;
+				}
+			}
+		}
+		return {
+			id: latest.id,
+			type: latest.type,
+			status: latest.status as JobSnapshot["status"],
+			label: latest.label,
+			durationMs: Math.max(0, now - latest.startTime),
+			...(resolvedModel ? { resolvedModel } : {}),
+			...(!resultConsumed && latest.resultText ? { resultText: latest.resultText } : {}),
+			...(!resultConsumed && latest.errorText ? { errorText: latest.errorText } : {}),
+		};
+	});
 }
 
 export function buildJobResult(
@@ -156,8 +184,9 @@ export function buildJobResult(
 		return true;
 	});
 	const jobResults = snapshotJobs(session, uniqueJobs);
+	const alreadyConsumed = new Set(jobResults.filter(job => manager.isJobResultConsumed(job.id)).map(job => job.id));
 
-	manager.acknowledgeDeliveries(jobResults.filter(j => j.status !== "running").map(j => j.id));
+	manager.consumeJobResults(jobResults.filter(j => j.status !== "running").map(j => j.id));
 
 	const completed = jobResults.filter(j => j.status !== "running");
 	const running = jobResults.filter(j => j.status === "running");
@@ -175,6 +204,13 @@ export function buildJobResult(
 		for (const j of completed) {
 			lines.push(`### ${j.id} [${j.type}] — ${j.status}`);
 			lines.push(`Label: ${j.label}`);
+			if (j.status !== "cancelled") {
+				lines.push(
+					alreadyConsumed.has(j.id)
+						? "Delivery: already delivered or recovered."
+						: "Delivery: not auto-delivered; recovered by this snapshot.",
+				);
+			}
 			if (j.resultText) {
 				lines.push("```", j.resultText, "```");
 			}

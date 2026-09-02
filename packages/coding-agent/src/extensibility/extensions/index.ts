@@ -5,6 +5,7 @@
 export type { SlashCommandInfo, SlashCommandLocation, SlashCommandSource } from "../slash-commands";
 export * from "./inline-path";
 export {
+	bindPreparedExtensions,
 	discoverAndLoadExtensions,
 	discoverExtensionPaths,
 	ExtensionRuntimeNotInitializedError,

@@ -147,6 +147,13 @@ const CONDITIONS: Record<string, (settings?: Settings) => boolean> = {
 			return false;
 		}
 	},
+	unexpectedStopSmart: () => {
+		try {
+			return Settings.instance.get("features.unexpectedStopDetection") === "smart";
+		} catch {
+			return false;
+		}
+	},
 };
 
 /**
