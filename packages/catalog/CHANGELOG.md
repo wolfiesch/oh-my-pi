@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Updated the Codex compatibility version so newly released models no longer reject requests as an outdated client.
 - Claude Sonnet 5 no longer advertises unsupported mid-conversation system messages.
 
 ## [18.1.2] - 2026-09-01
