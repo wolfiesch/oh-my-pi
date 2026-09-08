@@ -9,7 +9,13 @@ import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 } from "@oh-my-pi/pi-agent-core";
-import type { CredentialDisabledEvent, ImageContent, Model, ProviderResponseMetadata } from "@oh-my-pi/pi-ai";
+import {
+	validateToolArguments,
+	type CredentialDisabledEvent,
+	type ImageContent,
+	type Model,
+	type ProviderResponseMetadata,
+} from "@oh-my-pi/pi-ai";
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../../config/model-registry";
@@ -20,6 +26,7 @@ import { type Theme, theme } from "../../modes/theme/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
+import { ToolError, throwIfAborted } from "../../tools/tool-errors";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
@@ -74,6 +81,23 @@ import type {
 	UserPythonEvent,
 	UserPythonEventResult,
 } from "./types";
+
+type NativeToolResolution = {
+	tool: AgentTool;
+	makeContext: () => AgentToolContext;
+};
+
+type NativeReadToolName = "read" | "grep" | "glob";
+
+const NATIVE_READ_TOOL_NAMES: Record<NativeReadToolName, true> = {
+	read: true,
+	grep: true,
+	glob: true,
+};
+
+function isNativeReadToolName(name: string): name is NativeReadToolName {
+	return name in NATIVE_READ_TOOL_NAMES;
+}
 
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
@@ -542,13 +566,20 @@ export class ExtensionRunner {
 	 * `invokeTool`. The context factory is the same one the agent loop uses for tool execution, so a
 	 * delegated native call sees the ordinary session tool context (ui, cwd, snapshot state, etc.).
 	 */
-	#nativeToolResolver?: (name: string) => { tool: AgentTool; makeContext: () => AgentToolContext } | undefined;
+	#nativeToolResolver?: (name: string) => NativeToolResolution | undefined;
+	#nativeReadToolResolver?: (name: NativeReadToolName) => NativeToolResolution | undefined;
 
 	/** Wires the native-tool resolver used by {@link invokeNativeTool}. */
-	setNativeToolResolver(
-		resolve: (name: string) => { tool: AgentTool; makeContext: () => AgentToolContext } | undefined,
-	): void {
+	setNativeToolResolver(resolve: (name: string) => NativeToolResolution | undefined): void {
 		this.#nativeToolResolver = resolve;
+	}
+
+	/**
+	 * Wires the approval-gated native read-tool resolver used by {@link invokeReadTool}. Its targets
+	 * must already be wrapped with the normal {@link ExtensionToolWrapper} gate.
+	 */
+	setNativeReadToolResolver(resolve: (name: NativeReadToolName) => NativeToolResolution | undefined): void {
+		this.#nativeReadToolResolver = resolve;
 	}
 
 	/** Whether a native built-in of `name` is available to delegate to. */
@@ -593,6 +624,56 @@ export class ExtensionRunner {
 			options?.signal,
 			options?.onUpdate as never,
 			options?.callerContext ?? resolved.makeContext(),
+		)) as AgentToolResult<TDetails>;
+	}
+
+	/** Whether a native read target is currently enabled for the session. */
+	hasNativeReadTool(name: NativeReadToolName): boolean {
+		return this.#nativeReadToolResolver?.(name) !== undefined;
+	}
+
+	/**
+	 * Delegate a read-approved registered extension tool to an enabled native `read`, `grep`, or
+	 * `glob` target. This deliberately resolves a wrapper, not the unwrapped same-tool resolver:
+	 * cross-tool delegation has no inherited approval grant, so the target must validate, emit hooks,
+	 * and run its own approval policy. The fresh target context keeps session state and snapshot stores
+	 * while excluding unrelated caller metadata such as `providerSafetyApproved`.
+	 */
+	async invokeReadTool<TDetails = unknown>(
+		name: string,
+		params: Record<string, unknown>,
+		options?: { signal?: AbortSignal; onUpdate?: AgentToolUpdateCallback<TDetails> },
+	): Promise<AgentToolResult<TDetails>> {
+		if (!isNativeReadToolName(name)) {
+			throw new ToolError(`invokeReadTool only permits native read, grep, or glob; received "${name}".`);
+		}
+		const resolved = this.#nativeReadToolResolver?.(name);
+		if (!resolved) {
+			throw new ToolError(
+				`invokeReadTool: native "${name}" is unavailable in this session. Use the active native search tools instead.`,
+			);
+		}
+
+		const toolCallId = `invoke-read-${name}-${Date.now().toString(36)}`;
+		let validatedParams: Record<string, unknown>;
+		try {
+			validatedParams = validateToolArguments(resolved.tool, {
+				type: "toolCall",
+				id: toolCallId,
+				name,
+				arguments: params,
+			});
+		} catch (error) {
+			throw new ToolError(
+				`Invalid args for invokeReadTool "${name}": ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		return (await resolved.tool.execute(
+			toolCallId,
+			validatedParams as never,
+			options?.signal,
+			options?.onUpdate as never,
+			resolved.makeContext(),
 		)) as AgentToolResult<TDetails>;
 	}
 
@@ -1148,13 +1229,10 @@ export class ExtensionRunner {
 	/**
 	 * Creates an extension context, optionally scoped to a provider request model.
 	 *
-	 * `delegation` wires the same-tool `ctx.invokeTool` for a re-registered built-in: when `toolName`
-	 * names an existing native built-in, the context carries an `invokeTool` that runs it (see
-	 * {@link invokeNativeTool}). The rest inherits the wrapper's own call so a bare
-	 * `ctx.invokeTool(params)` behaves like the outer call — `context` preserves `toolCall`/provider
-	 * metadata, `signal`/`onUpdate` default to the wrapper's own channels so aborting the outer tool
-	 * call stops the native one and native progress still streams, and `depth` bounds recursion per
-	 * call chain. Explicit options passed to `invokeTool` override the inherited `signal`/`onUpdate`.
+	 * `delegation` wires the same-tool `ctx.invokeTool` for a re-registered built-in and
+	 * `ctx.invokeReadTool` for a registered tool that resolved to the read tier. Same-tool calls reuse
+	 * the caller's context because that approval already belongs to the original call. Read delegation
+	 * instead creates a fresh target context and re-runs the target's normal wrapper gate.
 	 */
 	createContext(
 		model?: Model,
@@ -1164,6 +1242,8 @@ export class ExtensionRunner {
 			context?: AgentToolContext;
 			signal?: AbortSignal;
 			onUpdate?: AgentToolUpdateCallback;
+			readApproved?: boolean;
+			readInvocationSignal?: AbortSignal;
 		},
 	): ExtensionContext {
 		const getModel = model ? () => model : this.#getModel;
@@ -1203,6 +1283,21 @@ export class ExtensionRunner {
 								depth: (delegation.depth ?? 0) + 1,
 								callerContext: delegation.context,
 							})
+					: undefined,
+			invokeReadTool:
+				delegation?.readApproved === true &&
+				(this.hasNativeReadTool("read") || this.hasNativeReadTool("grep") || this.hasNativeReadTool("glob"))
+					? async (name, params, options) => {
+							throwIfAborted(delegation.readInvocationSignal);
+							const signals = [delegation.readInvocationSignal, delegation.signal, options?.signal].filter(
+								(signal): signal is AbortSignal => signal !== undefined,
+							);
+							const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+							return this.invokeReadTool(name, params, {
+								signal,
+								onUpdate: options?.onUpdate ?? delegation.onUpdate,
+							});
+						}
 					: undefined,
 		};
 	}

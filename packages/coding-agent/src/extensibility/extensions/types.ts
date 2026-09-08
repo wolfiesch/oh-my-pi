@@ -522,6 +522,20 @@ export interface ExtensionContext {
 		params: Record<string, unknown>,
 		options?: { signal?: AbortSignal; onUpdate?: AgentToolUpdateCallback<TDetails> },
 	): Promise<AgentToolResult<TDetails>>;
+	/**
+	 * Run one native repository-reading tool through its normal availability, validation, extension-hook,
+	 * and approval path. Available only to an executing registered tool whose current approval tier is
+	 * `"read"`; it is absent from lifecycle and command contexts.
+	 *
+	 * Unlike {@link invokeTool}, this is not same-tool delegation and never inherits the caller's
+	 * provider-safety acknowledgement or tool-call metadata. It only permits `read`, `grep`, and `glob`,
+	 * whose native implementations own snapshot and seen-line recording.
+	 */
+	invokeReadTool?<TDetails = unknown>(
+		name: "read" | "grep" | "glob",
+		params: Record<string, unknown>,
+		options?: { signal?: AbortSignal; onUpdate?: AgentToolUpdateCallback<TDetails> },
+	): Promise<AgentToolResult<TDetails>>;
 
 	/**
 	 * Whether project-local inputs for the current working directory (extensions, settings,

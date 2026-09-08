@@ -2875,6 +2875,22 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		for (const tool of toolRegistry.values()) {
 			toolRegistry.set(tool.name, new ExtensionToolWrapper(tool, extensionRunner));
 		}
+		// `ctx.invokeReadTool` is intentionally separate from same-tool `ctx.invokeTool`: it may cross
+		// from an extension tool into only the native repository readers, so it must enter a fresh
+		// `ExtensionToolWrapper` and re-run target validation, hooks, and approval. Keep the unwrapped
+		// native instances here so `read` remains the sole snapshot/seen-line owner even if an extension
+		// re-registers a same-named tool in the visible registry.
+		const nativeReadToolsByName = new Map<string, Tool>();
+		for (const name of ["read", "grep", "glob"] as const) {
+			const nativeTool = nativeToolsByName.get(name);
+			if (nativeTool) nativeReadToolsByName.set(name, new ExtensionToolWrapper(nativeTool, extensionRunner));
+		}
+		extensionRunner.setNativeReadToolResolver(name => {
+			const tool = nativeReadToolsByName.get(name);
+			const available =
+				toolSession.isToolActive?.(name) === true || toolSession.xdev?.mountedNames.has(name) === true;
+			return tool && available ? { tool, makeContext: () => toolContextStore.getContext() } : undefined;
+		});
 		// Hashline `edit` stays in the registry so Cursor can call it as MCP.
 		// Native StrReplace arrives as `editToolCall` and materializes through
 		// exec `readArgs`/`writeArgs`; `pi_edit` still needs a `replace`-mode

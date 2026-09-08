@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added execution-scoped `ctx.invokeReadTool` for read-tier extensions to call native `read`, `grep`, and `glob` with their normal approval gates, cancellation, and session-owned edit snapshots.
 - Added optional `statusLine.secondaryLeftSegments` and `statusLine.secondaryRightSegments` rows, so dense custom status layouts can keep active-model quota visible without crowding the editor border. The `usage` segment now renders compact quota bars for every account under the active provider, marks the account used by the current session, supports daily provider windows, scopes shared Antigravity and Codex reports to the active model family, and explains when quota reporting is unavailable.
 - Added server-owned RPC operation lifecycles with accepted/started timing, exactly-once completed, failed, or cancelled outcomes, targeted idempotent cancellation, and bounded operation snapshots for reconciliation.
 - Added an authoritative RPC `get_state.activityPhase` (`provider`, `maintenance`, or `idle`) so hosts can distinguish provider completion from post-turn maintenance and terminal idle without changing legacy `isStreaming` semantics.

@@ -418,6 +418,33 @@ pi.registerTool({
 
 `tool_call`/`tool_result` intercept all tools once the registry is wrapped in `sdk.ts`, including built-ins and extension/custom tools. `ToolDefinition` also supports optional `hidden`, `defaultInactive`, `loadMode` (`"discoverable"` by default, or `"essential"`), `deferrable`, `approval` (`"exec"` by default), `strict`, `mcpServerName`, `mcpToolName`, `renderCall`, and `renderResult` fields.
 
+### Calling native read tools (`ctx.invokeReadTool`)
+
+An executing extension tool whose current approval tier is `read` can call native `read`, `grep`,
+or `glob` without replacing their registrations:
+
+```ts
+ctx.invokeReadTool?<TDetails>(
+  name: "read" | "grep" | "glob",
+  params: Record<string, unknown>,
+  options?: { signal?: AbortSignal; onUpdate?: AgentToolUpdateCallback<TDetails> },
+): Promise<AgentToolResult<TDetails>>
+```
+
+Pass the native tool's own arguments. For example, `read` accepts `{ path: "src/file.ts:10-20" }`.
+The bridge validates arguments, requires an enabled native target, and runs that target's normal
+approval and extension hooks. It uses the live session's native tool context, so read results retain
+genuine edit snapshots and seen-line provenance. Caller provider-safety acknowledgements do not carry
+over to the target.
+
+The capability exists only during the extension tool's execution. Await delegated calls before
+returning; retained calls are rejected and outstanding calls are aborted when execution finishes.
+Caller cancellation remains effective even when an explicit signal is supplied. Progress uses the
+caller's callback unless explicitly replaced. Event handlers and commands do not receive this API.
+
+Feature-detect the method on older hosts. This API does not change same-name `ctx.invokeTool`
+delegation or make fuzzy search results equivalent to native exact searches.
+
 ### File write fallback (`registerFileWriteFallback`)
 
 `write`, `edit` and `apply_patch` perform the real byte-write to an ordinary file

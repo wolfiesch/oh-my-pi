@@ -17,6 +17,7 @@ import {
 	denyError,
 	formatApprovalPrompt,
 	resolveApproval,
+	resolveToolTier,
 	truncateForPrompt,
 } from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
@@ -79,18 +80,32 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 		// call, so a bare `ctx.invokeTool(params)` keeps the caller's `toolCall`/provider metadata
 		// (write/edit LSP batching, computer safety acknowledgement), stops when the outer call is
 		// aborted, and still streams native progress.
-		return this.registeredTool.definition.execute(
-			toolCallId,
-			params,
-			signal,
-			onUpdate,
-			this.runner.createContext(undefined, {
-				toolName: this.registeredTool.definition.name,
-				context,
+		//
+		// `invokeReadTool` is a cross-tool capability, so confine it to this one read-approved
+		// execution. Extension code can retain `ctx` after returning or start background work without
+		// awaiting it; aborting this signal in `finally` both rejects those retained calls and stops
+		// nested native reads that are still running. Same-tool delegation deliberately has no such
+		// capability because it is governed by the wrapper call's ordinary lifetime and approval.
+		const readApproved = resolveToolTier(this.registeredTool.definition, params) === "read";
+		const readInvocation = readApproved ? new AbortController() : undefined;
+		try {
+			return await this.registeredTool.definition.execute(
+				toolCallId,
+				params,
 				signal,
 				onUpdate,
-			}),
-		);
+				this.runner.createContext(undefined, {
+					toolName: this.registeredTool.definition.name,
+					context,
+					signal,
+					onUpdate,
+					readApproved,
+					readInvocationSignal: readInvocation?.signal,
+				}),
+			);
+		} finally {
+			readInvocation?.abort();
+		}
 	}
 }
 

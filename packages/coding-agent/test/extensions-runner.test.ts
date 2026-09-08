@@ -11,6 +11,7 @@ import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { canonicalSnapshotKey, getFileSnapshotStore } from "@oh-my-pi/pi-coding-agent/edit/file-snapshot-store";
 import { ExtensionRuntime, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
@@ -21,16 +22,23 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type {
 	Extension,
+	ExtensionContext,
 	ExtensionError,
 	ExtensionServiceTier,
 	ExtensionUIContext,
 	InputEvent,
 	InputEventResult,
 	ProviderModelConfig,
+	RegisteredTool,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
+import {
+	ExtensionToolWrapper,
+	RegisteredToolAdapter,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 
 describe("ExtensionRunner", () => {
@@ -3806,6 +3814,251 @@ describe("ExtensionRunner", () => {
 			} finally {
 				vi.useRealTimers();
 			}
+		});
+	});
+
+	describe("invokeReadTool native delegation", () => {
+		function nativeReadProbe(seen: {
+			context?: unknown;
+			onUpdate?: unknown;
+			params?: unknown;
+			signal?: AbortSignal;
+		}): AgentTool {
+			return {
+				name: "read",
+				label: "Read",
+				description: "native read",
+				parameters: Type.Object({ path: Type.String() }),
+				execute: async (
+					_id: string,
+					params: unknown,
+					signal?: AbortSignal,
+					onUpdate?: unknown,
+					context?: unknown,
+				) => {
+					seen.params = params;
+					seen.signal = signal;
+					seen.onUpdate = onUpdate;
+					seen.context = context;
+					return { content: [{ type: "text", text: "native read" }], details: {} };
+				},
+			} as AgentTool;
+		}
+
+		const runnerWithReadNative = async (
+			native: AgentTool,
+			available: boolean = true,
+			context: unknown = { fresh: true },
+		) => {
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.setNativeReadToolResolver(name =>
+				name === native.name && available ? { tool: native, makeContext: () => context as never } : undefined,
+			);
+			return runner;
+		};
+
+		it("exposes only to read-approved callers and preserves the target allowlist and availability", async () => {
+			const runner = await runnerWithReadNative(nativeReadProbe({}));
+			expect(
+				runner.createContext(undefined, { toolName: "fff_search", readApproved: false }).invokeReadTool,
+			).toBeUndefined();
+
+			const ctx = runner.createContext(undefined, { toolName: "fff_search", readApproved: true });
+			expect(ctx.invokeReadTool).toBeDefined();
+			await expect(runner.invokeReadTool("bash", {})).rejects.toThrow(/only permits native read, grep, or glob/);
+			await expect(ctx.invokeReadTool?.("grep", { pattern: "needle" })).rejects.toThrow(
+				/native "grep" is unavailable/,
+			);
+		});
+
+		it("validates arguments before executing the native target", async () => {
+			const seen: { params?: unknown } = {};
+			const runner = await runnerWithReadNative(nativeReadProbe(seen));
+			const ctx = runner.createContext(undefined, { toolName: "fff_search", readApproved: true });
+
+			await expect(ctx.invokeReadTool?.("read", { unexpected: true })).rejects.toThrow(
+				/Invalid args for invokeReadTool "read"/,
+			);
+			expect(seen.params).toBeUndefined();
+		});
+
+		it("inherits outer abort and update channels while creating a fresh target context", async () => {
+			const seen: { context?: unknown; onUpdate?: unknown; signal?: AbortSignal } = {};
+			const targetContext = { fresh: true };
+			const runner = await runnerWithReadNative(nativeReadProbe(seen), true, targetContext);
+			const outer = new AbortController();
+			const onUpdate = () => {};
+			const ctx = runner.createContext(undefined, {
+				toolName: "fff_search",
+				readApproved: true,
+				context: { providerSafetyApproved: true } as never,
+				signal: outer.signal,
+				onUpdate,
+			});
+
+			await ctx.invokeReadTool?.("read", { path: "src/example.ts:2-4" });
+
+			expect(seen.signal).toBe(outer.signal);
+			expect(seen.onUpdate).toBe(onUpdate);
+			expect(seen.context).toBe(targetContext);
+			outer.abort();
+			expect(seen.signal?.aborted).toBe(true);
+		});
+
+		it("composes an explicit signal with the outer abort while allowing an explicit update callback", async () => {
+			const seen: { onUpdate?: unknown; signal?: AbortSignal } = {};
+			const runner = await runnerWithReadNative(nativeReadProbe(seen));
+			const outer = new AbortController();
+			const explicit = new AbortController();
+			const explicitOnUpdate = () => {};
+			const ctx = runner.createContext(undefined, {
+				toolName: "fff_search",
+				readApproved: true,
+				signal: outer.signal,
+				onUpdate: () => {},
+			});
+
+			await ctx.invokeReadTool?.(
+				"read",
+				{ path: "src/example.ts:2-4" },
+				{ signal: explicit.signal, onUpdate: explicitOnUpdate },
+			);
+
+			expect(seen.signal).not.toBe(outer.signal);
+			expect(seen.signal).not.toBe(explicit.signal);
+			expect(seen.onUpdate).toBe(explicitOnUpdate);
+			outer.abort();
+			expect(seen.signal?.aborted).toBe(true);
+		});
+		it("revokes a captured read delegation context after the registered tool returns", async () => {
+			const runner = await runnerWithReadNative(nativeReadProbe({}));
+			let captured: ExtensionContext | undefined;
+			const adapter = new RegisteredToolAdapter(
+				{
+					extensionPath: "fff.test.ts",
+					definition: {
+						name: "fff_search",
+						label: "FFF search",
+						description: "search",
+						parameters: Type.Object({}),
+						approval: "read",
+						execute: async (_id, _params, _signal, _onUpdate, ctx) => {
+							captured = ctx;
+							return { content: [{ type: "text", text: "done" }], details: {} };
+						},
+					},
+				} satisfies RegisteredTool,
+				runner,
+			);
+
+			await adapter.execute("outer", {});
+
+			await expect(captured?.invokeReadTool?.("read", { path: "src/example.ts" })).rejects.toThrow(
+				/Operation aborted/,
+			);
+		});
+
+		it("aborts an unawaited nested native read when the registered tool returns", async () => {
+			const nestedAbort = Promise.withResolvers<void>();
+			const nativeResult = Promise.withResolvers<never>();
+			const native: AgentTool = {
+				name: "read",
+				label: "Read",
+				description: "native read",
+				parameters: Type.Object({ path: Type.String() }),
+				execute: async (_id, _params, signal) => {
+					signal?.addEventListener(
+						"abort",
+						() => {
+							nestedAbort.resolve();
+							nativeResult.reject(new Error("nested read aborted"));
+						},
+						{ once: true },
+					);
+					return await nativeResult.promise;
+				},
+			};
+			const runner = await runnerWithReadNative(native);
+			const adapter = new RegisteredToolAdapter(
+				{
+					extensionPath: "fff.test.ts",
+					definition: {
+						name: "fff_search",
+						label: "FFF search",
+						description: "search",
+						parameters: Type.Object({}),
+						approval: "read",
+						execute: async (_id, _params, _signal, _onUpdate, ctx) => {
+							void ctx.invokeReadTool?.("read", { path: "src/example.ts" }).catch(() => {});
+							return { content: [{ type: "text", text: "done" }], details: {} };
+						},
+					},
+				} satisfies RegisteredTool,
+				runner,
+			);
+
+			await adapter.execute("outer", {});
+			await nestedAbort.promise;
+		});
+
+		it("keeps a native target's exact denial", async () => {
+			const native = nativeReadProbe({});
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const settings = Settings.isolated({ "tools.approval": { read: "deny" } });
+			runner.setNativeReadToolResolver(name =>
+				name === "read"
+					? {
+							tool: new ExtensionToolWrapper(native, runner),
+							makeContext: () => ({ settings }) as never,
+						}
+					: undefined,
+			);
+			const ctx = runner.createContext(undefined, { toolName: "fff_search", readApproved: true });
+
+			await expect(ctx.invokeReadTool?.("read", { path: "src/example.ts" })).rejects.toThrow(
+				'Tool "read" is blocked by user policy.',
+			);
+		});
+
+		it("uses native read as the session snapshot owner", async () => {
+			const filePath = path.join(tempDir.path(), "anchored.ts");
+			fs.writeFileSync(filePath, "export const anchored = true;\n");
+			const readSession = {
+				cwd: tempDir.path(),
+				hasUI: false,
+				getSessionFile: () => path.join(tempDir.path(), "session.jsonl"),
+				getSessionSpawns: () => "*",
+				getArtifactsDir: () => path.join(tempDir.path(), "artifacts"),
+				allocateOutputArtifact: async () => ({
+					id: "artifact-1",
+					path: path.join(tempDir.path(), "artifact-1.log"),
+				}),
+				settings: Settings.isolated({ "read.summarize.enabled": false }),
+				enableLsp: false,
+			} as ToolSession;
+			const nativeRead = new ReadTool(readSession);
+			const runner = await runnerWithReadNative(nativeRead as AgentTool);
+			const ctx = runner.createContext(undefined, { toolName: "fff_search", readApproved: true });
+
+			const result = await ctx.invokeReadTool?.("read", { path: `${filePath}:1-1` });
+			const text = result?.content.find(block => block.type === "text");
+			const match = text?.type === "text" ? /^\[[^#\r\n]+#([0-9A-F]{4})\]$/m.exec(text.text) : null;
+			expect(match).not.toBeNull();
+			expect(getFileSnapshotStore(readSession).byHash(canonicalSnapshotKey(filePath), match![1]!)).not.toBeNull();
 		});
 	});
 
