@@ -342,7 +342,7 @@ export interface OpenAICompat {
 	/** Extra fields to include in request body (e.g. gateway routing hints for OpenClaw-style proxies). */
 	extraBody?: Record<string, unknown>;
 	/** Request-session header that should mirror the normalized prompt-cache key. Default: unset. */
-	promptCacheSessionHeader?: "x-grok-conv-id";
+	promptCacheSessionHeader?: "x-grok-conv-id" | "x-opencode-session";
 	/** Whether chat-completions payloads should include provider-specific prompt-cache markers. */
 	cacheControlFormat?: "anthropic" | undefined;
 	/**
@@ -459,6 +459,12 @@ export interface OpenAICompat {
 export interface AnthropicCompat {
 	/** Whether thinking requests may include `context_management` and its beta header. Default: true. */
 	supportsContextManagement?: boolean;
+	/**
+	 * Request-session header that should mirror the normalized prompt-cache key.
+	 * Default: unset. A gateway that routes on a session header (Console Go's
+	 * `x-opencode-session`) needs it on the Anthropic-compatible route too.
+	 */
+	promptCacheSessionHeader?: "x-grok-conv-id" | "x-opencode-session";
 	/**
 	 * Whether requests may carry `output_config.effort` (and its effort beta
 	 * header). Vertex AI rejects the field/header. Default: true.
@@ -720,6 +726,8 @@ export interface ResolvedOpenAISharedCompat {
 	thinkingLoopGuard?: OpenAICompat["thinkingLoopGuard"];
 	/** Flatten/reject leftover root `anyOf`/`oneOf` unions in strict tool schemas (xAI's function-calling validator 400s on them). */
 	rejectRootObjectUnion: boolean;
+	/** Promote a pure union tool root to `type: "object"` (Console Go rejects any function whose parameter schema root is not an object). */
+	objectRootToolSchemas: boolean;
 	/** Retry without strict tools when the host rejects a strict grammar as too large (OpenRouter-Anthropic compiled-grammar overflow). */
 	retryWithoutStrictOnGrammarError: boolean;
 }
@@ -853,9 +861,13 @@ export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompa
 export type ResolvedOpenRouterCompat = ResolvedOpenAICompat & ResolvedOpenAIResponsesCompat;
 
 /** Fully-resolved anthropic-messages compat view (same contract as `ResolvedOpenAICompat`). */
-export type ResolvedAnthropicCompat = Required<Omit<AnthropicCompat, "streamIdleTimeoutMs" | "thinkingLoopGuard">> & {
+export type ResolvedAnthropicCompat = Required<
+	Omit<AnthropicCompat, "streamIdleTimeoutMs" | "thinkingLoopGuard" | "promptCacheSessionHeader">
+> & {
 	/** Thinking-loop watchdog guard family applied to streamed reasoning. */
 	thinkingLoopGuard?: AnthropicCompat["thinkingLoopGuard"];
+	/** Routing-session header a gateway requires; unset unless a provider rule declares one. */
+	promptCacheSessionHeader?: AnthropicCompat["promptCacheSessionHeader"];
 	/**
 	 * Stream-watchdog idle-timeout fallback in ms for slow reasoning hosts; 0 disables the idle watchdog.
 	 * Undefined defers to `PI_STREAM_IDLE_TIMEOUT_MS`, then the legacy

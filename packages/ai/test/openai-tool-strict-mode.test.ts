@@ -304,6 +304,60 @@ describe("OpenAI tool strict mode", () => {
 		expect(payload.tools?.every(tool => tool.function?.strict === undefined)).toBe(true);
 	});
 
+	it("promotes a pure union tool root to an object root when the provider validates the root type", async () => {
+		const base = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+		const unionRootTool: Tool = {
+			name: "browser_handoff",
+			description: "Request user attention",
+			parameters: {
+				anyOf: [
+					{
+						type: "object",
+						additionalProperties: false,
+						properties: { operation: { const: "request" }, prompt: { type: "string" } },
+						required: ["operation", "prompt"],
+					},
+					{
+						type: "object",
+						additionalProperties: false,
+						properties: { operation: { const: "resolve" }, tab_id: { type: "integer" } },
+						required: ["operation", "tab_id"],
+					},
+				],
+			},
+		};
+		const mixedUnionTool: Tool = {
+			name: "mixed_union",
+			description: "Union carrying a non-object branch",
+			parameters: { anyOf: [{ type: "object", properties: {} }, { type: "string" }] },
+		};
+		const context: Context = { ...testContext, tools: [unionRootTool, mixedUnionTool] };
+		const parameterSchemas = async (compat: Model<"openai-completions">["compat"]) => {
+			const payload = (await captureCompletionsPayload({ ...base, api: "openai-completions", compat }, context)) as {
+				tools?: Array<{ function?: { parameters?: Record<string, unknown> } }>;
+			};
+			return payload.tools?.map(tool => tool.function?.parameters) ?? [];
+		};
+
+		// Console Go rejects any function whose parameter root is not an object
+		// (`got 'type: null'`), which is exactly what a pure union root serializes
+		// to; the added tag narrows nothing because every branch is an object.
+		const promoted = await parameterSchemas({
+			...base.compat,
+			supportsStrictMode: false,
+			objectRootToolSchemas: true,
+		});
+		expect(promoted[0]?.type).toBe("object");
+		expect(promoted[0]?.anyOf).toHaveLength(2);
+		// A non-object branch is a real constraint: leave that union as authored.
+		expect(promoted[1]?.type).toBeUndefined();
+		expect(promoted[1]?.anyOf).toHaveLength(2);
+
+		const untouched = await parameterSchemas({ ...base.compat, supportsStrictMode: false });
+		expect(untouched[0]?.type).toBeUndefined();
+		expect(untouched[0]?.anyOf).toHaveLength(2);
+	});
+
 	it("surfaces captured JSON error bodies when the SDK reports no body", async () => {
 		const model: Model<"openai-completions"> = {
 			...(getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">),

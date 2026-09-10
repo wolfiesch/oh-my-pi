@@ -67,6 +67,7 @@ const compat: ResolvedOpenAICompat = {
 	clampOutputToModelMax: false,
 	stripImageInput: false,
 	rejectRootObjectUnion: false,
+	objectRootToolSchemas: false,
 	retryWithoutStrictOnGrammarError: false,
 	supportsPromptCacheKey: false,
 };

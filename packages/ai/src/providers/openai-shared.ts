@@ -205,7 +205,7 @@ function applyCoreWeaveProjectHeader(headers: Record<string, string>): void {
 	}
 }
 
-function setHeaderIfAbsent(headers: Record<string, string>, name: string, value: string): void {
+export function setHeaderIfAbsent(headers: Record<string, string>, name: string, value: string): void {
 	const normalizedName = name.toLowerCase();
 	for (const existingName in headers) {
 		if (existingName.toLowerCase() === normalizedName) return;
@@ -474,6 +474,16 @@ export function normalizeOpenRouterResponsesSessionId(sessionId: string | undefi
 /** Resolve a prompt-cache identity, falling back to the provider session unless caching is disabled. */
 export function getOpenAIPromptCacheKey(options: OpenAICacheOptions | undefined): string | undefined {
 	if (resolveCacheRetention(options?.cacheRetention) === "none") return undefined;
+	return normalizeOpenAIPromptCacheKey(options?.promptCacheKey ?? options?.sessionId);
+}
+
+/**
+ * Session identity for providers whose gateway requires one on *every* request
+ * (`compat.promptCacheSessionHeader`), such as Console Go's `x-opencode-session`.
+ * Unlike {@link getOpenAIPromptCacheKey} this ignores `cacheRetention`, because
+ * disabling caching must not strip a header the gateway routes on.
+ */
+export function getOpenAISessionHeaderId(options: OpenAICacheOptions | undefined): string | undefined {
 	return normalizeOpenAIPromptCacheKey(options?.promptCacheKey ?? options?.sessionId);
 }
 

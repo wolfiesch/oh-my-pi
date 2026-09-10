@@ -235,6 +235,23 @@ export function flattenExclusiveRequiredRootUnion(schema: Record<string, unknown
 	return flattened;
 }
 
+/**
+ * Declare `type: "object"` on a pure union root (`anyOf`/`oneOf` and no root
+ * `type`) whose branches are already object schemas. The tag narrows nothing —
+ * every branch already requires an object — but some upstream validators reject
+ * a function parameter schema whose root does not literally carry
+ * `type: "object"` (Console Go reports it as `got 'type: null'`).
+ */
+export function ensureObjectRootSchema(schema: Record<string, unknown>): Record<string, unknown> {
+	if (schema.type !== undefined) return schema;
+	const unionKey = Array.isArray(schema.anyOf) ? "anyOf" : Array.isArray(schema.oneOf) ? "oneOf" : undefined;
+	if (!unionKey) return schema;
+	const union = schema[unionKey];
+	if (!Array.isArray(union) || union.length === 0) return schema;
+	if (!union.every(branch => isSchemaRecord(branch) && branch.type === "object")) return schema;
+	return { ...schema, type: "object" };
+}
+
 /** Keys whose values are a single JSON Schema (not an array or map). */
 const SCHEMA_VALUE_KEYS = [
 	"additionalProperties",

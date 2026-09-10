@@ -1,6 +1,15 @@
 // Provider-wire compat for "opencode-go"; regenerated from the frozen census using deployment contract selectors.
 
 provider "opencode-go" {
+	// Console Go 400s every request without `x-opencode-session`
+	// ("Request is missing x-opencode-session and cannot be routed
+	// efficiently"), so the gateway's session key must ride every call.
+	prompt-cache-session-header "x-opencode-session"
+	// Console Go validates every function's parameter schema and 400s the whole
+	// request when the root is not an object ("Invalid schema for function
+	// 'browser_handoff': schema must be a JSON Schema of 'type: \"object\"',
+	// got 'type: null'"), which is what a pure anyOf tool root serializes to.
+	object-root-tool-schemas #true
 	// Replaces the OpenCode reasoning-model whenThinking fallback object.
 	when-thinking {
 		requires-reasoning-content-for-tool-calls #true
@@ -12,6 +21,17 @@ provider "opencode-go" {
 	long-usage-limit-fallback #true
 	class "deepseek" {
 		thinking-mode "effort"
+		// Every DeepSeek lane on the gateway rejects tool_choice, speaks
+		// max_tokens (never max_completion_tokens), streams reasoning through
+		// reasoning_content, and requires reasoning replay on tool calls — on
+		// both the completions and responses routes. These ride the class, not
+		// exact ids: this provider resolves models from a live `/v1/models`
+		// listing whose ids (`deepseek-flash`) never matched the census globs, so
+		// an id-scoped rule silently skipped every wire trait and the gateway
+		// dropped the requested output cap.
+		max-tokens-field "max_tokens"
+		reasoning-content-field "reasoning_content"
+		requires-reasoning-content-for-tool-calls #true
 		family "flash" {
 			supports-tool-choice #false
 		}
@@ -20,14 +40,10 @@ provider "opencode-go" {
 	models "deepseek-v4-flash-vision-exp" {
 		supports-tool-choice #true
 	}
-	// residue: the gateway's DeepSeek V4 flash/pro lanes reject tool_choice,
-	// speak max_tokens + reasoning_content, and require reasoning replay on
-	// tool calls (both the completions and responses routes).
+	// residue: a DeepSeek lane whose family selector does not resolve still
+	// rejects tool_choice.
 	models "deepseek-v4-flash" "deepseek-v4-pro" {
 		supports-tool-choice #false
-		max-tokens-field "max_tokens"
-		reasoning-content-field "reasoning_content"
-		requires-reasoning-content-for-tool-calls #true
 	}
 	class "glm" {
 		thinking-mode "effort"

@@ -5,6 +5,8 @@
 ### Fixed
 
 - Preserved Anthropic thinking now survives side requests, tool-description drift, turn-scoped reminders, and recoverable prefix mismatches without corrupting the conversation prefix.
+- Provider session headers now reach the Anthropic and OpenAI Responses transports, so gateways that route on them no longer reject requests that only carried the header on OpenAI chat completions.
+- Tool schemas whose root is a union of object variants now declare an object root, so providers that reject a non-object parameter root accept the request instead of failing the whole call.
 
 ## [18.1.2] - 2026-09-01
 

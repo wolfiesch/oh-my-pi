@@ -563,6 +563,7 @@ function detectOpenAICompat(
 		stripImageInput: false,
 		thinkingLoopGuard: undefined,
 		rejectRootObjectUnion: false,
+		objectRootToolSchemas: false,
 		retryWithoutStrictOnGrammarError: false,
 		supportsPromptCacheKey: false,
 	};
@@ -756,6 +757,7 @@ function resolveOpenAIResponsesPolicy(
 		officialEndpoint: isOfficialOpenAIEndpoint(provider, baseUrl),
 		harmonyLeakMitigation: false,
 		rejectRootObjectUnion: false,
+		objectRootToolSchemas: false,
 		retryWithoutStrictOnGrammarError: false,
 		cacheControlFormat: isOpenRouter && isAnthropicModel ? "anthropic" : undefined,
 		stripDeepseekSpecialTokens: facts.is("deepseek") && (provider === "nvidia" || provider === "deepseek"),

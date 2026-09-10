@@ -36,6 +36,7 @@ import { notifyProviderResponse } from "../utils/provider-response";
 import { callWithCopilotModelRetry } from "../utils/retry";
 import {
 	adaptSchemaForStrict,
+	ensureObjectRootSchema,
 	findStrictToolSchemaViolation,
 	flattenExclusiveRequiredRootUnion,
 	NO_STRICT,
@@ -82,6 +83,7 @@ import {
 	disableStrictToolsForScope,
 	getJuiceValue,
 	getOpenAIPromptCacheKey,
+	getOpenAISessionHeaderId,
 	getOpenAIResponsesRoutingSessionId,
 	getOpenAIStrictToolsScope,
 	getOpenRouterResponsesSessionId,
@@ -439,7 +441,7 @@ const streamOpenAIResponsesOnce = (
 			// stable prompt-cache key independently. Side-channel calls use this to
 			// avoid perturbing provider conversation state without cold-starting the cache.
 			const routingSessionId = getOpenAIResponsesRoutingSessionId(options);
-			const promptCacheSessionId = getOpenAIPromptCacheKey(options);
+			const promptCacheSessionId = getOpenAISessionHeaderId(options);
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
 			const { headers, copilotPremiumRequests, baseUrl } = resolveOpenAIRequestSetup(model, {
 				apiKey,
@@ -1397,7 +1399,10 @@ export function convertTools(
 		// subschemas ("property schema … must be an object"), so the Moonshot
 		// pass re-coerces them last.
 		const sanitized = sanitizeSchemaForOpenAIResponses(baseParameters);
-		const providerParameters = rejectRootObjectUnion ? flattenExclusiveRequiredRootUnion(sanitized) : sanitized;
+		const rootParameters = rejectRootObjectUnion ? flattenExclusiveRequiredRootUnion(sanitized) : sanitized;
+		const providerParameters = model.compat.objectRootToolSchemas
+			? ensureObjectRootSchema(rootParameters)
+			: rootParameters;
 		const responseParameters =
 			model.compat.toolSchemaFlavor === "moonshot-mfjs"
 				? (normalizeSchemaForMoonshot(providerParameters) as Record<string, unknown>)

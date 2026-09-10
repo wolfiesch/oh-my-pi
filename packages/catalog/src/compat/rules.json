@@ -10850,7 +10850,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:15",
+				"source": "providers/opencode-go.kdl:35",
 				"class": "deepseek",
 				"providers": [
 					"opencode-go"
@@ -10861,17 +10861,22 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:13",
+				"source": "providers/opencode-go.kdl:22",
 				"class": "deepseek",
 				"providers": [
 					"opencode-go"
 				],
+				"wire": {
+					"maxTokensField": "max_tokens",
+					"reasoningContentField": "reasoning_content",
+					"requiresReasoningContentForToolCalls": true
+				},
 				"thinking": {
 					"mode": "effort"
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:20",
+				"source": "providers/opencode-go.kdl:40",
 				"providers": [
 					"opencode-go"
 				],
@@ -10886,7 +10891,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:26",
+				"source": "providers/opencode-go.kdl:45",
 				"providers": [
 					"opencode-go"
 				],
@@ -10901,14 +10906,11 @@
 					}
 				],
 				"wire": {
-					"supportsToolChoice": false,
-					"maxTokensField": "max_tokens",
-					"reasoningContentField": "reasoning_content",
-					"requiresReasoningContentForToolCalls": true
+					"supportsToolChoice": false
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:32",
+				"source": "providers/opencode-go.kdl:48",
 				"class": "glm",
 				"providers": [
 					"opencode-go"
@@ -10918,7 +10920,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:35",
+				"source": "providers/opencode-go.kdl:51",
 				"class": "kimi",
 				"providers": [
 					"opencode-go"
@@ -10928,7 +10930,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:39",
+				"source": "providers/opencode-go.kdl:55",
 				"class": "mimo",
 				"providers": [
 					"opencode-go"
@@ -10939,7 +10941,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:38",
+				"source": "providers/opencode-go.kdl:54",
 				"class": "mimo",
 				"providers": [
 					"opencode-go"
@@ -10949,7 +10951,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:46",
+				"source": "providers/opencode-go.kdl:62",
 				"class": "qwen",
 				"providers": [
 					"opencode-go"
@@ -10975,7 +10977,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:50",
+				"source": "providers/opencode-go.kdl:66",
 				"class": "qwen",
 				"providers": [
 					"opencode-go"
@@ -11001,7 +11003,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:56",
+				"source": "providers/opencode-go.kdl:72",
 				"providers": [
 					"opencode-go"
 				],
@@ -11026,7 +11028,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:61",
+				"source": "providers/opencode-go.kdl:77",
 				"providers": [
 					"opencode-go"
 				],
@@ -11046,7 +11048,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:66",
+				"source": "providers/opencode-go.kdl:82",
 				"providers": [
 					"opencode-go"
 				],
@@ -11068,7 +11070,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:71",
+				"source": "providers/opencode-go.kdl:87",
 				"providers": [
 					"opencode-go"
 				],
@@ -11089,7 +11091,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:75",
+				"source": "providers/opencode-go.kdl:91",
 				"providers": [
 					"opencode-go"
 				],
@@ -11116,7 +11118,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:79",
+				"source": "providers/opencode-go.kdl:95",
 				"providers": [
 					"opencode-go"
 				],
@@ -11138,7 +11140,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:84",
+				"source": "providers/opencode-go.kdl:100",
 				"providers": [
 					"opencode-go"
 				],
@@ -11153,7 +11155,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:88",
+				"source": "providers/opencode-go.kdl:104",
 				"providers": [
 					"opencode-go"
 				],
@@ -11178,6 +11180,8 @@
 					"opencode-go"
 				],
 				"wire": {
+					"promptCacheSessionHeader": "x-opencode-session",
+					"objectRootToolSchemas": true,
 					"whenThinking": {
 						"requiresReasoningContentForToolCalls": true,
 						"allowsSyntheticReasoningContentForToolCalls": false,

@@ -5,6 +5,7 @@
 ### Added
 
 - Added support for Claude Fable 5.1
+- Added the `object-root-tool-schemas` compat axis for providers that reject a function parameter schema whose root is not an object.
 
 ### Changed
 
@@ -13,6 +14,7 @@
 ### Fixed
 
 - Updated the Codex compatibility version so newly released models no longer reject requests as an outdated client.
+- OpenCode Go requests now carry the gateway's session header, and its DeepSeek lanes use `max_tokens` with class-scoped reasoning replay, so the gateway stops dropping the requested output cap.
 - Claude Sonnet 5 no longer advertises unsupported mid-conversation system messages.
 
 ## [18.1.2] - 2026-09-01

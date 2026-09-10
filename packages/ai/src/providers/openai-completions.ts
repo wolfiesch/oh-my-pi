@@ -44,6 +44,7 @@ import { notifyProviderResponse } from "../utils/provider-response";
 import { callWithCopilotModelRetry } from "../utils/retry";
 import {
 	adaptSchemaForStrict,
+	ensureObjectRootSchema,
 	findStrictToolSchemaViolation,
 	flattenExclusiveRequiredRootUnion,
 	NO_STRICT,
@@ -93,6 +94,7 @@ import {
 	createOpenAIStrictToolsState,
 	disableStrictToolsForScope,
 	getOpenAIPromptCacheKey,
+	getOpenAISessionHeaderId,
 	getOpenAIStrictToolsScope,
 	isCompiledGrammarTooLargeStrictError,
 	isStrictToolsDisabledForScope,
@@ -731,7 +733,7 @@ const streamOpenAICompletionsOnce = (
 				apiKey,
 				options?.headers,
 				options?.initiatorOverride,
-				getOpenAIPromptCacheKey(options),
+				getOpenAISessionHeaderId(options),
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			let appliedStrictTools = false;
@@ -2422,9 +2424,10 @@ function convertTools(
 	const rejectRootObjectUnion = compat.rejectRootObjectUnion;
 	const adaptedTools = tools.map(tool => {
 		const strict = !NO_STRICT && compat.supportsStrictMode !== false && tool.strict !== false;
-		const baseParameters = rejectRootObjectUnion
+		const rootSchema = rejectRootObjectUnion
 			? flattenExclusiveRequiredRootUnion(toolWireSchema(tool))
 			: toolWireSchema(tool);
+		const baseParameters = compat.objectRootToolSchemas ? ensureObjectRootSchema(rootSchema) : rootSchema;
 		const adapted = adaptSchemaForStrict(baseParameters, strict);
 		return {
 			tool,

@@ -226,6 +226,7 @@ describe("openai-completions compatibility", () => {
 			clampOutputToModelMax: false,
 			stripImageInput: false,
 			rejectRootObjectUnion: false,
+			objectRootToolSchemas: false,
 			retryWithoutStrictOnGrammarError: false,
 			supportsPromptCacheKey: false,
 		} satisfies ResolvedOpenAICompat;

@@ -103,7 +103,7 @@ import {
 	hasCopilotVisionInput,
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
-import { getOpenAIPromptCacheKey } from "./openai-shared";
+import { getOpenAIPromptCacheKey, getOpenAISessionHeaderId, setHeaderIfAbsent } from "./openai-shared";
 import { transformMessages } from "./transform-messages";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 
@@ -1240,6 +1240,8 @@ export type AnthropicClientOptionsArgs = {
 	fetch?: FetchImpl;
 	maxRetryDelayMs?: number;
 	claudeCodeSessionId?: string;
+	/** Session identity for providers whose gateway routes on a compat session header. */
+	promptCacheSessionId?: string;
 };
 
 export type AnthropicClientOptionsResult = {
@@ -2191,6 +2193,7 @@ const streamAnthropicOnce = (
 					fetch: options?.fetch,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					claudeCodeSessionId: options?.sessionId ?? extractClaudeMetadataSessionId(options?.metadata?.user_id),
+					promptCacheSessionId: getOpenAISessionHeaderId(options),
 					disableStrictTools,
 				});
 				client = created.client;
@@ -3222,6 +3225,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		isOAuth,
 		maxRetryDelayMs,
 		claudeCodeSessionId,
+		promptCacheSessionId,
 		disableStrictTools: disableStrictToolsOverride,
 	} = args;
 	const compat = model.compat;
@@ -3331,6 +3335,10 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 				})
 			: [],
 	});
+
+	if (model.compat.promptCacheSessionHeader && promptCacheSessionId) {
+		setHeaderIfAbsent(defaultHeaders, model.compat.promptCacheSessionHeader, promptCacheSessionId);
+	}
 
 	if (model.provider === "cloudflare-ai-gateway") {
 		return {
